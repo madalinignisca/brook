@@ -39,7 +39,8 @@ Brook/
 │   ├── SECURITY.md            trust model (self-host, no E2EE), TLS, at-rest = operator, SSRF
 │   ├── PROTOCOL.md            wire protocol (WebSocket events + REST)
 │   ├── DATA_MODEL.md          entities and relationships
-│   └── ROADMAP.md             MVP phases / milestones
+│   ├── ROADMAP.md             MVP phases / milestones
+│   └── QUALITY.md             per-subproject testing, linting & CI standards
 ├── core/                  ← shared Rust core library (protocol, state, crypto, signaling)
 ├── services/             ← server side
 │   ├── api/                   chat/channels/files/bots backend (Python + FastAPI)
@@ -48,6 +49,7 @@ Brook/
 │   └── gateway/               reverse proxy + TLS termination (Caddy)
 ├── clients/              ← one native app per platform, all on top of `core/`
 │   ├── gnome/                 Rust + GTK4 + libadwaita   (also the Raspberry Pi target)
+│   ├── kde/                   Qt6 + Kirigami (+ KF6) via CXX-Qt  (Plasma)
 │   ├── macos/                 Swift + SwiftUI / AppKit
 │   ├── windows/               C# / .NET + WinUI 3
 │   ├── android/               Kotlin + Jetpack Compose (Material 3)

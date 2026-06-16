@@ -41,12 +41,15 @@ This is a proven pattern (Signal, Matrix's `matrix-rust-sdk`, 1Password): native
 | Platform | UI toolkit / language | Core binding | HIG target |
 |---|---|---|---|
 | **Linux / GNOME** *(+ Raspberry Pi)* | **GTK4 + libadwaita**, Rust | direct (both Rust — no FFI) | GNOME HIG; follows system light/dark + accent via `AdwStyleManager` |
+| **Linux / KDE Plasma** | **Qt 6 + Kirigami** (+ selective KF6) | **CXX-Qt** (Rust↔Qt) | Plasma HIG; follows Breeze theme/accent; menubar + system tray (see [../clients/kde/](../clients/kde/)) |
 | **macOS** | **SwiftUI + AppKit**, Swift | **UniFFI** (Rust→Swift) | macOS HIG; menu bar, native windowing |
 | **Windows** | **WinUI 3 (Windows App SDK)**, C#/.NET | C ABI (`csbindgen`/P-Invoke) | Fluent design; Mica, native title bar |
 | **Android** | **Jetpack Compose (Material 3)**, Kotlin | **UniFFI** (Rust→Kotlin/JNI) | Material 3; predictive back, themed icons |
 | **iOS** | **SwiftUI + UIKit**, Swift | **UniFFI** (Rust→Swift) | iOS HIG; shares much with macOS client |
 
 > The **GNOME client is the reference client** and the **Raspberry Pi 4B target** (see [MEDIA.md](MEDIA.md)). On Linux the whole stack is Rust, so it's the simplest to build first and the place we prove the core API.
+
+> **Two Linux desktops, on purpose.** GNOME and KDE Plasma have genuinely different conventions; a single libadwaita app on Plasma (or a Kirigami app on GNOME) is the "native nowhere" outcome we reject — *within* Linux. So Brook ships **both** a GTK4/libadwaita client and a Qt6/Kirigami client, each following its desktop's HIG, both over the same Rust `core`. The KDE client is built second and doubles as the proof of the **Qt↔Rust (CXX-Qt)** binding before the Apple/Windows FFI work.
 
 ## What stays native (never pushed into `core`)
 
