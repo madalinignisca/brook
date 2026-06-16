@@ -38,7 +38,7 @@ All methods converge on **one internal session**: `api` issues a short-lived **a
 
 ## 4. Files
 
-- Upload: client asks `api` for a **presigned PUT** (scoped to one object, short TTL) → PUTs bytes to MinIO over HTTPS. Download: presigned **GET** likewise.
+- Upload: client asks `api` for an **S3 POST Policy** (not a bare presigned PUT) → the policy embeds a **`content-length-range`** so MinIO **rejects oversize uploads at the edge, mid-transfer** — a presigned *PUT* cannot enforce size and would let a client write unbounded bytes (disk-fill DoS) before any `/commit` check. Download: presigned **GET** (single object, short TTL).
 - Presigned URLs are **bearer capabilities** — anyone holding one within its TTL can use it. Mitigations: **short TTL**, HTTPS only, scope to a single object+operation, and `api` authorizes the requester before minting.
 - At rest: see §4a — encryption at rest is the **operator's infrastructure concern**, not an app feature.
 
@@ -92,6 +92,7 @@ Starting values — tune with real data; the point is that nothing is left "shor
 
 **Call lifecycle / cleanup**
 - A `call` with no active participants for **5 min** is closed: SFU room torn down, `calls.ended_at` set. Guards against orphaned rooms when a client crashes mid-call.
+- **Don't trust the WS for "left."** A silently-dropped client leaves a half-open socket, so `api` must treat **Janus media state** as authoritative: subscribe to the **Janus Event Handler** (participant leaving / ICE/DTLS torn down) to definitively mark participants gone, in addition to explicit `call.leave` and WS close.
 
 ## 8. Threat-model notes (living)
 

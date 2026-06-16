@@ -28,6 +28,16 @@ We standardize on **H.264** as the primary call codec because it has the **broad
 - **VP8** is kept as a **software fallback** (cheap to encode at low resolution) for devices lacking H.264 HW encode.
 - VP9/AV1-SVC are future options where HW supports them (better layering, but narrower HW encode coverage today).
 
+## 3b. Audio (Opus + echo cancellation) — do not forget this
+
+The video story above is only half a call. Audio:
+
+- **Codec: Opus** (WebRTC standard; software encode/decode is cheap everywhere, including the Pi).
+- **Acoustic Echo Cancellation (AEC) is mandatory** for speaker calls (otherwise remote parties hear themselves). Plus noise suppression + auto-gain. On native GStreamer this is software DSP (`webrtcdsp`/`webrtcechoprobe`), which **costs real CPU** — and that cost lands on the **Pi 4B**, directly competing with H.264 encode for its budget.
+- Prefer the platform's **hardware/OS AEC** where available (PipeWire/WirePlumber echo-cancel module on Linux, VoiceProcessingIO on Apple, `AcousticEchoCanceler` on Android) before falling back to software DSP.
+- **Pi impact:** the acceptance test ([§6](#6-the-raspberry-pi-4b-target-optimization-litmus-test)) must include audio with AEC running, and the CPU budget must account for it — not just video encode.
+- The `MediaEngine` trait's `MediaSource` includes **mic**; audio capture/AEC/encode is part of each platform implementation.
+
 ## 4. The media engine abstraction
 
 `core` owns **signaling only** (negotiating with Janus over the WSS relay). The **media engine** — capture, encode, transport, decode, render — is per-platform behind a common interface so `core` can drive it uniformly:
@@ -74,6 +84,7 @@ To let the SFU serve different viewers different qualities, the sender either:
 
 **Baseline = single-layer H.264.** Simulcast with H.264 is genuinely tricky — RID/profile-level-id negotiation must line up across Janus, GStreamer `webrtcbin`, hardware encoders, and any browser/Safari peer, and it multiplies encoder load. So:
 - **MVP ships single-layer H.264** (one encode per published track). Quality adapts via bitrate/resolution renegotiation, not layers.
+- **Group-call gotcha:** in a non-transcoding SFU, *every receiver gets exactly what the sender encodes*. With no simulcast, a strong sender (e.g. a Mac pushing 1080p high-bitrate) can swamp weak receivers (Pi, poor mobile links). **MVP mitigation: enforce a conservative per-publisher max bitrate/resolution in group rooms** (e.g. ≤ ~1 Mbps / 720p), set via the Janus VideoRoom room config and/or sender-side caps in `core`, so the lowest-common-denominator stays playable. Lift it only once simulcast/SVC lands.
 - **Simulcast is a Phase-4 spike**, not assumed working: prove H.264 simulcast end-to-end (Janus VideoRoom ⇄ GStreamer) with measured interop before relying on it; otherwise stay single-layer (or evaluate VP9/AV1-SVC where HW allows).
 
 **Janus VideoRoom config (to pin down in Phase 4):** room advertises codecs (H.264 with an explicitly agreed `profile-level-id`, VP8 fallback). If/when the simulcast spike succeeds: publishers declare simulcast (rid-based or legacy `simulcast`), subscribers request a substream/temporal layer, and `core` sends `LayerHint`s. Document the exact `videoroom` parameters (`videocodec`, `h264_profile`, simulcast settings).
@@ -90,7 +101,8 @@ This is feasible **because** of the architecture (native GTK4 UI, no Electron, R
   - Target **720p30 single-layer** for the outgoing camera (no simulcast on the Pi — it can't afford the extra encodes).
   - **Screen share at reduced framerate** (e.g. 1080p @ 5–10 fps — screens are mostly static; this is cheap and crisp).
 - **Decode:** HW H.264 decode handles incoming streams up to 1080p comfortably.
-- **Pipeline:** keep frames in GPU memory (DMA-BUF) from `pipewiresrc`/camera → `v4l2h264enc` → `webrtcbin`; avoid CPU copies.
+- **Pipeline:** aim to keep frames in GPU memory (DMA-BUF) from `pipewiresrc`/camera → `v4l2h264enc` → `webrtcbin`; avoid CPU copies.
+  - ⚠️ **DMA-BUF retention risk (primary Pi unknown):** GStreamer's WebRTC RTP payloader (`rtph264pay`) often **can't consume DMA-BUF directly** and forces a CPU memory-map copy — which would erase the zero-copy win on the Pi. **Spike this first:** prove `v4l2h264enc ! rtph264pay ! webrtcbin` retains DMA-BUF (or measure the memcpy cost) **before** committing to the Pi target in Phase 4.
 - **Constraints to respect:** cap the number of *decoded* incoming video tiles (e.g. show only the active speaker + thumbnails) to bound decode load; prefer audio-only fallback under pressure.
 
 > **Encode budget — important:** "one encode per *published track*" is the rule, so **camera + screen share simultaneously = two H.264 encodes**, which likely exceeds the Pi 4B's encoder. On the Pi, treat camera and screen share as **mutually exclusive by default** (sharing the screen pauses the camera), so the Pi encodes **one** track at a time. Simultaneous camera+screen on the Pi is only enabled if measurements show headroom.

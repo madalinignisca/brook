@@ -21,11 +21,11 @@
 | `POST /channels` | create channel |
 | `GET /channels/{id}` · `PATCH /channels/{id}` · `DELETE /channels/{id}` | get / rename-topic / delete |
 | `GET /channels/{id}/members` · `POST` · `DELETE /channels/{id}/members/{uid}` | list / add / remove member |
-| `GET  /channels/{id}/messages?before=&limit=` | paginated history (see §5 limits) |
-| `POST /channels/{id}/messages` | send message (also broadcast via WS) |
+| `GET  /channels/{id}/messages?before=&after=&limit=` | history: `before=<id>` (back-paginate) or `after=<id>` (**forward-sync** missed messages on reconnect) |
+| `POST /channels/{id}/messages` | **send a message (the only send path)**; server persists then fans out via WS |
 | `PATCH /messages/{id}` · `DELETE /messages/{id}` | edit / soft-delete (author or channel owner) |
-| `POST /channels/{id}/files` | begin upload → `{upload_url (presigned PUT), file_id}` (state `pending`) |
-| `POST /files/{id}/commit` | finalize: server verifies object exists + size/type ≤ caps → state `committed` (attachable) |
+| `POST /channels/{id}/files` | begin upload → **S3 POST Policy** (`{url, fields}` with a `content-length-range`) + `file_id` (state `pending`) |
+| `POST /files/{id}/commit` | finalize: server confirms the object exists + type ok → state `committed` (attachable) |
 | `GET  /files/{id}` · `DELETE /files/{id}` | request **presigned GET** → `{download_url}` · delete |
 | `POST /channels/{id}/calls` | join call → `{room_id}` (signaling then over WS; api-proxied, no client Janus token) |
 | `POST /devices` · `DELETE /devices/{id}` | register/unregister an APNs/FCM push token (mobile) |
@@ -57,10 +57,11 @@ Messages are tagged envelopes:
 | `call.participant` | join/leave/mute in a room |
 
 ### Client → server commands
+> **Sending messages is REST-only** (`POST /channels/{id}/messages`), never a WS command — one send path avoids races between HTTP retries and WS reconnect-replay, and simplifies dedup. The WS carries only ephemeral signals (typing, call) and **receives** fan-out.
+
 | type | data |
 |---|---|
 | `auth` | access token (**required first frame**, see above) |
-| `message.send` | channel id, body, attachment file_ids |
 | `typing` | channel id |
 | `call.join` / `call.leave` | room id |
 | `call.signal` | SDP offer/answer, ICE candidates (to SFU) |
@@ -83,7 +84,7 @@ The client's **media engine** produces the SDP/tracks and consumes remote tracks
 Mobile OSes suspend background WebSockets, so an always-on WSS cannot be the delivery path on iOS/Android. We add **push**:
 
 - **Device registration:** clients register an **APNs (iOS) / FCM (Android)** token via `POST /devices` (revoked on logout / `DELETE /devices/{id}`).
-- **Wake on event:** when a message/mention/**call invite** targets a user with no live socket, `api` sends a push to wake the app, which then reconnects its WSS to sync. Desktop clients (always-on WSS) don't need push.
+- **Wake on event:** push is decided **per device, not per user.** A user's desktop having a live WS must **not** suppress push to their mobile (they may have walked away). Each registered mobile device gets a push (silent data / collapse-key for messages; high-priority for call invites) unless *that device* has a live foreground socket. Optionally gate by per-device presence (active/idle/away). Desktop clients with an always-on WS simply don't need push.
 - **Incoming calls:** delivered as high-priority push → **CallKit (iOS) / ConnectionService + foreground service (Android)** present the native incoming-call UI; the app joins the room on accept.
 - **Privacy:** push payloads carry minimal metadata (e.g. "new message in #x"), not message content, unless the user opts into content previews.
 - **Provider config** (APNs key/FCM credentials) is per-deployment operator config. Desktop builds omit push.
@@ -99,7 +100,7 @@ Mobile OSes suspend background WebSockets, so an always-on WSS cannot be the del
 - Idempotency: client supplies a client-side message id; server dedupes.
 - Offline: `core` queues outgoing commands and replays on reconnect; server dedupes by client id.
 - Versioning: REST is path-versioned under the **`/api/v1`** base (matching §1); WS envelope may carry a `v` field later.
-- **File upload states:** `pending` (presigned PUT issued) → `committed` (`POST /files/{id}/commit` verified object exists + size/type within caps). Only `committed` files may be attached to messages; uncommitted/orphaned objects are reaped by a sweep.
+- **File upload states:** `pending` (POST Policy issued; MinIO enforces size via `content-length-range`) → `committed` (`POST /files/{id}/commit` confirmed object exists + type ok). Only `committed` files may be attached to messages; uncommitted/orphaned objects are reaped by a sweep.
 - **Pagination:** `limit` default 50, **max 100**; page backwards with `before=<message_id>`.
 - **Sizes & lifetimes** (TTLs, message/file/payload caps, rate limits): single source of truth is [SECURITY.md](SECURITY.md) §7.
 - **Errors:** uniform JSON body `{ "error": { "code": "<machine_code>", "message": "<human>", "details?": {} } }` with a sensible HTTP status. Codes are a stable taxonomy (e.g. `auth.invalid_credentials`, `auth.totp_required`, `authz.forbidden`, `not_found`, `rate_limited`, `validation.*`, `conflict`). WS errors use an `error` event with the same shape.

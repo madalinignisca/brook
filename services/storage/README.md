@@ -4,9 +4,9 @@ S3-compatible blob storage for file transfers (feature 5).
 
 ## Model
 - File **bytes** live here; file **metadata** lives in Postgres (see [../../docs/DATA_MODEL.md](../../docs/DATA_MODEL.md)).
-- Clients upload/download via **presigned URLs** minted by `api` — bytes never proxy through `api`.
-  - Upload: `api` → presigned **PUT** (single object, short TTL) → client PUTs over HTTPS.
-  - Download: `api` → presigned **GET** → client GETs over HTTPS.
+- Clients upload/download via short-lived signed URLs minted by `api` — bytes never proxy through `api`.
+  - Upload: `api` → **S3 POST Policy** with a **`content-length-range`** (so MinIO rejects oversize uploads at the edge — a bare presigned PUT can't cap size; see [../../docs/SECURITY.md](../../docs/SECURITY.md) §4) → client POSTs over HTTPS.
+  - Download: `api` → presigned **GET** (single object, short TTL) → client GETs over HTTPS.
 - "Upload to server, pull anytime when online" maps exactly to: uploader PUTs; recipient GETs when next online.
 
 ## Security

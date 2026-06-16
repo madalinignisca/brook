@@ -34,6 +34,8 @@ Instead, **all non-UI logic lives once in [`core/`](../core/) (Rust)** and is co
 
 This is a proven pattern (Signal, Matrix's `matrix-rust-sdk`, 1Password): native UI, shared Rust engine. Rust is chosen for the core because it is fast, memory-lean (no GC pauses — matters on a Pi), has excellent FFI, and compiles to every target.
 
+> **FFI state-observation pattern (decide early).** "Observe state" across UniFFI is **not** automatic — UniFFI does not bridge a Rust async stream (e.g. a Tokio `broadcast`) to a Swift `@Published` / Kotlin `Flow`. The contract: **`core` exposes a callback/listener interface** (UniFFI callback interface) that the native layer implements and registers; the native side wraps those callbacks into its own observable (`@Observable`/`StateFlow`/etc.). On Linux (Rust↔Rust, GTK) the core's stream is consumed directly. Define this listener shape in the `core` API up front — it shapes every client.
+
 ## Per-platform stack
 
 | Platform | UI toolkit / language | Core binding | HIG target |
