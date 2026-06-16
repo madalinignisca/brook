@@ -1,0 +1,26 @@
+# secrets
+.env
+**/.env
+
+# rust
+target/
+**/target/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# node (if mediasoup path is taken later)
+node_modules/
+
+# build / os
+dist/
+build/
+.DS_Store
+
+# data volumes (if bind-mounted locally)
+pgdata/
+miniodata/
+caddydata/

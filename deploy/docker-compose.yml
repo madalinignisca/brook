@@ -1,0 +1,53 @@
+# smartChat — local development stack (SKELETON, fleshed out in Phase 0).
+# One entry point (Caddy/TLS); media (Janus) and files (MinIO) bypass the api.
+# See ../docs/ARCHITECTURE.md and ../docs/SECURITY.md.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - miniodata:/data
+    # exposed via caddy over HTTPS in prod
+
+  janus:
+    image: canyan/janus-gateway:latest   # pin a digest before real use
+    # VideoRoom SFU. Config lives in ../services/sfu/. Needs UDP media ports.
+    # network_mode/ports for RTP to be defined in Phase 4 (calls).
+
+  api:
+    build: ../services/api
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      MINIO_ENDPOINT: minio:9000
+      JANUS_URL: http://janus:8088/janus
+      JWT_SIGNING_KEY: ${JWT_SIGNING_KEY}
+    depends_on: [postgres, minio, janus]
+
+  caddy:
+    image: caddy:2
+    # Terminates TLS (HTTPS + WSS), routes to api/minio/janus.
+    # Caddyfile lives in ../services/gateway/.
+    ports:
+      - "443:443"
+      - "80:80"
+    depends_on: [api]
+    volumes:
+      - caddydata:/data
+
+volumes:
+  pgdata:
+  miniodata:
+  caddydata:
