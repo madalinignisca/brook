@@ -1,6 +1,10 @@
-# smartChat
+# Brook
 
-An open-source, **resource-respecting** alternative to Slack-like services — **core features only**, with **truly native clients** on every platform.
+> *A brook is a small stream — quiet, clear, and always flowing. So is your team's conversation.*
+
+An open-source, **resource-respecting** alternative to Slack-like services — **core features only**, with **truly native clients** on every platform. Self-hosted, you own your data.
+
+**License:** [GNU AGPL-3.0](LICENSE) — see [§License](#license).
 
 ## Goals (and explicit non-goals)
 
@@ -26,7 +30,7 @@ An open-source, **resource-respecting** alternative to Slack-like services — *
 Each **client** and each **service** lives in its own directory with its own `README.md`, so anyone (human or agent) working on one component sees its scope, stack, and links to the global specs — without needing the whole tree in context.
 
 ```
-smartChat/
+Brook/
 ├── docs/                  ← global, cross-cutting specs (read these first)
 │   ├── ARCHITECTURE.md        system overview, topology, the shared-core decision
 │   ├── CLIENT_PHILOSOPHY.md   native-per-OS strategy + shared Rust core
@@ -58,3 +62,13 @@ smartChat/
 ## Status
 
 Pre-implementation. This tree currently holds the **architecture spec**. Implementation proceeds in phases per [docs/ROADMAP.md](docs/ROADMAP.md).
+
+## License
+
+Brook is licensed under the **GNU Affero General Public License v3.0** ([AGPL-3.0](LICENSE)).
+
+This is a deliberate choice for **network-oriented, self-hosted software**:
+- The AGPL closes the "SaaS loophole" in the ordinary GPL — **anyone who runs a modified Brook as a network service must offer their modified source to its users.** You can't take Brook, improve it behind a hosted product, and keep those changes private.
+- In short: **fork freely, but contribute your changes back.** That keeps Brook honest as a community-owned alternative and prevents it from being quietly absorbed into a closed commercial offering.
+
+Copyright © Brook contributors. Contributions are accepted under the same license.

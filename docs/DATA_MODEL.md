@@ -17,7 +17,7 @@ Message ── (author) ─► User | Bot
 ## Tables (sketch)
 
 **users** — `id (uuidv7) · handle · display_name · avatar_file_id? · global_role (admin|member) · status (active|deactivated) · created_at`
-> **Global roles & bootstrap:** smartChat is **single-workspace per server** (one self-hosted instance = one organization; no multi-tenant). Two global roles: **admin** (manage users/bots/server settings) and **member**. The **first user created bootstraps as `admin`**; admins promote/deactivate others. `status=deactivated` handles **deprovisioning** (federated user removed upstream, or offboarded) without deleting history. Channel-level `owner|member` (in `memberships`) is separate from global role.
+> **Global roles & bootstrap:** Brook is **single-workspace per server** (one self-hosted instance = one organization; no multi-tenant). Two global roles: **admin** (manage users/bots/server settings) and **member**. The **first user created bootstraps as `admin`**; admins promote/deactivate others. `status=deactivated` handles **deprovisioning** (federated user removed upstream, or offboarded) without deleting history. Channel-level `owner|member` (in `memberships`) is separate from global role.
 **local_credentials** — `user_id · password_hash (argon2id)` (only for local accounts)
 **totp** — `user_id · secret (enc) · activated_at` (+ `recovery_codes`: `user_id · code_hash · used_at?`)
 **identities** — `id · user_id · provider (oidc|ldap) · issuer/server · subject_or_dn · created_at`

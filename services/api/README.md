@@ -8,7 +8,7 @@
 - Messages: persist + WebSocket fan-out; paginated history.
 - Files: mint **presigned** PUT/GET URLs for MinIO (bytes never proxy through here).
 - Bots: registry, signing secrets, channel membership; inbound webhook ingest; `/botname` outbound dispatch (HMAC-signed, **SSRF-guarded**).
-- Calls: **own Janus sessions/handles** and **proxy signaling** (api-proxied) between client WS and the Janus VideoRoom API; authorize joins from the smartChat session; deliver ICE servers/TURN credentials. Clients present no token to Janus.
+- Calls: **own Janus sessions/handles** and **proxy signaling** (api-proxied) between client WS and the Janus VideoRoom API; authorize joins from the Brook session; deliver ICE servers/TURN credentials. Clients present no token to Janus.
 
 ## Tech
 - FastAPI (async), WebSocket endpoint for realtime.

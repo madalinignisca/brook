@@ -1,6 +1,6 @@
 # Authentication
 
-> smartChat targets **self-hosted small business**. Auth must cover a lone team with local accounts *and* a company with central identity — without forcing either on the other. The operator chooses which methods are enabled per deployment.
+> Brook targets **self-hosted small business**. Auth must cover a lone team with local accounts *and* a company with central identity — without forcing either on the other. The operator chooses which methods are enabled per deployment.
 
 ## Design principle: pluggable methods, one internal session
 
@@ -8,7 +8,7 @@ No matter how a user authenticates, the `api` issues **its own** short-lived **a
 
 ```
   local pw(+TOTP) ┐
-  OIDC (Keycloak) ├──► api verifies ──► issues smartChat session (JWT + refresh) ──► WS / REST / SFU
+  OIDC (Keycloak) ├──► api verifies ──► issues Brook session (JWT + refresh) ──► WS / REST / SFU
   LDAP            ┘                         (uniform everywhere)
 ```
 
@@ -23,7 +23,7 @@ The default, always available (a small team needs nothing else).
 
 ## 2. OIDC — central authentication (test target: Keycloak)
 
-For companies with an identity provider. smartChat is the **Relying Party (RP)**.
+For companies with an identity provider. Brook is the **Relying Party (RP)**.
 
 - **Flow:** OAuth 2.0 **Authorization Code**, system browser, never an embedded webview (per RFC 8252).
 - **api-mediated (recommended)** — there are **two separate legs, each with its own PKCE chain. Do not conflate them** (conflating them is cryptographically impossible — the party that exchanges a code must hold the matching verifier):
@@ -32,20 +32,20 @@ For companies with an identity provider. smartChat is the **Relying Party (RP)**
   - `api` generates **its own** PKCE pair (`verifier_A`/`challenge_A`) and uses its client secret + `verifier_A` to exchange the Keycloak code. The native client is **not** involved in this PKCE chain.
 
   **Leg B — native client ⇄ `api`** (client is a *public* app):
-  - the client generates a **separate** PKCE pair (`verifier_B`/`challenge_B`) for the smartChat code it will receive.
+  - the client generates a **separate** PKCE pair (`verifier_B`/`challenge_B`) for the Brook code it will receive.
 
   Sequence:
   1. client opens the system browser to `api`'s `/auth/oidc/start`, passing **`challenge_B`**,
   2. `api` starts Leg A (its own `challenge_A`) and redirects the browser to Keycloak,
   3. user authenticates at Keycloak,
-  4. Keycloak → `api` (`/auth/oidc/callback`); `api` completes Leg A with `verifier_A`, validates the ID token, mints a short-lived smartChat code bound to `challenge_B`,
-  5. `api` redirects to the app (loopback / claimed link) with that smartChat code,
-  6. app calls `POST /auth/oidc/exchange` with the code + **`verifier_B`**; `api` verifies it → issues the smartChat session.
+  4. Keycloak → `api` (`/auth/oidc/callback`); `api` completes Leg A with `verifier_A`, validates the ID token, mints a short-lived Brook code bound to `challenge_B`,
+  5. `api` redirects to the app (loopback / claimed link) with that Brook code,
+  6. app calls `POST /auth/oidc/exchange` with the code + **`verifier_B`**; `api` verifies it → issues the Brook session.
 - **Per-platform redirect target:**
   - **Desktop** (GNOME/macOS/Windows): **loopback** `http://127.0.0.1:<port>/` (RFC 8252).
-  - **Mobile** (iOS/Android): loopback is not usable. **Prefer claimed HTTPS redirects — iOS Universal Links / Android App Links** (cryptographically bound to the app, so another app can't hijack them), driven by `ASWebAuthenticationSession` (iOS) / Custom Tabs (Android). A **custom URI scheme** `smartchat://oidc-callback` is a documented **fallback only** (custom schemes can be claimed by a malicious app).
+  - **Mobile** (iOS/Android): loopback is not usable. **Prefer claimed HTTPS redirects — iOS Universal Links / Android App Links** (cryptographically bound to the app, so another app can't hijack them), driven by `ASWebAuthenticationSession` (iOS) / Custom Tabs (Android). A **custom URI scheme** `brook://oidc-callback` is a documented **fallback only** (custom schemes can be claimed by a malicious app).
   - `core` abstracts this as a "redirect strategy" the native layer supplies.
-- **Identity mapping:** OIDC `sub` (issuer + subject) is the stable key → linked to a smartChat user. **JIT provisioning**: create the user on first login from claims (`preferred_username`, `email`, `name`). MFA is the provider's responsibility (so TOTP above is not layered on OIDC users).
+- **Identity mapping:** OIDC `sub` (issuer + subject) is the stable key → linked to a Brook user. **JIT provisioning**: create the user on first login from claims (`preferred_username`, `email`, `name`). MFA is the provider's responsibility (so TOTP above is not layered on OIDC users).
 - **Config (per deployment):** issuer URL, client id/secret, scopes, claim→profile mapping.
 
 ## 3. LDAP — pure LDAP (not the commercial services)
@@ -56,8 +56,8 @@ Focus on **plain LDAP (e.g. OpenLDAP)**. Azure AD / Google Workspace expose LDAP
 - **Modes:**
   - *Simple bind as user* — bind with the user-supplied DN/credentials to authenticate; or
   - *Service-account search + bind* — bind a read-only service account, search for the user (`uid`/`mail` filter), then bind as the found DN to verify the password.
-- **Attribute mapping:** `uid`/`cn`/`mail` → smartChat profile; **JIT provisioning** on first login.
-- **Authorization (group → role):** optionally read the user's LDAP groups (`memberOf` / group search) and map them to the smartChat **global role** (`admin`/`member`, see [DATA_MODEL.md](DATA_MODEL.md)) via configurable rules (e.g. `cn=it-admins → admin`). Absent a mapping, federated users provision as `member`; channel membership/permissions are still enforced by smartChat (see [SECURITY.md](SECURITY.md) §3). Same mapping applies to OIDC via a groups/roles claim. Deprovisioning upstream → mark the user `deactivated`.
+- **Attribute mapping:** `uid`/`cn`/`mail` → Brook profile; **JIT provisioning** on first login.
+- **Authorization (group → role):** optionally read the user's LDAP groups (`memberOf` / group search) and map them to the Brook **global role** (`admin`/`member`, see [DATA_MODEL.md](DATA_MODEL.md)) via configurable rules (e.g. `cn=it-admins → admin`). Absent a mapping, federated users provision as `member`; channel membership/permissions are still enforced by Brook (see [SECURITY.md](SECURITY.md) §3). Same mapping applies to OIDC via a groups/roles claim. Deprovisioning upstream → mark the user `deactivated`.
 - **Config (per deployment):** server URL, base DN, bind DN/filter, attribute map, group→role rules, TLS settings.
 
 ## 4. Account model

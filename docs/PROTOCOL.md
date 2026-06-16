@@ -10,8 +10,8 @@
 | `POST /auth/login` | local credentials → `{access_token, refresh_token}` or `{totp_required}` |
 | `POST /auth/totp` | login-time TOTP code → tokens; `POST /auth/totp/enroll` to set up |
 | `GET  /auth/oidc/start` | begin OIDC (Auth Code + PKCE) in system browser |
-| `GET  /auth/oidc/callback` | provider redirect; api exchanges provider code, issues a short-lived smartChat code, redirects to the app |
-| `POST /auth/oidc/exchange` | app exchanges the smartChat code + PKCE verifier → `{access_token, refresh_token}` |
+| `GET  /auth/oidc/callback` | provider redirect; api exchanges provider code, issues a short-lived Brook code, redirects to the app |
+| `POST /auth/oidc/exchange` | app exchanges the Brook code + PKCE verifier → `{access_token, refresh_token}` |
 | `POST /auth/ldap` | LDAP bind credentials → tokens |
 | `POST /auth/refresh` | refresh → new access token (rotates refresh token) |
 | `POST /auth/logout` | revoke refresh token |

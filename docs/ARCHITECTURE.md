@@ -4,7 +4,7 @@
 
 ## 1. System overview
 
-smartChat is a classic **client / server** system with a **dedicated media server (SFU)** for real-time audio/video, and **object storage** for files. Clients never talk to each other directly; they talk to the services.
+Brook is a classic **client / server** system with a **dedicated media server (SFU)** for real-time audio/video, and **object storage** for files. Clients never talk to each other directly; they talk to the services.
 
 ```
                          ┌──────────────────────────────────────────────┐
@@ -45,7 +45,7 @@ smartChat is a classic **client / server** system with a **dedicated media serve
 
 ## 3. The three transport planes
 
-smartChat deliberately separates concerns into three planes, each with different properties (this is why the design stays simple):
+Brook deliberately separates concerns into three planes, each with different properties (this is why the design stays simple):
 
 1. **Control plane** — REST over **HTTPS** (`client → api`): login, history, channel ops, file metadata, bot registration. Request/response.
 2. **Realtime plane** — WebSocket over **WSS** (`client ↔ api`): live messages, presence, typing, and **call signaling relay** (SDP/ICE to/from Janus). Bidirectional, low-latency.
@@ -61,7 +61,7 @@ The SFU is a **selective forwarder**, not a mixer. Each participant uploads **on
 
 ### Signaling model (decided): `api`-proxied
 Clients **never** speak the Janus API directly. **`api` owns all Janus sessions/handles** and is the only thing that talks to the Janus API. The client sends SDP/ICE over its **WSS** to `api`, which proxies to Janus and relays answers/candidates back. The **only** thing that flows client↔SFU directly is the **SRTP/DTLS media** (the media plane). Consequences:
-- "Authorization to join a call" = the client's **smartChat session** (checked by `api`); there is no separate Janus token the *client* presents. If Janus token auth is enabled, `api` manages those tokens server-side.
+- "Authorization to join a call" = the client's **Brook session** (checked by `api`); there is no separate Janus token the *client* presents. If Janus token auth is enabled, `api` manages those tokens server-side.
 - `api` owns Janus session/handle lifecycle: create on join, ICE trickle relay, renegotiation, and teardown on leave/disconnect/idle-cleanup (see [SECURITY.md](SECURITY.md) §7).
 - The **Janus Admin API is internal-only** — never routed publicly by the gateway.
 

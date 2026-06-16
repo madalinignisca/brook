@@ -4,7 +4,7 @@
 
 Most cross-platform chat apps (Slack, Discord, Teams) ship **one web UI** wrapped in Electron on every OS. The result is an app that looks identical everywhere and feels native nowhere — heavy on RAM, indifferent to platform conventions and hardware.
 
-smartChat takes the **opposite** stance, modelled on the Apple-ecosystem instinct that software should *respect the platform it runs on*:
+Brook takes the **opposite** stance, modelled on the Apple-ecosystem instinct that software should *respect the platform it runs on*:
 
 > **The UI is 100% native to each OS. The logic is shared once. The app should feel like the OS built it.**
 

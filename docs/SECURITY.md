@@ -2,7 +2,7 @@
 
 > Principle: **only the call media is encrypted for free. Everything else is our responsibility.** Never trust the client.
 >
-> **Scope & trust model.** smartChat is **self-hosted, own-your-data** software for small business. The security goal is *transport security + strong authentication + the operator fully controlling their server and data* — **not** hiding data from the server operator. **E2EE is an explicit non-goal**: if two people want server-opaque privacy, that's what Signal et al. are for. This keeps the system simple and operable by a small-business admin.
+> **Scope & trust model.** Brook is **self-hosted, own-your-data** software for small business. The security goal is *transport security + strong authentication + the operator fully controlling their server and data* — **not** hiding data from the server operator. **E2EE is an explicit non-goal**: if two people want server-opaque privacy, that's what Signal et al. are for. This keeps the system simple and operable by a small-business admin.
 
 ## 1. Transport summary — what's automatic vs. ours
 
@@ -31,7 +31,7 @@ SRTP/DTLS is **hop-by-hop (client ↔ SFU)**. The SFU terminates encryption, so 
 
 All methods converge on **one internal session**: `api` issues a short-lived **access token (JWT)** + refresh token; everything downstream consumes that uniformly.
 
-- **Call authorization:** signaling is **`api`-proxied** (see [ARCHITECTURE.md](ARCHITECTURE.md) §Signaling model) — `api` owns Janus sessions and authorizes joins from the client's **smartChat session**; the client does **not** present a token directly to Janus. Any Janus-side token auth is managed server-side by `api`. A client can never join a room it wasn't authorized for.
+- **Call authorization:** signaling is **`api`-proxied** (see [ARCHITECTURE.md](ARCHITECTURE.md) §Signaling model) — `api` owns Janus sessions and authorizes joins from the client's **Brook session**; the client does **not** present a token directly to Janus. Any Janus-side token auth is managed server-side by `api`. A client can never join a room it wasn't authorized for.
 - **AuthZ on every operation:** membership/permission checked server-side on **every** REST call **and every WebSocket message**. The client UI hiding a button is never the enforcement point.
 - Presence/typing/messages are only fanned out to authorized channel members.
 - **Token storage (client):** tokens kept in the platform keystore by `core` (Secret Service/Keychain/Credential Manager/Keystore).
@@ -44,7 +44,7 @@ All methods converge on **one internal session**: `api` issues a short-lived **a
 
 ## 4a. Encryption at rest is the operator's, and must never block the app
 
-A competent admin self-hosting on a small cloud server will often enable **encrypted volumes/disks, encrypted PostgreSQL, SSE on object storage, TLS to the database**, etc. smartChat must be **agnostic** to all of it:
+A competent admin self-hosting on a small cloud server will often enable **encrypted volumes/disks, encrypted PostgreSQL, SSE on object storage, TLS to the database**, etc. Brook must be **agnostic** to all of it:
 
 - The app treats **storage and the database as opaque dependencies**. It requires **no** specific at-rest scheme and must **work unchanged** whether the disk/DB/bucket is encrypted or not.
 - No app logic may *depend on* or be *blocked by* at-rest encryption (no assumptions about plaintext-on-disk, no custom KMS coupling). Connection details (incl. TLS-to-DB, SSE buckets) are pure **configuration**.
@@ -78,7 +78,7 @@ Starting values — tune with real data; the point is that nothing is left "shor
 - Access token (JWT): **15 min**. Refresh token: **7 days**, **rotated** on each use (old one revoked; reuse ⇒ revoke the family).
 - **Janus session** (server-side, owned by `api`): created on join, torn down on leave/disconnect/idle (no client-presented token — see §3).
 - **Presigned URL** (PUT/GET): **10 min**.
-- OIDC smartChat exchange code: **60 s**, single-use.
+- OIDC Brook exchange code: **60 s**, single-use.
 - TOTP: 30 s step, ±1 window tolerance; recovery codes single-use.
 
 **Size caps**

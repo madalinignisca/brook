@@ -1,4 +1,4 @@
-# smartChat — local development stack (SKELETON, fleshed out in Phase 0).
+# Brook — local development stack (SKELETON, fleshed out in Phase 0).
 # One entry point (Caddy/TLS); media (Janus) and files (MinIO) bypass the api.
 # See ../docs/ARCHITECTURE.md and ../docs/SECURITY.md.
 

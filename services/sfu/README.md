@@ -16,7 +16,7 @@ The real-time **media router** (SFU). See [../../docs/MEDIA.md](../../docs/MEDIA
 
 ## Integration (api-proxied — decided)
 - **`api` owns all Janus sessions/handles** and is the only thing that talks to the Janus API. Clients send SDP/ICE over their WSS to `api`, which proxies to Janus. See [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) §Signaling model.
-- Clients do **not** present a token to Janus; `api` authorizes joins from the smartChat session.
+- Clients do **not** present a token to Janus; `api` authorizes joins from the Brook session.
 - Only **SRTP/DTLS media** flows client ↔ SFU directly (never via `api`).
 - **Janus Admin API is internal-only** — never exposed by the gateway.
 - **TURN:** `coturn` is part of the media architecture, not an afterthought — see [../../docs/MEDIA.md](../../docs/MEDIA.md) §TURN (ICE server distribution, credentials, ports, TLS/TCP fallback).
