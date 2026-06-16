@@ -14,10 +14,12 @@ The real-time **media router** (SFU). See [../../docs/MEDIA.md](../../docs/MEDIA
 - Friendlier to our **bring-your-own native `webrtcbin`** client.
 - mediasoup stays the fallback for finer routing control / aggressive horizontal scaling.
 
-## Integration
-- `api` mints **room-scoped, short-lived join tokens**; clients present them to join.
-- Media is **SRTP/DTLS**, client ↔ SFU directly (never via `api`).
-- `coturn` to be added in the calls phase for restrictive NATs.
+## Integration (api-proxied — decided)
+- **`api` owns all Janus sessions/handles** and is the only thing that talks to the Janus API. Clients send SDP/ICE over their WSS to `api`, which proxies to Janus. See [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) §Signaling model.
+- Clients do **not** present a token to Janus; `api` authorizes joins from the smartChat session.
+- Only **SRTP/DTLS media** flows client ↔ SFU directly (never via `api`).
+- **Janus Admin API is internal-only** — never exposed by the gateway.
+- **TURN:** `coturn` is part of the media architecture, not an afterthought — see [../../docs/MEDIA.md](../../docs/MEDIA.md) §TURN (ICE server distribution, credentials, ports, TLS/TCP fallback).
 
 ## This directory will hold
-Janus config (`janus.jcfg`, `janus.plugin.videoroom.jcfg`), container setup, and notes on the VideoRoom message flow.
+Janus config (`janus.jcfg`, `janus.plugin.videoroom.jcfg`), container setup, and notes on the VideoRoom message flow + session lifecycle owned by `api`.

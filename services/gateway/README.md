@@ -3,8 +3,9 @@
 Single public entry point. **Owns all TLS** so individual services speak plaintext internally.
 
 ## Responsibilities
-- Terminate **TLS** for HTTPS (REST) and **WSS** (WebSocket) — automatic certs via Let's Encrypt/ACME.
-- Route: `/api/*` and `/ws` → `api`; serve/route MinIO and (optionally) Janus endpoints over HTTPS.
+- Terminate **TLS** for HTTPS (REST) and **WSS** (WebSocket) — automatic certs via Let's Encrypt/ACME (min TLS 1.2, prefer 1.3).
+- Route: `/api/*` and `/ws` → `api`; serve presigned MinIO access over HTTPS.
+- **Never route the Janus Admin API publicly** — it stays internal-only. Client call signaling is `api`-proxied (clients don't reach Janus's API), so the gateway exposes no Janus endpoint. See [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) §Signaling model.
 - One place for HSTS, security headers, and rate-limit/abuse rules at the edge.
 
 ## Why Caddy

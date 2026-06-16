@@ -4,7 +4,7 @@
 
 ## 1. Topology recap
 
-We use an **SFU** (Janus + VideoRoom). Each participant uploads **one** encoded stream; the SFU forwards copies to subscribers and **never transcodes**. Therefore:
+We use an **SFU** (Janus + VideoRoom). Each participant uploads **one encoded stream per published track** (camera, screen, mic); the SFU forwards copies to subscribers and **never transcodes**. Therefore:
 
 - **All encoding/decoding happens on the client.** Hardware acceleration is a *client* concern; the SFU choice does not affect it.
 - The SFU is the public, reachable endpoint, so clients connect *to it* — this largely removes the NAT/TURN burden of peer-to-peer.
@@ -72,9 +72,11 @@ To let the SFU serve different viewers different qualities, the sender either:
 - **Simulcast**: encode the same source 2–3× at different resolutions → **multiplies encoder load** → exactly where hardware encode pays off; or
 - **SVC** (VP9/AV1): one scalable encode the SFU peels layers from → lighter encode, narrower HW support.
 
-Default: **H.264 simulcast (e.g. 720p + 360p)** on capable hardware; **single-layer** on constrained devices like the Pi.
+**Baseline = single-layer H.264.** Simulcast with H.264 is genuinely tricky — RID/profile-level-id negotiation must line up across Janus, GStreamer `webrtcbin`, hardware encoders, and any browser/Safari peer, and it multiplies encoder load. So:
+- **MVP ships single-layer H.264** (one encode per published track). Quality adapts via bitrate/resolution renegotiation, not layers.
+- **Simulcast is a Phase-4 spike**, not assumed working: prove H.264 simulcast end-to-end (Janus VideoRoom ⇄ GStreamer) with measured interop before relying on it; otherwise stay single-layer (or evaluate VP9/AV1-SVC where HW allows).
 
-**Janus VideoRoom config (to pin down in Phase 4):** publishers declare simulcast (rid-based or legacy `simulcast`); the room advertises codecs (H.264 with the agreed profile/level-id, VP8 fallback). Subscribers request a substream/temporal layer; `core` sends `LayerHint`s and the SFU switches layers per receiver. Document the exact `videoroom` room parameters (`videocodec`, `h264_profile`, simulcast settings) alongside the engine work.
+**Janus VideoRoom config (to pin down in Phase 4):** room advertises codecs (H.264 with an explicitly agreed `profile-level-id`, VP8 fallback). If/when the simulcast spike succeeds: publishers declare simulcast (rid-based or legacy `simulcast`), subscribers request a substream/temporal layer, and `core` sends `LayerHint`s. Document the exact `videoroom` parameters (`videocodec`, `h264_profile`, simulcast settings).
 
 ## 6. The Raspberry Pi 4B target (optimization litmus test)
 
@@ -91,13 +93,25 @@ This is feasible **because** of the architecture (native GTK4 UI, no Electron, R
 - **Pipeline:** keep frames in GPU memory (DMA-BUF) from `pipewiresrc`/camera → `v4l2h264enc` → `webrtcbin`; avoid CPU copies.
 - **Constraints to respect:** cap the number of *decoded* incoming video tiles (e.g. show only the active speaker + thumbnails) to bound decode load; prefer audio-only fallback under pressure.
 
-**Why it should hold:** the Pi only ever encodes **one** stream (SFU forwards it), decodes a **bounded** number, and renders with native GTK4. No web engine, no transcoding, GC-free Rust core. The risks are the Pi's weak H.264 *encoder* and thermals — mitigated by single-layer 720p and framerate caps.
+> **Encode budget — important:** "one encode per *published track*" is the rule, so **camera + screen share simultaneously = two H.264 encodes**, which likely exceeds the Pi 4B's encoder. On the Pi, treat camera and screen share as **mutually exclusive by default** (sharing the screen pauses the camera), so the Pi encodes **one** track at a time. Simultaneous camera+screen on the Pi is only enabled if measurements show headroom.
 
-> ⚠️ **This is a hypothesis, not a measured result.** The Pi 4B's VideoCore H.264 *encoder* is modest and thermally constrained, and `v4l2h264enc` quality/throughput vary by firmware. Treat the targets above as a starting profile to **validate with the acceptance test before committing** — adjust resolution/fps (or fall back to audio-only) based on real numbers. Active cooling likely required for sustained calls.
+**Why it should hold:** with the one-track-at-a-time rule the Pi encodes **a single** H.264 stream (SFU forwards it), decodes a **bounded** number, and renders with native GTK4. No web engine, no transcoding, GC-free Rust core. The risks are the Pi's weak H.264 *encoder* and thermals — mitigated by single-layer 720p, framerate caps, and camera-or-screen.
 
-**Pi acceptance test:** 1:1 call, camera 720p30 + screen share, sustained 10 min, CPU headroom remaining and no thermal throttle. Then a 3-person channel call (active-speaker view).
+> ⚠️ **This is a hypothesis, not a measured result.** The Pi 4B's VideoCore H.264 *encoder* is modest and thermally constrained, and `v4l2h264enc` quality/throughput vary by firmware. Treat the targets above as a starting profile to **validate with the acceptance test before committing** — adjust resolution/fps (or fall back to audio-only) based on real numbers. Active cooling likely required for sustained calls. The whole Pi target is **conditional on these measurements**.
+
+**Pi acceptance test:** 1:1 call, **camera 720p30 *or* screen share** (one encode), sustained 10 min, CPU headroom remaining and no thermal throttle. Then a 3-person channel call (active-speaker view, decode-bounded).
+
+## 6a. TURN (`coturn`) — part of the architecture, not an afterthought
+
+An SFU removes *peer-to-peer* NAT pain (clients connect to the SFU), but a client behind a restrictive firewall still may not reach the SFU's UDP media ports. TURN is required for those:
+
+- **`coturn`** relays media when direct UDP fails. Offer **TURN over UDP, TCP, and TLS/443** so it works through hostile firewalls that only allow 443.
+- **ICE servers** (STUN/TURN URLs + **short-lived TURN credentials**, e.g. HMAC `rest` credentials minted by `api`) are delivered to the client during call setup over the WS.
+- **Ports:** open the SFU media UDP range and the coturn relay range; document them in deploy.
+- **Fallback order:** host/srflx (direct) → TURN/UDP → TURN/TCP → TURN/TLS:443.
+- Stand up in **Phase 4** alongside calls.
 
 ## 7. Open decisions
 
 - Per-client: GStreamer vs. platform-native WebRTC (esp. iOS).
-- TURN server (`coturn`) needed for restrictive NATs even with an SFU — add in the calls phase.
+- H.264 simulcast viability (Phase-4 spike) vs. staying single-layer / SVC.

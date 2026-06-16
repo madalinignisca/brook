@@ -16,7 +16,8 @@ Message ── (author) ─► User | Bot
 
 ## Tables (sketch)
 
-**users** — `id (uuidv7) · handle · display_name · avatar_file_id? · created_at`
+**users** — `id (uuidv7) · handle · display_name · avatar_file_id? · global_role (admin|member) · status (active|deactivated) · created_at`
+> **Global roles & bootstrap:** smartChat is **single-workspace per server** (one self-hosted instance = one organization; no multi-tenant). Two global roles: **admin** (manage users/bots/server settings) and **member**. The **first user created bootstraps as `admin`**; admins promote/deactivate others. `status=deactivated` handles **deprovisioning** (federated user removed upstream, or offboarded) without deleting history. Channel-level `owner|member` (in `memberships`) is separate from global role.
 **local_credentials** — `user_id · password_hash (argon2id)` (only for local accounts)
 **totp** — `user_id · secret (enc) · activated_at` (+ `recovery_codes`: `user_id · code_hash · used_at?`)
 **identities** — `id · user_id · provider (oidc|ldap) · issuer/server · subject_or_dn · created_at`
@@ -32,10 +33,13 @@ Message ── (author) ─► User | Bot
 > `id` is UUIDv7 → time-sortable, drives pagination (`before=<id>`).
 
 **attachments** — `message_id · file_id`
-**files** — `id · owner_id · bucket · object_key · filename · size · content_type · created_at`
-> Bytes live in MinIO; this row is metadata + the object pointer. Access via presigned URLs.
+**files** — `id · owner_id · bucket · object_key · filename · size · content_type · status (pending|committed) · created_at`
+> Bytes live in MinIO; this row is metadata + the object pointer. Access via presigned URLs. **`status`**: created `pending` on presigned PUT; flips to `committed` after `POST /files/{id}/commit` verifies the object exists and size/type ≤ caps. Only `committed` files attach to messages; `pending`/orphaned objects are swept (see [PROTOCOL.md](PROTOCOL.md) §5).
 
-**bots** — `id · owner_id · name (slug, used in /name) · webhook_url · signing_secret · created_at`
+**bots** — `id · owner_id · name (slug, used in /name) · webhook_url · inbound_secret_hash · outbound_secret_enc · created_at`
+> Two secrets, two storage strategies (see [SECURITY.md](SECURITY.md) §5): inbound is only *verified* → store a **hash**; outbound must be *produced* → store **encrypted** (retrievable).
+
+**devices** — `id · user_id · platform (apns|fcm) · push_token · created_at` (for mobile push wake / call invites)
 **channel_bots** — `channel_id · bot_id · added_by` (which bots participate where)
 
 **calls** — `id (room_id) · channel_id · started_by · started_at · last_active_at · ended_at?`

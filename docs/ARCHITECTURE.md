@@ -35,8 +35,8 @@ smartChat is a classic **client / server** system with a **dedicated media serve
 
 | Component | Tech | Responsibility |
 |---|---|---|
-| **gateway** | Caddy | Single public entry point; terminates **TLS** (auto Let's Encrypt) for HTTPS + WSS; routes to `api` and (optionally) Janus admin. |
-| **api** | Python + FastAPI | Auth, users, channels/DMs, message persistence + fan-out (WebSocket), file metadata + presigned URL minting, bot registry, webhook in/out, **mints SFU join tokens**. |
+| **gateway** | Caddy | Single public entry point; terminates **TLS** (auto Let's Encrypt) for HTTPS + WSS; routes to `api`. The **Janus Admin API is never routed publicly** (internal network only). |
+| **api** | Python + FastAPI | Auth, users, channels/DMs, message persistence + fan-out (WebSocket), file metadata + presigned URL minting, bot registry, webhook in/out, **owns Janus sessions & proxies call signaling**. |
 | **sfu** | Janus + VideoRoom | Real-time media **router** (SFU). Receives one upstream per sender, forwards to subscribers. **No transcoding.** See [MEDIA.md](MEDIA.md). |
 | **storage** | MinIO (S3-compatible) | File blobs. Clients PUT/GET via short-lived **presigned URLs** — bytes never proxy through `api`. |
 | **db** | PostgreSQL | Users, channels, membership, messages, files metadata, bots, tokens. |
@@ -57,7 +57,13 @@ Plus an **out-of-band data plane**: file bytes go **client ↔ MinIO** directly 
 
 ## 4. Why an SFU, and what it does
 
-The SFU is a **selective forwarder**, not a mixer. Each participant uploads **one** encoded stream; the SFU routes copies to subscribers. It does **not** decode or re-encode — so **all encoding happens on the client**, which is why hardware encode is purely a client concern (see [MEDIA.md](MEDIA.md)). This keeps server CPU low and lets a sender adapt quality via **simulcast/SVC** layers the SFU picks per receiver.
+The SFU is a **selective forwarder**, not a mixer. Each participant uploads **one encoded stream per published track**; the SFU routes copies to subscribers. It does **not** decode or re-encode — so **all encoding happens on the client**, which is why hardware encode is purely a client concern (see [MEDIA.md](MEDIA.md)). This keeps server CPU low.
+
+### Signaling model (decided): `api`-proxied
+Clients **never** speak the Janus API directly. **`api` owns all Janus sessions/handles** and is the only thing that talks to the Janus API. The client sends SDP/ICE over its **WSS** to `api`, which proxies to Janus and relays answers/candidates back. The **only** thing that flows client↔SFU directly is the **SRTP/DTLS media** (the media plane). Consequences:
+- "Authorization to join a call" = the client's **smartChat session** (checked by `api`); there is no separate Janus token the *client* presents. If Janus token auth is enabled, `api` manages those tokens server-side.
+- `api` owns Janus session/handle lifecycle: create on join, ICE trickle relay, renegotiation, and teardown on leave/disconnect/idle-cleanup (see [SECURITY.md](SECURITY.md) §7).
+- The **Janus Admin API is internal-only** — never routed publicly by the gateway.
 
 We chose **Janus + VideoRoom** over mediasoup because: it is a standalone daemon driven from FastAPI over a documented API (no Node service), it is friendlier to a **bring-your-own** native `webrtcbin` peer, and its VideoRoom plugin ships room/simulcast/recording logic so we reach a working call sooner. mediasoup remains the fallback if we later need its finer routing control or horizontal-scaling model.
 
@@ -79,3 +85,9 @@ Every client = **native UI** + **shared Rust `core`**. The core exposes an async
 ## 8. Deployment
 
 Local dev is a single `docker-compose` bringing up Postgres, MinIO, Janus, Caddy, and the api. See [../deploy/](../deploy/). Production is the same components behind Caddy with real certificates.
+
+### Realtime state & scaling (decided)
+The WebSocket layer is **stateful** (presence, channel fan-out, call signaling, offline replay), so `api` is **not** trivially stateless:
+- **MVP: single-node `api`** (a small business runs one node). The WS hub, presence, and Janus session ownership live in-process. Simple and correct.
+- **Scale-out (later): sticky WS routing + a pub/sub bus** (Redis or NATS) so any node can fan-out messages/presence to sockets it doesn't hold. Call signaling stays **node-affine** (the node owning a call's WS owns its Janus session). Presence/session state moves to shared storage (Redis).
+- This is an explicit decision, not "stateless + horizontal" (which would contradict the realtime design).

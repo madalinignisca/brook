@@ -16,7 +16,7 @@
 | File transfer (presigned) | ❌ unless HTTPS | us + MinIO | **HTTPS**, short-lived URLs |
 | Webhooks (bot in/out) | ❌ | **us** | HTTPS + signing + SSRF guard |
 
-**TLS termination:** one reverse proxy — **Caddy** — terminates TLS for HTTPS + WSS (auto Let's Encrypt / ACME). MinIO served over HTTPS too. No plaintext anywhere on the wire. **Minimum TLS 1.2; prefer 1.3.**
+**TLS termination:** one reverse proxy — **Caddy** — terminates TLS for HTTPS + WSS (auto Let's Encrypt / ACME), **minimum TLS 1.2; prefer 1.3**. **All public/external traffic is TLS — no plaintext leaves the host.** *Internal* service-to-service traffic (api↔Postgres/MinIO/Janus) runs on a **private, trusted network** and may be plaintext in a single-host deployment; operators spanning hosts should enable TLS-to-DB / internal TLS (or mTLS). This is a deployment choice, not an app requirement (see §4a).
 
 ## 2. Calls — encryption depth (important caveat)
 
@@ -31,7 +31,7 @@ SRTP/DTLS is **hop-by-hop (client ↔ SFU)**. The SFU terminates encryption, so 
 
 All methods converge on **one internal session**: `api` issues a short-lived **access token (JWT)** + refresh token; everything downstream consumes that uniformly.
 
-- **SFU join tokens:** `api` mints **short-lived, room-scoped** tokens for Janus; the client presents them to join a call. A client can never join a room it wasn't authorized for.
+- **Call authorization:** signaling is **`api`-proxied** (see [ARCHITECTURE.md](ARCHITECTURE.md) §Signaling model) — `api` owns Janus sessions and authorizes joins from the client's **smartChat session**; the client does **not** present a token directly to Janus. Any Janus-side token auth is managed server-side by `api`. A client can never join a room it wasn't authorized for.
 - **AuthZ on every operation:** membership/permission checked server-side on **every** REST call **and every WebSocket message**. The client UI hiding a button is never the enforcement point.
 - Presence/typing/messages are only fanned out to authorized channel members.
 - **Token storage (client):** tokens kept in the platform keystore by `core` (Secret Service/Keychain/Credential Manager/Keystore).
@@ -52,9 +52,9 @@ A competent admin self-hosting on a small cloud server will often enable **encry
 
 ## 5. Bots & webhooks (features 6 & 7)
 
-**Both directions are signed:**
-- **Inbound** (external → channel as bot): each bot has a **signing secret**. Requests carry an **HMAC signature** header over the body + timestamp; `api` verifies it and rejects stale timestamps (replay protection).
-- **Outbound** (`/botname …` → bot URL): `api` **signs its POST** so the receiving bot can verify authenticity.
+**Both directions are signed, with two distinct secrets per bot:**
+- **Inbound** (external → channel as bot): an **inbound secret** the operator gave the external system. `api` only needs to *verify* HMAC signatures, so it stores a **hash** of this secret (shown once at creation). Requests carry an HMAC over body + timestamp; stale timestamps rejected (replay protection).
+- **Outbound** (`/botname …` → bot URL): `api` must *produce* a signature, so the **outbound signing secret must be retrievable** — stored encrypted (envelope encryption via the app's key / operator secret store), not plaintext. The receiving bot verifies with its copy.
 
 **SSRF — the sharp edge.** Users register bot webhook **URLs**. A malicious URL could target `localhost`, `169.254.169.254` (cloud metadata), or internal IPs.
 - **Allowlist scheme = HTTPS only.**
@@ -76,7 +76,7 @@ Starting values — tune with real data; the point is that nothing is left "shor
 
 **Token & session lifetimes**
 - Access token (JWT): **15 min**. Refresh token: **7 days**, **rotated** on each use (old one revoked; reuse ⇒ revoke the family).
-- **SFU join token** (Janus): **5 min**, room-scoped, single-use to join.
+- **Janus session** (server-side, owned by `api`): created on join, torn down on leave/disconnect/idle (no client-presented token — see §3).
 - **Presigned URL** (PUT/GET): **10 min**.
 - OIDC smartChat exchange code: **60 s**, single-use.
 - TOTP: 30 s step, ±1 window tolerance; recovery codes single-use.

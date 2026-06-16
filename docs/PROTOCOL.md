@@ -24,9 +24,11 @@
 | `GET  /channels/{id}/messages?before=&limit=` | paginated history (see §5 limits) |
 | `POST /channels/{id}/messages` | send message (also broadcast via WS) |
 | `PATCH /messages/{id}` · `DELETE /messages/{id}` | edit / soft-delete (author or channel owner) |
-| `POST /channels/{id}/files` | request **presigned PUT** → `{upload_url, file_id}` |
+| `POST /channels/{id}/files` | begin upload → `{upload_url (presigned PUT), file_id}` (state `pending`) |
+| `POST /files/{id}/commit` | finalize: server verifies object exists + size/type ≤ caps → state `committed` (attachable) |
 | `GET  /files/{id}` · `DELETE /files/{id}` | request **presigned GET** → `{download_url}` · delete |
-| `POST /channels/{id}/calls` | start/join call → `{room_id, sfu_join_token}` |
+| `POST /channels/{id}/calls` | join call → `{room_id}` (signaling then over WS; api-proxied, no client Janus token) |
+| `POST /devices` · `DELETE /devices/{id}` | register/unregister an APNs/FCM push token (mobile) |
 | `GET  /bots` · `POST /bots` | list / register bots (returns signing secret once) |
 | `GET /bots/{id}` · `PATCH /bots/{id}` · `DELETE /bots/{id}` | get / update (url, regen secret) / delete |
 | `POST /channels/{id}/bots` · `DELETE /channels/{id}/bots/{bot}` | add / remove bot from channel |
@@ -76,6 +78,16 @@ client.core ◄─call.signal(SDP/ICE)─ api ◄─ Janus negotiation
 
 The client's **media engine** produces the SDP/tracks and consumes remote tracks; `core` only shuttles signaling. See [MEDIA.md](MEDIA.md).
 
+## 3a. Push & mobile background (decided)
+
+Mobile OSes suspend background WebSockets, so an always-on WSS cannot be the delivery path on iOS/Android. We add **push**:
+
+- **Device registration:** clients register an **APNs (iOS) / FCM (Android)** token via `POST /devices` (revoked on logout / `DELETE /devices/{id}`).
+- **Wake on event:** when a message/mention/**call invite** targets a user with no live socket, `api` sends a push to wake the app, which then reconnects its WSS to sync. Desktop clients (always-on WSS) don't need push.
+- **Incoming calls:** delivered as high-priority push → **CallKit (iOS) / ConnectionService + foreground service (Android)** present the native incoming-call UI; the app joins the room on accept.
+- **Privacy:** push payloads carry minimal metadata (e.g. "new message in #x"), not message content, unless the user opts into content previews.
+- **Provider config** (APNs key/FCM credentials) is per-deployment operator config. Desktop builds omit push.
+
 ## 4. Slash commands & bots
 
 - `slash.command` with text matching `^/(?<bot>\w+)\s+(?<msg>.*)$` → `api` looks up the bot, signs and POSTs `{channel, user, message}` to the bot's URL (SSRF-guarded).
@@ -86,7 +98,8 @@ The client's **media engine** produces the SDP/tracks and consumes remote tracks
 - IDs are UUIDv7 (sortable). Timestamps ISO-8601 UTC.
 - Idempotency: client supplies a client-side message id; server dedupes.
 - Offline: `core` queues outgoing commands and replays on reconnect; server dedupes by client id.
-- Versioning: path-versioned REST (`/v1`); WS envelope may carry a `v` field later.
+- Versioning: REST is path-versioned under the **`/api/v1`** base (matching §1); WS envelope may carry a `v` field later.
+- **File upload states:** `pending` (presigned PUT issued) → `committed` (`POST /files/{id}/commit` verified object exists + size/type within caps). Only `committed` files may be attached to messages; uncommitted/orphaned objects are reaped by a sweep.
 - **Pagination:** `limit` default 50, **max 100**; page backwards with `before=<message_id>`.
 - **Sizes & lifetimes** (TTLs, message/file/payload caps, rate limits): single source of truth is [SECURITY.md](SECURITY.md) §7.
 - **Errors:** uniform JSON body `{ "error": { "code": "<machine_code>", "message": "<human>", "details?": {} } }` with a sensible HTTP status. Codes are a stable taxonomy (e.g. `auth.invalid_credentials`, `auth.totp_required`, `authz.forbidden`, `not_found`, `rate_limited`, `validation.*`, `conflict`). WS errors use an `error` event with the same shape.
