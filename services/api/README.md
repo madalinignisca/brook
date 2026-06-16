@@ -17,6 +17,21 @@
 - Talks to **Janus** over its HTTP/WS API ([../sfu/](../sfu/)) and **MinIO** over S3 API ([../storage/](../storage/)).
 - Sits behind **Caddy** ([../gateway/](../gateway/)) which terminates TLS.
 
+## Develop (local)
+```bash
+cd services/api
+uv sync --extra dev                 # create .venv + install (locked)
+BROOK_ALLOW_INSECURE_AUTH=1 uv run uvicorn app.main:app --reload   # dev only
+
+# Quality gates (all run in CI — see .github/workflows/api.yml):
+uv run ruff check . && uv run ruff format --check .
+uv run mypy app
+uv run coverage run -m pytest && uv run coverage report   # >=80% gate
+uv run bandit -q -r app tests -s B101,B105,B106
+uv run pip-audit --skip-editable
+```
+> Startup **refuses a weak/default `BROOK_JWT_SIGNING_KEY`** (forgeable tokens). In prod set a strong (≥32-char) key; for local dev set `BROOK_ALLOW_INSECURE_AUTH=1`. Tests run against SQLite by default; set `BROOK_TEST_DATABASE_URL` (Postgres) to run the suite against Postgres (CI does both). Implemented so far (Phase 0): `/health`, local `register`/`login`/`refresh`/`logout`/`me` with first-user→admin bootstrap.
+
 ## Contracts
 - Wire protocol: [../../docs/PROTOCOL.md](../../docs/PROTOCOL.md)
 - Security model: [../../docs/SECURITY.md](../../docs/SECURITY.md)

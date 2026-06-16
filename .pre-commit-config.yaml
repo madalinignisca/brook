@@ -1,0 +1,49 @@
+# Fast local quality gates. Install: `pre-commit install`
+# Full type-checking and tests run in CI (see .github/workflows/).
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+
+  # Python (services/api) — lint + format
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+        files: ^services/api/
+      - id: ruff-format
+        files: ^services/api/
+
+  # Secret scanning, repo-wide
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+
+  # Markdown lint for docs
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.41.0
+    hooks:
+      - id: markdownlint
+        args: ["--disable", "MD013", "MD033", "MD041"]
+
+  # Type-check the API on commit (uses the project venv via uv).
+  - repo: local
+    hooks:
+      - id: mypy-api
+        name: mypy (services/api)
+        entry: bash -c 'cd services/api && uv run mypy app'
+        language: system
+        files: ^services/api/.*\.py$
+        pass_filenames: false
+
+# When Rust lands (core/, clients/gnome, clients/kde), add local hooks:
+#   cargo fmt --check  /  cargo clippy --all-targets -- -D warnings

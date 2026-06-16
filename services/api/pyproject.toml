@@ -1,0 +1,69 @@
+[project]
+name = "brook-api"
+version = "0.0.0"
+description = "Brook server API — auth, chat, channels, files, bots"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "aiosqlite>=0.20",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "argon2-cffi>=23.1",
+    "pyjwt>=2.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "mypy>=1.10",
+    "ruff>=0.6",
+    "bandit>=1.7",
+    "pip-audit>=2.7",
+    "coverage>=7.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]  # asserts + test-only secret literals
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+exclude = ["tests/"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+# SQLAlchemy's async bridges through greenlets; without this, code executed
+# inside async DB calls is under-counted.
+concurrency = ["thread", "greenlet"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 80

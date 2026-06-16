@@ -1,0 +1,74 @@
+name: api
+
+on:
+  push:
+    branches: [main]
+    paths: ["services/api/**", ".github/workflows/api.yml"]
+  pull_request:
+    paths: ["services/api/**", ".github/workflows/api.yml"]
+
+defaults:
+  run:
+    working-directory: services/api
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install (locked)
+        run: uv sync --locked --extra dev
+      - name: Ruff (lint)
+        run: uv run ruff check .
+      - name: Ruff (format)
+        run: uv run ruff format --check .
+      - name: mypy (strict)
+        run: uv run mypy app
+      - name: Tests + coverage gate (SQLite)
+        run: |
+          uv run coverage run -m pytest
+          uv run coverage report
+      - name: Bandit (security)
+        # B101 (asserts) and B105/B106 (password literals) are expected in tests;
+        # ruff's flake8-bandit (S) still covers app code for those categories.
+        run: uv run bandit -q -r app tests -s B101,B105,B106
+      - name: pip-audit (dependency CVEs)
+        run: uv run pip-audit --skip-editable
+
+  tests-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: brook
+          POSTGRES_PASSWORD: brook
+          POSTGRES_DB: brook_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U brook"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      BROOK_TEST_DATABASE_URL: postgresql+asyncpg://brook:brook@localhost:5432/brook_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install (locked)
+        run: uv sync --locked --extra dev
+      - name: Tests against Postgres
+        run: uv run pytest
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t brook-api services/api
+        working-directory: ${{ github.workspace }}

@@ -15,6 +15,7 @@ Incremental: each phase is independently usable and proves a piece of the archit
 - **OIDC** RP (Authorization Code + PKCE, system browser) — validate against **Keycloak**; JIT provisioning.
 - **LDAP** (LDAPS/StartTLS) bind + attribute mapping; JIT provisioning.
 - `identities` table; operator config to enable methods. See [AUTH.md](AUTH.md).
+- **Auth hardening** (deferred from Phase 0, flagged in review): per-IP/per-handle **rate limiting + lockout** on login/refresh; refresh-token **family lineage** so reuse of a revoked token revokes the whole family (theft response); harden the first-user bootstrap against concurrent registration; optional refresh **grace window** for dropped-response retries.
 - **Exit:** the same client logs in via local+TOTP, via Keycloak (OIDC), and via OpenLDAP.
 
 ## Phase 1 — Chat (the core loop)
