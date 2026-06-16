@@ -16,7 +16,7 @@
 | File transfer (presigned) | ❌ unless HTTPS | us + MinIO | **HTTPS**, short-lived URLs |
 | Webhooks (bot in/out) | ❌ | **us** | HTTPS + signing + SSRF guard |
 
-**TLS termination:** one reverse proxy — **Caddy** — terminates TLS for HTTPS + WSS (auto Let's Encrypt / ACME). MinIO served over HTTPS too. No plaintext anywhere on the wire.
+**TLS termination:** one reverse proxy — **Caddy** — terminates TLS for HTTPS + WSS (auto Let's Encrypt / ACME). MinIO served over HTTPS too. No plaintext anywhere on the wire. **Minimum TLS 1.2; prefer 1.3.**
 
 ## 2. Calls — encryption depth (important caveat)
 
@@ -64,13 +64,36 @@ A competent admin self-hosting on a small cloud server will often enable **encry
 
 ## 6. Other baseline controls
 
-- **Input validation** on all API inputs; strict message size limits.
-- **Rate limiting** on auth, message send, file requests, webhook calls.
+- **Input validation** on all API inputs; size limits per §7.
+- **Rate limiting** on auth, message send, file requests, webhook calls — concrete thresholds in §7.
 - **Secrets management:** DB creds, MinIO keys, JWT signing key, Janus admin secret, bot signing secrets — via environment/secret store, never in the repo. `.env.example` documents names only.
 - **Least privilege** between services (e.g. MinIO bucket policy, DB roles).
 - **No telemetry.** Logs are operational only and avoid message content.
 
-## 7. Threat-model notes (living)
+## 7. Concrete limits & lifetimes (single source of truth)
+
+Starting values — tune with real data; the point is that nothing is left "short-lived (unspecified)".
+
+**Token & session lifetimes**
+- Access token (JWT): **15 min**. Refresh token: **7 days**, **rotated** on each use (old one revoked; reuse ⇒ revoke the family).
+- **SFU join token** (Janus): **5 min**, room-scoped, single-use to join.
+- **Presigned URL** (PUT/GET): **10 min**.
+- OIDC smartChat exchange code: **60 s**, single-use.
+- TOTP: 30 s step, ±1 window tolerance; recovery codes single-use.
+
+**Size caps**
+- Message body: **16 KB**. Webhook payload (in/out): **64 KB**. File upload: **100 MB** default (operator-configurable).
+- WS first-frame `auth` timeout: **5 s**.
+
+**Rate limits** (per user/IP unless noted)
+- Auth (login/totp/ldap/refresh): **5 / min** then backoff/lockout.
+- Message send: **30 / 10 s**. File-URL requests: **20 / min**.
+- Outbound webhook per bot: **10 / s**. Inbound webhook per bot: **20 / s**.
+
+**Call lifecycle / cleanup**
+- A `call` with no active participants for **5 min** is closed: SFU room torn down, `calls.ended_at` set. Guards against orphaned rooms when a client crashes mid-call.
+
+## 8. Threat-model notes (living)
 
 - **Trust boundary = the operator's server.** By design the operator (and a fully compromised server) can access messages, files, and media. This is accepted: it's self-hosted, own-your-data software, not a zero-trust/E2EE product. Operators must secure their infrastructure (§4a).
 - Compromised SFU ⇒ media exposure. Inherent to an SFU; accepted within the trust model above.

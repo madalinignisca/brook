@@ -31,7 +31,11 @@ For companies with an identity provider. smartChat is the **Relying Party (RP)**
   2. user authenticates at the provider (Keycloak),
   3. provider → `api` redirect (`/auth/oidc/callback`); `api` exchanges the code, validates the ID token,
   4. `api` redirects back to the app via **loopback (`127.0.0.1`)** or a **custom URI scheme** with a short-lived smartChat code,
-  5. app exchanges that code (PKCE verifier) for the smartChat session.
+  5. app exchanges that code (PKCE verifier) for the smartChat session (`POST /auth/oidc/exchange`).
+- **Per-platform redirect target:**
+  - **Desktop** (GNOME/macOS/Windows): **loopback** `http://127.0.0.1:<port>/` (RFC 8252).
+  - **Mobile** (iOS/Android): loopback is not usable — use a **custom URI scheme** `smartchat://oidc-callback` (or an Android App Link / iOS Universal Link), driven by `ASWebAuthenticationSession` (iOS) / Custom Tabs (Android).
+  - `core` abstracts this as a "redirect strategy" the native layer supplies.
 - **Identity mapping:** OIDC `sub` (issuer + subject) is the stable key → linked to a smartChat user. **JIT provisioning**: create the user on first login from claims (`preferred_username`, `email`, `name`). MFA is the provider's responsibility (so TOTP above is not layered on OIDC users).
 - **Config (per deployment):** issuer URL, client id/secret, scopes, claim→profile mapping.
 
@@ -44,7 +48,8 @@ Focus on **plain LDAP (e.g. OpenLDAP)**. Azure AD / Google Workspace expose LDAP
   - *Simple bind as user* — bind with the user-supplied DN/credentials to authenticate; or
   - *Service-account search + bind* — bind a read-only service account, search for the user (`uid`/`mail` filter), then bind as the found DN to verify the password.
 - **Attribute mapping:** `uid`/`cn`/`mail` → smartChat profile; **JIT provisioning** on first login.
-- **Config (per deployment):** server URL, base DN, bind DN/filter, attribute map, TLS settings.
+- **Authorization (group → role):** optionally read the user's LDAP groups (`memberOf` / group search) and map them to smartChat roles via configurable rules (e.g. `cn=admins → owner`). Absent a mapping, federated users get the default member role; channel membership/permissions are still enforced by smartChat (see [SECURITY.md](SECURITY.md) §3). Same mapping concept applies to OIDC via a groups/roles claim.
+- **Config (per deployment):** server URL, base DN, bind DN/filter, attribute map, group→role rules, TLS settings.
 
 ## 4. Account model
 

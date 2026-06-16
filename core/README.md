@@ -4,7 +4,7 @@ The **single shared brain** of every client. All non-UI logic lives here once; e
 
 ## Responsibilities
 - Auth/session + token refresh.
-- REST client (control plane) + WebSocket client (realtime + call signaling relay), with reconnection/backoff and an offline outgoing queue.
+- REST client (control plane) + WebSocket client (realtime + call signaling relay), with reconnection/backoff and a **bounded** offline outgoing queue (cap ~100 commands; oldest-evict with a user-visible "failed to send" state — never unbounded memory growth).
 - Local state model + event log; observable state for the UI.
 - File transfer orchestration (presigned URL flow, progress, resume).
 - **Call signaling** state machine (negotiates with Janus via the WS relay; drives the platform `MediaEngine`).

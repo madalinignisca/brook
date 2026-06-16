@@ -12,6 +12,7 @@
 
 ## Tech
 - FastAPI (async), WebSocket endpoint for realtime.
+- `GET /health` liveness/readiness endpoint (Janus exposes its own); used by compose/orchestration.
 - PostgreSQL (see [../../docs/DATA_MODEL.md](../../docs/DATA_MODEL.md)).
 - Talks to **Janus** over its HTTP/WS API ([../sfu/](../sfu/)) and **MinIO** over S3 API ([../storage/](../storage/)).
 - Sits behind **Caddy** ([../gateway/](../gateway/)) which terminates TLS.

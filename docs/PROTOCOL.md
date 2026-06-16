@@ -10,24 +10,33 @@
 | `POST /auth/login` | local credentials → `{access_token, refresh_token}` or `{totp_required}` |
 | `POST /auth/totp` | login-time TOTP code → tokens; `POST /auth/totp/enroll` to set up |
 | `GET  /auth/oidc/start` | begin OIDC (Auth Code + PKCE) in system browser |
-| `GET  /auth/oidc/callback` | provider redirect; api exchanges code → app loopback/custom-scheme |
+| `GET  /auth/oidc/callback` | provider redirect; api exchanges provider code, issues a short-lived smartChat code, redirects to the app |
+| `POST /auth/oidc/exchange` | app exchanges the smartChat code + PKCE verifier → `{access_token, refresh_token}` |
 | `POST /auth/ldap` | LDAP bind credentials → tokens |
-| `POST /auth/refresh` | refresh → new access token |
+| `POST /auth/refresh` | refresh → new access token (rotates refresh token) |
 | `POST /auth/logout` | revoke refresh token |
-| `GET  /me` | current user |
+| `GET  /health` | liveness/readiness (also on `sfu`; unauthenticated) |
+| `GET  /me` · `PATCH /me` | current user · update profile/avatar |
 | `GET  /channels` | channels/DMs the user belongs to |
 | `POST /channels` | create channel |
-| `GET  /channels/{id}/messages?before=&limit=` | paginated history |
+| `GET /channels/{id}` · `PATCH /channels/{id}` · `DELETE /channels/{id}` | get / rename-topic / delete |
+| `GET /channels/{id}/members` · `POST` · `DELETE /channels/{id}/members/{uid}` | list / add / remove member |
+| `GET  /channels/{id}/messages?before=&limit=` | paginated history (see §5 limits) |
 | `POST /channels/{id}/messages` | send message (also broadcast via WS) |
+| `PATCH /messages/{id}` · `DELETE /messages/{id}` | edit / soft-delete (author or channel owner) |
 | `POST /channels/{id}/files` | request **presigned PUT** → `{upload_url, file_id}` |
-| `GET  /files/{id}` | request **presigned GET** → `{download_url}` |
+| `GET  /files/{id}` · `DELETE /files/{id}` | request **presigned GET** → `{download_url}` · delete |
 | `POST /channels/{id}/calls` | start/join call → `{room_id, sfu_join_token}` |
-| `GET  /bots`, `POST /bots` | list / register bots (returns signing secret once) |
+| `GET  /bots` · `POST /bots` | list / register bots (returns signing secret once) |
+| `GET /bots/{id}` · `PATCH /bots/{id}` · `DELETE /bots/{id}` | get / update (url, regen secret) / delete |
+| `POST /channels/{id}/bots` · `DELETE /channels/{id}/bots/{bot}` | add / remove bot from channel |
 | `POST /bots/{id}/webhook` | **inbound** webhook: external posts as bot (HMAC-signed) |
 
 ## 2. WebSocket (realtime plane) — `wss://<host>/ws`
 
-Authenticated at connect with the access token. Messages are tagged envelopes:
+**Authentication:** the access token is sent in the **first message** after the socket opens (an `auth` command), **not** as a query parameter (query strings leak into logs/proxies). The server rejects (closes) the socket if the first frame is not a valid `auth` within a short timeout. Tokens are re-validated; an expired token closes the socket and the client refreshes + reconnects.
+
+Messages are tagged envelopes:
 
 ```json
 { "type": "<event>", "id": "<uuid>", "ts": "<iso8601>", "data": { ... } }
@@ -48,6 +57,7 @@ Authenticated at connect with the access token. Messages are tagged envelopes:
 ### Client → server commands
 | type | data |
 |---|---|
+| `auth` | access token (**required first frame**, see above) |
 | `message.send` | channel id, body, attachment file_ids |
 | `typing` | channel id |
 | `call.join` / `call.leave` | room id |
@@ -71,9 +81,12 @@ The client's **media engine** produces the SDP/tracks and consumes remote tracks
 - `slash.command` with text matching `^/(?<bot>\w+)\s+(?<msg>.*)$` → `api` looks up the bot, signs and POSTs `{channel, user, message}` to the bot's URL (SSRF-guarded).
 - Bot replies arrive via the inbound webhook (`POST /bots/{id}/webhook`, HMAC-verified) and are broadcast as `bot.message`.
 
-## 5. Conventions
+## 5. Conventions, limits & errors
 
 - IDs are UUIDv7 (sortable). Timestamps ISO-8601 UTC.
 - Idempotency: client supplies a client-side message id; server dedupes.
 - Offline: `core` queues outgoing commands and replays on reconnect; server dedupes by client id.
 - Versioning: path-versioned REST (`/v1`); WS envelope may carry a `v` field later.
+- **Pagination:** `limit` default 50, **max 100**; page backwards with `before=<message_id>`.
+- **Sizes & lifetimes** (TTLs, message/file/payload caps, rate limits): single source of truth is [SECURITY.md](SECURITY.md) §7.
+- **Errors:** uniform JSON body `{ "error": { "code": "<machine_code>", "message": "<human>", "details?": {} } }` with a sensible HTTP status. Codes are a stable taxonomy (e.g. `auth.invalid_credentials`, `auth.totp_required`, `authz.forbidden`, `not_found`, `rate_limited`, `validation.*`, `conflict`). WS errors use an `error` event with the same shape.

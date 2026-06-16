@@ -38,8 +38,9 @@ Message ── (author) ─► User | Bot
 **bots** — `id · owner_id · name (slug, used in /name) · webhook_url · signing_secret · created_at`
 **channel_bots** — `channel_id · bot_id · added_by` (which bots participate where)
 
-**calls** — `id (room_id) · channel_id · started_by · started_at · ended_at?`
+**calls** — `id (room_id) · channel_id · started_by · started_at · last_active_at · ended_at?`
 **call_participants** — `call_id · user_id · joined_at · left_at?`
+> `last_active_at` drives **orphan cleanup**: a call with no active participants for the call-idle TTL ([SECURITY.md](SECURITY.md) §7) is closed and its SFU room torn down — guards against client crashes mid-call.
 
 ## Notes
 

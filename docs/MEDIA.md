@@ -40,6 +40,24 @@ core (Rust)  ──trait MediaEngine──►  platform implementation
                                       - decode (HW) → render to a native surface
 ```
 
+### `MediaEngine` contract (sketch — finalize before Phase 4)
+`core` drives signaling and calls into the engine; the engine reports back via events. Indicative async interface:
+
+```rust
+trait MediaEngine {
+    async fn join(&self, room: RoomConfig) -> Result<()>;      // create transports
+    async fn leave(&self) -> Result<()>;
+    async fn publish(&self, src: MediaSource) -> Result<TrackId>; // camera | screen | mic
+    async fn unpublish(&self, t: TrackId) -> Result<()>;
+    async fn subscribe(&self, remote: TrackId, layer: LayerHint) -> Result<()>;
+    async fn apply_remote_sdp(&self, sdp: Sdp) -> Result<()>;
+    async fn add_remote_ice(&self, c: IceCandidate) -> Result<()>;
+    // events out: LocalSdp, LocalIce, TrackAdded/Removed, RenderTarget, Stats
+    fn events(&self) -> EventStream<MediaEvent>;
+}
+```
+`RenderTarget` hands the native layer a surface/handle to draw decoded video into (GTK `Paintable`, `CALayer`, `SurfaceView`, …). Screen capture is initiated by the engine via the platform path (Wayland portal → `pipewiresrc`, ScreenCaptureKit, MediaProjection).
+
 ### Primary strategy: GStreamer `webrtcbin` everywhere it fits
 GStreamer is cross-platform and gives **explicit control of the hardware encoder element** per platform (`vah264enc`, `v4l2h264enc`, `nvh264enc`, …) plus **zero-copy DMA-BUF** from capture to encoder. It is the natural fit for **Linux, the Pi, and Windows**, and works on Android/macOS too.
 
@@ -55,6 +73,8 @@ To let the SFU serve different viewers different qualities, the sender either:
 - **SVC** (VP9/AV1): one scalable encode the SFU peels layers from → lighter encode, narrower HW support.
 
 Default: **H.264 simulcast (e.g. 720p + 360p)** on capable hardware; **single-layer** on constrained devices like the Pi.
+
+**Janus VideoRoom config (to pin down in Phase 4):** publishers declare simulcast (rid-based or legacy `simulcast`); the room advertises codecs (H.264 with the agreed profile/level-id, VP8 fallback). Subscribers request a substream/temporal layer; `core` sends `LayerHint`s and the SFU switches layers per receiver. Document the exact `videoroom` room parameters (`videocodec`, `h264_profile`, simulcast settings) alongside the engine work.
 
 ## 6. The Raspberry Pi 4B target (optimization litmus test)
 
@@ -72,6 +92,8 @@ This is feasible **because** of the architecture (native GTK4 UI, no Electron, R
 - **Constraints to respect:** cap the number of *decoded* incoming video tiles (e.g. show only the active speaker + thumbnails) to bound decode load; prefer audio-only fallback under pressure.
 
 **Why it should hold:** the Pi only ever encodes **one** stream (SFU forwards it), decodes a **bounded** number, and renders with native GTK4. No web engine, no transcoding, GC-free Rust core. The risks are the Pi's weak H.264 *encoder* and thermals — mitigated by single-layer 720p and framerate caps.
+
+> ⚠️ **This is a hypothesis, not a measured result.** The Pi 4B's VideoCore H.264 *encoder* is modest and thermally constrained, and `v4l2h264enc` quality/throughput vary by firmware. Treat the targets above as a starting profile to **validate with the acceptance test before committing** — adjust resolution/fps (or fall back to audio-only) based on real numbers. Active cooling likely required for sustained calls.
 
 **Pi acceptance test:** 1:1 call, camera 720p30 + screen share, sustained 10 min, CPU headroom remaining and no thermal throttle. Then a 3-person channel call (active-speaker view).
 
