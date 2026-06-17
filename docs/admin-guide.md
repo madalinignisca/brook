@@ -62,13 +62,34 @@ admin creates a user by sending the same `register` request with an
 | `make up` | build + start the stack (data preserved) |
 | `make down` | stop the stack, **keep** data |
 | `make logs` / `make ps` | follow logs / list services |
-| `make rebuild` | rebuild + restart the `api` after pulling new code |
+| `make rebuild` | rebuild + restart the `api` after pulling new code (applies DB migrations) |
+| `make migrate` | apply database migrations to the latest version (without a rebuild) |
+| `make dbrev` | show the current database schema revision + history |
 | `make reset` | **wipe all data** (Postgres + storage volumes) and start fresh |
 | `make storage` | also start MinIO (Phase 2 — file storage) |
 | `make media` | also start Janus (Phase 4 — calls) |
 
 `make reset` is destructive — it deletes the database. Use it to start over;
 not for routine restarts.
+
+## Upgrades & database migrations
+
+The database schema is managed by **Alembic migrations**, not recreated on the
+fly — so upgrading to a newer Brook **preserves your existing data**. The `api`
+container runs `alembic upgrade head` automatically every time it starts, so the
+normal upgrade is just:
+
+```bash
+git pull                 # get the new version
+make rebuild             # rebuild the api image; it migrates on startup, then serves
+make dbrev               # (optional) confirm the schema is at the latest revision
+```
+
+Migrations only ever *add to* or *transform* your data in place — they never
+wipe it. Still, **take a backup before upgrading** (see below); it's the safe
+habit for any schema change. If a migration ever fails, the `api` container stops
+before serving (so it won't run against a half-migrated database) and the failure
+is in `make logs`.
 
 ## Backups
 

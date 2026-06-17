@@ -4,7 +4,7 @@ ENV := .env
 
 .DEFAULT_GOAL := help
 
-.PHONY: help init up down reset restart logs ps rebuild storage media
+.PHONY: help init up down reset restart logs ps rebuild storage media migrate dbrev
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -46,8 +46,15 @@ logs: ## Follow logs (last 100 lines)
 ps: ## Show running services
 	$(COMPOSE) ps
 
-rebuild: ## Rebuild & restart only the api
+rebuild: ## Rebuild & restart only the api (entrypoint applies migrations on start)
 	$(COMPOSE) up -d --build api
+
+migrate: ## Apply DB migrations to head in the running api (no rebuild)
+	$(COMPOSE) exec api alembic upgrade head
+
+dbrev: ## Show the current DB revision and migration history
+	$(COMPOSE) exec api alembic current
+	$(COMPOSE) exec api alembic history --verbose | head -40
 
 storage: ## Start, also bringing up MinIO (Phase 2)
 	@[ -f $(ENV) ] || $(MAKE) init

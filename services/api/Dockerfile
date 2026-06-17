@@ -15,9 +15,11 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
 
-# App code, then install the project itself against the locked env.
+# App code + migrations, then install the project itself against the locked env.
 COPY app ./app
-RUN uv sync --locked --no-dev
+COPY alembic ./alembic
+COPY alembic.ini docker-entrypoint.sh ./
+RUN chmod +x docker-entrypoint.sh && uv sync --locked --no-dev
 
 # Run as an unprivileged user.
 RUN useradd --create-home --uid 10001 appuser \
@@ -30,5 +32,6 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"
 
-# Behind Caddy (TLS). Bind all interfaces inside the container network.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Behind Caddy (TLS). The entrypoint runs `alembic upgrade head`, then serves
+# (binds all interfaces inside the container network).
+CMD ["./docker-entrypoint.sh"]

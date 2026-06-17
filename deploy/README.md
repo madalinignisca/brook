@@ -36,13 +36,36 @@ curl -X POST http://<vm-ip>:8080/api/v1/auth/register \
 | `make up` | build + start the core stack (data preserved) |
 | `make down` | stop the stack, **keep** data |
 | `make reset` | **wipe** all volumes (Postgres + MinIO) → fresh rebuild of the **core** stack (re-run `make storage`/`make media` if you were using them) |
-| `make rebuild` | rebuild + restart just the `api` (after code changes) |
+| `make rebuild` | rebuild + restart just the `api` (after code changes); applies migrations on start |
+| `make migrate` | apply DB migrations to head in the running `api` (no rebuild) |
+| `make dbrev` | show current DB revision + migration history |
 | `make logs` / `make ps` | follow logs / list services |
 | `make storage` | also start **MinIO** (Phase 2) |
 | `make media` | also start **Janus** (Phase 4) |
 
 `make reset` is the clean-slate button: it removes the database and object data
 so you can start over from an empty server.
+
+## Database migrations (Alembic)
+
+The schema is owned by **Alembic migrations**, not `create_all` — so a persistent
+server can be **upgraded in place without wiping data**. The `api` entrypoint runs
+`alembic upgrade head` on every start (idempotent), so `make up` / `make rebuild`
+always bring the schema current. `BROOK_AUTO_CREATE_SCHEMA` is therefore **false**
+in this stack (create-all would drift from the migration history).
+
+- **Upgrade flow** (staging/prod): `git pull` → `make rebuild` → it migrates, then
+  serves. Inspect with `make dbrev`.
+- **Authoring a migration** (dev, on a machine with the toolchain) after changing
+  `services/api/app/models.py`:
+  ```bash
+  cd services/api
+  uv run alembic revision --autogenerate -m "describe the change"
+  uv run alembic upgrade head          # try it locally
+  ```
+  Review the generated file in `services/api/alembic/versions/` before committing —
+  autogenerate is a strong draft, not gospel (it can miss server-side defaults,
+  enum/type changes, and data backfills).
 
 ## Connecting the GNOME client (Phase 0, plain HTTP)
 
