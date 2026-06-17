@@ -62,8 +62,11 @@ def test_upgrade_adopts_pre_alembic_db(tmp_path: Path, monkeypatch: pytest.Monke
     sync_engine.dispose()
     assert "alembic_version" not in _table_names(db_path)
 
+    # Upgrade to the *baseline* specifically, not head: the adoption scenario is a
+    # database whose schema matches the baseline era. (Using head + create_all of
+    # the current models would collide once a second migration exists — a time bomb.)
     cfg = _alembic_config(f"sqlite+aiosqlite:///{db_path}", monkeypatch)
-    command.upgrade(cfg, "head")  # must NOT raise "table already exists"
+    command.upgrade(cfg, BASELINE_REVISION)  # must NOT raise "table already exists"
 
     assert {"users", "refresh_tokens", "alembic_version"} <= _table_names(db_path)
     with sqlite3.connect(db_path) as conn:
