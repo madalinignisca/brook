@@ -1,53 +1,74 @@
-# Brook — local development stack (SKELETON, fleshed out in Phase 0).
-# One entry point (Caddy/TLS); media (Janus) and files (MinIO) bypass the api.
-# See ../docs/ARCHITECTURE.md and ../docs/SECURITY.md.
+# Brook server stack. Default = the lean Phase 0 login stack (postgres + api + caddy).
+# Object storage (Phase 2) and the media SFU (Phase 4) are behind compose profiles
+# so they don't run until needed. See ./README.md and the Makefile.
+name: brook
 
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:-brook}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-brook}
     volumes:
       - pgdata:/var/lib/postgresql/data
-
-  minio:
-    image: minio/minio
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-    volumes:
-      - miniodata:/data
-    # exposed via caddy over HTTPS in prod
-
-  janus:
-    image: canyan/janus-gateway:latest   # pin a digest before real use
-    # VideoRoom SFU. Config lives in ../services/sfu/. Needs UDP media ports.
-    # network_mode/ports for RTP to be defined in Phase 4 (calls).
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-brook}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   api:
-    build: ../services/api
+    build:
+      context: ../services/api
+    restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      MINIO_ENDPOINT: minio:9000
-      JANUS_URL: http://janus:8088/janus
-      JWT_SIGNING_KEY: ${JWT_SIGNING_KEY}
-    depends_on: [postgres, minio, janus]
+      BROOK_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-brook}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-brook}
+      BROOK_JWT_SIGNING_KEY: ${BROOK_JWT_SIGNING_KEY:?set BROOK_JWT_SIGNING_KEY in .env (>=32 chars)}
+      # Phase 0 creates tables on startup; switch to Alembic + false later.
+      BROOK_AUTO_CREATE_SCHEMA: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "8000"
 
   caddy:
-    image: caddy:2
-    # Terminates TLS (HTTPS + WSS), routes to api/minio/janus.
-    # Caddyfile lives in ../services/gateway/.
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - api
     ports:
-      - "443:443"
-      - "80:80"
-    depends_on: [api]
+      # Plain HTTP on the LAN (Phase 0). Switch the Caddyfile to TLS later.
+      - "${BROOK_HTTP_PORT:-8080}:80"
     volumes:
-      - caddydata:/data
+      - ../services/gateway/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  # --- Phase 2: object storage. Enable with `make storage`. ---
+  minio:
+    image: minio/minio
+    profiles: ["storage"]
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-brook}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    volumes:
+      - miniodata:/data
+    ports:
+      - "${BROOK_MINIO_CONSOLE_PORT:-9001}:9001"
+
+  # --- Phase 4: media SFU (Janus). Enable with `make media`. Config lands in Phase 4. ---
+  janus:
+    image: canyan/janus-gateway:latest
+    profiles: ["media"]
+    restart: unless-stopped
 
 volumes:
   pgdata:
   miniodata:
-  caddydata:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,20 @@
+# Brook gateway.
+#
+# Phase 0 — plain HTTP on the LAN (no TLS yet). Caddy reverse-proxies both REST
+# and WebSocket (it upgrades automatically) to the api. The client connects with
+# BROOK_ALLOW_INSECURE_HTTP=1 (see deploy/README.md).
+#
+# To switch to TLS later, replace the `:80` block, e.g.:
+#   chat.example.com {           # real domain (+ DNS challenge) → Let's Encrypt
+#       reverse_proxy api:8000
+#   }
+# or for a self-signed internal CA on the LAN:
+#   https://brook.lan {
+#       tls internal
+#       reverse_proxy api:8000
+#   }
+
+:80 {
+	encode gzip
+	reverse_proxy api:8000
+}

@@ -19,6 +19,15 @@ impl CoreConfig {
     /// loopback host (`localhost`/`127.0.0.1`/`::1`) for local development and tests.
     /// This prevents ever sending credentials/tokens in cleartext.
     pub fn new(base_url: &str) -> Result<Self> {
+        Self::with_options(base_url, false)
+    }
+
+    /// Like [`CoreConfig::new`], but `allow_insecure_http` additionally permits
+    /// plain `http` to **any** host.
+    ///
+    /// **Development only** (e.g. a homelab LAN server without TLS yet) — it sends
+    /// credentials in cleartext. The UI gates this behind an explicit opt-in.
+    pub fn with_options(base_url: &str, allow_insecure_http: bool) -> Result<Self> {
         let mut s = base_url.to_string();
         if !s.ends_with('/') {
             s.push('/');
@@ -29,7 +38,7 @@ impl CoreConfig {
         let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
         match url.scheme() {
             "https" => {}
-            "http" if is_loopback => {}
+            "http" if is_loopback || allow_insecure_http => {}
             _ => return Err(Error::InsecureServerUrl),
         }
 
@@ -56,6 +65,15 @@ mod tests {
     fn rejects_plain_http_to_remote() {
         assert!(matches!(
             CoreConfig::new("http://chat.example.com"),
+            Err(Error::InsecureServerUrl)
+        ));
+    }
+
+    #[test]
+    fn allows_remote_http_only_with_explicit_opt_in() {
+        assert!(CoreConfig::with_options("http://192.168.1.50:8080", true).is_ok());
+        assert!(matches!(
+            CoreConfig::with_options("http://192.168.1.50:8080", false),
             Err(Error::InsecureServerUrl)
         ));
     }

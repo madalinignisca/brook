@@ -31,15 +31,41 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
+/// Present a minimal error window so startup failures are visible to the user.
+fn present_error(app: &adw::Application, message: &str) {
+    let page = adw::StatusPage::builder()
+        .icon_name("dialog-error-symbolic")
+        .title("Couldn't start Brook")
+        .description(message)
+        .build();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&page));
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .title("Brook")
+        .default_width(420)
+        .default_height(400)
+        .content(&toolbar)
+        .build();
+    window.present();
+}
+
 fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
     let server = std::env::var("BROOK_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string());
-    let client = match CoreConfig::new(&server).and_then(BrookClient::new) {
-        Ok(client) => Arc::new(client),
-        Err(err) => {
-            tracing::error!(%err, "failed to initialize core client");
-            return;
-        }
-    };
+    // Dev-only: allow a plain-http LAN server (e.g. a homelab VM without TLS yet).
+    let allow_insecure_http = std::env::var("BROOK_ALLOW_INSECURE_HTTP").as_deref() == Ok("1");
+    let client =
+        match CoreConfig::with_options(&server, allow_insecure_http).and_then(BrookClient::new) {
+            Ok(client) => Arc::new(client),
+            Err(err) => {
+                tracing::error!(%err, "failed to initialize core client");
+                // Show the problem in a window rather than exiting silently
+                // (e.g. when launched from the app grid, with no terminal).
+                present_error(app, &format!("Couldn't connect to “{server}”.\n\n{err}"));
+                return;
+            }
+        };
 
     // --- Login view ---
     let handle_row = adw::EntryRow::builder().title("Handle").build();
