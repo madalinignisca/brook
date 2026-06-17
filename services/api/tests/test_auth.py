@@ -60,7 +60,11 @@ async def test_refresh_rotates_and_revokes_old(client: httpx.AsyncClient) -> Non
 
 
 async def test_me_requires_auth(client: httpx.AsyncClient) -> None:
-    assert (await client.get(f"{API}/me")).status_code in (401, 403)
+    # A *missing* token is 401 "not authenticated", not a 403 authorization failure.
+    resp = await client.get(f"{API}/me")
+    assert resp.status_code == 401
+    assert resp.headers["WWW-Authenticate"] == "Bearer"
+    assert resp.json()["error"]["code"] == "auth.unauthorized"
 
 
 async def test_duplicate_handle_conflicts(client: httpx.AsyncClient) -> None:
@@ -80,6 +84,30 @@ async def test_login_unknown_handle_is_401(client: httpx.AsyncClient) -> None:
     await _register(client, "alice")
     resp = await client.post(f"{API}/login", json={"handle": "ghost", "password": "whatever-long"})
     assert resp.status_code == 401
+
+
+async def test_error_uses_brook_envelope_with_code(client: httpx.AsyncClient) -> None:
+    # Brook's wire contract (PROTOCOL.md §5): {"error": {code, message}}, NOT
+    # FastAPI's default {"detail": ...}. Clients parse this shape.
+    await _register(client, "alice")
+    resp = await client.post(f"{API}/login", json={"handle": "alice", "password": "nope-long"})
+    assert resp.status_code == 401
+    body = resp.json()
+    assert "detail" not in body
+    assert body["error"]["code"] == "auth.invalid_credentials"
+    assert body["error"]["message"]
+
+
+async def test_validation_error_uses_envelope(client: httpx.AsyncClient) -> None:
+    # A malformed body (password too short) → 422 in the same envelope.
+    resp = await client.post(
+        f"{API}/register", json={"handle": "x", "display_name": "X", "password": "short"}
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert "detail" not in body
+    assert body["error"]["code"] == "validation.error"
+    assert body["error"]["details"]["errors"]
 
 
 async def test_logout_revokes_refresh_token(client: httpx.AsyncClient) -> None:

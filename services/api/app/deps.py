@@ -14,11 +14,14 @@ from .config import Settings, get_settings
 from .db import get_session
 from .models import User
 
-_bearer = HTTPBearer(auto_error=True)
+# auto_error=False so a *missing* Authorization header is handled here as a 401
+# `auth.unauthorized` (not authenticated) rather than HTTPBearer's framework 403,
+# which would misclassify an unauthenticated caller as an authorization failure.
+_bearer = HTTPBearer(auto_error=False)
 
 
 async def get_current_user(
-    credentials: Annotated[HTTPAuthorizationCredentials, Depends(_bearer)],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
     session: Annotated[AsyncSession, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> User:
@@ -30,6 +33,12 @@ async def get_current_user(
         detail={"code": "auth.invalid_token", "message": "Invalid or expired token"},
         headers={"WWW-Authenticate": "Bearer"},
     )
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "auth.unauthorized", "message": "Not authenticated"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     try:
         payload = decode_access_token(settings, credentials.credentials)
         if payload.get("type") != "access":

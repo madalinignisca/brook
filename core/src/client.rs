@@ -86,12 +86,12 @@ struct TokenPair {
 }
 
 #[derive(Deserialize)]
-struct ApiErrorBody {
-    detail: Option<ApiErrorDetail>,
+struct ApiErrorEnvelope {
+    error: Option<ApiErrorContent>,
 }
 
 #[derive(Deserialize)]
-struct ApiErrorDetail {
+struct ApiErrorContent {
     code: String,
     message: String,
 }
@@ -103,13 +103,13 @@ async fn api_error(resp: reqwest::Response) -> Error {
         tracing::warn!(%err, "failed to read error response body");
         String::new()
     });
-    if let Ok(ApiErrorBody {
-        detail: Some(detail),
-    }) = serde_json::from_str::<ApiErrorBody>(&body)
+    if let Ok(ApiErrorEnvelope {
+        error: Some(content),
+    }) = serde_json::from_str::<ApiErrorEnvelope>(&body)
     {
         return Error::Api {
-            code: detail.code,
-            message: detail.message,
+            code: content.code,
+            message: content.message,
         };
     }
     // Non-JSON / unstructured error (e.g. a proxy 502 HTML page): keep the status
@@ -171,7 +171,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/login"))
             .respond_with(ResponseTemplate::new(401).set_body_json(json!({
-                "detail": { "code": "auth.invalid_credentials", "message": "Invalid handle or password" }
+                "error": { "code": "auth.invalid_credentials", "message": "Invalid handle or password" }
             })))
             .mount(&server)
             .await;

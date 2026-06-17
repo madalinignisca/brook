@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from . import __version__
 from .config import get_settings
 from .db import init_models
+from .errors import register_error_handlers
 from .routers import auth, health
 
 
@@ -24,6 +25,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     """Build and configure the FastAPI app."""
     app = FastAPI(title="Brook API", version=__version__, lifespan=lifespan)
+    register_error_handlers(app)
     app.include_router(health.router)
     app.include_router(auth.router, prefix="/api/v1")
     return app
