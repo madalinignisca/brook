@@ -61,9 +61,17 @@ Brook/
 
 **Shared Rust core + native UI per platform.** All non-UI logic — networking, protocol, state, file transfer, call signaling, crypto — lives once in `core/` (Rust). Each client is a *thin native UI* over that core, via language bindings (UniFFI for Swift/Kotlin, C ABI for C#). This is the only way to get five genuinely native UIs without writing (and bug-fixing) the hard logic five times. See [docs/CLIENT_PHILOSOPHY.md](docs/CLIENT_PHILOSOPHY.md).
 
+## Documentation
+
+- **Operators** → [docs/admin-guide.md](docs/admin-guide.md) — deploy, run, reset, back up, and troubleshoot a Brook server.
+- **End users** → [docs/user-guide.md](docs/user-guide.md) — install the client, connect to a server, sign in.
+- **Developers** → the rest of [docs/](docs/) (architecture, protocol, security, data model) + [docs/QUALITY.md](docs/QUALITY.md).
+
+The guides are kept in step with each phase and mark **Available now** vs **Planned** features explicitly.
+
 ## Status
 
-Pre-implementation. This tree currently holds the **architecture spec**. Implementation proceeds in phases per [docs/ROADMAP.md](docs/ROADMAP.md).
+Phase 0 in progress: server + GNOME client with **accounts and login** working end-to-end. Subsequent phases (chat, files, bots, calls) follow [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License
 
