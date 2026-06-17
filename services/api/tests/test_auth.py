@@ -21,7 +21,9 @@ async def test_first_user_bootstraps_as_admin(client: httpx.AsyncClient) -> None
 async def test_second_register_requires_admin(client: httpx.AsyncClient) -> None:
     await _register(client, "alice")  # first = admin
     # anonymous second registration is forbidden
-    assert (await _register(client, "bob")).status_code == 403
+    forbidden = await _register(client, "bob")
+    assert forbidden.status_code == 403
+    assert forbidden.json()["error"]["code"] == "authz.forbidden"
 
     # admin can create a member
     login = await client.post(f"{API}/login", json={"handle": "alice", "password": "supersecret"})
@@ -73,11 +75,14 @@ async def test_duplicate_handle_conflicts(client: httpx.AsyncClient) -> None:
     access = login.json()["access_token"]
     dup = await _register(client, "alice", headers={"Authorization": f"Bearer {access}"})
     assert dup.status_code == 409
+    assert dup.json()["error"]["code"] == "conflict"
 
 
 async def test_invalid_bearer_token_rejected(client: httpx.AsyncClient) -> None:
+    # An *invalid* token (vs. a missing one) is auth.invalid_token, also 401.
     resp = await client.get(f"{API}/me", headers={"Authorization": "Bearer not-a-real-token"})
     assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "auth.invalid_token"
 
 
 async def test_login_unknown_handle_is_401(client: httpx.AsyncClient) -> None:

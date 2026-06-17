@@ -16,6 +16,22 @@ Conventions:
 
 ## 2026-06-17
 
+### Test hardening from the friends reviews
+
+Turned the friends' findings into regression tests and tightened weak ones
+(15 → 21 tests):
+
+- `tests/test_migrations.py`: the pre-Alembic **adoption** case (the HIGH
+  finding) + fresh install + downgrade/upgrade round-trip.
+- `tests/test_errors.py`: error-envelope contract — bare 404, 405, and an
+  **unhandled 500** (regression for the catch-all handler finding).
+- `tests/test_auth.py`: replaced loose assertions (`status in (401, 403)` — the
+  kind of slack that *hid* the original 403-vs-401 bug) with exact error codes.
+
+Both regression tests were verified to **fail without their fix** (guard removed
+-> "table already exists"; handler removed -> non-JSON 500 body), then pass with
+it restored — so they actually bite.
+
 ### Brook-owned error envelope (server + client core) — reviewed by Codex/Gemini/Vibe
 
 Replaced FastAPI's default `{"detail": ...}` error body with Brook's own
