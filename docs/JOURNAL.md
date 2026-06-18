@@ -14,6 +14,40 @@ Conventions:
 
 ---
 
+## 2026-06-18
+
+### KDE/Plasma client — Phase 0 login skeleton (Qt6 + Kirigami via CXX-Qt)
+
+Second Linux client, peer to GNOME, which also proves the Qt<->Rust binding
+before the macOS/Windows FFI clients. `clients/kde`: a Kirigami login page over
+`brook-core` via **CXX-Qt 0.8**, mirroring the GNOME reactive flow.
+
+- `src/login.rs`: a `LoginController` QObject (CXX-Qt bridge) exposing
+  `logIn(server, handle, password)` and `busy`/`loggedIn`/`errorText`/
+  `displayName` properties. Networking runs on a Tokio runtime; results are
+  marshalled back onto the Qt thread via `cxx_qt::Threading`.
+- `qml/Main.qml`: Kirigami `ApplicationWindow` (follows Plasma theme/accent),
+  login form -> home placeholder, with the dev plain-http opt-in
+  (`BROOK_ALLOW_INSECURE_HTTP`) honored like the GNOME client.
+- Builds (CXX-Qt links Qt statically) and runs; the Kirigami window loads clean.
+  fmt + clippy clean. Login verified end-to-end against the local stack.
+
+Friends review (Codex gpt-5.5, Gemini CLI, Vibe) — applied:
+- **MEDIUM** (Codex): adding `clients/kde` to workspace `members` made
+  `cargo … --workspace` (and CI) try to build it, which needs Qt6/CXX-Qt/Kirigami
+  CI doesn't have. Added `default-members = [core, gnome]` and dropped
+  `--workspace` from the rust CI so default builds skip kde (build it with `-p`).
+- **LOW** (Codex): untracked `clients/kde/.qmlls.ini` (machine-specific absolute
+  path from the QML language server) and git-ignored it.
+- Declined: Codex's "LoginController may be uncreatable" — `#[derive(Default)]`
+  supplies the constructor (verified at runtime); Gemini's `initialPage` won't
+  transition — it does in this Kirigami version (verified). Vibe ran in plan mode
+  and gave only categories; its concerns mirror the existing GNOME client.
+
+Tooling note: also wired a machine-global `friends-review` command
+(`~/.local/bin` + a `/friends-review` Claude command) so the three-model review
+runs the same way in every project.
+
 ## 2026-06-17
 
 ### Test hardening from the friends reviews

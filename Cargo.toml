@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["core", "clients/gnome"]
+members = ["core", "clients/gnome", "clients/kde"]
+# Default builds/tests (and CI's non-`--workspace` commands) skip the KDE client:
+# it needs Qt6 + CXX-Qt + Kirigami system tooling that plain `cargo build` and
+# non-Plasma contributors lack. Build it explicitly with `-p brook-kde` on a
+# machine with Qt6 installed. (A dedicated Qt-enabled CI job is a follow-up.)
+default-members = ["core", "clients/gnome"]
 
 [workspace.package]
 edition = "2021"

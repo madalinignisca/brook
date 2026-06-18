@@ -33,11 +33,13 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+      # No --workspace: builds the default-members (core + gnome). The KDE client
+      # needs Qt6/CXX-Qt/Kirigami not installed here; it gets its own CI job later.
       - name: Clippy (warnings = errors)
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo test --locked
 
   deny:
     runs-on: ubuntu-latest

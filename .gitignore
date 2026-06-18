@@ -32,3 +32,6 @@ build/
 pgdata/
 miniodata/
 caddydata/
+
+# Editor/LSP scratch (qmlls writes a machine-specific absolute buildDir)
+.qmlls.ini
