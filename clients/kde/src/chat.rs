@@ -76,6 +76,7 @@ impl qobject::ChatController {
         let qt = self.qt_thread();
         app::runtime().spawn(async move {
             let Some(client) = app::client().await else {
+                tracing::warn!("chat start before login (no client)");
                 return;
             };
 
@@ -86,7 +87,9 @@ impl qobject::ChatController {
             }
             // Subscribe BEFORE connecting so no events fired during connect are missed.
             let mut events = client.events();
-            let _ = client.start_realtime().await;
+            if let Err(err) = client.start_realtime().await {
+                tracing::warn!(%err, "failed to start realtime");
+            }
             emit_channels(&client, &qt).await;
 
             loop {
@@ -142,7 +145,7 @@ impl qobject::ChatController {
         app::runtime().spawn(async move {
             if let Some(client) = app::client().await {
                 if let Err(err) = client.send_message(&channel_id, &body).await {
-                    eprintln!("brook-kde: failed to send message: {err}");
+                    tracing::warn!(%err, "failed to send message");
                 }
             }
         });

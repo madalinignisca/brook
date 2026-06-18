@@ -4,17 +4,18 @@
 //! then streams server events onto a broadcast channel the UI subscribes to.
 //! Reconnects with capped exponential backoff. Single connection per client.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use url::Url;
 
-use crate::{Error, Message, Result};
+use crate::{Error, Message, Result, Session};
 
 /// A realtime event pushed from the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +51,7 @@ pub(crate) fn ws_url(base: &Url) -> Result<Url> {
 /// Returns whether the socket became `ready` (used to decide reconnect backoff).
 async fn run_once(url: &Url, token: &str, tx: &broadcast::Sender<ServerEvent>) -> Result<bool> {
     let (mut socket, _resp) = connect_async(url.as_str()).await?;
+    tracing::info!(%url, "websocket connected; sending auth");
 
     let auth = json!({ "type": "auth", "data": { "access_token": token } });
     socket.send(WsMessage::Text(auth.to_string())).await?;
@@ -61,6 +63,7 @@ async fn run_once(url: &Url, token: &str, tx: &broadcast::Sender<ServerEvent>) -
                 Ok(env) => match env.event_type.as_str() {
                     "ready" => {
                         ready = true;
+                        tracing::info!("websocket subscribed (ready)");
                         let _ = tx.send(ServerEvent::Ready);
                     }
                     "message.new" => match serde_json::from_value::<Message>(env.data) {
@@ -85,9 +88,24 @@ async fn run_once(url: &Url, token: &str, tx: &broadcast::Sender<ServerEvent>) -
 
 /// Reconnect loop: keep a live connection, backing off on failure. Runs for the
 /// life of the client (events are dropped when there are no subscribers).
-pub(crate) async fn run(url: Url, token: String, tx: broadcast::Sender<ServerEvent>) {
+pub(crate) async fn run(
+    url: Url,
+    session: Arc<RwLock<Option<Session>>>,
+    tx: broadcast::Sender<ServerEvent>,
+) {
     let mut backoff = 1u64;
     loop {
+        // Read the *current* access token each (re)connect, so after a background
+        // refresh the socket reconnects authorized rather than with a stale token.
+        let token = match session.read().await.as_ref() {
+            Some(s) => s.access_token.clone(),
+            None => {
+                // Not logged in (yet/anymore): idle and re-check instead of exiting,
+                // so a later login restarts the socket without a new task.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
         match run_once(&url, &token, &tx).await {
             // Reset backoff only after a usable (ready) session, so an immediate
             // auth-close (e.g. expired token) backs off instead of spin-reconnecting.

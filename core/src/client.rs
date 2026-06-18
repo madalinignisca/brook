@@ -1,6 +1,8 @@
 //! The Brook core client.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -11,6 +13,16 @@ use url::Url;
 use crate::ws::{self, ServerEvent};
 use crate::{AuthState, Channel, CoreConfig, Error, Message, Result, Session, User};
 
+/// Shared, mutable session — read by chat calls, the WS, and the refresh loop.
+type SharedSession = Arc<RwLock<Option<Session>>>;
+
+/// Refresh the access token this long before its ~15 min server TTL elapses.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(600);
+
+/// After a transient refresh failure (or while logged out), poll again this soon
+/// — short enough to recover well before the access token expires.
+const REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Shared client: networking + observable auth state.
 ///
 /// Cheap to clone-by-`Arc` from the UI; safe to call from any async task.
@@ -20,7 +32,7 @@ pub struct BrookClient {
     state_tx: watch::Sender<AuthState>,
     state_rx: watch::Receiver<AuthState>,
     /// The active session (set on login), used to authorize chat calls + the WS.
-    session: RwLock<Option<Session>>,
+    session: SharedSession,
     /// Realtime events fan-out to UI subscribers.
     events_tx: broadcast::Sender<ServerEvent>,
     /// Guards against starting the realtime task more than once.
@@ -38,7 +50,7 @@ impl BrookClient {
             http,
             state_tx,
             state_rx,
-            session: RwLock::new(None),
+            session: Arc::new(RwLock::new(None)),
             events_tx,
             realtime_started: AtomicBool::new(false),
         })
@@ -211,18 +223,22 @@ impl BrookClient {
     /// Open the realtime WebSocket (idempotent). Spawns a background reconnect
     /// loop on the current Tokio runtime.
     pub async fn start_realtime(&self) -> Result<()> {
-        // Resolve token + url BEFORE claiming the flag, so a call made while logged
+        // Require a session BEFORE claiming the flag, so a call made while logged
         // out fails cleanly and a later (authenticated) call can still start.
-        let token = self.access_token().await?;
+        self.access_token().await?;
         let url = ws::ws_url(&self.base)?;
         if self.realtime_started.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        // TODO(Phase 1b): the WS reuses this token across reconnects; once the
-        // 15-min access token expires it can't recover. Pass a token provider that
-        // refreshes (needs client-side refresh-token rotation) before relying on
-        // long-lived sessions.
-        tokio::spawn(ws::run(url, token, self.events_tx.clone()));
+        // The WS reads the current token from the shared session on each (re)connect,
+        // and a background loop refreshes the access token before it expires — so a
+        // long-lived session keeps both REST calls and the socket authorized.
+        tokio::spawn(ws::run(url, self.session.clone(), self.events_tx.clone()));
+        tokio::spawn(refresh_loop(
+            self.http.clone(),
+            self.base.clone(),
+            self.session.clone(),
+        ));
         Ok(())
     }
 
@@ -278,6 +294,62 @@ async fn api_error(resp: reqwest::Response) -> Error {
             snippet
         },
     }
+}
+
+/// Periodically rotate the access token so a long-lived session keeps REST calls
+/// and the WebSocket authorized. Runs for the client's life: when there's no
+/// session (logged out, or the refresh token was rejected) it idles and polls, so
+/// a later login is picked up automatically without restarting the task.
+async fn refresh_loop(http: reqwest::Client, base: Url, session: SharedSession) {
+    let mut delay = REFRESH_INTERVAL;
+    loop {
+        tokio::time::sleep(delay).await;
+        delay = match refresh_once(&http, &base, &session).await {
+            Ok(true) => REFRESH_INTERVAL,        // refreshed → next near expiry
+            Ok(false) => REFRESH_RETRY_INTERVAL, // no session / token rejected → poll for login
+            Err(err) => {
+                tracing::warn!(%err, "token refresh failed; retrying soon");
+                REFRESH_RETRY_INTERVAL // transient (network/5xx) → retry before expiry
+            }
+        };
+    }
+}
+
+/// Rotate access+refresh tokens once via `/auth/refresh`.
+///
+/// `Ok(false)` means "no work / give up for now": either there's no session, or
+/// the refresh token was rejected (4xx) — in which case the session is cleared so
+/// callers see [`Error::NotAuthenticated`]. `Err` is transient (retry).
+async fn refresh_once(http: &reqwest::Client, base: &Url, session: &SharedSession) -> Result<bool> {
+    let refresh_token = match session.read().await.as_ref() {
+        Some(s) => s.refresh_token.clone(),
+        None => return Ok(false),
+    };
+    let url = base.join("api/v1/auth/refresh")?;
+    let resp = http
+        .post(url)
+        .json(&json!({ "refresh_token": refresh_token }))
+        .send()
+        .await?;
+    if resp.status().is_client_error() {
+        // The refresh token is invalid/expired — drop the session, stop retrying.
+        *session.write().await = None;
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        return Err(api_error(resp).await); // 5xx → transient
+    }
+    let tokens: TokenPair = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
+    if let Some(session) = session.write().await.as_mut() {
+        // Compare-and-set: only apply if the session still holds the token we
+        // rotated — otherwise a concurrent (re)login replaced it and our result
+        // is stale (would mix an old token with a new user).
+        if session.refresh_token == refresh_token {
+            session.access_token = tokens.access_token;
+            session.refresh_token = tokens.refresh_token;
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

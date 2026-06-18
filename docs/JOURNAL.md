@@ -16,6 +16,27 @@ Conventions:
 
 ## 2026-06-18
 
+### Phase 1 fix — session token refresh + WS live-token, reviewed by Codex/Gemini/Vibe
+
+First live two-account testing exposed: after the 15-min access token expired,
+sends returned `auth.invalid_token` and the realtime socket couldn't recover (it
+held a static token). Fix in `core`:
+
+- A background loop refreshes the access token (~10 min, before the 15-min TTL)
+  via `/auth/refresh`, rotating both tokens in the shared session.
+- The WebSocket reads the *current* token from the shared session on each
+  (re)connect; both clients now connect + subscribe (verified in logs).
+- KDE gained a `tracing` subscriber so core logs (incl. WS lifecycle) surface.
+
+Applied three-model review (Codex gpt-5.5, Gemini CLI, Vibe):
+- HIGH (Codex, Vibe): refresh TOCTOU — an in-flight refresh could write old
+  tokens into a newer (relogin) session. Compare-and-set on the refresh token.
+- HIGH/MED (Vibe, Gemini): a rejected refresh token (4xx) retried forever. Now
+  clears the session and stops; transient errors retry in 15s, not 10 min.
+- HIGH/MED (Gemini, Codex): loops exited on logout without resetting the guard,
+  blocking relogin. Loops now idle-and-poll for a session and self-heal.
+- LOW (Gemini): KDE error logging moved from eprintln to tracing.
+
 ### Phase 1 KDE client — chat UI (Kirigami + CXX-Qt), reviewed by Codex/Gemini/Vibe
 
 `clients/kde`: a `ChatController` CXX-Qt bridge (`src/chat.rs`) exposing

@@ -105,6 +105,8 @@ dependencies = [
  "cxx-qt-lib",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
