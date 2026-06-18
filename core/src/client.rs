@@ -1,11 +1,15 @@
 //! The Brook core client.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch, RwLock};
 use url::Url;
 
-use crate::{AuthState, CoreConfig, Error, Result, Session, User};
+use crate::ws::{self, ServerEvent};
+use crate::{AuthState, Channel, CoreConfig, Error, Message, Result, Session, User};
 
 /// Shared client: networking + observable auth state.
 ///
@@ -15,6 +19,12 @@ pub struct BrookClient {
     http: reqwest::Client,
     state_tx: watch::Sender<AuthState>,
     state_rx: watch::Receiver<AuthState>,
+    /// The active session (set on login), used to authorize chat calls + the WS.
+    session: RwLock<Option<Session>>,
+    /// Realtime events fan-out to UI subscribers.
+    events_tx: broadcast::Sender<ServerEvent>,
+    /// Guards against starting the realtime task more than once.
+    realtime_started: AtomicBool,
 }
 
 impl BrookClient {
@@ -22,11 +32,15 @@ impl BrookClient {
     pub fn new(config: CoreConfig) -> Result<Self> {
         let http = reqwest::Client::builder().build()?;
         let (state_tx, state_rx) = watch::channel(AuthState::LoggedOut);
+        let (events_tx, _) = broadcast::channel(256);
         Ok(Self {
             base: config.base_url,
             http,
             state_tx,
             state_rx,
+            session: RwLock::new(None),
+            events_tx,
+            realtime_started: AtomicBool::new(false),
         })
     }
 
@@ -40,6 +54,9 @@ impl BrookClient {
         // `send` only fails if all receivers are dropped; `self` holds `state_rx`,
         // so it can never fail here. Ignoring the result is safe.
         let _ = self.state_tx.send(AuthState::Authenticating);
+        // Drop any prior session up front so a failed attempt can never leave the
+        // previous user's token usable by chat calls.
+        *self.session.write().await = None;
         let result = self.do_login(handle, password).await;
         let next = match &result {
             Ok(session) => AuthState::LoggedIn(session.user.clone()),
@@ -62,16 +79,154 @@ impl BrookClient {
         }
         let tokens: TokenPair = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
         let user = self.fetch_me(&tokens.access_token).await?;
-        Ok(Session {
+        let session = Session {
             access_token: tokens.access_token,
             refresh_token: tokens.refresh_token,
             user,
-        })
+        };
+        // Retain the session so chat calls and the WS can authorize.
+        *self.session.write().await = Some(session.clone());
+        Ok(session)
     }
 
     async fn fetch_me(&self, access_token: &str) -> Result<User> {
         let url = self.base.join("api/v1/auth/me")?;
         let resp = self.http.get(url).bearer_auth(access_token).send().await?;
+        if !resp.status().is_success() {
+            return Err(api_error(resp).await);
+        }
+        resp.json().await.map_err(|_| Error::UnexpectedResponse)
+    }
+
+    /// The current access token, or [`Error::NotAuthenticated`] if logged out.
+    async fn access_token(&self) -> Result<String> {
+        self.session
+            .read()
+            .await
+            .as_ref()
+            .map(|s| s.access_token.clone())
+            .ok_or(Error::NotAuthenticated)
+    }
+
+    /// The logged-in user's id (for rendering DM titles), or `None` if logged out.
+    pub async fn current_user_id(&self) -> Option<String> {
+        self.session
+            .read()
+            .await
+            .as_ref()
+            .map(|s| s.user.id.clone())
+    }
+
+    /// Channels and DMs the user belongs to.
+    pub async fn list_channels(&self) -> Result<Vec<Channel>> {
+        let token = self.access_token().await?;
+        let url = self.base.join("api/v1/channels")?;
+        let resp = self.http.get(url).bearer_auth(token).send().await?;
+        self.parse(resp).await
+    }
+
+    /// Create a named channel (server requires the caller be a global admin).
+    pub async fn create_channel(&self, name: &str, topic: Option<&str>) -> Result<Channel> {
+        self.post_channel(json!({ "kind": "channel", "name": name, "topic": topic }))
+            .await
+    }
+
+    /// Open (or find the existing) 1:1 DM with the user `member_handle`.
+    pub async fn open_dm(&self, member_handle: &str) -> Result<Channel> {
+        self.post_channel(json!({ "kind": "dm", "member": member_handle }))
+            .await
+    }
+
+    async fn post_channel(&self, body: serde_json::Value) -> Result<Channel> {
+        let token = self.access_token().await?;
+        let url = self.base.join("api/v1/channels")?;
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await?;
+        self.parse(resp).await
+    }
+
+    /// Add a member (by handle) to a channel. Requires admin or channel owner.
+    pub async fn add_member(&self, channel_id: &str, handle: &str) -> Result<()> {
+        let token = self.access_token().await?;
+        let url = self
+            .base
+            .join(&format!("api/v1/channels/{channel_id}/members"))?;
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .json(&json!({ "handle": handle }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(api_error(resp).await);
+        }
+        Ok(())
+    }
+
+    /// Channel history, oldest→newest. `before` back-paginates from a message id.
+    pub async fn channel_history(
+        &self,
+        channel_id: &str,
+        before: Option<&str>,
+    ) -> Result<Vec<Message>> {
+        let token = self.access_token().await?;
+        let mut url = self
+            .base
+            .join(&format!("api/v1/channels/{channel_id}/messages"))?;
+        if let Some(before) = before {
+            url.query_pairs_mut().append_pair("before", before);
+        }
+        let resp = self.http.get(url).bearer_auth(token).send().await?;
+        self.parse(resp).await
+    }
+
+    /// Send a message into a channel (the only send path); the server fans it out.
+    pub async fn send_message(&self, channel_id: &str, body: &str) -> Result<Message> {
+        let token = self.access_token().await?;
+        let url = self
+            .base
+            .join(&format!("api/v1/channels/{channel_id}/messages"))?;
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .json(&json!({ "body": body }))
+            .send()
+            .await?;
+        self.parse(resp).await
+    }
+
+    /// Subscribe to realtime [`ServerEvent`]s (call [`Self::start_realtime`] once
+    /// after login to open the socket).
+    pub fn events(&self) -> broadcast::Receiver<ServerEvent> {
+        self.events_tx.subscribe()
+    }
+
+    /// Open the realtime WebSocket (idempotent). Spawns a background reconnect
+    /// loop on the current Tokio runtime.
+    pub async fn start_realtime(&self) -> Result<()> {
+        // Resolve token + url BEFORE claiming the flag, so a call made while logged
+        // out fails cleanly and a later (authenticated) call can still start.
+        let token = self.access_token().await?;
+        let url = ws::ws_url(&self.base)?;
+        if self.realtime_started.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        // TODO(Phase 1b): the WS reuses this token across reconnects; once the
+        // 15-min access token expires it can't recover. Pass a token provider that
+        // refreshes (needs client-side refresh-token rotation) before relying on
+        // long-lived sessions.
+        tokio::spawn(ws::run(url, token, self.events_tx.clone()));
+        Ok(())
+    }
+
+    async fn parse<T: DeserializeOwned>(&self, resp: reqwest::Response) -> Result<T> {
         if !resp.status().is_success() {
             return Err(api_error(resp).await);
         }
@@ -184,5 +339,78 @@ mod tests {
             other => panic!("expected Api error, got {other:?}"),
         }
         assert!(matches!(*client.state().borrow(), AuthState::Failed(_)));
+    }
+
+    async fn logged_in_client(server: &MockServer) -> BrookClient {
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "a", "refresh_token": "r", "token_type": "bearer"
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/auth/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "u1", "handle": "alice", "display_name": "Alice", "global_role": "admin"
+            })))
+            .mount(server)
+            .await;
+        let client = client_for(server).await;
+        client.login("alice", "supersecret").await.unwrap();
+        client
+    }
+
+    #[tokio::test]
+    async fn lists_channels_and_titles_dm_by_other_member() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/channels"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "id": "c1", "kind": "dm", "name": null, "topic": null,
+                "created_by": "u1", "created_at": "2026-06-18T00:00:00Z",
+                "members": [
+                    {"id": "u1", "handle": "alice", "display_name": "Alice"},
+                    {"id": "u2", "handle": "bob", "display_name": "Bob"}
+                ]
+            }])))
+            .mount(&server)
+            .await;
+
+        let channels = client.list_channels().await.unwrap();
+        assert_eq!(channels.len(), 1);
+        assert!(channels[0].is_dm());
+        // A DM is titled by the *other* member.
+        assert_eq!(channels[0].title("u1"), "Bob");
+    }
+
+    #[tokio::test]
+    async fn sends_message_and_parses_author() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/channels/c1/messages"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "019ed8", "channel_id": "c1", "author_id": "u1",
+                "author_handle": "alice", "author_display_name": "Alice",
+                "body": "hi bob", "created_at": "2026-06-18T00:00:00Z", "edited_at": null
+            })))
+            .mount(&server)
+            .await;
+
+        let message = client.send_message("c1", "hi bob").await.unwrap();
+        assert_eq!(message.body, "hi bob");
+        assert_eq!(message.author_handle.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn chat_calls_require_login() {
+        let server = MockServer::start().await;
+        let client = client_for(&server).await;
+        assert!(matches!(
+            client.list_channels().await.unwrap_err(),
+            Error::NotAuthenticated
+        ));
     }
 }

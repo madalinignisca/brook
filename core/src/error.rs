@@ -33,6 +33,20 @@ pub enum Error {
     /// The server responded in a shape the client could not understand.
     #[error("unexpected response from server")]
     UnexpectedResponse,
+
+    /// An authenticated call was made before logging in.
+    #[error("not authenticated")]
+    NotAuthenticated,
+
+    /// A WebSocket transport error (boxed — tungstenite's error is large).
+    #[error("websocket error: {0}")]
+    WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for Error {
+    fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
+        Error::WebSocket(Box::new(err))
+    }
 }
 
 /// Convenience result type for the core.
