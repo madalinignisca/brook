@@ -1,10 +1,10 @@
 //! Chat domain types: channels, members, and messages (mirror the api's
 //! `ChannelOut` / `MessageOut`).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A member of a channel (lightweight user reference).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ChannelMember {
     /// User id.
     pub id: String,
@@ -15,7 +15,7 @@ pub struct ChannelMember {
 }
 
 /// A channel or 1:1 DM the user belongs to.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Channel {
     /// Stable channel id.
     pub id: String,
@@ -56,7 +56,7 @@ impl Channel {
 }
 
 /// A message in a channel.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Message {
     /// UUIDv7 id (time-sortable).
     pub id: String,

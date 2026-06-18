@@ -16,6 +16,29 @@ Conventions:
 
 ## 2026-06-18
 
+### Phase 1 KDE client — chat UI (Kirigami + CXX-Qt), reviewed by Codex/Gemini/Vibe
+
+`clients/kde`: a `ChatController` CXX-Qt bridge (`src/chat.rs`) exposing
+start/refresh/select_channel/send/open_dm/create_channel and emitting JSON to QML
+via `channels_loaded`/`history_loaded`/`message_received` signals; `qml/Main.qml`
+gains a two-pane chat page (channel list + messages + composer + new-conversation
+sheet). `src/app.rs` shares one authenticated `BrookClient` between the login and
+chat controllers. Core chat DTOs gained `Serialize` for the JSON bridge.
+
+Applied three-model review (Codex gpt-5.5, Gemini CLI):
+- **MEDIUM** (Gemini): subscribed to `events()` *after* `start_realtime()`, racing
+  missed events. Subscribe first now.
+- **LOW** (Gemini): guarded the realtime listener with a once-flag so a recreated
+  chat page can't spawn overlapping loops.
+- **LOW** (Codex): clear the message model on channel switch (don't show the old
+  channel while loading).
+- **MEDIUM** (Vibe): null-guard `members` in the QML title helper.
+- **Declined** Gemini's HIGH ("signals are camelCase in QML") — cxx-qt 0.8 keeps
+  snake_case (proven when `logIn` failed and `log_in` worked at login; the moc
+  header shows `Q_SIGNAL channels_loaded`), so `onChannels_loaded` is correct.
+- Deferred: optimistic send + WS-echo dedupe (same as GNOME; WS normally up);
+  surfacing network errors to the UI.
+
 ### Phase 1 GNOME client — chat UI, reviewed by Codex/Gemini/Vibe
 
 `clients/gnome/src/chat.rs`: an `AdwOverlaySplitView` with a channel/DM sidebar,

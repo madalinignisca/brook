@@ -4,6 +4,8 @@
 //! switches to a placeholder home page on success. The `LoginController`
 //! QObject lives in [`login`]; the UI is QML (see `qml/Main.qml`).
 
+pub mod app;
+pub mod chat;
 pub mod login;
 
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QUrl};

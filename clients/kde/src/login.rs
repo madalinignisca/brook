@@ -5,18 +5,13 @@
 //! `cxx_qt::Threading` so the QML properties update on the GUI thread.
 
 use core::pin::Pin;
-use std::sync::OnceLock;
+use std::sync::Arc;
 
 use brook_core::{BrookClient, CoreConfig};
 use cxx_qt::Threading;
 use cxx_qt_lib::QString;
 
-/// One process-wide multi-thread Tokio runtime drives all networking.
-static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-
-fn runtime() -> &'static tokio::runtime::Runtime {
-    RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("create Tokio runtime"))
-}
+use crate::app;
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -74,15 +69,18 @@ impl qobject::LoginController {
         self.as_mut().set_busy(true);
 
         let qt_thread = self.qt_thread();
-        runtime().spawn(async move {
+        app::runtime().spawn(async move {
             // Dev-only: allow a plain-http LAN server (a homelab VM without TLS),
             // matching the GNOME client's BROOK_ALLOW_INSECURE_HTTP opt-in.
             let allow_insecure_http =
                 std::env::var("BROOK_ALLOW_INSECURE_HTTP").as_deref() == Ok("1");
             let outcome = async {
                 let config = CoreConfig::with_options(&server, allow_insecure_http)?;
-                let client = BrookClient::new(config)?;
-                client.login(&handle, &password).await
+                let client = Arc::new(BrookClient::new(config)?);
+                let session = client.login(&handle, &password).await?;
+                // Share the authenticated client with the chat controller.
+                app::set_client(client).await;
+                Ok::<_, brook_core::Error>(session)
             }
             .await;
 
