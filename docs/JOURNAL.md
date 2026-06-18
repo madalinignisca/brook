@@ -16,6 +16,27 @@ Conventions:
 
 ## 2026-06-18
 
+### Phase 1 GNOME client — chat UI, reviewed by Codex/Gemini/Vibe
+
+`clients/gnome/src/chat.rs`: an `AdwOverlaySplitView` with a channel/DM sidebar,
+message list, and composer over `brook-core`. Networking on the Tokio runtime
+(await `JoinHandle` on the GLib loop); realtime `message.new` events consumed
+from the core broadcast channel and appended live. A "+" popover opens DMs by
+handle and (admins) creates channels. `main.rs` swaps the login placeholder for
+the chat view on sign-in.
+
+Applied three-model review (Codex gpt-5.5, Gemini CLI):
+- **HIGH** (Codex, Gemini): `start_realtime().await` ran on the GLib executor but
+  spawns a Tokio task → would **panic at login**. Now run via `runtime.spawn`.
+- **MEDIUM** (Codex): history load cleared the list *after* the await, wiping
+  live messages that arrived meanwhile. Clear *before* the await now.
+- Deferred (TODO): strong `Rc<Chat>` capture cycle (nil impact for the
+  single-window session; weak-capture refactor later). Vibe produced no findings.
+
+### Phase 1 core — chat client (channels, messages, realtime WS), reviewed by Codex/Gemini/Vibe
+
+(See commit 970ef92.)
+
 ### Phase 1 server — chat (channels, DMs, messages, WebSocket fan-out), reviewed by Codex/Gemini/Vibe
 
 The server half of Phase 1: two accounts can chat 1:1 and in channels.

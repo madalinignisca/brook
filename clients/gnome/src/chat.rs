@@ -1,0 +1,477 @@
+//! The post-login chat view: a sidebar of channels/DMs, a message list, and a
+//! composer — over `brook-core`. Networking runs on the Tokio runtime; results
+//! are applied on the GTK main loop (await a runtime `JoinHandle` inside
+//! `spawn_future_local`). Realtime `message.new` events are consumed from the
+//! core's broadcast channel on the main loop and appended live.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use adw::prelude::*;
+use brook_core::{BrookClient, Channel, Message, ServerEvent};
+use gtk::glib;
+use tokio::runtime::Handle;
+
+/// Shared UI state captured by the various callbacks.
+///
+/// TODO(Phase 1b): callbacks capture `Rc<Chat>` strongly while `Chat` owns the
+/// widgets, forming a reference cycle (flagged in review). Harmless for the
+/// single-window session lifetime, but should move to weak captures to honor the
+/// no-cycles contract in `main.rs`.
+struct Chat {
+    client: Arc<BrookClient>,
+    runtime: Handle,
+    me: Rc<RefCell<Option<String>>>,
+    is_admin: Rc<RefCell<bool>>,
+    current: Rc<RefCell<Option<String>>>,
+    channel_list: gtk::ListBox,
+    channels: Rc<RefCell<Vec<Channel>>>,
+    message_list: gtk::ListBox,
+    message_scroll: gtk::ScrolledWindow,
+    title: adw::WindowTitle,
+    composer: gtk::Entry,
+    send_button: gtk::Button,
+}
+
+/// Build the chat view. `is_admin` controls whether channel creation is offered.
+pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::Widget {
+    let channel_list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .css_classes(["navigation-sidebar"])
+        .build();
+
+    let message_list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["background"])
+        .build();
+    let message_scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&message_list)
+        .build();
+
+    let composer = gtk::Entry::builder()
+        .placeholder_text("Message…")
+        .hexpand(true)
+        .sensitive(false)
+        .build();
+    let send_button = gtk::Button::builder()
+        .icon_name("paper-plane-symbolic")
+        .sensitive(false)
+        .css_classes(["suggested-action"])
+        .build();
+
+    let title = adw::WindowTitle::new("Brook", "Pick a conversation");
+
+    let chat = Rc::new(Chat {
+        client,
+        runtime,
+        me: Rc::new(RefCell::new(None)),
+        is_admin: Rc::new(RefCell::new(is_admin)),
+        current: Rc::new(RefCell::new(None)),
+        channel_list: channel_list.clone(),
+        channels: Rc::new(RefCell::new(Vec::new())),
+        message_list: message_list.clone(),
+        message_scroll: message_scroll.clone(),
+        title: title.clone(),
+        composer: composer.clone(),
+        send_button: send_button.clone(),
+    });
+
+    // --- sidebar ---
+    let add_button = gtk::MenuButton::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("New conversation")
+        .popover(&new_conversation_popover(&chat))
+        .build();
+    let sidebar_header = adw::HeaderBar::builder()
+        .show_end_title_buttons(false)
+        .build();
+    sidebar_header.pack_start(&add_button);
+    sidebar_header.set_title_widget(Some(&adw::WindowTitle::new("Brook", "")));
+
+    let sidebar_scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&channel_list)
+        .build();
+    let sidebar = adw::ToolbarView::new();
+    sidebar.add_top_bar(&sidebar_header);
+    sidebar.set_content(Some(&sidebar_scroll));
+
+    // --- content ---
+    let content_header = adw::HeaderBar::new();
+    content_header.set_title_widget(Some(&title));
+
+    let composer_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    composer_row.append(&composer);
+    composer_row.append(&send_button);
+
+    let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content_box.append(&message_scroll);
+    content_box.append(&composer_row);
+
+    let content = adw::ToolbarView::new();
+    content.add_top_bar(&content_header);
+    content.set_content(Some(&content_box));
+
+    let split = adw::OverlaySplitView::builder()
+        .sidebar(&sidebar)
+        .content(&content)
+        .min_sidebar_width(240.0)
+        .max_sidebar_width(360.0)
+        .build();
+
+    // --- wiring ---
+    channel_list.connect_row_selected({
+        let chat = chat.clone();
+        move |_, row| {
+            if let Some(row) = row {
+                let idx = row.index() as usize;
+                let id = chat.channels.borrow().get(idx).map(|c| c.id.clone());
+                if let Some(id) = id {
+                    select_channel(&chat, &id);
+                }
+            }
+        }
+    });
+
+    let do_send: Rc<dyn Fn()> = Rc::new({
+        let chat = chat.clone();
+        move || send_current(&chat)
+    });
+    composer.connect_activate({
+        let do_send = do_send.clone();
+        move |_| (do_send)()
+    });
+    send_button.connect_clicked({
+        let do_send = do_send.clone();
+        move |_| (do_send)()
+    });
+
+    // Resolve our user id, load channels, open the realtime stream.
+    bootstrap(&chat);
+
+    split.upcast()
+}
+
+/// Load the current user id, the channel list, and start realtime.
+fn bootstrap(chat: &Rc<Chat>) {
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        // These run on the Tokio runtime, not the GLib executor: `start_realtime`
+        // calls `tokio::spawn` internally and would panic off-runtime.
+        let id = chat
+            .runtime
+            .spawn({
+                let client = chat.client.clone();
+                async move { client.current_user_id().await }
+            })
+            .await
+            .ok()
+            .flatten();
+        if let Some(id) = id {
+            *chat.me.borrow_mut() = Some(id);
+        }
+        let _ = chat
+            .runtime
+            .spawn({
+                let client = chat.client.clone();
+                async move { client.start_realtime().await }
+            })
+            .await;
+
+        spawn_event_loop(&chat);
+        refresh_channels(&chat, None);
+    });
+}
+
+/// Consume realtime events on the GTK main loop, appending live messages.
+fn spawn_event_loop(chat: &Rc<Chat>) {
+    let chat = chat.clone();
+    let mut events = chat.client.events();
+    glib::spawn_future_local(async move {
+        loop {
+            match events.recv().await {
+                Ok(ServerEvent::MessageNew(message)) => {
+                    let is_current = chat
+                        .current
+                        .borrow()
+                        .as_deref()
+                        .is_some_and(|c| c == message.channel_id);
+                    if is_current {
+                        append_message(&chat, &message);
+                    }
+                }
+                Ok(ServerEvent::Ready) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break, // sender gone
+            }
+        }
+    });
+}
+
+/// (Re)load the sidebar channel list. `select` optionally selects a channel id.
+fn refresh_channels(chat: &Rc<Chat>, select: Option<String>) {
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let handle = chat.runtime.spawn({
+            let client = chat.client.clone();
+            async move { client.list_channels().await }
+        });
+        let Ok(Ok(channels)) = handle.await else {
+            return;
+        };
+
+        while let Some(row) = chat.channel_list.row_at_index(0) {
+            chat.channel_list.remove(&row);
+        }
+        let me = chat.me.borrow().clone().unwrap_or_default();
+        for channel in &channels {
+            chat.channel_list
+                .append(&channel_row(&channel.title(&me), channel.is_dm()));
+        }
+        *chat.channels.borrow_mut() = channels;
+
+        if let Some(id) = select {
+            let idx = chat.channels.borrow().iter().position(|c| c.id == id);
+            if let Some(idx) = idx {
+                if let Some(row) = chat.channel_list.row_at_index(idx as i32) {
+                    chat.channel_list.select_row(Some(&row));
+                }
+            }
+        }
+    });
+}
+
+/// Load and render a channel's history, and enable the composer.
+fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
+    *chat.current.borrow_mut() = Some(channel_id.to_string());
+    let me = chat.me.borrow().clone().unwrap_or_default();
+    if let Some(channel) = chat.channels.borrow().iter().find(|c| c.id == channel_id) {
+        chat.title.set_title(&channel.title(&me));
+        chat.title.set_subtitle(if channel.is_dm() {
+            "Direct message"
+        } else {
+            "Channel"
+        });
+    }
+    chat.composer.set_sensitive(true);
+    chat.send_button.set_sensitive(true);
+
+    // Clear now, before the await, so live messages that arrive while history is
+    // loading are appended to a fresh list rather than wiped by a late clear.
+    while let Some(row) = chat.message_list.row_at_index(0) {
+        chat.message_list.remove(&row);
+    }
+
+    let chat = chat.clone();
+    let channel_id = channel_id.to_string();
+    glib::spawn_future_local(async move {
+        let handle = chat.runtime.spawn({
+            let client = chat.client.clone();
+            let channel_id = channel_id.clone();
+            async move { client.channel_history(&channel_id, None).await }
+        });
+        let Ok(Ok(messages)) = handle.await else {
+            return;
+        };
+        // Only render if the user hasn't switched channels meanwhile.
+        if chat.current.borrow().as_deref() != Some(channel_id.as_str()) {
+            return;
+        }
+        for message in &messages {
+            append_message(&chat, message);
+        }
+    });
+}
+
+/// Send the composer's text into the current channel (the WS echo renders it).
+fn send_current(chat: &Rc<Chat>) {
+    let body = chat.composer.text().to_string();
+    let Some(channel_id) = chat.current.borrow().clone() else {
+        return;
+    };
+    if body.trim().is_empty() {
+        return;
+    }
+    chat.composer.set_text("");
+
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let handle = chat.runtime.spawn({
+            let client = chat.client.clone();
+            async move { client.send_message(&channel_id, &body).await }
+        });
+        if let Ok(Err(err)) = handle.await {
+            tracing::warn!(%err, "failed to send message");
+        }
+    });
+}
+
+/// Append a message row and scroll to the bottom.
+fn append_message(chat: &Rc<Chat>, message: &Message) {
+    let author = message
+        .author_display_name
+        .clone()
+        .or_else(|| message.author_handle.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(4)
+        .margin_bottom(4)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    let author_label = gtk::Label::builder()
+        .label(&author)
+        .xalign(0.0)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    let body_label = gtk::Label::builder()
+        .label(&message.body)
+        .xalign(0.0)
+        .wrap(true)
+        .selectable(true)
+        .build();
+    row.append(&author_label);
+    row.append(&body_label);
+
+    let list_row = gtk::ListBoxRow::builder()
+        .activatable(false)
+        .child(&row)
+        .build();
+    chat.message_list.append(&list_row);
+
+    // Scroll to bottom after layout settles.
+    let adj = chat.message_scroll.vadjustment();
+    glib::idle_add_local_once(move || adj.set_value(adj.upper()));
+}
+
+fn channel_row(title: &str, is_dm: bool) -> gtk::ListBoxRow {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(8)
+        .margin_end(8)
+        .build();
+    let icon = gtk::Image::from_icon_name(if is_dm {
+        "avatar-default-symbolic"
+    } else {
+        "user-available-symbolic"
+    });
+    let label = gtk::Label::builder().label(title).xalign(0.0).build();
+    row.append(&icon);
+    row.append(&label);
+    gtk::ListBoxRow::builder().child(&row).build()
+}
+
+/// The "+" popover: open a DM by handle, or (admins) create a channel.
+fn new_conversation_popover(chat: &Rc<Chat>) -> gtk::Popover {
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+
+    // New DM
+    let dm_entry = gtk::Entry::builder().placeholder_text("handle").build();
+    let dm_button = gtk::Button::with_label("Open DM");
+    column.append(
+        &gtk::Label::builder()
+            .label("New direct message")
+            .xalign(0.0)
+            .build(),
+    );
+    column.append(&dm_entry);
+    column.append(&dm_button);
+
+    let popover = gtk::Popover::builder().child(&column).build();
+
+    dm_button.connect_clicked({
+        let chat = chat.clone();
+        let dm_entry = dm_entry.clone();
+        let popover = popover.clone();
+        move |_| {
+            let handle = dm_entry.text().trim().to_string();
+            if handle.is_empty() {
+                return;
+            }
+            dm_entry.set_text("");
+            popover.popdown();
+            open_dm(&chat, handle);
+        }
+    });
+
+    if *chat.is_admin.borrow() {
+        let name_entry = gtk::Entry::builder().placeholder_text("name").build();
+        let create_button = gtk::Button::with_label("Create channel");
+        column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        column.append(
+            &gtk::Label::builder()
+                .label("New channel (admin)")
+                .xalign(0.0)
+                .build(),
+        );
+        column.append(&name_entry);
+        column.append(&create_button);
+
+        create_button.connect_clicked({
+            let chat = chat.clone();
+            let name_entry = name_entry.clone();
+            let popover = popover.clone();
+            move |_| {
+                let name = name_entry.text().trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                name_entry.set_text("");
+                popover.popdown();
+                create_channel(&chat, name);
+            }
+        });
+    }
+
+    popover
+}
+
+fn open_dm(chat: &Rc<Chat>, handle: String) {
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let join = chat.runtime.spawn({
+            let client = chat.client.clone();
+            async move { client.open_dm(&handle).await }
+        });
+        if let Ok(Ok(channel)) = join.await {
+            refresh_channels(&chat, Some(channel.id));
+        }
+    });
+}
+
+fn create_channel(chat: &Rc<Chat>, name: String) {
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let join = chat.runtime.spawn({
+            let client = chat.client.clone();
+            async move { client.create_channel(&name, None).await }
+        });
+        if let Ok(Ok(channel)) = join.await {
+            refresh_channels(&chat, Some(channel.id));
+        }
+    });
+}

@@ -8,6 +8,8 @@
 //! back by hand. All GTK widgets are captured by **weak** reference inside async
 //! tasks and signal handlers so nothing keeps the window graph alive (no cycles).
 
+mod chat;
+
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -182,15 +184,15 @@ fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
     // the window is gone — no leak.
     glib::spawn_future_local({
         let client = client.clone();
-        let home_weak = home.downgrade();
+        let runtime = runtime.clone();
         let stack_weak = stack.downgrade();
         let error_weak = error_label.downgrade();
         let button_weak = login_button.downgrade();
+        let window_weak = window.downgrade();
         async move {
             let mut state = client.state();
             loop {
-                let (Some(home), Some(stack), Some(error_label), Some(login_button)) = (
-                    home_weak.upgrade(),
+                let (Some(stack), Some(error_label), Some(login_button)) = (
                     stack_weak.upgrade(),
                     error_weak.upgrade(),
                     button_weak.upgrade(),
@@ -204,8 +206,17 @@ fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
                         error_label.set_text("");
                     }
                     AuthState::LoggedIn(user) => {
-                        home.set_title(&format!("Signed in as {}", user.display_name));
-                        stack.set_visible_child_name("home");
+                        // Build the chat view once, then switch to it. The window
+                        // grows to a comfortable chat size on first sign-in.
+                        if stack.child_by_name("chat").is_none() {
+                            let is_admin = user.global_role == "admin";
+                            let view = chat::build(client.clone(), runtime.clone(), is_admin);
+                            stack.add_named(&view, Some("chat"));
+                            if let Some(window) = window_weak.upgrade() {
+                                window.set_default_size(900, 640);
+                            }
+                        }
+                        stack.set_visible_child_name("chat");
                     }
                     AuthState::Failed(message) => {
                         error_label.set_text(message);
