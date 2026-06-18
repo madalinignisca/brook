@@ -11,7 +11,7 @@ from . import __version__
 from .config import get_settings
 from .db import init_models
 from .errors import register_error_handlers
-from .routers import auth, health
+from .routers import auth, channels, health, ws
 
 
 @asynccontextmanager
@@ -28,6 +28,8 @@ def create_app() -> FastAPI:
     register_error_handlers(app)
     app.include_router(health.router)
     app.include_router(auth.router, prefix="/api/v1")
+    app.include_router(channels.router, prefix="/api/v1")
+    app.include_router(ws.router)  # /ws at the root, not under /api/v1
     return app
 
 

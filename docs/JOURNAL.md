@@ -16,6 +16,35 @@ Conventions:
 
 ## 2026-06-18
 
+### Phase 1 server — chat (channels, DMs, messages, WebSocket fan-out), reviewed by Codex/Gemini/Vibe
+
+The server half of Phase 1: two accounts can chat 1:1 and in channels.
+
+- Models + migration (`3e79d72bf1f9`): `channels` (dm|channel), `memberships`
+  (owner|member), `messages` (UUIDv7 id → time-sortable pagination, soft-delete).
+- REST (`routers/channels.py`): `GET/POST /channels` (channel = **admin only**;
+  dm = find-or-create by member handle), `POST /channels/{id}/members`,
+  `GET /channels/{id}/messages` (before/after pagination, oldest→newest),
+  `POST /channels/{id}/messages` (single send path → persist → fan out).
+- Realtime: in-process hub (`app/hub.py`) + `/ws` (auth in first frame, replies
+  `ready`, then `message.new` envelopes). Single-node; scale-out deferred.
+- Tests: 29 total incl. a live WS test (alice→bob delivery) and REST coverage
+  (perms, find-or-create DM, pagination). Verified on Postgres.
+
+Applied three-model review (Vibe, Codex gpt-5.5, Gemini CLI):
+- **HIGH** (Gemini, Vibe): `channels.created_by` was non-nullable but FK is
+  `ondelete=SET NULL` → IntegrityError on creator deletion. Made it nullable
+  (model + schema + migration).
+- **MEDIUM** (Codex, Gemini): `add_member` 404'd a global admin who wasn't a
+  channel member, making the admin-override dead code. Now authorizes without
+  requiring caller membership.
+- **MEDIUM** (Gemini): history used an inner join on the FK-less `author_id`,
+  silently dropping messages from bots/deleted users. Switched to outerjoin.
+- **MEDIUM/LOW** (Vibe): narrowed the WS auth exception catch and dropped the
+  loose `token` alias (accept only `access_token`).
+- Deferred: DM find-or-create race under concurrency (TODO: canonical per-pair
+  key) — no concurrency in Phase 1 manual testing.
+
 ### KDE/Plasma client — Phase 0 login skeleton (Qt6 + Kirigami via CXX-Qt)
 
 Second Linux client, peer to GNOME, which also proves the Qt<->Rust binding
