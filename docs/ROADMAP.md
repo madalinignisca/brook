@@ -1,5 +1,8 @@
 # Roadmap
 
+> Phase overview (the "when"). For the detailed, status-tracked feature catalog
+> (the "what", item by item) see [FEATURES.md](FEATURES.md).
+
 Incremental: each phase is independently usable and proves a piece of the architecture. The **GNOME/Linux client + `core`** lead every phase (Rust-only, fastest loop, and the Raspberry Pi target).
 
 ## Phase 0 — Foundations
