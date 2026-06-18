@@ -181,6 +181,25 @@ impl BrookClient {
         Ok(())
     }
 
+    /// Mark a channel read up to `message_id` (or its latest message if `None`).
+    pub async fn mark_read(&self, channel_id: &str, message_id: Option<&str>) -> Result<()> {
+        let token = self.access_token().await?;
+        let url = self
+            .base
+            .join(&format!("api/v1/channels/{channel_id}/read"))?;
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .json(&json!({ "message_id": message_id }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(api_error(resp).await);
+        }
+        Ok(())
+    }
+
     /// Channel history, oldest→newest. `before` back-paginates from a message id.
     pub async fn channel_history(
         &self,

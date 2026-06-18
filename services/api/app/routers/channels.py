@@ -13,8 +13,9 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from ..db import get_session
 from ..deps import get_current_user
@@ -26,6 +27,7 @@ from ..schemas import (
     MemberAdd,
     MessageCreate,
     MessageOut,
+    ReadIn,
     UserSummary,
 )
 
@@ -68,7 +70,7 @@ async def _members(session: AsyncSession, channel_id: uuid.UUID) -> list[User]:
     return list((await session.scalars(stmt)).all())
 
 
-def _channel_out(channel: Channel, members: list[User]) -> ChannelOut:
+def _channel_out(channel: Channel, members: list[User], unread_count: int = 0) -> ChannelOut:
     return ChannelOut(
         id=channel.id,
         kind=channel.kind,
@@ -77,7 +79,45 @@ def _channel_out(channel: Channel, members: list[User]) -> ChannelOut:
         created_by=channel.created_by,
         created_at=channel.created_at,
         members=[UserSummary.model_validate(m) for m in members],
+        unread_count=unread_count,
     )
+
+
+async def _unread_counts(session: AsyncSession, user_id: uuid.UUID) -> dict[uuid.UUID, int]:
+    """Unread count per channel for a user, in a single query (avoids N+1).
+
+    Unread = non-deleted messages newer than the membership's read marker.
+    """
+    msg = aliased(Message)
+    stmt = (
+        select(Membership.channel_id, func.count(msg.id))
+        .select_from(Membership)
+        .outerjoin(
+            msg,
+            and_(
+                msg.channel_id == Membership.channel_id,
+                msg.deleted_at.is_(None),
+                or_(
+                    Membership.last_read_message_id.is_(None),
+                    msg.id > Membership.last_read_message_id,
+                ),
+            ),
+        )
+        .where(Membership.user_id == user_id)
+        .group_by(Membership.channel_id)
+    )
+    return {channel_id: count for channel_id, count in (await session.execute(stmt)).all()}
+
+
+async def _latest_message_id(session: AsyncSession, channel_id: uuid.UUID) -> uuid.UUID | None:
+    """The newest non-deleted message id in a channel, or None."""
+    latest: uuid.UUID | None = await session.scalar(
+        select(Message.id)
+        .where(Message.channel_id == channel_id, Message.deleted_at.is_(None))
+        .order_by(Message.id.desc())
+        .limit(1)
+    )
+    return latest
 
 
 async def _membership(
@@ -99,7 +139,7 @@ async def _require_member(session: AsyncSession, channel_id: uuid.UUID, user: Us
 
 @router.get("", response_model=list[ChannelOut])
 async def list_channels(user: CurrentUser, session: Session) -> list[ChannelOut]:
-    """Channels and DMs the caller belongs to."""
+    """Channels and DMs the caller belongs to, each with the caller's unread count."""
     channels = list(
         (
             await session.scalars(
@@ -110,7 +150,8 @@ async def list_channels(user: CurrentUser, session: Session) -> list[ChannelOut]
             )
         ).all()
     )
-    return [_channel_out(c, await _members(session, c.id)) for c in channels]
+    unread = await _unread_counts(session, user.id)
+    return [_channel_out(c, await _members(session, c.id), unread.get(c.id, 0)) for c in channels]
 
 
 @router.post("", response_model=ChannelOut, status_code=status.HTTP_201_CREATED)
@@ -188,7 +229,17 @@ async def add_member(
     if target is None:
         raise _validation("Unknown user")
     if await _membership(session, channel_id, target.id) is None:
-        session.add(Membership(channel_id=channel_id, user_id=target.id, role="member"))
+        # Start the new member at the channel's latest message, so they aren't
+        # flooded with all prior history counted as unread.
+        last_read = await _latest_message_id(session, channel_id)
+        session.add(
+            Membership(
+                channel_id=channel_id,
+                user_id=target.id,
+                role="member",
+                last_read_message_id=last_read,
+            )
+        )
         await session.commit()
         # Fan out so the new member (and existing ones) refresh their channel list live.
         await _emit_channel_update(hub, session, channel)
@@ -253,6 +304,14 @@ async def send_message(
 
     message = Message(channel_id=channel_id, author_type="user", author_id=user.id, body=body.body)
     session.add(message)
+    await session.flush()
+    # Sending implicitly reads the channel up to your own message — but only ever
+    # advance the marker (don't rewind past a newer message read concurrently).
+    membership = await _membership(session, channel_id, user.id)
+    if membership is not None and (
+        membership.last_read_message_id is None or message.id > membership.last_read_message_id
+    ):
+        membership.last_read_message_id = message.id
     await session.commit()
     await session.refresh(message)
 
@@ -260,6 +319,39 @@ async def send_message(
     member_ids = [m.id for m in await _members(session, channel_id)]
     await hub.send_to_users(member_ids, _envelope("message.new", jsonable_encoder(out)))
     return out
+
+
+@router.post("/{channel_id}/read", status_code=status.HTTP_204_NO_CONTENT)
+async def mark_read(
+    channel_id: uuid.UUID, body: ReadIn, user: CurrentUser, session: Session
+) -> None:
+    """Advance the caller's read marker (to ``message_id``, or the channel's latest)."""
+    membership = await _membership(session, channel_id, user.id)
+    if membership is None:
+        raise _not_found()
+
+    target = body.message_id
+    if target is None:
+        target = await _latest_message_id(session, channel_id)
+    else:
+        # Reject a forged/foreign id — otherwise a client could set a future marker
+        # and permanently suppress its own unread count.
+        valid = await session.scalar(
+            select(Message.id).where(
+                Message.id == target,
+                Message.channel_id == channel_id,
+                Message.deleted_at.is_(None),
+            )
+        )
+        if valid is None:
+            raise _validation("Unknown message for this channel")
+    if target is None:
+        return  # no messages to mark
+
+    # Only ever advance the marker (UUIDv7 ids are time-sortable).
+    if membership.last_read_message_id is None or target > membership.last_read_message_id:
+        membership.last_read_message_id = target
+        await session.commit()
 
 
 def _message_out(message: Message, author: User | None) -> MessageOut:

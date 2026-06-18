@@ -83,6 +83,13 @@ class ChannelOut(BaseModel):
     created_by: uuid.UUID | None
     created_at: datetime
     members: list[UserSummary]
+    unread_count: int = 0
+
+
+class ReadIn(BaseModel):
+    """Mark a channel read up to ``message_id`` (or its latest message if omitted)."""
+
+    message_id: uuid.UUID | None = None
 
 
 class MemberAdd(BaseModel):

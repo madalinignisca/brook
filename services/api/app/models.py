@@ -113,6 +113,9 @@ class Membership(Base):
     )
     role: Mapped[str] = mapped_column(String(16), default="member")  # 'owner' | 'member'
     joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Highest message id the user has read in this channel (UUIDv7 is sortable, so
+    # unread = messages with a greater id). No FK: messages may be soft-deleted.
+    last_read_message_id: Mapped[uuid.UUID | None] = mapped_column(default=None)
 
 
 class Message(Base):

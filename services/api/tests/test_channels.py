@@ -160,3 +160,70 @@ async def test_history_pagination_before(client: httpx.AsyncClient) -> None:
         headers=_auth(alice),
     )
     assert [m["body"] for m in older.json()] == ["m1", "m2"]
+
+
+async def test_unread_count_and_mark_read(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    dm = (
+        await client.post(
+            f"{API}/channels", json={"kind": "dm", "member": "bob"}, headers=_auth(alice)
+        )
+    ).json()
+    cid = dm["id"]
+    for text in ("one", "two"):
+        await client.post(
+            f"{API}/channels/{cid}/messages", json={"body": text}, headers=_auth(alice)
+        )
+
+    async def unread_for(token: str) -> int:
+        chans = (await client.get(f"{API}/channels", headers=_auth(token))).json()
+        return int(next(c for c in chans if c["id"] == cid)["unread_count"])
+
+    # The author auto-reads their own messages; the recipient has 2 unread.
+    assert await unread_for(alice) == 0
+    assert await unread_for(bob) == 2
+
+    # Marking read (latest) clears bob's unread.
+    r = await client.post(f"{API}/channels/{cid}/read", json={}, headers=_auth(bob))
+    assert r.status_code == 204
+    assert await unread_for(bob) == 0
+
+
+async def test_added_member_starts_caught_up(client: httpx.AsyncClient) -> None:
+    """A member added to a channel with history isn't flooded with unread."""
+    alice, _bob = await _two_users(client)
+    await _register(client, "carol", headers=_auth(alice))
+    carol = await _token(client, "carol")
+    chan = (
+        await client.post(
+            f"{API}/channels", json={"kind": "channel", "name": "general"}, headers=_auth(alice)
+        )
+    ).json()
+    cid = chan["id"]
+    for text in ("a", "b", "c"):
+        await client.post(
+            f"{API}/channels/{cid}/messages", json={"body": text}, headers=_auth(alice)
+        )
+
+    await client.post(
+        f"{API}/channels/{cid}/members", json={"handle": "carol"}, headers=_auth(alice)
+    )
+    chans = (await client.get(f"{API}/channels", headers=_auth(carol))).json()
+    assert next(c for c in chans if c["id"] == cid)["unread_count"] == 0
+
+
+async def test_mark_read_rejects_foreign_message(client: httpx.AsyncClient) -> None:
+    import uuid
+
+    alice, bob = await _two_users(client)
+    dm = (
+        await client.post(
+            f"{API}/channels", json={"kind": "dm", "member": "bob"}, headers=_auth(alice)
+        )
+    ).json()
+    resp = await client.post(
+        f"{API}/channels/{dm['id']}/read",
+        json={"message_id": str(uuid.uuid4())},
+        headers=_auth(bob),
+    )
+    assert resp.status_code == 422

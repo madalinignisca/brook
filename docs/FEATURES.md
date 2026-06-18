@@ -69,7 +69,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 | Quote-reply (inline, no thread panes) | ⬜ | P1b | **decided** — light replies with quoted context, NOT full threads |
 | Pinned messages | ⬜ | P1b | |
 | Link to message / copy link | ⬜ | P1b | |
-| Unread / read-state tracking | ⬜ | PN | **prerequisite for notifications** |
+| Unread / read-state tracking | 🟡 | PN | server+core done (read marker, unread_count, mark-read); client badges ⬜ |
 | Drafts (per channel) | ⬜ | P1b | client-local |
 | Message search | ⬜ | P2 | **decided in** — Postgres full-text search |
 | File attachments | ⬜ | P2 | |

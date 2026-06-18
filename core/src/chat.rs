@@ -27,6 +27,9 @@ pub struct Channel {
     pub topic: Option<String>,
     /// Current members.
     pub members: Vec<ChannelMember>,
+    /// Unread messages for the current user (server-computed).
+    #[serde(default)]
+    pub unread_count: i64,
 }
 
 impl Channel {

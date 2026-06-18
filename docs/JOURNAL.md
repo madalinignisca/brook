@@ -16,6 +16,23 @@ Conventions:
 
 ## 2026-06-18
 
+### "Make it alive" #2a — unread read-state (server + core), reviewed by Codex/Gemini/Vibe
+
+Foundation for unread badges/notifications: `memberships.last_read_message_id`
+(migration 288a47108837), `ChannelOut.unread_count` (single GROUP BY query),
+`POST /channels/{id}/read` (mark up to a message or the latest), author
+auto-reads their own sends. Core: `Channel.unread_count` + `client.mark_read()`.
+33 server + 9 core tests. (Client badge rendering is the next increment.)
+
+Applied three-model review (Codex gpt-5.5, Gemini CLI, Vibe):
+- HIGH (Gemini): `last_read=None` counted ALL history as unread → flood. New
+  members now start at the channel's latest message; a migration backfill catches
+  existing members up.
+- MEDIUM (Codex/Gemini/Vibe): `mark_read` accepted a forged/foreign `message_id`
+  (could silence unread forever) → validate it exists in the channel.
+- MEDIUM (Gemini): `send_message` could rewind the read cursor → advance-only.
+- MEDIUM (Gemini/Vibe): N+1 unread query → single GROUP BY.
+
 ### "Make it alive" #1 — live channel updates + add-member UI, reviewed by Codex/Gemini/Vibe
 
 Closes the "added to a channel but had no idea" gap. Server emits `channel.update`
