@@ -186,6 +186,19 @@ Kirigami.ApplicationWindow {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     spacing: 0
+                    Controls.ToolBar {
+                        Layout.fillWidth: true
+                        visible: page.currentChannel !== ""
+                        RowLayout {
+                            anchors.fill: parent
+                            Item { Layout.fillWidth: true }
+                            Controls.Button {
+                                text: "Add member"
+                                icon.name: "contact-new"
+                                onClicked: addMemberSheet.open()
+                            }
+                        }
+                    }
                     Controls.ScrollView {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
@@ -266,6 +279,28 @@ Kirigami.ApplicationWindow {
                             chat.create_channel(chanField.text);
                             chanField.text = "";
                             newConvSheet.close();
+                        }
+                    }
+                }
+            }
+
+            Kirigami.OverlaySheet {
+                id: addMemberSheet
+                title: "Add member"
+                ColumnLayout {
+                    spacing: Kirigami.Units.largeSpacing
+                    Controls.Label { text: "Add a user to this channel by handle" }
+                    Controls.TextField {
+                        id: memberField
+                        Layout.fillWidth: true
+                        placeholderText: "handle"
+                    }
+                    Controls.Button {
+                        text: "Add"
+                        onClicked: {
+                            chat.add_member(page.currentChannel, memberField.text);
+                            memberField.text = "";
+                            addMemberSheet.close();
                         }
                     }
                 }

@@ -15,15 +15,21 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use url::Url;
 
-use crate::{Error, Message, Result, Session};
+use crate::{Channel, Error, Message, Result, Session};
 
 /// A realtime event pushed from the server.
+///
+/// `#[non_exhaustive]`: more kinds (typing, presence, calls) will be added, so
+/// consumers must include a catch-all arm and won't break when they land.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ServerEvent {
     /// The socket authenticated and is now subscribed to fan-out.
     Ready,
     /// A new message arrived in a channel the user belongs to.
     MessageNew(Message),
+    /// A channel's membership/metadata changed (e.g. the user was added to it).
+    ChannelUpdate(Channel),
 }
 
 #[derive(Deserialize)]
@@ -71,6 +77,12 @@ async fn run_once(url: &Url, token: &str, tx: &broadcast::Sender<ServerEvent>) -
                             let _ = tx.send(ServerEvent::MessageNew(message));
                         }
                         Err(err) => tracing::warn!(%err, "failed to parse message.new payload"),
+                    },
+                    "channel.update" => match serde_json::from_value::<Channel>(env.data) {
+                        Ok(channel) => {
+                            let _ = tx.send(ServerEvent::ChannelUpdate(channel));
+                        }
+                        Err(err) => tracing::warn!(%err, "failed to parse channel.update payload"),
                     },
                     _ => {} // typing / presence / call — ignored in Phase 1
                 },

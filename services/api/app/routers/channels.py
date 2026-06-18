@@ -114,7 +114,9 @@ async def list_channels(user: CurrentUser, session: Session) -> list[ChannelOut]
 
 
 @router.post("", response_model=ChannelOut, status_code=status.HTTP_201_CREATED)
-async def create_channel(body: ChannelCreate, user: CurrentUser, session: Session) -> ChannelOut:
+async def create_channel(
+    body: ChannelCreate, user: CurrentUser, session: Session, hub: HubDep
+) -> ChannelOut:
     """Create a channel (admin only) or open/find a 1:1 DM (any member)."""
     if body.kind == "channel":
         if user.global_role != "admin":
@@ -159,12 +161,14 @@ async def create_channel(body: ChannelCreate, user: CurrentUser, session: Sessio
     )
     await session.commit()
     await session.refresh(channel)
+    # Notify the other member so their client shows the new DM live.
+    await _emit_channel_update(hub, session, channel)
     return _channel_out(channel, await _members(session, channel.id))
 
 
 @router.post("/{channel_id}/members", status_code=status.HTTP_204_NO_CONTENT)
 async def add_member(
-    channel_id: uuid.UUID, body: MemberAdd, user: CurrentUser, session: Session
+    channel_id: uuid.UUID, body: MemberAdd, user: CurrentUser, session: Session, hub: HubDep
 ) -> None:
     """Add a member to a channel. Caller must be a global admin or the channel owner.
 
@@ -186,6 +190,16 @@ async def add_member(
     if await _membership(session, channel_id, target.id) is None:
         session.add(Membership(channel_id=channel_id, user_id=target.id, role="member"))
         await session.commit()
+        # Fan out so the new member (and existing ones) refresh their channel list live.
+        await _emit_channel_update(hub, session, channel)
+
+
+async def _emit_channel_update(hub: Hub, session: AsyncSession, channel: Channel) -> None:
+    """Broadcast a `channel.update` to a channel's members (membership/metadata changed)."""
+    members = await _members(session, channel.id)
+    out = _channel_out(channel, members)
+    member_ids = [m.id for m in members]
+    await hub.send_to_users(member_ids, _envelope("channel.update", jsonable_encoder(out)))
 
 
 @router.get("/{channel_id}/messages", response_model=list[MessageOut])

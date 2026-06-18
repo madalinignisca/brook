@@ -49,6 +49,9 @@ pub mod qobject {
         /// Create a channel (server enforces admin), then reload channels.
         #[qinvokable]
         fn create_channel(self: Pin<&mut Self>, name: &QString);
+        /// Add a member (by handle) to a channel, then reload channels.
+        #[qinvokable]
+        fn add_member(self: Pin<&mut Self>, channel_id: &QString, handle: &QString);
 
         #[qsignal]
         fn channels_loaded(self: Pin<&mut Self>, json: QString);
@@ -100,7 +103,15 @@ impl qobject::ChatController {
                             this.as_mut().message_received(QString::from(json.as_str()));
                         });
                     }
+                    Ok(ServerEvent::ChannelUpdate(_)) => {
+                        // Reload the list, but detached — don't block the event loop
+                        // on an HTTP round-trip (would risk lagging/dropping events).
+                        let client = client.clone();
+                        let qt = qt.clone();
+                        app::runtime().spawn(async move { emit_channels(&client, &qt).await });
+                    }
                     Ok(ServerEvent::Ready) => {}
+                    Ok(_) => {} // future event kinds — ignored
                     Err(RecvError::Lagged(_)) => continue,
                     Err(RecvError::Closed) => break,
                 }
@@ -172,6 +183,23 @@ impl qobject::ChatController {
                 return;
             };
             if client.create_channel(&name, None).await.is_ok() {
+                emit_channels(&client, &qt).await;
+            }
+        });
+    }
+
+    fn add_member(self: Pin<&mut Self>, channel_id: &QString, handle: &QString) {
+        let qt = self.qt_thread();
+        let channel_id = channel_id.to_string();
+        let handle = handle.to_string();
+        if handle.trim().is_empty() {
+            return;
+        }
+        app::runtime().spawn(async move {
+            let Some(client) = app::client().await else {
+                return;
+            };
+            if client.add_member(&channel_id, &handle).await.is_ok() {
                 emit_channels(&client, &qt).await;
             }
         });

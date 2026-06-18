@@ -85,3 +85,55 @@ def test_ws_rejects_missing_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     config.get_settings.cache_clear()
     db._engine = None
     db._sessionmaker = None
+
+
+def test_ws_channel_update_when_added_to_channel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Being added to a channel pushes a live `channel.update` (the invite gap)."""
+    _reset(tmp_path, monkeypatch)
+    app = create_app()
+    with TestClient(app) as http:
+
+        def register(handle: str, token: str | None = None) -> None:
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            r = http.post(
+                "/api/v1/auth/register",
+                json={"handle": handle, "display_name": handle.title(), "password": PW},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+        def login(handle: str) -> str:
+            r = http.post("/api/v1/auth/login", json={"handle": handle, "password": PW})
+            return str(r.json()["access_token"])
+
+        register("alice")  # admin
+        alice = login("alice")
+        register("bob", token=alice)
+        bob = login("bob")
+        chan = http.post(
+            "/api/v1/channels",
+            json={"kind": "channel", "name": "general"},
+            headers={"Authorization": f"Bearer {alice}"},
+        ).json()
+
+        with http.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "auth", "data": {"access_token": bob}})
+            assert ws.receive_json()["type"] == "ready"
+
+            added = http.post(
+                f"/api/v1/channels/{chan['id']}/members",
+                json={"handle": "bob"},
+                headers={"Authorization": f"Bearer {alice}"},
+            )
+            assert added.status_code == 204
+
+            event = ws.receive_json()
+            assert event["type"] == "channel.update"
+            assert event["data"]["id"] == chan["id"]
+            assert "bob" in {m["handle"] for m in event["data"]["members"]}
+
+    config.get_settings.cache_clear()
+    db._engine = None
+    db._sessionmaker = None

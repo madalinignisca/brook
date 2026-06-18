@@ -16,6 +16,20 @@ Conventions:
 
 ## 2026-06-18
 
+### "Make it alive" #1 — live channel updates + add-member UI, reviewed by Codex/Gemini/Vibe
+
+Closes the "added to a channel but had no idea" gap. Server emits `channel.update`
+to a channel's members on `add_member` and on DM creation (the other member);
+core relays it as `ServerEvent::ChannelUpdate`; both clients reload their channel
+list live on receipt. Add-member UI: a header popover (GNOME) and a toolbar
+button + sheet (KDE), wired to `add_member`. Server test added (30 total).
+
+Applied three-model review (Codex gpt-5.5, Gemini CLI; Vibe: nothing material):
+- MEDIUM (Codex): made `ServerEvent` `#[non_exhaustive]` (+ catch-all arms) so
+  future event kinds don't break consumers.
+- MEDIUM (Gemini): KDE awaited the channel reload inside the WS loop (could lag/
+  drop events) → now spawned detached.
+
 ### Phase 1 fix — session token refresh + WS live-token, reviewed by Codex/Gemini/Vibe
 
 First live two-account testing exposed: after the 15-min access token expired,

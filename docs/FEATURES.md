@@ -46,7 +46,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 | Public channel (browse + self-join) | ⬜ | P1b | **decided in** — discoverable list + join endpoint |
 | Channel topic / description | 🟡 | P1 | topic stored; no edit UI |
 | Create channel (admin) | ✅ | P1 | |
-| Add member (invite) | 🟡 | P1b | core + API done; **no client UI** |
+| Add member (invite) | ✅ | P1b | API + UI in both clients + live `channel.update` |
 | Remove member / leave channel | ⬜ | P1b | |
 | Rename channel | ⬜ | P1b | |
 | Archive channel | ⬜ | P1b | preferred over delete (keeps history) |
@@ -80,7 +80,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 |---|---|---|---|
 | Presence: online / away / offline | ⬜ | PN | ephemeral (in-memory), `presence.update` event |
 | Typing indicators | ⬜ | PN | `typing` command exists in PROTOCOL |
-| **Live channel updates** (added/removed/renamed/archived) | ⬜ | PN | **the "gabriel had no idea" gap** — `channel.update` event → sidebar refreshes live |
+| **Live channel updates** (added/removed/renamed/archived) | 🟡 | PN | added + DM-create live via `channel.update`; removed/renamed/archived ⬜ |
 | Live membership in a channel | ⬜ | PN | |
 | Reconnect forward-sync (`after=`) of missed messages | 🟡 | PN | WS reconnects; client doesn't yet replay misses |
 

@@ -103,6 +103,12 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
     // --- content ---
     let content_header = adw::HeaderBar::new();
     content_header.set_title_widget(Some(&title));
+    let add_member_button = gtk::MenuButton::builder()
+        .icon_name("contact-new-symbolic")
+        .tooltip_text("Add member to this channel")
+        .popover(&add_member_popover(&chat))
+        .build();
+    content_header.pack_end(&add_member_button);
 
     let composer_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -211,7 +217,13 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         append_message(&chat, &message);
                     }
                 }
+                Ok(ServerEvent::ChannelUpdate(_)) => {
+                    // Added to / removed from a channel, or metadata changed:
+                    // reload the sidebar so it reflects the change live.
+                    refresh_channels(&chat, None);
+                }
                 Ok(ServerEvent::Ready) => {}
+                Ok(_) => {} // future event kinds — ignored
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break, // sender gone
             }
@@ -474,4 +486,57 @@ fn create_channel(chat: &Rc<Chat>, name: String) {
             refresh_channels(&chat, Some(channel.id));
         }
     });
+}
+
+/// Popover to add a member (by handle) to the currently-selected channel.
+fn add_member_popover(chat: &Rc<Chat>) -> gtk::Popover {
+    let entry = gtk::Entry::builder().placeholder_text("handle").build();
+    let button = gtk::Button::with_label("Add to channel");
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    column.append(
+        &gtk::Label::builder()
+            .label("Add member")
+            .xalign(0.0)
+            .build(),
+    );
+    column.append(&entry);
+    column.append(&button);
+    let popover = gtk::Popover::builder().child(&column).build();
+
+    button.connect_clicked({
+        let chat = chat.clone();
+        let entry = entry.clone();
+        let popover = popover.clone();
+        move |_| {
+            let handle = entry.text().trim().to_string();
+            let Some(channel_id) = chat.current.borrow().clone() else {
+                return;
+            };
+            if handle.is_empty() {
+                return;
+            }
+            entry.set_text("");
+            popover.popdown();
+            let chat = chat.clone();
+            glib::spawn_future_local(async move {
+                let join = chat.runtime.spawn({
+                    let client = chat.client.clone();
+                    async move { client.add_member(&channel_id, &handle).await }
+                });
+                // The server fans out channel.update; the new member's client
+                // refreshes itself. Reload ours too so the member count updates.
+                if let Ok(Ok(())) = join.await {
+                    refresh_channels(&chat, None);
+                }
+            });
+        }
+    });
+    popover
 }
