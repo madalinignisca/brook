@@ -10,9 +10,19 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
-use brook_core::{BrookClient, Channel, Message, ServerEvent};
+use brook_core::{BrookClient, Channel, Message, ReactionSummary, ServerEvent};
 use gtk::glib;
 use tokio::runtime::Handle;
+
+/// Quick-react emoji offered by the per-message reaction picker.
+const QUICK_EMOJI: [&str; 6] = [
+    "\u{1f44d}",
+    "\u{2764}",
+    "\u{1f602}",
+    "\u{1f389}",
+    "\u{1f440}",
+    "\u{1f64f}",
+];
 
 /// Shared UI state captured by the various callbacks.
 ///
@@ -44,12 +54,18 @@ struct Chat {
     send_button: gtk::Button,
 }
 
-/// The widgets of a rendered message we may mutate after an edit/delete event.
+/// The widgets of a rendered message we may mutate after an edit/delete/reaction.
 #[derive(Clone)]
 struct MessageWidgets {
     row: gtk::ListBoxRow,
     body: gtk::Label,
     edited: gtk::Label,
+    /// The channel this message is in (for toggling reactions on it).
+    channel_id: String,
+    /// Container holding the reaction chips (rebuilt on each reaction change).
+    reactions_box: gtk::Box,
+    /// Current reaction tallies, kept in sync from `reaction.update` events.
+    reactions: Rc<RefCell<Vec<ReactionSummary>>>,
 }
 
 /// Build the chat view. `is_admin` controls whether channel creation is offered.
@@ -326,6 +342,16 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         set_reply(&chat, None);
                     }
                 }
+                Ok(ServerEvent::ReactionUpdate {
+                    message_id,
+                    emoji,
+                    user_id,
+                    added,
+                    count,
+                    ..
+                }) => {
+                    apply_reaction(&chat, &message_id, &emoji, &user_id, added, count);
+                }
                 Ok(ServerEvent::ChannelUpdate(_)) => {
                     // Added to / removed from a channel, or metadata changed:
                     // reload the sidebar so it reflects the change live.
@@ -531,6 +557,20 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
     }
     row.append(&body_label);
 
+    // Reactions row: chips + a quick-react picker.
+    let reactions_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .build();
+    let reactions_wrapper = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .margin_top(2)
+        .build();
+    reactions_wrapper.append(&reactions_box);
+    reactions_wrapper.append(&react_button(chat, &message.channel_id, &message.id));
+    row.append(&reactions_wrapper);
+
     let list_row = gtk::ListBoxRow::builder()
         .activatable(false)
         .child(&row)
@@ -547,12 +587,137 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
             row: list_row,
             body: body_label,
             edited: edited_label,
+            channel_id: message.channel_id.clone(),
+            reactions_box,
+            reactions: Rc::new(RefCell::new(message.reactions.clone())),
         },
     );
+    render_reactions(chat, &message.id);
 
     // Scroll to bottom after layout settles.
     let adj = chat.message_scroll.vadjustment();
     glib::idle_add_local_once(move || adj.set_value(adj.upper()));
+}
+
+/// Rebuild a message's reaction chips from its tracked tallies.
+fn render_reactions(chat: &Rc<Chat>, message_id: &str) {
+    let Some(mw) = chat.message_rows.borrow().get(message_id).cloned() else {
+        return;
+    };
+    while let Some(child) = mw.reactions_box.first_child() {
+        mw.reactions_box.remove(&child);
+    }
+    let channel_id = mw.channel_id.clone();
+    for summary in mw.reactions.borrow().iter() {
+        let chip = gtk::Button::builder()
+            .label(format!("{} {}", summary.emoji, summary.count))
+            .has_frame(false)
+            .build();
+        if summary.me {
+            chip.add_css_class("suggested-action");
+        }
+        chip.connect_clicked({
+            let chat = chat.clone();
+            let channel_id = channel_id.clone();
+            let message_id = message_id.to_string();
+            let emoji = summary.emoji.clone();
+            move |_| toggle_reaction(&chat, channel_id.clone(), message_id.clone(), emoji.clone())
+        });
+        mw.reactions_box.append(&chip);
+    }
+}
+
+/// A "react" menu button offering the quick-react emoji.
+fn react_button(chat: &Rc<Chat>, channel_id: &str, message_id: &str) -> gtk::MenuButton {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(2)
+        .margin_top(2)
+        .margin_bottom(2)
+        .margin_start(2)
+        .margin_end(2)
+        .build();
+    let popover = gtk::Popover::builder().build();
+    for emoji in QUICK_EMOJI {
+        let button = gtk::Button::builder().label(emoji).has_frame(false).build();
+        button.connect_clicked({
+            let chat = chat.clone();
+            let popover = popover.clone();
+            let channel_id = channel_id.to_string();
+            let message_id = message_id.to_string();
+            move |_| {
+                popover.popdown();
+                toggle_reaction(
+                    &chat,
+                    channel_id.clone(),
+                    message_id.clone(),
+                    emoji.to_string(),
+                );
+            }
+        });
+        row.append(&button);
+    }
+    popover.set_child(Some(&row));
+    gtk::MenuButton::builder()
+        .icon_name("face-smile-symbolic")
+        .has_frame(false)
+        .popover(&popover)
+        .tooltip_text("Add reaction")
+        .build()
+}
+
+/// Toggle a reaction on the server; the WS `reaction.update` echo re-renders.
+fn toggle_reaction(chat: &Rc<Chat>, channel_id: String, message_id: String, emoji: String) {
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let result = chat
+            .runtime
+            .spawn({
+                let client = chat.client.clone();
+                async move {
+                    client
+                        .toggle_reaction(&channel_id, &message_id, &emoji)
+                        .await
+                }
+            })
+            .await;
+        if let Ok(Err(err)) = result {
+            tracing::warn!(%err, "failed to toggle reaction");
+        }
+    });
+}
+
+/// Apply an incremental `reaction.update` to a message's tallies, then re-render.
+fn apply_reaction(
+    chat: &Rc<Chat>,
+    message_id: &str,
+    emoji: &str,
+    user_id: &str,
+    added: bool,
+    count: i64,
+) {
+    let me = chat.me.borrow().clone().unwrap_or_default();
+    let is_me = !me.is_empty() && user_id == me;
+    let Some(mw) = chat.message_rows.borrow().get(message_id).cloned() else {
+        return;
+    };
+    {
+        let mut reactions = mw.reactions.borrow_mut();
+        if let Some(existing) = reactions.iter_mut().find(|r| r.emoji == emoji) {
+            existing.count = count;
+            if is_me {
+                existing.me = added;
+            }
+        } else if count > 0 {
+            reactions.push(ReactionSummary {
+                emoji: emoji.to_string(),
+                count,
+                me: is_me && added,
+            });
+        }
+        reactions.retain(|r| r.count > 0);
+    }
+    render_reactions(chat, message_id);
 }
 
 /// A flat "⋯" menu: Reply (any message) plus Edit / Delete for our own.

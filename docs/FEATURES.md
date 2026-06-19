@@ -65,7 +65,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 | Markdown formatting (bold/italic/code/links) | ⬜ | P1b | render + compose; keep minimal |
 | Code blocks | ⬜ | P1b | |
 | Mentions (@user, @channel, @here) | ⬜ | PN | drives notifications |
-| Emoji reactions | ⬜ | P1b | **decided in** — lightweight; new `reactions` table |
+| Emoji reactions | 🟢 | P1b | `reactions` table + toggle endpoint; chips + quick-react picker in both clients, live via `reaction.update` |
 | Quote-reply (inline, no thread panes) | 🟢 | P1b | `reply_to_id` + resolved excerpt; Reply action, composer banner, inline quote in both clients |
 | Pinned messages | ⬜ | P1b | |
 | Link to message / copy link | ⬜ | P1b | |

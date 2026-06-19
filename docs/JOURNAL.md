@@ -16,6 +16,24 @@ Conventions:
 
 ## 2026-06-19
 
+### P1b emoji reactions — both clients (slices B/C), reviewed by Codex/Gemini/Vibe
+
+Reaction chips (emoji + count, highlighted when `me`) under each message + a
+per-message quick-react picker (👍❤️😂🎉👀🙏), all synced live via the incremental
+`reaction.update`. GNOME: chips in a `reactions_box` per `MessageWidgets`, rebuilt
+on each change; `apply_reaction` folds the increment into tracked tallies. KDE:
+`toggle_reaction` invokable + `reaction_updated` signal; chips via a Repeater +
+quick-react Menu.
+
+Applied review (Codex/Gemini/Vibe — Gemini clean):
+- MED (Codex): KDE — a nested array in a `ListModel` role becomes a nested
+  ListModel (breaks `modelData`/`length`); store reactions as a **JSON-string role**
+  and parse at use.
+- HIGH (Vibe): GNOME `apply_reaction` double-borrow → clone the widgets once;
+  `render_reactions` used `chat.current` → store/use `MessageWidgets.channel_id`.
+- Declined (Vibe): "ReactionUpdate ignores channel_id" — `message_rows` is
+  channel-scoped and ids are unique, so a cross-channel reaction matches no row.
+
 ### P1b emoji reactions — server + core (slice A)
 
 `reactions` table (migration c3d4e5f6a7b8): composite PK (message_id, user_id,

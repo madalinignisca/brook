@@ -110,8 +110,38 @@ Kirigami.ApplicationWindow {
                     body: m.body,
                     edited: m.edited_at ? true : false,
                     replyAuthor: m.reply_to ? (m.reply_to.author_display_name || m.reply_to.author_handle || "Unknown") : "",
-                    replyBody: m.reply_to ? m.reply_to.body : ""
+                    replyBody: m.reply_to ? m.reply_to.body : "",
+                    // Stored as a JSON string: a nested JS array in a ListModel role
+                    // gets wrapped in a nested ListModel, breaking modelData/length.
+                    reactionsJson: JSON.stringify(m.reactions || [])
                 });
+            }
+            readonly property var quickEmoji: ["👍", "❤️", "😂", "🎉", "👀", "🙏"]
+            function applyReaction(r) {
+                if (r.channel_id !== page.currentChannel)
+                    return;
+                for (var i = 0; i < messagesModel.count; i++) {
+                    if (messagesModel.get(i).mid !== r.message_id)
+                        continue;
+                    var list = JSON.parse(messagesModel.get(i).reactionsJson);
+                    var next = [];
+                    var found = false;
+                    for (var j = 0; j < list.length; j++) {
+                        var item = { emoji: list[j].emoji, count: list[j].count, me: list[j].me };
+                        if (item.emoji === r.emoji) {
+                            found = true;
+                            item.count = r.count;
+                            if (r.user_id === chat.my_id)
+                                item.me = r.added;
+                        }
+                        if (item.count > 0)
+                            next.push(item);
+                    }
+                    if (!found && r.count > 0)
+                        next.push({ emoji: r.emoji, count: r.count, me: (r.user_id === chat.my_id && r.added) });
+                    messagesModel.setProperty(i, "reactionsJson", JSON.stringify(next));
+                    break;
+                }
             }
             function startReply(mid, author) {
                 page.replyingTo = mid;
@@ -196,6 +226,9 @@ Kirigami.ApplicationWindow {
                             break;
                         }
                     }
+                }
+                function onReaction_updated(json) {
+                    page.applyReaction(JSON.parse(json));
                 }
             }
 
@@ -286,6 +319,8 @@ Kirigami.ApplicationWindow {
                             clip: true
                             spacing: Kirigami.Units.smallSpacing
                             delegate: ColumnLayout {
+                                id: msgDelegate
+                                property string mmid: model.mid
                                 width: ListView.view ? ListView.view.width : implicitWidth
                                 spacing: 0
                                 RowLayout {
@@ -353,6 +388,38 @@ Kirigami.ApplicationWindow {
                                     Layout.fillWidth: true
                                     Layout.leftMargin: Kirigami.Units.largeSpacing
                                     Layout.rightMargin: Kirigami.Units.largeSpacing
+                                }
+                                // Reaction chips + quick-react picker.
+                                RowLayout {
+                                    Layout.leftMargin: Kirigami.Units.largeSpacing
+                                    spacing: Kirigami.Units.smallSpacing
+                                    Repeater {
+                                        model: JSON.parse(model.reactionsJson)
+                                        delegate: Controls.Button {
+                                            required property var modelData
+                                            text: modelData.emoji + " " + modelData.count
+                                            flat: true
+                                            highlighted: modelData.me
+                                            font: Kirigami.Theme.smallFont
+                                            onClicked: chat.toggle_reaction(page.currentChannel, msgDelegate.mmid, modelData.emoji)
+                                        }
+                                    }
+                                    Controls.ToolButton {
+                                        icon.name: "smiley-add"
+                                        display: Controls.AbstractButton.IconOnly
+                                        onClicked: emojiMenu.open()
+                                        Controls.Menu {
+                                            id: emojiMenu
+                                            Repeater {
+                                                model: page.quickEmoji
+                                                delegate: Controls.MenuItem {
+                                                    required property string modelData
+                                                    text: modelData
+                                                    onTriggered: chat.toggle_reaction(page.currentChannel, msgDelegate.mmid, modelData)
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             onCountChanged: positionViewAtEnd()

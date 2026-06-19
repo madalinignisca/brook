@@ -64,6 +64,14 @@ pub mod qobject {
         /// Delete a message (author or admin); the WS echo removes it.
         #[qinvokable]
         fn delete_message(self: Pin<&mut Self>, channel_id: &QString, message_id: &QString);
+        /// Toggle the caller's emoji reaction on a message.
+        #[qinvokable]
+        fn toggle_reaction(
+            self: Pin<&mut Self>,
+            channel_id: &QString,
+            message_id: &QString,
+            emoji: &QString,
+        );
         /// Mark a channel read up to its latest message.
         #[qinvokable]
         fn mark_read(self: Pin<&mut Self>, channel_id: &QString);
@@ -81,6 +89,8 @@ pub mod qobject {
         fn message_updated(self: Pin<&mut Self>, json: QString);
         #[qsignal]
         fn message_deleted(self: Pin<&mut Self>, channel_id: QString, message_id: QString);
+        #[qsignal]
+        fn reaction_updated(self: Pin<&mut Self>, json: QString);
     }
 
     impl cxx_qt::Threading for ChatController {}
@@ -140,6 +150,27 @@ impl qobject::ChatController {
                                 QString::from(channel_id.as_str()),
                                 QString::from(message_id.as_str()),
                             );
+                        });
+                    }
+                    Ok(ServerEvent::ReactionUpdate {
+                        channel_id,
+                        message_id,
+                        emoji,
+                        user_id,
+                        added,
+                        count,
+                    }) => {
+                        let json = serde_json::json!({
+                            "channel_id": channel_id,
+                            "message_id": message_id,
+                            "emoji": emoji,
+                            "user_id": user_id,
+                            "added": added,
+                            "count": count,
+                        })
+                        .to_string();
+                        let _ = qt.queue(move |mut this: Pin<&mut Controller>| {
+                            this.as_mut().reaction_updated(QString::from(json.as_str()));
                         });
                     }
                     Ok(ServerEvent::ChannelUpdate(_)) => {
@@ -277,6 +308,27 @@ impl qobject::ChatController {
             if let Some(client) = app::client().await {
                 if let Err(err) = client.delete_message(&channel_id, &message_id).await {
                     tracing::warn!(%err, "delete_message failed");
+                }
+            }
+        });
+    }
+
+    fn toggle_reaction(
+        self: Pin<&mut Self>,
+        channel_id: &QString,
+        message_id: &QString,
+        emoji: &QString,
+    ) {
+        let channel_id = channel_id.to_string();
+        let message_id = message_id.to_string();
+        let emoji = emoji.to_string();
+        app::runtime().spawn(async move {
+            if let Some(client) = app::client().await {
+                if let Err(err) = client
+                    .toggle_reaction(&channel_id, &message_id, &emoji)
+                    .await
+                {
+                    tracing::warn!(%err, "toggle_reaction failed");
                 }
             }
         });
