@@ -16,6 +16,21 @@ Conventions:
 
 ## 2026-06-18
 
+### Fix — read-state migration `max(uuid)` fails on Postgres (deploy-discovered)
+
+Live testing: KDE spammed `mark_read failed: not_found`. Root cause was **not**
+client code — the running server (uvicorn in Docker, up 40h) predated the unread
+work: its OpenAPI had no `/read` route and no `unread_count` (the badges only
+*looked* live because clients increment locally). Rebuilding the api container to
+deploy current code then surfaced the real bug: migration `288a47108837`'s backfill
+used `SELECT max(messages.id)` — **Postgres has no `max(uuid)` aggregate**, so the
+migration crashed on startup (502). It passed CI because `test_migrations` runs on
+SQLite, where `max` accepts any type — a real SQLite-vs-Postgres test gap.
+
+Fix: newest id via `ORDER BY messages.id DESC LIMIT 1` (UUIDv7 is time-sortable;
+works on both engines). Redeployed: migration applies, `/read` → 204, `unread_count`
+served. TODO: exercise migrations against Postgres in CI to close the gap.
+
 ### #3 fix — GNOME notifications via gio (not freedesktop), reviewed by Codex/Gemini/Vibe
 
 Live testing: GNOME showed no notifications. Diagnosed (notify-rust `show()`

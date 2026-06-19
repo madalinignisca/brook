@@ -28,13 +28,17 @@ def upgrade() -> None:
 
     # Backfill: mark existing members caught up to their channel's latest message,
     # so the new unread counter doesn't suddenly flag all history as unread.
+    # Postgres has no max(uuid) aggregate, so take the newest id via ORDER BY ...
+    # LIMIT 1 (UUIDv7 ids are time-sortable). This also works on SQLite.
     op.execute(
         """
         UPDATE memberships
         SET last_read_message_id = (
-            SELECT max(messages.id) FROM messages
+            SELECT messages.id FROM messages
             WHERE messages.channel_id = memberships.channel_id
               AND messages.deleted_at IS NULL
+            ORDER BY messages.id DESC
+            LIMIT 1
         )
         """
     )
