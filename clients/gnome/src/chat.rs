@@ -32,6 +32,11 @@ struct Chat {
     badges: Rc<RefCell<Vec<gtk::Label>>>,
     /// message id -> its widgets, for live edit/delete of the open channel.
     message_rows: Rc<RefCell<HashMap<String, MessageWidgets>>>,
+    /// The message id currently being replied to (quote-reply), if any.
+    replying_to: Rc<RefCell<Option<String>>>,
+    /// The reply banner shown above the composer while replying.
+    reply_bar: gtk::Revealer,
+    reply_label: gtk::Label,
     message_list: gtk::ListBox,
     message_scroll: gtk::ScrolledWindow,
     title: adw::WindowTitle,
@@ -77,6 +82,33 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
 
     let title = adw::WindowTitle::new("Brook", "Pick a conversation");
 
+    // Reply banner (revealed above the composer while quoting a message).
+    let reply_label = gtk::Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .wrap(false)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    let reply_cancel = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .has_frame(false)
+        .tooltip_text("Cancel reply")
+        .build();
+    let reply_inner = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_start(12)
+        .margin_end(6)
+        .margin_top(4)
+        .margin_bottom(4)
+        .build();
+    reply_inner.append(&reply_label);
+    reply_inner.append(&reply_cancel);
+    let reply_bar = gtk::Revealer::builder()
+        .child(&reply_inner)
+        .reveal_child(false)
+        .build();
+
     let chat = Rc::new(Chat {
         client,
         runtime,
@@ -87,6 +119,9 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
         channels: Rc::new(RefCell::new(Vec::new())),
         badges: Rc::new(RefCell::new(Vec::new())),
         message_rows: Rc::new(RefCell::new(HashMap::new())),
+        replying_to: Rc::new(RefCell::new(None)),
+        reply_bar: reply_bar.clone(),
+        reply_label: reply_label.clone(),
         message_list: message_list.clone(),
         message_scroll: message_scroll.clone(),
         title: title.clone(),
@@ -138,7 +173,13 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
 
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content_box.append(&message_scroll);
+    content_box.append(&reply_bar);
     content_box.append(&composer_row);
+
+    reply_cancel.connect_clicked({
+        let chat = chat.clone();
+        move |_| set_reply(&chat, None)
+    });
 
     let content = adw::ToolbarView::new();
     content.add_top_bar(&content_header);
@@ -280,6 +321,10 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     if let Some(widgets) = removed {
                         chat.message_list.remove(&widgets.row);
                     }
+                    // If we were replying to this message, the reply target is gone.
+                    if chat.replying_to.borrow().as_deref() == Some(message_id.as_str()) {
+                        set_reply(&chat, None);
+                    }
                 }
                 Ok(ServerEvent::ChannelUpdate(_)) => {
                     // Added to / removed from a channel, or metadata changed:
@@ -360,6 +405,8 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
     }
     mark_read(chat, channel_id.to_string(), None);
 
+    // A pending reply targets a message in the channel we're leaving — drop it.
+    set_reply(chat, None);
     // Clear now, before the await, so live messages that arrive while history is
     // loading are appended to a fresh list rather than wiped by a late clear.
     chat.message_rows.borrow_mut().clear();
@@ -398,12 +445,18 @@ fn send_current(chat: &Rc<Chat>) {
         return;
     }
     chat.composer.set_text("");
+    let reply_to = chat.replying_to.borrow().clone();
+    set_reply(chat, None);
 
     let chat = chat.clone();
     glib::spawn_future_local(async move {
         let handle = chat.runtime.spawn({
             let client = chat.client.clone();
-            async move { client.send_message(&channel_id, &body, None).await }
+            async move {
+                client
+                    .send_message(&channel_id, &body, reply_to.as_deref())
+                    .await
+            }
         });
         if let Ok(Err(err)) = handle.await {
             tracing::warn!(%err, "failed to send message");
@@ -452,9 +505,7 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
         .borrow()
         .as_deref()
         .is_some_and(|me| me == message.author_id);
-    if is_own {
-        header.append(&message_actions_button(chat, message));
-    }
+    header.append(&message_actions_button(chat, message, is_own));
 
     let body_label = gtk::Label::builder()
         .label(&message.body)
@@ -463,6 +514,21 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
         .selectable(true)
         .build();
     row.append(&header);
+    // Quoted-reply preview above the body, if this message is a reply.
+    if let Some(reply) = &message.reply_to {
+        let who = reply
+            .author_display_name
+            .clone()
+            .or_else(|| reply.author_handle.clone())
+            .unwrap_or_else(|| "Unknown".to_string());
+        let quote = gtk::Label::builder()
+            .label(format!("\u{21b3} {who}: {}", reply.body))
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["caption", "dim-label"])
+            .build();
+        row.append(&quote);
+    }
     row.append(&body_label);
 
     let list_row = gtk::ListBoxRow::builder()
@@ -489,8 +555,8 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
     glib::idle_add_local_once(move || adj.set_value(adj.upper()));
 }
 
-/// A flat "⋯" menu button with Edit / Delete for one of our own messages.
-fn message_actions_button(chat: &Rc<Chat>, message: &Message) -> gtk::MenuButton {
+/// A flat "⋯" menu: Reply (any message) plus Edit / Delete for our own.
+fn message_actions_button(chat: &Rc<Chat>, message: &Message, is_own: bool) -> gtk::MenuButton {
     let menu = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -499,6 +565,38 @@ fn message_actions_button(chat: &Rc<Chat>, message: &Message) -> gtk::MenuButton
         .margin_start(4)
         .margin_end(4)
         .build();
+    let popover = gtk::Popover::builder().build();
+
+    let reply = gtk::Button::builder()
+        .label("Reply")
+        .has_frame(false)
+        .build();
+    menu.append(&reply);
+    reply.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        let message_id = message.id.clone();
+        let label = message
+            .author_display_name
+            .clone()
+            .or_else(|| message.author_handle.clone())
+            .unwrap_or_else(|| "message".to_string());
+        move |_| {
+            popover.popdown();
+            set_reply(&chat, Some((message_id.clone(), label.clone())));
+        }
+    });
+
+    if !is_own {
+        popover.set_child(Some(&menu));
+        return gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .has_frame(false)
+            .popover(&popover)
+            .tooltip_text("Message actions")
+            .build();
+    }
+
     let edit = gtk::Button::builder()
         .label("Edit")
         .has_frame(false)
@@ -510,7 +608,7 @@ fn message_actions_button(chat: &Rc<Chat>, message: &Message) -> gtk::MenuButton
         .build();
     menu.append(&edit);
     menu.append(&delete);
-    let popover = gtk::Popover::builder().child(&menu).build();
+    popover.set_child(Some(&menu));
 
     edit.connect_clicked({
         let chat = chat.clone();
@@ -676,6 +774,22 @@ fn notify(id: &str, summary: &str, body: &str) {
     let notification = gtk::gio::Notification::new(summary);
     notification.set_body(Some(body));
     app.send_notification(Some(id), &notification);
+}
+
+/// Enter (`Some`) or leave (`None`) reply mode; toggles the banner above composer.
+fn set_reply(chat: &Rc<Chat>, target: Option<(String, String)>) {
+    match target {
+        Some((id, label)) => {
+            *chat.replying_to.borrow_mut() = Some(id);
+            chat.reply_label.set_label(&format!("Replying to {label}"));
+            chat.reply_bar.set_reveal_child(true);
+            chat.composer.grab_focus();
+        }
+        None => {
+            *chat.replying_to.borrow_mut() = None;
+            chat.reply_bar.set_reveal_child(false);
+        }
+    }
 }
 
 /// Mark a channel read (up to `message_id`, or its latest) on the server.

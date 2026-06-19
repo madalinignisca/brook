@@ -84,6 +84,8 @@ Kirigami.ApplicationWindow {
             title: "Brook"
 
             property string currentChannel: ""
+            property string replyingTo: ""
+            property string replyingToText: ""
 
             Component.onCompleted: chat.start()
 
@@ -106,14 +108,26 @@ Kirigami.ApplicationWindow {
                     authorId: m.author_id,
                     author: m.author_display_name || m.author_handle || "Unknown",
                     body: m.body,
-                    edited: m.edited_at ? true : false
+                    edited: m.edited_at ? true : false,
+                    replyAuthor: m.reply_to ? (m.reply_to.author_display_name || m.reply_to.author_handle || "Unknown") : "",
+                    replyBody: m.reply_to ? m.reply_to.body : ""
                 });
+            }
+            function startReply(mid, author) {
+                page.replyingTo = mid;
+                page.replyingToText = "Replying to " + author;
+                composer.forceActiveFocus();
+            }
+            function cancelReply() {
+                page.replyingTo = "";
+                page.replyingToText = "";
             }
             function sendMessage() {
                 if (composer.text.trim().length === 0)
                     return;
-                chat.send(page.currentChannel, composer.text);
+                chat.send(page.currentChannel, composer.text, page.replyingTo);
                 composer.text = "";
+                page.cancelReply();
             }
 
             Connections {
@@ -174,6 +188,8 @@ Kirigami.ApplicationWindow {
                 function onMessage_deleted(cid, mid) {
                     if (cid !== page.currentChannel)
                         return;
+                    if (page.replyingTo === mid)
+                        page.cancelReply(); // the reply target is gone
                     for (var i = 0; i < messagesModel.count; i++) {
                         if (messagesModel.get(i).mid === mid) {
                             messagesModel.remove(i);
@@ -230,6 +246,7 @@ Kirigami.ApplicationWindow {
                                 }
                                 onClicked: {
                                     page.currentChannel = model.cid;
+                                    page.cancelReply(); // a pending reply targets the old channel
                                     messagesModel.clear(); // don't show the old channel while loading
                                     channelsModel.setProperty(index, "unread", 0);
                                     chat.select_channel(model.cid);
@@ -287,6 +304,13 @@ Kirigami.ApplicationWindow {
                                         font: Kirigami.Theme.smallFont
                                     }
                                     Item { Layout.fillWidth: true }
+                                    // Reply is available on any message.
+                                    Controls.ToolButton {
+                                        text: "Reply"
+                                        display: Controls.AbstractButton.TextOnly
+                                        font: Kirigami.Theme.smallFont
+                                        onClicked: page.startReply(model.mid, model.author)
+                                    }
                                     // Author-only actions for this message.
                                     Controls.ToolButton {
                                         text: "Edit"
@@ -312,6 +336,17 @@ Kirigami.ApplicationWindow {
                                         }
                                     }
                                 }
+                                // Quoted-reply preview above the body, if any.
+                                Controls.Label {
+                                    visible: model.replyBody !== ""
+                                    text: "↳ " + model.replyAuthor + ": " + model.replyBody
+                                    opacity: 0.6
+                                    elide: Text.ElideRight
+                                    font: Kirigami.Theme.smallFont
+                                    Layout.fillWidth: true
+                                    Layout.leftMargin: Kirigami.Units.largeSpacing
+                                    Layout.rightMargin: Kirigami.Units.largeSpacing
+                                }
                                 Controls.Label {
                                     text: model.body
                                     wrapMode: Text.WordWrap
@@ -324,6 +359,24 @@ Kirigami.ApplicationWindow {
                         }
                     }
                     Kirigami.Separator { Layout.fillWidth: true }
+                    // Reply banner — shown while quoting a message.
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.leftMargin: Kirigami.Units.smallSpacing
+                        Layout.rightMargin: Kirigami.Units.smallSpacing
+                        visible: page.replyingTo !== ""
+                        Controls.Label {
+                            text: page.replyingToText
+                            elide: Text.ElideRight
+                            opacity: 0.7
+                            font: Kirigami.Theme.smallFont
+                            Layout.fillWidth: true
+                        }
+                        Controls.ToolButton {
+                            icon.name: "dialog-close"
+                            onClicked: page.cancelReply()
+                        }
+                    }
                     RowLayout {
                         Layout.fillWidth: true
                         Layout.margins: Kirigami.Units.smallSpacing

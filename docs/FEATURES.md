@@ -66,7 +66,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 | Code blocks | ⬜ | P1b | |
 | Mentions (@user, @channel, @here) | ⬜ | PN | drives notifications |
 | Emoji reactions | ⬜ | P1b | **decided in** — lightweight; new `reactions` table |
-| Quote-reply (inline, no thread panes) | ⬜ | P1b | **decided** — light replies with quoted context, NOT full threads |
+| Quote-reply (inline, no thread panes) | 🟢 | P1b | `reply_to_id` + resolved excerpt; Reply action, composer banner, inline quote in both clients |
 | Pinned messages | ⬜ | P1b | |
 | Link to message / copy link | ⬜ | P1b | |
 | Unread / read-state tracking | 🟡 | PN | server+core done (read marker, unread_count, mark-read); client badges ⬜ |

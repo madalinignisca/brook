@@ -16,6 +16,24 @@ Conventions:
 
 ## 2026-06-19
 
+### P1b quote-reply — both clients (slices B/C), reviewed by Codex/Gemini/Vibe
+
+A **Reply** action on any message → a banner above the composer ("Replying to X")
+with cancel → send carries `reply_to_id`; the quoted excerpt renders inline above
+the reply ("↳ author: …"). GNOME: a `Revealer` reply bar + `replying_to` state,
+Reply added to the per-message `⋯` menu (now on every message). KDE: page
+`replyingTo`/`replyingToText` + banner, Reply ToolButton in the delegate, quote
+label; `send` invokable gained `reply_to_id`. Reply mode clears on channel switch.
+
+Applied review (Codex/Gemini/Vibe — Vibe clean):
+- LOW (Codex): a pending reply to a since-deleted message would lose the draft on
+  send → clear the reply when its target is deleted (both clients).
+- Deferred (Codex MED): live-updating an inline quote when the quoted message is
+  later edited/deleted (the excerpt is point-in-time; needs per-quote tracking).
+- Declined (Gemini HIGH): "reference cycle in the new closures" — identical to the
+  file's ~22 other `Rc<Chat>` closures, already the documented Phase 1b
+  weak-capture TODO; converting 2 of 22 wouldn't break the cycle.
+
 ### P1b quote-reply — server + core (slice A)
 
 `messages.reply_to_id` (migration b7c2f1a9d3e4, self-FK `ON DELETE SET NULL` so a

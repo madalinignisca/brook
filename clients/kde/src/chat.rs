@@ -40,9 +40,10 @@ pub mod qobject {
         /// Load a channel's history (emits `history_loaded`).
         #[qinvokable]
         fn select_channel(self: Pin<&mut Self>, channel_id: &QString);
-        /// Send a message; the WS echo renders it.
+        /// Send a message (optionally a quote-reply; empty `reply_to_id` = none).
+        /// The WS echo renders it.
         #[qinvokable]
-        fn send(self: Pin<&mut Self>, channel_id: &QString, body: &QString);
+        fn send(self: Pin<&mut Self>, channel_id: &QString, body: &QString, reply_to_id: &QString);
         /// Open/find a 1:1 DM by handle, then reload channels.
         #[qinvokable]
         fn open_dm(self: Pin<&mut Self>, handle: &QString);
@@ -185,15 +186,20 @@ impl qobject::ChatController {
         });
     }
 
-    fn send(self: Pin<&mut Self>, channel_id: &QString, body: &QString) {
+    fn send(self: Pin<&mut Self>, channel_id: &QString, body: &QString, reply_to_id: &QString) {
         let channel_id = channel_id.to_string();
         let body = body.to_string();
+        let reply_to_id = reply_to_id.to_string();
         if body.trim().is_empty() {
             return;
         }
+        let reply = (!reply_to_id.is_empty()).then_some(reply_to_id);
         app::runtime().spawn(async move {
             if let Some(client) = app::client().await {
-                if let Err(err) = client.send_message(&channel_id, &body, None).await {
+                if let Err(err) = client
+                    .send_message(&channel_id, &body, reply.as_deref())
+                    .await
+                {
                     tracing::warn!(%err, "failed to send message");
                 }
             }
