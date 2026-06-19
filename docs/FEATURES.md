@@ -104,7 +104,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 
 | Feature | Status | Phase | Notes |
 |---|---|---|---|
-| Desktop OS notification | ⬜ | PN | GNOME: `Gio`/portal; KDE: `KNotifications` |
+| Desktop OS notification | 🟡 | PN | done via freedesktop D-Bus (both); native gio/`KNotifications` later |
 | Tray icon w/ unread count | ⬜ | PN | KDE `KStatusNotifierItem`; GNOME via extension/portal |
 | Notification sound | ⬜ | PN | |
 | Mobile push (messages, mentions, call invites) | ⬜ | P7 | APNs/FCM, per [PROTOCOL.md](PROTOCOL.md) §3a |
