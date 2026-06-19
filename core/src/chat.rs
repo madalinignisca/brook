@@ -84,6 +84,20 @@ pub struct Message {
     /// A compact preview of the quoted message, if this is a reply.
     #[serde(default)]
     pub reply_to: Option<ReplyExcerpt>,
+    /// Emoji reaction tallies on this message (with the caller's `me` flag).
+    #[serde(default)]
+    pub reactions: Vec<ReactionSummary>,
+}
+
+/// An emoji's reaction tally on a message, plus whether the caller reacted.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReactionSummary {
+    /// The emoji.
+    pub emoji: String,
+    /// How many users reacted with it.
+    pub count: i64,
+    /// Whether the current user is one of them.
+    pub me: bool,
 }
 
 /// A compact preview of a quoted message (for rendering quote-replies).

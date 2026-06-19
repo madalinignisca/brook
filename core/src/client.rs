@@ -11,7 +11,9 @@ use tokio::sync::{broadcast, watch, RwLock};
 use url::Url;
 
 use crate::ws::{self, ServerEvent};
-use crate::{AuthState, Channel, CoreConfig, Error, Message, Result, Session, User};
+use crate::{
+    AuthState, Channel, CoreConfig, Error, Message, ReactionSummary, Result, Session, User,
+};
 
 /// Shared, mutable session — read by chat calls, the WS, and the refresh loop.
 type SharedSession = Arc<RwLock<Option<Session>>>;
@@ -254,6 +256,28 @@ impl BrookClient {
             .patch(url)
             .bearer_auth(token)
             .json(&json!({ "body": body }))
+            .send()
+            .await?;
+        self.parse(resp).await
+    }
+
+    /// Toggle the caller's emoji reaction on a message. Returns the message's full
+    /// reaction summary (from the caller's perspective).
+    pub async fn toggle_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<Vec<ReactionSummary>> {
+        let token = self.access_token().await?;
+        let url = self
+            .base
+            .join(&format!("api/v1/channels/{channel_id}/messages/{message_id}/reactions"))?;
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .json(&json!({ "emoji": emoji }))
             .send()
             .await?;
         self.parse(resp).await

@@ -16,6 +16,19 @@ Conventions:
 
 ## 2026-06-19
 
+### P1b emoji reactions — server + core (slice A)
+
+`reactions` table (migration c3d4e5f6a7b8): composite PK (message_id, user_id,
+emoji), both FKs `ON DELETE CASCADE`. `POST /messages/{id}/reactions {emoji}`
+**toggles** the caller's reaction. `MessageOut.reactions` = per-emoji tally with the
+caller's `me` flag (batch-aggregated in history via GROUP BY + `max(case...)`, no
+N+1). Because `me` is per-recipient, the WS `reaction.update` carries an
+*incremental* change `{message_id, channel_id, emoji, user_id, added, count}`, not a
+full summary — each client adjusts its own view. core: `Message.reactions`,
+`ReactionSummary`, `ServerEvent::ReactionUpdate`, `client.toggle_reaction`. Tests:
+toggle/aggregate/`me` flag, non-member 404, WS fan-out. 41 server + 9 core. Client
+reaction UI follows (slices B/C).
+
 ### P1b quote-reply — both clients (slices B/C), reviewed by Codex/Gemini/Vibe
 
 A **Reply** action on any message → a banner above the composer ("Replying to X")

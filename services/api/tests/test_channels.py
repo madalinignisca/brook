@@ -358,3 +358,43 @@ async def test_reply_to_foreign_message_rejected(client: httpx.AsyncClient) -> N
         headers=_auth(alice),
     )
     assert resp.status_code == 404
+
+
+async def test_reactions_toggle_and_aggregate(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    cid, mid = await _dm_with_message(client, alice, bob)
+    url = f"{API}/channels/{cid}/messages/{mid}/reactions"
+
+    # alice reacts 👍 -> count 1, me True for alice
+    r = await client.post(url, json={"emoji": "👍"}, headers=_auth(alice))
+    assert r.status_code == 200
+    assert r.json() == [{"emoji": "👍", "count": 1, "me": True}]
+
+    # bob reacts 👍 too -> count 2
+    r = await client.post(url, json={"emoji": "👍"}, headers=_auth(bob))
+    assert r.json() == [{"emoji": "👍", "count": 2, "me": True}]
+
+    # history shows the tally; me reflects the caller
+    hist = await client.get(f"{API}/channels/{cid}/messages", headers=_auth(alice))
+    msg = next(m for m in hist.json() if m["id"] == mid)
+    assert msg["reactions"] == [{"emoji": "👍", "count": 2, "me": True}]
+
+    # alice toggles 👍 off -> bob's still counts; alice's me is now False
+    r = await client.post(url, json={"emoji": "👍"}, headers=_auth(alice))
+    assert r.json() == [{"emoji": "👍", "count": 1, "me": False}]
+    hist = await client.get(f"{API}/channels/{cid}/messages", headers=_auth(bob))
+    msg = next(m for m in hist.json() if m["id"] == mid)
+    assert msg["reactions"] == [{"emoji": "👍", "count": 1, "me": True}]
+
+
+async def test_reaction_requires_membership(client: httpx.AsyncClient) -> None:
+    alice, _bob = await _two_users(client)
+    cid, mid = await _dm_with_message(client, alice, _bob)
+    await _register(client, "carol", headers=_auth(alice))
+    carol = await _token(client, "carol")
+    resp = await client.post(
+        f"{API}/channels/{cid}/messages/{mid}/reactions",
+        json={"emoji": "👍"},
+        headers=_auth(carol),
+    )
+    assert resp.status_code == 404  # non-member can't see/react in the channel

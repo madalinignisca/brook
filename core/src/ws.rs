@@ -37,6 +37,21 @@ pub enum ServerEvent {
         /// The deleted message's id.
         message_id: String,
     },
+    /// A reaction was added or removed on a message.
+    ReactionUpdate {
+        /// The channel the message is in.
+        channel_id: String,
+        /// The reacted-to message.
+        message_id: String,
+        /// The emoji.
+        emoji: String,
+        /// The user who toggled it.
+        user_id: String,
+        /// True if added, false if removed.
+        added: bool,
+        /// The new total count for this emoji on the message.
+        count: i64,
+    },
     /// A channel's membership/metadata changed (e.g. the user was added to it).
     ChannelUpdate(Channel),
 }
@@ -46,6 +61,17 @@ pub enum ServerEvent {
 struct MessageDeleted {
     id: String,
     channel_id: String,
+}
+
+/// Payload of a `reaction.update` envelope.
+#[derive(Deserialize)]
+struct ReactionChanged {
+    channel_id: String,
+    message_id: String,
+    emoji: String,
+    user_id: String,
+    added: bool,
+    count: i64,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +134,19 @@ async fn run_once(url: &Url, token: &str, tx: &broadcast::Sender<ServerEvent>) -
                             });
                         }
                         Err(err) => tracing::warn!(%err, "failed to parse message.delete payload"),
+                    },
+                    "reaction.update" => match serde_json::from_value::<ReactionChanged>(env.data) {
+                        Ok(r) => {
+                            let _ = tx.send(ServerEvent::ReactionUpdate {
+                                channel_id: r.channel_id,
+                                message_id: r.message_id,
+                                emoji: r.emoji,
+                                user_id: r.user_id,
+                                added: r.added,
+                                count: r.count,
+                            });
+                        }
+                        Err(err) => tracing::warn!(%err, "failed to parse reaction.update payload"),
                     },
                     "channel.update" => match serde_json::from_value::<Channel>(env.data) {
                         Ok(channel) => {

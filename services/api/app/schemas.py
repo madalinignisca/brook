@@ -120,6 +120,20 @@ class ReplyExcerpt(BaseModel):
     body: str  # truncated for display
 
 
+class ReactionToggle(BaseModel):
+    """Toggle the caller's reaction with this emoji on a message."""
+
+    emoji: str = Field(min_length=1, max_length=32)
+
+
+class ReactionSummary(BaseModel):
+    """An emoji's reaction tally on a message, plus whether the caller reacted."""
+
+    emoji: str
+    count: int
+    me: bool
+
+
 class MessageOut(BaseModel):
     """A persisted message, with its author resolved for display."""
 
@@ -133,3 +147,4 @@ class MessageOut(BaseModel):
     edited_at: datetime | None
     reply_to_id: uuid.UUID | None = None
     reply_to: ReplyExcerpt | None = None
+    reactions: list[ReactionSummary] = Field(default_factory=list)

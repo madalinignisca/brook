@@ -13,14 +13,14 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from ..db import get_session
 from ..deps import get_current_user
 from ..hub import Hub, get_hub
-from ..models import Channel, Membership, Message, User, utcnow
+from ..models import Channel, Membership, Message, Reaction, User, utcnow
 from ..schemas import (
     ChannelCreate,
     ChannelOut,
@@ -28,6 +28,8 @@ from ..schemas import (
     MessageCreate,
     MessageEdit,
     MessageOut,
+    ReactionSummary,
+    ReactionToggle,
     ReadIn,
     ReplyExcerpt,
     UserSummary,
@@ -289,8 +291,13 @@ async def history(
     rows = list((await session.execute(stmt)).all())
     if after is None:
         rows.reverse()
-    excerpts = await _reply_excerpts(session, [m for m, _ in rows])
-    return [_message_out(m, author, excerpts.get(m.reply_to_id)) for m, author in rows]
+    messages = [m for m, _ in rows]
+    excerpts = await _reply_excerpts(session, messages)
+    reactions = await _reactions_for(session, [m.id for m in messages], user.id)
+    return [
+        _message_out(m, author, excerpts.get(m.reply_to_id), reactions.get(m.id))
+        for m, author in rows
+    ]
 
 
 @router.post(
@@ -374,8 +381,9 @@ async def edit_message(
         quoted = await session.get(Message, message.reply_to_id)
         if quoted is not None:
             reply = _excerpt(quoted, await session.get(User, quoted.author_id))
+    reactions = (await _reactions_for(session, [message_id], user.id)).get(message_id, [])
 
-    out = _message_out(message, user, reply)
+    out = _message_out(message, user, reply, reactions)
     member_ids = [m.id for m in await _members(session, channel_id)]
     await hub.send_to_users(member_ids, _envelope("message.update", jsonable_encoder(out)))
     return out
@@ -403,6 +411,61 @@ async def delete_message(
         member_ids,
         _envelope("message.delete", {"id": str(message_id), "channel_id": str(channel_id)}),
     )
+
+
+@router.post(
+    "/{channel_id}/messages/{message_id}/reactions",
+    response_model=list[ReactionSummary],
+)
+async def toggle_reaction(
+    channel_id: uuid.UUID,
+    message_id: uuid.UUID,
+    body: ReactionToggle,
+    user: CurrentUser,
+    session: Session,
+    hub: HubDep,
+) -> list[ReactionSummary]:
+    """Toggle the caller's emoji reaction on a message; fan out the change."""
+    await _require_member(session, channel_id, user)
+    await _get_message(session, channel_id, message_id)  # 404 if not a live message here
+
+    existing = await session.get(Reaction, (message_id, user.id, body.emoji))
+    if existing is None:
+        session.add(Reaction(message_id=message_id, user_id=user.id, emoji=body.emoji))
+        added = True
+    else:
+        await session.delete(existing)
+        added = False
+    await session.commit()
+
+    count = (
+        await session.scalar(
+            select(func.count())
+            .select_from(Reaction)
+            .where(Reaction.message_id == message_id, Reaction.emoji == body.emoji)
+        )
+    ) or 0
+
+    # The `me` flag is per-recipient, so fan an incremental change (who/what/count),
+    # not a full summary; each client adjusts its own view.
+    member_ids = [m.id for m in await _members(session, channel_id)]
+    await hub.send_to_users(
+        member_ids,
+        _envelope(
+            "reaction.update",
+            {
+                "message_id": str(message_id),
+                "channel_id": str(channel_id),
+                "emoji": body.emoji,
+                "user_id": str(user.id),
+                "added": added,
+                "count": count,
+            },
+        ),
+    )
+
+    summary = await _reactions_for(session, [message_id], user.id)
+    return summary.get(message_id, [])
 
 
 @router.post("/{channel_id}/read", status_code=status.HTTP_204_NO_CONTENT)
@@ -439,7 +502,10 @@ async def mark_read(
 
 
 def _message_out(
-    message: Message, author: User | None, reply: ReplyExcerpt | None = None
+    message: Message,
+    author: User | None,
+    reply: ReplyExcerpt | None = None,
+    reactions: list[ReactionSummary] | None = None,
 ) -> MessageOut:
     return MessageOut(
         id=message.id,
@@ -452,7 +518,35 @@ def _message_out(
         edited_at=message.edited_at,
         reply_to_id=message.reply_to_id,
         reply_to=reply,
+        reactions=reactions or [],
     )
+
+
+async def _reactions_for(
+    session: AsyncSession, message_ids: list[uuid.UUID], user_id: uuid.UUID
+) -> dict[uuid.UUID, list[ReactionSummary]]:
+    """Reaction tallies per message (with the caller's `me` flag), in one query."""
+    if not message_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(
+                Reaction.message_id,
+                Reaction.emoji,
+                func.count().label("count"),
+                func.max(case((Reaction.user_id == user_id, 1), else_=0)).label("me"),
+            )
+            .where(Reaction.message_id.in_(message_ids))
+            .group_by(Reaction.message_id, Reaction.emoji)
+            .order_by(Reaction.emoji)
+        )
+    ).all()
+    out: dict[uuid.UUID, list[ReactionSummary]] = {}
+    for message_id, emoji, count, me in rows:
+        out.setdefault(message_id, []).append(
+            ReactionSummary(emoji=emoji, count=count, me=bool(me))
+        )
+    return out
 
 
 def _excerpt(message: Message, author: User | None) -> ReplyExcerpt:

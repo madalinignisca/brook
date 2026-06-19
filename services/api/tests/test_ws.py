@@ -81,6 +81,18 @@ def test_ws_delivers_message_new(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             assert update["data"]["body"] == "hi bob (edited)"
             assert update["data"]["edited_at"] is not None
 
+            # reacting fans out reaction.update (incremental change)
+            http.post(
+                f"/api/v1/channels/{dm['id']}/messages/{mid}/reactions",
+                json={"emoji": "👍"},
+                headers={"Authorization": f"Bearer {alice}"},
+            )
+            reaction = ws.receive_json()
+            assert reaction["type"] == "reaction.update"
+            assert reaction["data"]["emoji"] == "👍"
+            assert reaction["data"]["added"] is True
+            assert reaction["data"]["count"] == 1
+
             # deleting fans out message.delete
             http.delete(
                 f"/api/v1/channels/{dm['id']}/messages/{mid}",

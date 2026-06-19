@@ -16,7 +16,7 @@ mod session;
 mod state;
 mod ws;
 
-pub use chat::{Channel, ChannelMember, Message};
+pub use chat::{Channel, ChannelMember, Message, ReactionSummary, ReplyExcerpt};
 pub use client::BrookClient;
 pub use config::CoreConfig;
 pub use error::{Error, Result};
