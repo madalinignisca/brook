@@ -223,22 +223,27 @@ impl qobject::ChatController {
     }
 
     fn notify(self: Pin<&mut Self>, summary: &QString, body: &QString) {
-        let summary = summary.to_string();
-        let body = body.to_string();
-        app::runtime().spawn_blocking(move || {
-            // Finite timeout: notify-rust's default (-1) is a persistent banner
-            // that blocks later notifications until dismissed.
-            if let Err(err) = notify_rust::Notification::new()
-                .summary(&summary)
-                .body(&body)
-                .appname("Brook")
-                .timeout(notify_rust::Timeout::Milliseconds(5000))
-                .show()
-            {
-                tracing::warn!(%err, "desktop notification failed");
-            }
-        });
+        show_notification(summary.to_string(), body.to_string());
     }
+}
+
+/// Show a desktop notification on a plain OS thread (NOT tokio `spawn_blocking`:
+/// notify-rust's blocking zbus can return Ok from a tokio blocking thread without
+/// rendering; a standalone-style thread works).
+fn show_notification(summary: String, body: String) {
+    std::thread::spawn(move || {
+        // Finite timeout: notify-rust's default (-1) is a persistent banner that
+        // blocks later notifications until dismissed.
+        if let Err(err) = notify_rust::Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .appname("Brook")
+            .timeout(notify_rust::Timeout::Milliseconds(5000))
+            .show()
+        {
+            tracing::warn!(%err, "desktop notification failed");
+        }
+    });
 }
 
 /// Fetch channels and emit them as JSON on the Qt thread.

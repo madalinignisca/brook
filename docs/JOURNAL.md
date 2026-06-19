@@ -16,6 +16,28 @@ Conventions:
 
 ## 2026-06-18
 
+### Desktop notifications don't render on GNOME Shell in dev — root-caused, deferred to packaging
+
+After the server fix, unread works end-to-end but notifications show in **neither**
+client on GNOME Shell. Root-caused: `notify-rust`/`gio` both report the send as
+**Ok** (a real `message.new` notification fires, identity gating correct), and a
+**standalone** notify-rust process **does** display on this same GNOME — but
+neither client does. The distinguishing factor: GNOME Shell associates a *windowed*
+app's notifications with its **app-id** and suppresses them unless a matching
+`.desktop` is **installed and in the shell's cache**. The standalone has no window
+(anonymous → shown); both clients have windows with app-ids GNOME can't resolve:
+GNOME client = `dev.brook.Brook` (entry installed mid-session but shell not
+re-read), KDE client = `brook-kde` (no entry, and it sets no `desktopFileName`).
+
+Verified NOT the cause: tokio `spawn_blocking` vs std thread, the `-1` timeout,
+identity gating. Code is correct and sends. **Deferred to packaging** (the part of
+the stack that installs desktop entries + an icon, after which the shell has them).
+Unread badges cover the in-app "new messages" signal meanwhile.
+
+Packaging TODO: install `dev.brook.Brook.desktop` (GNOME) + a `dev.brook.kde`
+entry, set `QGuiApplication::setDesktopFileName("dev.brook.kde")` on the KDE client,
+ship icons; then verify notifications render (incl. a one-time shell refresh).
+
 ### Fix — read-state migration `max(uuid)` fails on Postgres (deploy-discovered)
 
 Live testing: KDE spammed `mark_read failed: not_found`. Root cause was **not**
