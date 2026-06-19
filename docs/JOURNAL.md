@@ -16,6 +16,21 @@ Conventions:
 
 ## 2026-06-18
 
+### "Make it alive" #2b — unread badges in both clients, reviewed by Codex/Gemini/Vibe
+
+Sidebar unread badges fed by `unread_count`: GNOME renders a per-row count label
+(parallel `badges` vec), KDE an `unread` model role + delegate badge. Both bump
+live on a message in a non-open channel, and clear + `mark_read` on open. Marks
+read for messages received while the channel is open, too.
+
+Applied three-model review (Codex gpt-5.5, Gemini CLI, Vibe):
+- HIGH (Codex, Gemini): a RefCell panic in GNOME `select_channel` — an inline
+  `if let chat.channels.borrow()…` held the immutable borrow into the body where
+  `borrow_mut()` runs → panic on every channel select. Extract idx first.
+- MEDIUM (Codex): messages received while viewing a channel weren't marked read
+  server-side → mark-read on current-channel messages (both clients).
+- HIGH/MED (Vibe): KDE `unread_count || 0` guard; log `mark_read` errors.
+
 ### "Make it alive" #2a — unread read-state (server + core), reviewed by Codex/Gemini/Vibe
 
 Foundation for unread badges/notifications: `memberships.last_read_message_id`

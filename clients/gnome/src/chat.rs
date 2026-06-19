@@ -27,6 +27,8 @@ struct Chat {
     current: Rc<RefCell<Option<String>>>,
     channel_list: gtk::ListBox,
     channels: Rc<RefCell<Vec<Channel>>>,
+    /// Unread badge label per sidebar row, parallel to `channels`.
+    badges: Rc<RefCell<Vec<gtk::Label>>>,
     message_list: gtk::ListBox,
     message_scroll: gtk::ScrolledWindow,
     title: adw::WindowTitle,
@@ -72,6 +74,7 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
         current: Rc::new(RefCell::new(None)),
         channel_list: channel_list.clone(),
         channels: Rc::new(RefCell::new(Vec::new())),
+        badges: Rc::new(RefCell::new(Vec::new())),
         message_list: message_list.clone(),
         message_scroll: message_scroll.clone(),
         title: title.clone(),
@@ -215,6 +218,18 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         .is_some_and(|c| c == message.channel_id);
                     if is_current {
                         append_message(&chat, &message);
+                        mark_read(&chat, message.channel_id.clone(), Some(message.id.clone()));
+                    } else {
+                        // Bump the unread badge for the channel that received it.
+                        let idx = chat
+                            .channels
+                            .borrow()
+                            .iter()
+                            .position(|c| c.id == message.channel_id);
+                        if let Some(idx) = idx {
+                            chat.channels.borrow_mut()[idx].unread_count += 1;
+                            update_badge(&chat, idx);
+                        }
                     }
                 }
                 Ok(ServerEvent::ChannelUpdate(_)) => {
@@ -246,10 +261,13 @@ fn refresh_channels(chat: &Rc<Chat>, select: Option<String>) {
         while let Some(row) = chat.channel_list.row_at_index(0) {
             chat.channel_list.remove(&row);
         }
+        chat.badges.borrow_mut().clear();
         let me = chat.me.borrow().clone().unwrap_or_default();
         for channel in &channels {
-            chat.channel_list
-                .append(&channel_row(&channel.title(&me), channel.is_dm()));
+            let (row, badge) =
+                channel_row(&channel.title(&me), channel.is_dm(), channel.unread_count);
+            chat.channel_list.append(&row);
+            chat.badges.borrow_mut().push(badge);
         }
         *chat.channels.borrow_mut() = channels;
 
@@ -278,6 +296,20 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
     }
     chat.composer.set_sensitive(true);
     chat.send_button.set_sensitive(true);
+
+    // Opening a channel reads it: clear its unread badge locally and tell the
+    // server. Compute idx in its own statement so the immutable borrow is dropped
+    // before borrow_mut (an inline `if let` scrutinee would hold it and panic).
+    let idx = chat
+        .channels
+        .borrow()
+        .iter()
+        .position(|c| c.id == channel_id);
+    if let Some(idx) = idx {
+        chat.channels.borrow_mut()[idx].unread_count = 0;
+        update_badge(chat, idx);
+    }
+    mark_read(chat, channel_id.to_string(), None);
 
     // Clear now, before the await, so live messages that arrive while history is
     // loading are appended to a fresh list rather than wiped by a late clear.
@@ -370,7 +402,8 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
     glib::idle_add_local_once(move || adj.set_value(adj.upper()));
 }
 
-fn channel_row(title: &str, is_dm: bool) -> gtk::ListBoxRow {
+/// A sidebar row; returns the row and its (initially-styled) unread badge label.
+fn channel_row(title: &str, is_dm: bool, unread: i64) -> (gtk::ListBoxRow, gtk::Label) {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -384,10 +417,43 @@ fn channel_row(title: &str, is_dm: bool) -> gtk::ListBoxRow {
     } else {
         "user-available-symbolic"
     });
-    let label = gtk::Label::builder().label(title).xalign(0.0).build();
+    let label = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .hexpand(true)
+        .build();
+    let badge = gtk::Label::builder()
+        .label(unread.to_string())
+        .css_classes(["caption-heading", "accent"])
+        .visible(unread > 0)
+        .build();
     row.append(&icon);
     row.append(&label);
-    gtk::ListBoxRow::builder().child(&row).build()
+    row.append(&badge);
+    (gtk::ListBoxRow::builder().child(&row).build(), badge)
+}
+
+/// Refresh a single row's badge from the channel's current `unread_count`.
+fn update_badge(chat: &Rc<Chat>, idx: usize) {
+    let count = chat.channels.borrow().get(idx).map(|c| c.unread_count);
+    if let (Some(count), Some(badge)) = (count, chat.badges.borrow().get(idx)) {
+        badge.set_label(&count.to_string());
+        badge.set_visible(count > 0);
+    }
+}
+
+/// Mark a channel read (up to `message_id`, or its latest) on the server.
+fn mark_read(chat: &Rc<Chat>, channel_id: String, message_id: Option<String>) {
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let _ = chat
+            .runtime
+            .spawn({
+                let client = chat.client.clone();
+                async move { client.mark_read(&channel_id, message_id.as_deref()).await }
+            })
+            .await;
+    });
 }
 
 /// The "+" popover: open a DM by handle, or (admins) create a channel.

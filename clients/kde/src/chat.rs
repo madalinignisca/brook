@@ -52,6 +52,9 @@ pub mod qobject {
         /// Add a member (by handle) to a channel, then reload channels.
         #[qinvokable]
         fn add_member(self: Pin<&mut Self>, channel_id: &QString, handle: &QString);
+        /// Mark a channel read up to its latest message.
+        #[qinvokable]
+        fn mark_read(self: Pin<&mut Self>, channel_id: &QString);
 
         #[qsignal]
         fn channels_loaded(self: Pin<&mut Self>, json: QString);
@@ -201,6 +204,17 @@ impl qobject::ChatController {
             };
             if client.add_member(&channel_id, &handle).await.is_ok() {
                 emit_channels(&client, &qt).await;
+            }
+        });
+    }
+
+    fn mark_read(self: Pin<&mut Self>, channel_id: &QString) {
+        let channel_id = channel_id.to_string();
+        app::runtime().spawn(async move {
+            if let Some(client) = app::client().await {
+                if let Err(err) = client.mark_read(&channel_id, None).await {
+                    tracing::warn!(%err, "mark_read failed");
+                }
             }
         });
     }

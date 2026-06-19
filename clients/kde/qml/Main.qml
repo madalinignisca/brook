@@ -119,7 +119,11 @@ Kirigami.ApplicationWindow {
                     channelsModel.clear();
                     var arr = JSON.parse(json);
                     for (var i = 0; i < arr.length; i++)
-                        channelsModel.append({ cid: arr[i].id, label: channelTitle(arr[i]) });
+                        channelsModel.append({
+                            cid: arr[i].id,
+                            label: channelTitle(arr[i]),
+                            unread: arr[i].unread_count || 0
+                        });
                 }
                 function onHistory_loaded(cid, json) {
                     if (cid !== page.currentChannel)
@@ -131,8 +135,18 @@ Kirigami.ApplicationWindow {
                 }
                 function onMessage_received(json) {
                     var m = JSON.parse(json);
-                    if (m.channel_id === page.currentChannel)
+                    if (m.channel_id === page.currentChannel) {
                         appendMessage(m);
+                        chat.mark_read(page.currentChannel);
+                    } else {
+                        // Bump the unread badge for the channel that received it.
+                        for (var i = 0; i < channelsModel.count; i++) {
+                            if (channelsModel.get(i).cid === m.channel_id) {
+                                channelsModel.setProperty(i, "unread", channelsModel.get(i).unread + 1);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -168,11 +182,25 @@ Kirigami.ApplicationWindow {
                             clip: true
                             delegate: Controls.ItemDelegate {
                                 width: ListView.view ? ListView.view.width : implicitWidth
-                                text: model.label
+                                contentItem: RowLayout {
+                                    Controls.Label {
+                                        text: model.label
+                                        elide: Text.ElideRight
+                                        Layout.fillWidth: true
+                                    }
+                                    Controls.Label {
+                                        text: model.unread
+                                        visible: model.unread > 0
+                                        color: Kirigami.Theme.highlightColor
+                                        font.bold: true
+                                    }
+                                }
                                 onClicked: {
                                     page.currentChannel = model.cid;
                                     messagesModel.clear(); // don't show the old channel while loading
+                                    channelsModel.setProperty(index, "unread", 0);
                                     chat.select_channel(model.cid);
+                                    chat.mark_read(model.cid);
                                 }
                             }
                         }
