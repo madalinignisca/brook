@@ -315,3 +315,46 @@ async def test_admin_can_delete_others_message_but_member_cannot(client: httpx.A
     assert (
         await client.delete(f"{API}/channels/{cid}/messages/{mid}", headers=_auth(alice))
     ).status_code == 204
+
+
+async def test_quote_reply(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    cid, mid = await _dm_with_message(client, alice, bob)
+
+    replied = await client.post(
+        f"{API}/channels/{cid}/messages",
+        json={"body": "replying!", "reply_to_id": mid},
+        headers=_auth(bob),
+    )
+    assert replied.status_code == 201
+    data = replied.json()
+    assert data["reply_to_id"] == mid
+    assert data["reply_to"]["body"] == "original"
+    assert data["reply_to"]["author_handle"] == "alice"
+
+    # history carries the resolved excerpt too
+    hist = await client.get(f"{API}/channels/{cid}/messages", headers=_auth(alice))
+    reply_msg = next(m for m in hist.json() if m["id"] == data["id"])
+    assert reply_msg["reply_to"]["body"] == "original"
+
+
+async def test_reply_to_foreign_message_rejected(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    cid, _mid = await _dm_with_message(client, alice, bob)
+    # a message id from a different channel
+    other = (
+        await client.post(
+            f"{API}/channels", json={"kind": "channel", "name": "general"}, headers=_auth(alice)
+        )
+    ).json()["id"]
+    foreign = (
+        await client.post(
+            f"{API}/channels/{other}/messages", json={"body": "elsewhere"}, headers=_auth(alice)
+        )
+    ).json()["id"]
+    resp = await client.post(
+        f"{API}/channels/{cid}/messages",
+        json={"body": "bad reply", "reply_to_id": foreign},
+        headers=_auth(alice),
+    )
+    assert resp.status_code == 404

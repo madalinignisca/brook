@@ -102,12 +102,22 @@ class MessageCreate(BaseModel):
     """Send a message into a channel."""
 
     body: str = Field(min_length=1, max_length=4000)
+    reply_to_id: uuid.UUID | None = None
 
 
 class MessageEdit(BaseModel):
     """Edit a message's body."""
 
     body: str = Field(min_length=1, max_length=4000)
+
+
+class ReplyExcerpt(BaseModel):
+    """A compact preview of the message a reply quotes."""
+
+    id: uuid.UUID
+    author_handle: str | None
+    author_display_name: str | None
+    body: str  # truncated for display
 
 
 class MessageOut(BaseModel):
@@ -121,3 +131,5 @@ class MessageOut(BaseModel):
     body: str
     created_at: datetime
     edited_at: datetime | None
+    reply_to_id: uuid.UUID | None = None
+    reply_to: ReplyExcerpt | None = None

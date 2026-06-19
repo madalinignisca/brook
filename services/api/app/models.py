@@ -133,6 +133,11 @@ class Message(Base):
     author_type: Mapped[str] = mapped_column(String(8), default="user")  # 'user' | 'bot'
     author_id: Mapped[uuid.UUID] = mapped_column()  # polymorphic (user|bot); no FK
     body: Mapped[str] = mapped_column(Text)
+    # Quote-reply: the message this one replies to (same channel). SET NULL on
+    # delete so a reply survives the quoted message being removed.
+    reply_to_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), default=None
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)

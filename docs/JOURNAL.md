@@ -16,6 +16,16 @@ Conventions:
 
 ## 2026-06-19
 
+### P1b quote-reply — server + core (slice A)
+
+`messages.reply_to_id` (migration b7c2f1a9d3e4, self-FK `ON DELETE SET NULL` so a
+reply survives the quoted message). `POST /messages` takes `reply_to_id` (validated
+live + same channel via `_get_message`); `MessageOut` carries `reply_to_id` + a
+truncated `reply_to` excerpt (author + 140-char body), batch-resolved in history to
+avoid N+1, and on edit. core: `Message.reply_to_id`/`reply_to: ReplyExcerpt`,
+`client.send_message(..., reply_to_id)`. 15 channel tests (excerpt in send + history;
+foreign reply 404). Client reply UI follows (slices B/C).
+
 ### P1b edit/delete messages — both clients (slices B/C), reviewed by Codex/Gemini/Vibe
 
 Per-message author-only **Edit** (prefilled dialog) + **Delete** (confirm), an

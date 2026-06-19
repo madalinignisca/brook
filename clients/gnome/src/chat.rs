@@ -403,7 +403,7 @@ fn send_current(chat: &Rc<Chat>) {
     glib::spawn_future_local(async move {
         let handle = chat.runtime.spawn({
             let client = chat.client.clone();
-            async move { client.send_message(&channel_id, &body).await }
+            async move { client.send_message(&channel_id, &body, None).await }
         });
         if let Ok(Err(err)) = handle.await {
             tracing::warn!(%err, "failed to send message");

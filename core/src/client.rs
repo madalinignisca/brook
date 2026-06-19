@@ -218,7 +218,12 @@ impl BrookClient {
     }
 
     /// Send a message into a channel (the only send path); the server fans it out.
-    pub async fn send_message(&self, channel_id: &str, body: &str) -> Result<Message> {
+    pub async fn send_message(
+        &self,
+        channel_id: &str,
+        body: &str,
+        reply_to_id: Option<&str>,
+    ) -> Result<Message> {
         let token = self.access_token().await?;
         let url = self
             .base
@@ -227,7 +232,7 @@ impl BrookClient {
             .http
             .post(url)
             .bearer_auth(token)
-            .json(&json!({ "body": body }))
+            .json(&json!({ "body": body, "reply_to_id": reply_to_id }))
             .send()
             .await?;
         self.parse(resp).await
@@ -524,7 +529,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let message = client.send_message("c1", "hi bob").await.unwrap();
+        let message = client.send_message("c1", "hi bob", None).await.unwrap();
         assert_eq!(message.body, "hi bob");
         assert_eq!(message.author_handle.as_deref(), Some("alice"));
     }

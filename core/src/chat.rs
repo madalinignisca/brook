@@ -78,4 +78,23 @@ pub struct Message {
     /// ISO-8601 last-edit timestamp, if the message was edited.
     #[serde(default)]
     pub edited_at: Option<String>,
+    /// The id of the message this one replies to (quote-reply), if any.
+    #[serde(default)]
+    pub reply_to_id: Option<String>,
+    /// A compact preview of the quoted message, if this is a reply.
+    #[serde(default)]
+    pub reply_to: Option<ReplyExcerpt>,
+}
+
+/// A compact preview of a quoted message (for rendering quote-replies).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReplyExcerpt {
+    /// The quoted message's id.
+    pub id: String,
+    /// Quoted author handle (absent for bots / deleted users).
+    pub author_handle: Option<String>,
+    /// Quoted author display name.
+    pub author_display_name: Option<String>,
+    /// Quoted body (truncated server-side).
+    pub body: String,
 }

@@ -29,8 +29,12 @@ from ..schemas import (
     MessageEdit,
     MessageOut,
     ReadIn,
+    ReplyExcerpt,
     UserSummary,
 )
+
+# Quoted-reply previews are truncated to this many characters.
+_REPLY_EXCERPT_LEN = 140
 
 router = APIRouter(prefix="/channels", tags=["channels"])
 
@@ -285,7 +289,8 @@ async def history(
     rows = list((await session.execute(stmt)).all())
     if after is None:
         rows.reverse()
-    return [_message_out(m, author) for m, author in rows]
+    excerpts = await _reply_excerpts(session, [m for m, _ in rows])
+    return [_message_out(m, author, excerpts.get(m.reply_to_id)) for m, author in rows]
 
 
 @router.post(
@@ -303,7 +308,19 @@ async def send_message(
     """Persist a message then fan it out to the channel's members over the WS."""
     await _require_member(session, channel_id, user)
 
-    message = Message(channel_id=channel_id, author_type="user", author_id=user.id, body=body.body)
+    # Quote-reply: the target must be a live message in this same channel.
+    reply: ReplyExcerpt | None = None
+    if body.reply_to_id is not None:
+        quoted = await _get_message(session, channel_id, body.reply_to_id)
+        reply = _excerpt(quoted, await session.get(User, quoted.author_id))
+
+    message = Message(
+        channel_id=channel_id,
+        author_type="user",
+        author_id=user.id,
+        body=body.body,
+        reply_to_id=body.reply_to_id,
+    )
     session.add(message)
     await session.flush()
     # Sending implicitly reads the channel up to your own message — but only ever
@@ -316,7 +333,7 @@ async def send_message(
     await session.commit()
     await session.refresh(message)
 
-    out = _message_out(message, user)
+    out = _message_out(message, user, reply)
     member_ids = [m.id for m in await _members(session, channel_id)]
     await hub.send_to_users(member_ids, _envelope("message.new", jsonable_encoder(out)))
     return out
@@ -352,7 +369,13 @@ async def edit_message(
     await session.commit()
     await session.refresh(message)
 
-    out = _message_out(message, user)
+    reply: ReplyExcerpt | None = None
+    if message.reply_to_id is not None:
+        quoted = await session.get(Message, message.reply_to_id)
+        if quoted is not None:
+            reply = _excerpt(quoted, await session.get(User, quoted.author_id))
+
+    out = _message_out(message, user, reply)
     member_ids = [m.id for m in await _members(session, channel_id)]
     await hub.send_to_users(member_ids, _envelope("message.update", jsonable_encoder(out)))
     return out
@@ -415,7 +438,9 @@ async def mark_read(
         await session.commit()
 
 
-def _message_out(message: Message, author: User | None) -> MessageOut:
+def _message_out(
+    message: Message, author: User | None, reply: ReplyExcerpt | None = None
+) -> MessageOut:
     return MessageOut(
         id=message.id,
         channel_id=message.channel_id,
@@ -425,7 +450,37 @@ def _message_out(message: Message, author: User | None) -> MessageOut:
         body=message.body,
         created_at=message.created_at,
         edited_at=message.edited_at,
+        reply_to_id=message.reply_to_id,
+        reply_to=reply,
     )
+
+
+def _excerpt(message: Message, author: User | None) -> ReplyExcerpt:
+    """A compact, truncated preview of a quoted message."""
+    body = message.body if message.deleted_at is None else "(deleted)"
+    return ReplyExcerpt(
+        id=message.id,
+        author_handle=author.handle if author else None,
+        author_display_name=author.display_name if author else None,
+        body=body[:_REPLY_EXCERPT_LEN],
+    )
+
+
+async def _reply_excerpts(
+    session: AsyncSession, messages: list[Message]
+) -> dict[uuid.UUID, ReplyExcerpt]:
+    """Resolve previews of the quoted messages for a batch, in one query (no N+1)."""
+    ids = {m.reply_to_id for m in messages if m.reply_to_id is not None}
+    if not ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(Message, User)
+            .outerjoin(User, User.id == Message.author_id)
+            .where(Message.id.in_(ids))
+        )
+    ).all()
+    return {msg.id: _excerpt(msg, author) for msg, author in rows}
 
 
 def _envelope(event_type: str, data: Any) -> dict[str, Any]:
