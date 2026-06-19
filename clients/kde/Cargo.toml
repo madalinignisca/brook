@@ -15,6 +15,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 serde_json = "1"
 tracing = { workspace = true }
 tracing-subscriber = "0.3"
+notify-rust = "4"
 
 [build-dependencies]
 cxx-qt-build = { version = "0.8", features = ["link_qt_object_files"] }

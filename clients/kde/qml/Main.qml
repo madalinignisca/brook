@@ -140,11 +140,19 @@ Kirigami.ApplicationWindow {
                         chat.mark_read(page.currentChannel);
                     } else {
                         // Bump the unread badge for the channel that received it.
+                        var label = "Brook";
                         for (var i = 0; i < channelsModel.count; i++) {
                             if (channelsModel.get(i).cid === m.channel_id) {
                                 channelsModel.setProperty(i, "unread", channelsModel.get(i).unread + 1);
+                                label = channelsModel.get(i).label;
                                 break;
                             }
+                        }
+                        // Desktop notification — only when we know who we are and
+                        // it's someone else (don't notify our own messages).
+                        if (chat.my_id && m.author_id !== chat.my_id) {
+                            var who = m.author_display_name || m.author_handle || "Someone";
+                            chat.notify(label, who + ": " + m.body);
                         }
                     }
                 }

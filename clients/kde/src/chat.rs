@@ -55,6 +55,9 @@ pub mod qobject {
         /// Mark a channel read up to its latest message.
         #[qinvokable]
         fn mark_read(self: Pin<&mut Self>, channel_id: &QString);
+        /// Show a desktop notification (freedesktop D-Bus).
+        #[qinvokable]
+        fn notify(self: Pin<&mut Self>, summary: &QString, body: &QString);
 
         #[qsignal]
         fn channels_loaded(self: Pin<&mut Self>, json: QString);
@@ -215,6 +218,21 @@ impl qobject::ChatController {
                 if let Err(err) = client.mark_read(&channel_id, None).await {
                     tracing::warn!(%err, "mark_read failed");
                 }
+            }
+        });
+    }
+
+    fn notify(self: Pin<&mut Self>, summary: &QString, body: &QString) {
+        let summary = summary.to_string();
+        let body = body.to_string();
+        app::runtime().spawn_blocking(move || {
+            if let Err(err) = notify_rust::Notification::new()
+                .summary(&summary)
+                .body(&body)
+                .appname("Brook")
+                .show()
+            {
+                tracing::warn!(%err, "desktop notification failed");
             }
         });
     }

@@ -16,6 +16,22 @@ Conventions:
 
 ## 2026-06-18
 
+### "Make it alive" #3 — desktop notifications, reviewed by Codex/Gemini/Vibe
+
+Native desktop notifications via freedesktop D-Bus (`notify-rust`) — works on
+GNOME and Plasma without an installed `.desktop` file (native gio/KNotifications
+is later polish). Fires for a message in a channel you're **not** viewing,
+skipping your own; shown off the UI thread (`spawn_blocking`). GNOME notifies
+inline in the event loop; KDE exposes a `notify()` invokable the QML calls.
+
+Applied three-model review (Codex: clean; Gemini; Vibe on retry):
+- HIGH (Vibe): own-message notifications could fire when identity isn't resolved
+  (`unwrap_or_default`/empty `my_id`) → only notify when identity is known *and*
+  differs.
+- MEDIUM (Vibe): log `Notification::show()` errors instead of swallowing.
+- Declined (Gemini): "notifies for the active channel" — verified false; the
+  notify call is already inside the non-current-channel branch.
+
 ### "Make it alive" #2b — unread badges in both clients, reviewed by Codex/Gemini/Vibe
 
 Sidebar unread badges fed by `unread_count`: GNOME renders a per-row count label

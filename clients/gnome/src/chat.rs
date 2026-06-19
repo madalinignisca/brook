@@ -230,6 +230,25 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                             chat.channels.borrow_mut()[idx].unread_count += 1;
                             update_badge(&chat, idx);
                         }
+                        // Desktop notification — only when we know who we are and
+                        // it's someone else (don't notify our own messages, and
+                        // don't guess if our identity isn't resolved yet).
+                        let me = chat.me.borrow().clone().unwrap_or_default();
+                        if !me.is_empty() && message.author_id != me {
+                            let author = message
+                                .author_display_name
+                                .clone()
+                                .or_else(|| message.author_handle.clone())
+                                .unwrap_or_else(|| "Someone".to_string());
+                            let title = chat
+                                .channels
+                                .borrow()
+                                .iter()
+                                .find(|c| c.id == message.channel_id)
+                                .map(|c| c.title(&me))
+                                .unwrap_or_else(|| "Brook".to_string());
+                            notify(&chat, title, format!("{author}: {}", message.body));
+                        }
                     }
                 }
                 Ok(ServerEvent::ChannelUpdate(_)) => {
@@ -440,6 +459,20 @@ fn update_badge(chat: &Rc<Chat>, idx: usize) {
         badge.set_label(&count.to_string());
         badge.set_visible(count > 0);
     }
+}
+
+/// Show a desktop notification (freedesktop D-Bus) off the UI thread.
+fn notify(chat: &Rc<Chat>, summary: String, body: String) {
+    chat.runtime.spawn_blocking(move || {
+        if let Err(err) = notify_rust::Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .appname("Brook")
+            .show()
+        {
+            tracing::warn!(%err, "desktop notification failed");
+        }
+    });
 }
 
 /// Mark a channel read (up to `message_id`, or its latest) on the server.
