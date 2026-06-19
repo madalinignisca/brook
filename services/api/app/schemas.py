@@ -104,6 +104,12 @@ class MessageCreate(BaseModel):
     body: str = Field(min_length=1, max_length=4000)
 
 
+class MessageEdit(BaseModel):
+    """Edit a message's body."""
+
+    body: str = Field(min_length=1, max_length=4000)
+
+
 class MessageOut(BaseModel):
     """A persisted message, with its author resolved for display."""
 

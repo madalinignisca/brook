@@ -28,8 +28,24 @@ pub enum ServerEvent {
     Ready,
     /// A new message arrived in a channel the user belongs to.
     MessageNew(Message),
+    /// An existing message was edited (carries the updated message).
+    MessageUpdate(Message),
+    /// A message was deleted.
+    MessageDelete {
+        /// The channel the message belonged to.
+        channel_id: String,
+        /// The deleted message's id.
+        message_id: String,
+    },
     /// A channel's membership/metadata changed (e.g. the user was added to it).
     ChannelUpdate(Channel),
+}
+
+/// Payload of a `message.delete` envelope.
+#[derive(Deserialize)]
+struct MessageDeleted {
+    id: String,
+    channel_id: String,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +93,21 @@ async fn run_once(url: &Url, token: &str, tx: &broadcast::Sender<ServerEvent>) -
                             let _ = tx.send(ServerEvent::MessageNew(message));
                         }
                         Err(err) => tracing::warn!(%err, "failed to parse message.new payload"),
+                    },
+                    "message.update" => match serde_json::from_value::<Message>(env.data) {
+                        Ok(message) => {
+                            let _ = tx.send(ServerEvent::MessageUpdate(message));
+                        }
+                        Err(err) => tracing::warn!(%err, "failed to parse message.update payload"),
+                    },
+                    "message.delete" => match serde_json::from_value::<MessageDeleted>(env.data) {
+                        Ok(d) => {
+                            let _ = tx.send(ServerEvent::MessageDelete {
+                                channel_id: d.channel_id,
+                                message_id: d.id,
+                            });
+                        }
+                        Err(err) => tracing::warn!(%err, "failed to parse message.delete payload"),
                     },
                     "channel.update" => match serde_json::from_value::<Channel>(env.data) {
                         Ok(channel) => {

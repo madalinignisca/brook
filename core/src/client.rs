@@ -233,6 +233,40 @@ impl BrookClient {
         self.parse(resp).await
     }
 
+    /// Edit a message's body (author only). Returns the updated message.
+    pub async fn edit_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        body: &str,
+    ) -> Result<Message> {
+        let token = self.access_token().await?;
+        let url = self
+            .base
+            .join(&format!("api/v1/channels/{channel_id}/messages/{message_id}"))?;
+        let resp = self
+            .http
+            .patch(url)
+            .bearer_auth(token)
+            .json(&json!({ "body": body }))
+            .send()
+            .await?;
+        self.parse(resp).await
+    }
+
+    /// Delete a message (author or admin).
+    pub async fn delete_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
+        let token = self.access_token().await?;
+        let url = self
+            .base
+            .join(&format!("api/v1/channels/{channel_id}/messages/{message_id}"))?;
+        let resp = self.http.delete(url).bearer_auth(token).send().await?;
+        if !resp.status().is_success() {
+            return Err(api_error(resp).await);
+        }
+        Ok(())
+    }
+
     /// Subscribe to realtime [`ServerEvent`]s (call [`Self::start_realtime`] once
     /// after login to open the socket).
     pub fn events(&self) -> broadcast::Receiver<ServerEvent> {

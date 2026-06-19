@@ -26,6 +26,7 @@ from ..schemas import (
     ChannelOut,
     MemberAdd,
     MessageCreate,
+    MessageEdit,
     MessageOut,
     ReadIn,
     UserSummary,
@@ -319,6 +320,66 @@ async def send_message(
     member_ids = [m.id for m in await _members(session, channel_id)]
     await hub.send_to_users(member_ids, _envelope("message.new", jsonable_encoder(out)))
     return out
+
+
+async def _get_message(
+    session: AsyncSession, channel_id: uuid.UUID, message_id: uuid.UUID
+) -> Message:
+    """A live (non-deleted) message in the channel, or 404."""
+    message = await session.get(Message, message_id)
+    if message is None or message.channel_id != channel_id or message.deleted_at is not None:
+        raise _not_found()
+    return message
+
+
+@router.patch("/{channel_id}/messages/{message_id}", response_model=MessageOut)
+async def edit_message(
+    channel_id: uuid.UUID,
+    message_id: uuid.UUID,
+    body: MessageEdit,
+    user: CurrentUser,
+    session: Session,
+    hub: HubDep,
+) -> MessageOut:
+    """Edit a message's body (author only), then fan out `message.update`."""
+    await _require_member(session, channel_id, user)
+    message = await _get_message(session, channel_id, message_id)
+    if message.author_id != user.id:
+        raise _forbidden("Only the author can edit a message")
+
+    message.body = body.body
+    message.edited_at = utcnow()
+    await session.commit()
+    await session.refresh(message)
+
+    out = _message_out(message, user)
+    member_ids = [m.id for m in await _members(session, channel_id)]
+    await hub.send_to_users(member_ids, _envelope("message.update", jsonable_encoder(out)))
+    return out
+
+
+@router.delete("/{channel_id}/messages/{message_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_message(
+    channel_id: uuid.UUID,
+    message_id: uuid.UUID,
+    user: CurrentUser,
+    session: Session,
+    hub: HubDep,
+) -> None:
+    """Soft-delete a message (author or a global admin), then fan out `message.delete`."""
+    await _require_member(session, channel_id, user)
+    message = await _get_message(session, channel_id, message_id)
+    if message.author_id != user.id and user.global_role != "admin":
+        raise _forbidden("Only the author or an admin can delete a message")
+
+    message.deleted_at = utcnow()
+    await session.commit()
+
+    member_ids = [m.id for m in await _members(session, channel_id)]
+    await hub.send_to_users(
+        member_ids,
+        _envelope("message.delete", {"id": str(message_id), "channel_id": str(channel_id)}),
+    )
 
 
 @router.post("/{channel_id}/read", status_code=status.HTTP_204_NO_CONTENT)

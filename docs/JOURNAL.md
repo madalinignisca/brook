@@ -14,6 +14,19 @@ Conventions:
 
 ---
 
+## 2026-06-19
+
+### P1b edit/delete messages — server + core (slice A)
+
+`PATCH /channels/{id}/messages/{mid}` (author-only edit → `edited_at`, fans
+`message.update`) and `DELETE …/{mid}` (author or global admin → soft-delete via
+`deleted_at`, fans `message.delete` `{id,channel_id}`). No migration — the columns
+already existed. Core: `Message.edited_at`, `ServerEvent::MessageUpdate` /
+`MessageDelete`, `client.edit_message`/`delete_message`. Tests: 4 REST (author
+edits, non-author 403, author deletes + 404-on-deleted, admin-deletes-others vs
+member 403) + WS update/delete fan-out. 37 server + 9 core green. Clients next
+(slices B/C). Not yet friends-reviewed — bundling with the client UI.
+
 ## 2026-06-18
 
 ### Desktop notifications don't render on GNOME Shell in dev — root-caused, deferred to packaging

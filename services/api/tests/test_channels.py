@@ -227,3 +227,91 @@ async def test_mark_read_rejects_foreign_message(client: httpx.AsyncClient) -> N
         headers=_auth(bob),
     )
     assert resp.status_code == 422
+
+
+async def _dm_with_message(client: httpx.AsyncClient, alice: str, bob: str) -> tuple[str, str]:
+    """An alice↔bob DM with one message from alice; returns (channel_id, message_id)."""
+    dm = (
+        await client.post(
+            f"{API}/channels", json={"kind": "dm", "member": "bob"}, headers=_auth(alice)
+        )
+    ).json()
+    msg = (
+        await client.post(
+            f"{API}/channels/{dm['id']}/messages", json={"body": "original"}, headers=_auth(alice)
+        )
+    ).json()
+    return dm["id"], msg["id"]
+
+
+async def test_author_edits_message(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    cid, mid = await _dm_with_message(client, alice, bob)
+
+    edited = await client.patch(
+        f"{API}/channels/{cid}/messages/{mid}", json={"body": "fixed"}, headers=_auth(alice)
+    )
+    assert edited.status_code == 200
+    assert edited.json()["body"] == "fixed"
+    assert edited.json()["edited_at"] is not None
+
+    hist = await client.get(f"{API}/channels/{cid}/messages", headers=_auth(bob))
+    assert [m["body"] for m in hist.json()] == ["fixed"]
+
+
+async def test_non_author_cannot_edit(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    cid, mid = await _dm_with_message(client, alice, bob)
+    resp = await client.patch(
+        f"{API}/channels/{cid}/messages/{mid}", json={"body": "hijack"}, headers=_auth(bob)
+    )
+    assert resp.status_code == 403
+
+
+async def test_author_deletes_message(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    cid, mid = await _dm_with_message(client, alice, bob)
+
+    deleted = await client.delete(f"{API}/channels/{cid}/messages/{mid}", headers=_auth(alice))
+    assert deleted.status_code == 204
+
+    hist = await client.get(f"{API}/channels/{cid}/messages", headers=_auth(bob))
+    assert hist.json() == []
+    # editing a deleted message is a 404
+    assert (
+        await client.patch(
+            f"{API}/channels/{cid}/messages/{mid}", json={"body": "x"}, headers=_auth(alice)
+        )
+    ).status_code == 404
+
+
+async def test_admin_can_delete_others_message_but_member_cannot(client: httpx.AsyncClient) -> None:
+    # alice is the admin (first user); bob is a member. bob posts in a shared channel.
+    alice, bob = await _two_users(client)
+    chan = (
+        await client.post(
+            f"{API}/channels", json={"kind": "channel", "name": "general"}, headers=_auth(alice)
+        )
+    ).json()
+    cid = chan["id"]
+    await client.post(f"{API}/channels/{cid}/members", json={"handle": "bob"}, headers=_auth(alice))
+    mid = (
+        await client.post(
+            f"{API}/channels/{cid}/messages", json={"body": "bob's msg"}, headers=_auth(bob)
+        )
+    ).json()["id"]
+
+    # a non-author, non-admin can't delete it
+    await _register(client, "carol", headers=_auth(alice))
+    carol = await _token(client, "carol")
+    await client.post(
+        f"{API}/channels/{cid}/members", json={"handle": "carol"}, headers=_auth(alice)
+    )
+    assert (
+        await client.delete(f"{API}/channels/{cid}/messages/{mid}", headers=_auth(carol))
+    ).status_code == 403
+
+    # the admin (alice) can
+    assert (
+        await client.delete(f"{API}/channels/{cid}/messages/{mid}", headers=_auth(alice))
+    ).status_code == 204

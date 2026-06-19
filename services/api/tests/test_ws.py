@@ -68,6 +68,27 @@ def test_ws_delivers_message_new(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             assert event["data"]["body"] == "hi bob"
             assert event["data"]["author_handle"] == "alice"
             assert event["data"]["channel_id"] == dm["id"]
+            mid = event["data"]["id"]
+
+            # editing fans out message.update
+            http.patch(
+                f"/api/v1/channels/{dm['id']}/messages/{mid}",
+                json={"body": "hi bob (edited)"},
+                headers={"Authorization": f"Bearer {alice}"},
+            )
+            update = ws.receive_json()
+            assert update["type"] == "message.update"
+            assert update["data"]["body"] == "hi bob (edited)"
+            assert update["data"]["edited_at"] is not None
+
+            # deleting fans out message.delete
+            http.delete(
+                f"/api/v1/channels/{dm['id']}/messages/{mid}",
+                headers={"Authorization": f"Bearer {alice}"},
+            )
+            delete = ws.receive_json()
+            assert delete["type"] == "message.delete"
+            assert delete["data"] == {"id": mid, "channel_id": dm["id"]}
 
     config.get_settings.cache_clear()
     db._engine = None
