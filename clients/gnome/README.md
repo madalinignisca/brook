@@ -18,5 +18,24 @@
 ## Raspberry Pi 4B notes
 Same codebase, no special build. Encode path uses `v4l2h264enc`; target **720p30 single-layer** + reduced-fps screen share; cap decoded tiles (active-speaker view). Acceptance test in [../../docs/MEDIA.md](../../docs/MEDIA.md) §6.
 
+## Desktop notifications
+Uses the GApplication-native `gio::Notification` path. GNOME Shell only **renders**
+these once it has the app's desktop entry in its cache — so notifications appear
+only when [`data/dev.brook.Brook.desktop`](data/dev.brook.Brook.desktop) is
+installed (and the shell has re-read it). Packaging installs it; for a **dev**
+build, install it once:
+
+```bash
+install -Dm644 clients/gnome/data/dev.brook.Brook.desktop \
+  ~/.local/share/applications/dev.brook.Brook.desktop
+update-desktop-database ~/.local/share/applications
+# then log out/in (or restart GNOME Shell) so it picks up the new entry
+```
+
+(notify-rust / raw freedesktop notifications are *not* a fallback here — GNOME
+deliberately drops them for a registered GApplication. Plasma renders them fine,
+which is why the KDE client uses notify-rust.)
+
 ## Packaging
-Flatpak (with the GNOME runtime, which provides GTK4/libadwaita/GStreamer).
+Flatpak (with the GNOME runtime, which provides GTK4/libadwaita/GStreamer). The
+Flatpak manifest installs `data/dev.brook.Brook.desktop`.

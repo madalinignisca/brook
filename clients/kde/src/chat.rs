@@ -226,10 +226,13 @@ impl qobject::ChatController {
         let summary = summary.to_string();
         let body = body.to_string();
         app::runtime().spawn_blocking(move || {
+            // Finite timeout: notify-rust's default (-1) is a persistent banner
+            // that blocks later notifications until dismissed.
             if let Err(err) = notify_rust::Notification::new()
                 .summary(&summary)
                 .body(&body)
                 .appname("Brook")
+                .timeout(notify_rust::Timeout::Milliseconds(5000))
                 .show()
             {
                 tracing::warn!(%err, "desktop notification failed");

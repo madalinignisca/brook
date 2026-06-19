@@ -242,7 +242,6 @@ dependencies = [
  "brook-core",
  "gtk4",
  "libadwaita",
- "notify-rust",
  "tokio",
  "tracing",
  "tracing-subscriber",

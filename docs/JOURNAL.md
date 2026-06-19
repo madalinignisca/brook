@@ -16,6 +16,24 @@ Conventions:
 
 ## 2026-06-18
 
+### #3 fix — GNOME notifications via gio (not freedesktop), reviewed by Codex/Gemini/Vibe
+
+Live testing: GNOME showed no notifications. Diagnosed (notify-rust `show()`
+returned Ok, app registered as a GApplication `dev.brook.Brook`, no desktop entry,
+not in GNOME's notification app list) → **GNOME Shell drops raw freedesktop
+`Notify` from a registered GApplication**; it renders only GTK notifications
+(`org.gtk.Notifications`) tied to an installed `.desktop`. Switched the GNOME
+client to `gio::Notification` via the app, added `data/dev.brook.Brook.desktop`
+(+ install/README note); KDE keeps notify-rust (Plasma renders it). Explicit 5s
+timeout on both (notify-rust default `-1` = persistent banner that blocks others).
+
+Caveat: GNOME only displays once the desktop entry is installed AND the shell has
+re-read it (re-login / packaging). The notification *logic* is verified correct.
+
+Applied review (Codex/Gemini/Vibe): document/install the `.desktop` (Codex);
+warn when no default GApplication (Vibe). Declined: notify-rust GNOME fallback
+(GNOME drops it), `send_notification` error log (returns no Result).
+
 ### "Make it alive" #3 — desktop notifications, reviewed by Codex/Gemini/Vibe
 
 Native desktop notifications via freedesktop D-Bus (`notify-rust`) — works on

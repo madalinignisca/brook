@@ -247,7 +247,11 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                                 .find(|c| c.id == message.channel_id)
                                 .map(|c| c.title(&me))
                                 .unwrap_or_else(|| "Brook".to_string());
-                            notify(&chat, title, format!("{author}: {}", message.body));
+                            notify(
+                                &message.channel_id,
+                                &title,
+                                &format!("{author}: {}", message.body),
+                            );
                         }
                     }
                 }
@@ -461,18 +465,20 @@ fn update_badge(chat: &Rc<Chat>, idx: usize) {
     }
 }
 
-/// Show a desktop notification (freedesktop D-Bus) off the UI thread.
-fn notify(chat: &Rc<Chat>, summary: String, body: String) {
-    chat.runtime.spawn_blocking(move || {
-        if let Err(err) = notify_rust::Notification::new()
-            .summary(&summary)
-            .body(&body)
-            .appname("Brook")
-            .show()
-        {
-            tracing::warn!(%err, "desktop notification failed");
-        }
-    });
+/// Show a desktop notification via the GApplication (`org.gtk.Notifications`).
+///
+/// GNOME Shell drops the raw freedesktop `Notify` from a registered GApplication
+/// (it expects GTK notifications, tied to the installed `.desktop`), so we use the
+/// native gio path. `id` lets a channel's later notification replace its earlier
+/// one. Runs on the GLib main thread (where the event loop already is).
+fn notify(id: &str, summary: &str, body: &str) {
+    let Some(app) = gtk::gio::Application::default() else {
+        tracing::warn!("no default GApplication; cannot send notification");
+        return;
+    };
+    let notification = gtk::gio::Notification::new(summary);
+    notification.set_body(Some(body));
+    app.send_notification(Some(id), &notification);
 }
 
 /// Mark a channel read (up to `message_id`, or its latest) on the server.

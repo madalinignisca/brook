@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Brook
+GenericName=Team Chat
+Comment=Resource-respecting team chat
+Exec=brook-gnome
+Icon=dev.brook.Brook
+Terminal=false
+Categories=Network;InstantMessaging;Chat;GTK;
+Keywords=chat;messaging;team;
+StartupNotify=true
+StartupWMClass=dev.brook.Brook
