@@ -102,8 +102,11 @@ Kirigami.ApplicationWindow {
             }
             function appendMessage(m) {
                 messagesModel.append({
+                    mid: m.id,
+                    authorId: m.author_id,
                     author: m.author_display_name || m.author_handle || "Unknown",
-                    body: m.body
+                    body: m.body,
+                    edited: m.edited_at ? true : false
                 });
             }
             function sendMessage() {
@@ -153,6 +156,28 @@ Kirigami.ApplicationWindow {
                         if (chat.my_id && m.author_id !== chat.my_id) {
                             var who = m.author_display_name || m.author_handle || "Someone";
                             chat.notify(label, who + ": " + m.body);
+                        }
+                    }
+                }
+                function onMessage_updated(json) {
+                    var m = JSON.parse(json);
+                    if (m.channel_id !== page.currentChannel)
+                        return;
+                    for (var i = 0; i < messagesModel.count; i++) {
+                        if (messagesModel.get(i).mid === m.id) {
+                            messagesModel.setProperty(i, "body", m.body);
+                            messagesModel.setProperty(i, "edited", true);
+                            break;
+                        }
+                    }
+                }
+                function onMessage_deleted(cid, mid) {
+                    if (cid !== page.currentChannel)
+                        return;
+                    for (var i = 0; i < messagesModel.count; i++) {
+                        if (messagesModel.get(i).mid === mid) {
+                            messagesModel.remove(i);
+                            break;
                         }
                     }
                 }
@@ -246,11 +271,46 @@ Kirigami.ApplicationWindow {
                             delegate: ColumnLayout {
                                 width: ListView.view ? ListView.view.width : implicitWidth
                                 spacing: 0
-                                Controls.Label {
-                                    text: model.author
-                                    opacity: 0.7
-                                    font: Kirigami.Theme.smallFont
+                                RowLayout {
+                                    Layout.fillWidth: true
                                     Layout.leftMargin: Kirigami.Units.largeSpacing
+                                    Layout.rightMargin: Kirigami.Units.largeSpacing
+                                    Controls.Label {
+                                        text: model.author
+                                        opacity: 0.7
+                                        font: Kirigami.Theme.smallFont
+                                    }
+                                    Controls.Label {
+                                        text: "edited"
+                                        visible: model.edited
+                                        opacity: 0.5
+                                        font: Kirigami.Theme.smallFont
+                                    }
+                                    Item { Layout.fillWidth: true }
+                                    // Author-only actions for this message.
+                                    Controls.ToolButton {
+                                        text: "Edit"
+                                        visible: chat.my_id && model.authorId === chat.my_id
+                                        display: Controls.AbstractButton.TextOnly
+                                        font: Kirigami.Theme.smallFont
+                                        onClicked: {
+                                            editDialog.cid = page.currentChannel;
+                                            editDialog.mid = model.mid;
+                                            editField.text = model.body;
+                                            editDialog.open();
+                                        }
+                                    }
+                                    Controls.ToolButton {
+                                        text: "Delete"
+                                        visible: chat.my_id && model.authorId === chat.my_id
+                                        display: Controls.AbstractButton.TextOnly
+                                        font: Kirigami.Theme.smallFont
+                                        onClicked: {
+                                            deleteDialog.cid = page.currentChannel;
+                                            deleteDialog.mid = model.mid;
+                                            deleteDialog.open();
+                                        }
+                                    }
                                 }
                                 Controls.Label {
                                     text: model.body
@@ -340,6 +400,33 @@ Kirigami.ApplicationWindow {
                         }
                     }
                 }
+            }
+
+            Kirigami.PromptDialog {
+                id: editDialog
+                property string cid: ""
+                property string mid: ""
+                title: "Edit message"
+                standardButtons: Controls.Dialog.Ok | Controls.Dialog.Cancel
+                onAccepted: {
+                    if (editField.text.trim().length > 0)
+                        chat.edit_message(editDialog.cid, editDialog.mid, editField.text);
+                }
+                Controls.TextField {
+                    id: editField
+                    Layout.fillWidth: true
+                    onAccepted: editDialog.accept()
+                }
+            }
+
+            Kirigami.PromptDialog {
+                id: deleteDialog
+                property string cid: ""
+                property string mid: ""
+                title: "Delete message?"
+                subtitle: "This can't be undone."
+                standardButtons: Controls.Dialog.Ok | Controls.Dialog.Cancel
+                onAccepted: chat.delete_message(deleteDialog.cid, deleteDialog.mid)
             }
         }
     }

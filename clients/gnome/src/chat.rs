@@ -5,6 +5,7 @@
 //! core's broadcast channel on the main loop and appended live.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -29,11 +30,21 @@ struct Chat {
     channels: Rc<RefCell<Vec<Channel>>>,
     /// Unread badge label per sidebar row, parallel to `channels`.
     badges: Rc<RefCell<Vec<gtk::Label>>>,
+    /// message id -> its widgets, for live edit/delete of the open channel.
+    message_rows: Rc<RefCell<HashMap<String, MessageWidgets>>>,
     message_list: gtk::ListBox,
     message_scroll: gtk::ScrolledWindow,
     title: adw::WindowTitle,
     composer: gtk::Entry,
     send_button: gtk::Button,
+}
+
+/// The widgets of a rendered message we may mutate after an edit/delete event.
+#[derive(Clone)]
+struct MessageWidgets {
+    row: gtk::ListBoxRow,
+    body: gtk::Label,
+    edited: gtk::Label,
 }
 
 /// Build the chat view. `is_admin` controls whether channel creation is offered.
@@ -75,6 +86,7 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
         channel_list: channel_list.clone(),
         channels: Rc::new(RefCell::new(Vec::new())),
         badges: Rc::new(RefCell::new(Vec::new())),
+        message_rows: Rc::new(RefCell::new(HashMap::new())),
         message_list: message_list.clone(),
         message_scroll: message_scroll.clone(),
         title: title.clone(),
@@ -255,6 +267,20 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         }
                     }
                 }
+                Ok(ServerEvent::MessageUpdate(message)) => {
+                    // Update the row in place if the edited message is on screen.
+                    let widgets = chat.message_rows.borrow().get(&message.id).cloned();
+                    if let Some(widgets) = widgets {
+                        widgets.body.set_label(&message.body);
+                        widgets.edited.set_visible(true);
+                    }
+                }
+                Ok(ServerEvent::MessageDelete { message_id, .. }) => {
+                    let removed = chat.message_rows.borrow_mut().remove(&message_id);
+                    if let Some(widgets) = removed {
+                        chat.message_list.remove(&widgets.row);
+                    }
+                }
                 Ok(ServerEvent::ChannelUpdate(_)) => {
                     // Added to / removed from a channel, or metadata changed:
                     // reload the sidebar so it reflects the change live.
@@ -336,6 +362,7 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
 
     // Clear now, before the await, so live messages that arrive while history is
     // loading are appended to a fresh list rather than wiped by a late clear.
+    chat.message_rows.borrow_mut().clear();
     while let Some(row) = chat.message_list.row_at_index(0) {
         chat.message_list.remove(&row);
     }
@@ -400,29 +427,199 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
         .margin_start(12)
         .margin_end(12)
         .build();
+
+    // Header: author + "edited" marker + (for our own messages) an actions menu.
+    let header = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
     let author_label = gtk::Label::builder()
         .label(&author)
         .xalign(0.0)
+        .hexpand(true)
         .css_classes(["caption", "dim-label"])
         .build();
+    let edited_label = gtk::Label::builder()
+        .label("edited")
+        .css_classes(["caption", "dim-label"])
+        .visible(message.edited_at.is_some())
+        .build();
+    header.append(&author_label);
+    header.append(&edited_label);
+
+    let is_own = chat
+        .me
+        .borrow()
+        .as_deref()
+        .is_some_and(|me| me == message.author_id);
+    if is_own {
+        header.append(&message_actions_button(chat, message));
+    }
+
     let body_label = gtk::Label::builder()
         .label(&message.body)
         .xalign(0.0)
         .wrap(true)
         .selectable(true)
         .build();
-    row.append(&author_label);
+    row.append(&header);
     row.append(&body_label);
 
     let list_row = gtk::ListBoxRow::builder()
         .activatable(false)
         .child(&row)
         .build();
+    // De-dupe: if this id is already on screen (history + WS echo can overlap),
+    // drop the old row so edit/delete only ever tracks one.
+    if let Some(old) = chat.message_rows.borrow_mut().remove(&message.id) {
+        chat.message_list.remove(&old.row);
+    }
     chat.message_list.append(&list_row);
+    chat.message_rows.borrow_mut().insert(
+        message.id.clone(),
+        MessageWidgets {
+            row: list_row,
+            body: body_label,
+            edited: edited_label,
+        },
+    );
 
     // Scroll to bottom after layout settles.
     let adj = chat.message_scroll.vadjustment();
     glib::idle_add_local_once(move || adj.set_value(adj.upper()));
+}
+
+/// A flat "⋯" menu button with Edit / Delete for one of our own messages.
+fn message_actions_button(chat: &Rc<Chat>, message: &Message) -> gtk::MenuButton {
+    let menu = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(4)
+        .margin_bottom(4)
+        .margin_start(4)
+        .margin_end(4)
+        .build();
+    let edit = gtk::Button::builder()
+        .label("Edit")
+        .has_frame(false)
+        .build();
+    let delete = gtk::Button::builder()
+        .label("Delete")
+        .has_frame(false)
+        .css_classes(["error"])
+        .build();
+    menu.append(&edit);
+    menu.append(&delete);
+    let popover = gtk::Popover::builder().child(&menu).build();
+
+    edit.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        let channel_id = message.channel_id.clone();
+        let message_id = message.id.clone();
+        move |_| {
+            popover.popdown();
+            // Read the CURRENT body — a prior live edit may have changed it, so the
+            // captured original would revert it.
+            let current = chat
+                .message_rows
+                .borrow()
+                .get(&message_id)
+                .map(|w| w.body.label().to_string())
+                .unwrap_or_default();
+            edit_message_dialog(&chat, channel_id.clone(), message_id.clone(), current);
+        }
+    });
+    delete.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        let channel_id = message.channel_id.clone();
+        let message_id = message.id.clone();
+        move |_| {
+            popover.popdown();
+            delete_message_confirm(&chat, channel_id.clone(), message_id.clone());
+        }
+    });
+
+    gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .has_frame(false)
+        .popover(&popover)
+        .tooltip_text("Message actions")
+        .build()
+}
+
+/// Edit dialog: prefilled entry → `edit_message` (the WS `message.update` re-renders).
+fn edit_message_dialog(chat: &Rc<Chat>, channel_id: String, message_id: String, current: String) {
+    let entry = gtk::Entry::builder().text(&current).hexpand(true).build();
+    let dialog = adw::AlertDialog::builder()
+        .heading("Edit message")
+        .extra_child(&entry)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("save", "Save");
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("save"));
+    dialog.connect_response(None, {
+        let chat = chat.clone();
+        move |_, response| {
+            if response != "save" {
+                return;
+            }
+            let body = entry.text().to_string();
+            if body.trim().is_empty() {
+                return;
+            }
+            let chat = chat.clone();
+            let channel_id = channel_id.clone();
+            let message_id = message_id.clone();
+            glib::spawn_future_local(async move {
+                let result = chat
+                    .runtime
+                    .spawn({
+                        let client = chat.client.clone();
+                        async move { client.edit_message(&channel_id, &message_id, &body).await }
+                    })
+                    .await;
+                if let Ok(Err(err)) = result {
+                    tracing::warn!(%err, "failed to edit message");
+                }
+            });
+        }
+    });
+    dialog.present(Some(&chat.message_list));
+}
+
+/// Delete confirmation → `delete_message` (the WS `message.delete` removes the row).
+fn delete_message_confirm(chat: &Rc<Chat>, channel_id: String, message_id: String) {
+    let dialog = adw::AlertDialog::new(Some("Delete message?"), Some("This can't be undone."));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("delete", "Delete");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.connect_response(None, {
+        let chat = chat.clone();
+        move |_, response| {
+            if response != "delete" {
+                return;
+            }
+            let chat = chat.clone();
+            let channel_id = channel_id.clone();
+            let message_id = message_id.clone();
+            glib::spawn_future_local(async move {
+                let result = chat
+                    .runtime
+                    .spawn({
+                        let client = chat.client.clone();
+                        async move { client.delete_message(&channel_id, &message_id).await }
+                    })
+                    .await;
+                if let Ok(Err(err)) = result {
+                    tracing::warn!(%err, "failed to delete message");
+                }
+            });
+        }
+    });
+    dialog.present(Some(&chat.message_list));
 }
 
 /// A sidebar row; returns the row and its (initially-styled) unread badge label.

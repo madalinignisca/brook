@@ -52,6 +52,17 @@ pub mod qobject {
         /// Add a member (by handle) to a channel, then reload channels.
         #[qinvokable]
         fn add_member(self: Pin<&mut Self>, channel_id: &QString, handle: &QString);
+        /// Edit a message's body (author only); the WS echo re-renders it.
+        #[qinvokable]
+        fn edit_message(
+            self: Pin<&mut Self>,
+            channel_id: &QString,
+            message_id: &QString,
+            body: &QString,
+        );
+        /// Delete a message (author or admin); the WS echo removes it.
+        #[qinvokable]
+        fn delete_message(self: Pin<&mut Self>, channel_id: &QString, message_id: &QString);
         /// Mark a channel read up to its latest message.
         #[qinvokable]
         fn mark_read(self: Pin<&mut Self>, channel_id: &QString);
@@ -65,6 +76,10 @@ pub mod qobject {
         fn history_loaded(self: Pin<&mut Self>, channel_id: QString, json: QString);
         #[qsignal]
         fn message_received(self: Pin<&mut Self>, json: QString);
+        #[qsignal]
+        fn message_updated(self: Pin<&mut Self>, json: QString);
+        #[qsignal]
+        fn message_deleted(self: Pin<&mut Self>, channel_id: QString, message_id: QString);
     }
 
     impl cxx_qt::Threading for ChatController {}
@@ -107,6 +122,23 @@ impl qobject::ChatController {
                         let json = serde_json::to_string(&message).unwrap_or_default();
                         let _ = qt.queue(move |mut this: Pin<&mut Controller>| {
                             this.as_mut().message_received(QString::from(json.as_str()));
+                        });
+                    }
+                    Ok(ServerEvent::MessageUpdate(message)) => {
+                        let json = serde_json::to_string(&message).unwrap_or_default();
+                        let _ = qt.queue(move |mut this: Pin<&mut Controller>| {
+                            this.as_mut().message_updated(QString::from(json.as_str()));
+                        });
+                    }
+                    Ok(ServerEvent::MessageDelete {
+                        channel_id,
+                        message_id,
+                    }) => {
+                        let _ = qt.queue(move |mut this: Pin<&mut Controller>| {
+                            this.as_mut().message_deleted(
+                                QString::from(channel_id.as_str()),
+                                QString::from(message_id.as_str()),
+                            );
                         });
                     }
                     Ok(ServerEvent::ChannelUpdate(_)) => {
@@ -207,6 +239,39 @@ impl qobject::ChatController {
             };
             if client.add_member(&channel_id, &handle).await.is_ok() {
                 emit_channels(&client, &qt).await;
+            }
+        });
+    }
+
+    fn edit_message(
+        self: Pin<&mut Self>,
+        channel_id: &QString,
+        message_id: &QString,
+        body: &QString,
+    ) {
+        let channel_id = channel_id.to_string();
+        let message_id = message_id.to_string();
+        let body = body.to_string();
+        if body.trim().is_empty() {
+            return;
+        }
+        app::runtime().spawn(async move {
+            if let Some(client) = app::client().await {
+                if let Err(err) = client.edit_message(&channel_id, &message_id, &body).await {
+                    tracing::warn!(%err, "edit_message failed");
+                }
+            }
+        });
+    }
+
+    fn delete_message(self: Pin<&mut Self>, channel_id: &QString, message_id: &QString) {
+        let channel_id = channel_id.to_string();
+        let message_id = message_id.to_string();
+        app::runtime().spawn(async move {
+            if let Some(client) = app::client().await {
+                if let Err(err) = client.delete_message(&channel_id, &message_id).await {
+                    tracing::warn!(%err, "delete_message failed");
+                }
             }
         });
     }

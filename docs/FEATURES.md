@@ -60,8 +60,8 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 |---|---|---|---|
 | Send message (single path) | ✅ | P1 | REST → WS fan-out |
 | History pagination (`before`) | ✅ | P1 | `after`/forward-sync ⬜ |
-| Edit message | ⬜ | P1b | `PATCH /messages/{id}` (spec'd, not built) |
-| Delete message (soft) | ⬜ | P1b | `DELETE /messages/{id}`; `deleted_at` exists |
+| Edit message | 🟢 | P1b | `PATCH /messages/{id}` (author-only) + `message.update`; UI in both clients |
+| Delete message (soft) | 🟢 | P1b | `DELETE /messages/{id}` (author/admin) + `message.delete`; UI in both clients |
 | Markdown formatting (bold/italic/code/links) | ⬜ | P1b | render + compose; keep minimal |
 | Code blocks | ⬜ | P1b | |
 | Mentions (@user, @channel, @here) | ⬜ | PN | drives notifications |

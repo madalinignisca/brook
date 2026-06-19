@@ -16,6 +16,26 @@ Conventions:
 
 ## 2026-06-19
 
+### P1b edit/delete messages — both clients (slices B/C), reviewed by Codex/Gemini/Vibe
+
+Per-message author-only **Edit** (prefilled dialog) + **Delete** (confirm), an
+"edited" marker, all reflected live via `message.update`/`message.delete`. GNOME:
+a `⋯` popover per own message + `AdwAlertDialog` (bumped adw feature to `v1_5`),
+rows tracked by id in a `HashMap` for in-place update/remove. KDE: ToolButtons in
+the delegate + `Kirigami.PromptDialog`s, model rows carry `mid`/`authorId`/`edited`.
+
+Applied review (Codex/Gemini/Vibe):
+- HIGH/MED (Gemini, Codex): the Edit action captured the original body, so
+  reopening after a live edit reverted it → read the current label at click time.
+- MED (Codex): duplicate ids could overwrite the row map (history + WS echo
+  overlap) → de-dupe the old row on append.
+- MED (Vibe): log edit/delete call errors.
+- Declined: "remove `.await` after `runtime.spawn`" (false positive — cooperative
+  inside `spawn_future_local`, same as `send_current`); channel_id check on
+  update/delete (map is already channel-scoped); KDE `unwrap_or_default`
+  (consistent, can't fail). Deferred (LOW): multi-line edit (composer is
+  single-line too); admin-delete-others in the UI (a later moderation slice).
+
 ### P1b edit/delete messages — server + core (slice A)
 
 `PATCH /channels/{id}/messages/{mid}` (author-only edit → `edited_at`, fans
