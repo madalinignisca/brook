@@ -54,6 +54,17 @@ pub enum ServerEvent {
     },
     /// A channel's membership/metadata changed (e.g. the user was added to it).
     ChannelUpdate(Channel),
+    /// A channel was deleted.
+    ChannelDelete {
+        /// The deleted channel's id.
+        channel_id: String,
+    },
+}
+
+/// Payload of a `channel.delete` envelope.
+#[derive(Deserialize)]
+struct ChannelDeleted {
+    id: String,
 }
 
 /// Payload of a `message.delete` envelope.
@@ -153,6 +164,12 @@ async fn run_once(url: &Url, token: &str, tx: &broadcast::Sender<ServerEvent>) -
                             let _ = tx.send(ServerEvent::ChannelUpdate(channel));
                         }
                         Err(err) => tracing::warn!(%err, "failed to parse channel.update payload"),
+                    },
+                    "channel.delete" => match serde_json::from_value::<ChannelDeleted>(env.data) {
+                        Ok(d) => {
+                            let _ = tx.send(ServerEvent::ChannelDelete { channel_id: d.id });
+                        }
+                        Err(err) => tracing::warn!(%err, "failed to parse channel.delete payload"),
                     },
                     _ => {} // typing / presence / call — ignored in Phase 1
                 },

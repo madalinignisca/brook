@@ -98,6 +98,10 @@ class Channel(Base):
         ForeignKey("users.id", ondelete="SET NULL")
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Public channels are browsable + self-joinable by any user (vs invite-only).
+    public: Mapped[bool] = mapped_column(default=False)
+    # Archived channels are read-only and hidden from the default list.
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
 class Membership(Base):

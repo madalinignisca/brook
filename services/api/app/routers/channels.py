@@ -24,6 +24,7 @@ from ..models import Channel, Membership, Message, Reaction, User, utcnow
 from ..schemas import (
     ChannelCreate,
     ChannelOut,
+    ChannelPatch,
     MemberAdd,
     MessageCreate,
     MessageEdit,
@@ -87,6 +88,8 @@ def _channel_out(channel: Channel, members: list[User], unread_count: int = 0) -
         created_at=channel.created_at,
         members=[UserSummary.model_validate(m) for m in members],
         unread_count=unread_count,
+        public=channel.public,
+        archived=channel.archived_at is not None,
     )
 
 
@@ -144,6 +147,22 @@ async def _require_member(session: AsyncSession, channel_id: uuid.UUID, user: Us
     return channel
 
 
+async def _require_channel_admin(
+    session: AsyncSession, channel_id: uuid.UUID, user: User
+) -> Channel:
+    """The channel, if it exists, is a real channel (not a DM), and the caller is a
+    global admin or its owner. 404 if missing, 422 for a DM, 403 otherwise."""
+    channel = await session.get(Channel, channel_id)
+    if channel is None:
+        raise _not_found()
+    if channel.kind == "dm":
+        raise _validation("DMs cannot be renamed, archived, or deleted")
+    caller = await _membership(session, channel_id, user.id)
+    if user.global_role != "admin" and (caller is None or caller.role != "owner"):
+        raise _forbidden("Only an admin or the channel owner can manage this channel")
+    return channel
+
+
 @router.get("", response_model=list[ChannelOut])
 async def list_channels(user: CurrentUser, session: Session) -> list[ChannelOut]:
     """Channels and DMs the caller belongs to, each with the caller's unread count."""
@@ -161,6 +180,27 @@ async def list_channels(user: CurrentUser, session: Session) -> list[ChannelOut]
     return [_channel_out(c, await _members(session, c.id), unread.get(c.id, 0)) for c in channels]
 
 
+@router.get("/public", response_model=list[ChannelOut])
+async def list_public_channels(user: CurrentUser, session: Session) -> list[ChannelOut]:
+    """Public, non-archived channels the caller hasn't joined yet (to self-join)."""
+    joined = select(Membership.channel_id).where(Membership.user_id == user.id)
+    channels = list(
+        (
+            await session.scalars(
+                select(Channel)
+                .where(
+                    Channel.kind == "channel",
+                    Channel.public.is_(True),
+                    Channel.archived_at.is_(None),
+                    Channel.id.not_in(joined),
+                )
+                .order_by(Channel.name)
+            )
+        ).all()
+    )
+    return [_channel_out(c, await _members(session, c.id)) for c in channels]
+
+
 @router.post("", response_model=ChannelOut, status_code=status.HTTP_201_CREATED)
 async def create_channel(
     body: ChannelCreate, user: CurrentUser, session: Session, hub: HubDep
@@ -171,7 +211,13 @@ async def create_channel(
             raise _forbidden("Admin role required to create channels")
         if not body.name:
             raise _validation("A channel name is required")
-        channel = Channel(kind="channel", name=body.name, topic=body.topic, created_by=user.id)
+        channel = Channel(
+            kind="channel",
+            name=body.name,
+            topic=body.topic,
+            created_by=user.id,
+            public=body.public,
+        )
         session.add(channel)
         await session.flush()
         session.add(Membership(channel_id=channel.id, user_id=user.id, role="owner"))
@@ -252,6 +298,68 @@ async def add_member(
         await _emit_channel_update(hub, session, channel)
 
 
+@router.patch("/{channel_id}", response_model=ChannelOut)
+async def update_channel(
+    channel_id: uuid.UUID, body: ChannelPatch, user: CurrentUser, session: Session, hub: HubDep
+) -> ChannelOut:
+    """Rename / retopic / archive a channel (admin or owner). Fans `channel.update`."""
+    channel = await _require_channel_admin(session, channel_id, user)
+    if body.name is not None:
+        if not body.name.strip():
+            raise _validation("A channel name cannot be empty")
+        channel.name = body.name
+    if body.topic is not None:
+        channel.topic = body.topic
+    if body.archived is not None:
+        channel.archived_at = utcnow() if body.archived else None
+    await session.commit()
+    await session.refresh(channel)
+
+    members = await _members(session, channel_id)
+    await _emit_channel_update(hub, session, channel)
+    return _channel_out(channel, members)
+
+
+@router.delete("/{channel_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_channel(
+    channel_id: uuid.UUID, user: CurrentUser, session: Session, hub: HubDep
+) -> None:
+    """Delete a channel and its history (admin or owner). Fans `channel.delete`."""
+    channel = await _require_channel_admin(session, channel_id, user)
+    member_ids = [m.id for m in await _members(session, channel_id)]
+    await session.delete(channel)  # cascades to memberships, messages, reactions
+    await session.commit()
+    await hub.send_to_users(member_ids, _envelope("channel.delete", {"id": str(channel_id)}))
+
+
+@router.post("/{channel_id}/join", response_model=ChannelOut)
+async def join_channel(
+    channel_id: uuid.UUID, user: CurrentUser, session: Session, hub: HubDep
+) -> ChannelOut:
+    """Self-join a public, non-archived channel. Fans `channel.update`."""
+    channel = await session.get(Channel, channel_id)
+    if (
+        channel is None
+        or channel.kind != "channel"
+        or not channel.public
+        or channel.archived_at is not None
+    ):
+        raise _not_found()
+    if await _membership(session, channel_id, user.id) is None:
+        last_read = await _latest_message_id(session, channel_id)
+        session.add(
+            Membership(
+                channel_id=channel_id,
+                user_id=user.id,
+                role="member",
+                last_read_message_id=last_read,
+            )
+        )
+        await session.commit()
+        await _emit_channel_update(hub, session, channel)
+    return _channel_out(channel, await _members(session, channel_id))
+
+
 async def _emit_channel_update(hub: Hub, session: AsyncSession, channel: Channel) -> None:
     """Broadcast a `channel.update` to a channel's members (membership/metadata changed)."""
     members = await _members(session, channel.id)
@@ -313,7 +421,9 @@ async def send_message(
     hub: HubDep,
 ) -> MessageOut:
     """Persist a message then fan it out to the channel's members over the WS."""
-    await _require_member(session, channel_id, user)
+    channel = await _require_member(session, channel_id, user)
+    if channel.archived_at is not None:
+        raise _forbidden("This channel is archived")
 
     # Quote-reply: the target must be a live message in this same channel.
     reply: ReplyExcerpt | None = None

@@ -145,6 +145,59 @@ impl BrookClient {
             .await
     }
 
+    /// Create a public (browsable + self-joinable) channel. Requires admin.
+    pub async fn create_public_channel(&self, name: &str) -> Result<Channel> {
+        self.post_channel(json!({ "kind": "channel", "name": name, "public": true }))
+            .await
+    }
+
+    /// Rename / retopic / archive a channel (admin or owner). `None` fields unchanged.
+    pub async fn update_channel(
+        &self,
+        channel_id: &str,
+        name: Option<&str>,
+        topic: Option<&str>,
+        archived: Option<bool>,
+    ) -> Result<Channel> {
+        let token = self.access_token().await?;
+        let url = self.base.join(&format!("api/v1/channels/{channel_id}"))?;
+        let resp = self
+            .http
+            .patch(url)
+            .bearer_auth(token)
+            .json(&json!({ "name": name, "topic": topic, "archived": archived }))
+            .send()
+            .await?;
+        self.parse(resp).await
+    }
+
+    /// Delete a channel and its history (admin or owner).
+    pub async fn delete_channel(&self, channel_id: &str) -> Result<()> {
+        let token = self.access_token().await?;
+        let url = self.base.join(&format!("api/v1/channels/{channel_id}"))?;
+        let resp = self.http.delete(url).bearer_auth(token).send().await?;
+        if !resp.status().is_success() {
+            return Err(api_error(resp).await);
+        }
+        Ok(())
+    }
+
+    /// Public, non-archived channels the user hasn't joined yet (to self-join).
+    pub async fn list_public_channels(&self) -> Result<Vec<Channel>> {
+        let token = self.access_token().await?;
+        let url = self.base.join("api/v1/channels/public")?;
+        let resp = self.http.get(url).bearer_auth(token).send().await?;
+        self.parse(resp).await
+    }
+
+    /// Self-join a public channel.
+    pub async fn join_channel(&self, channel_id: &str) -> Result<Channel> {
+        let token = self.access_token().await?;
+        let url = self.base.join(&format!("api/v1/channels/{channel_id}/join"))?;
+        let resp = self.http.post(url).bearer_auth(token).send().await?;
+        self.parse(resp).await
+    }
+
     /// Open (or find the existing) 1:1 DM with the user `member_handle`.
     pub async fn open_dm(&self, member_handle: &str) -> Result<Channel> {
         self.post_channel(json!({ "kind": "dm", "member": member_handle }))

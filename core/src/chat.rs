@@ -30,6 +30,12 @@ pub struct Channel {
     /// Unread messages for the current user (server-computed).
     #[serde(default)]
     pub unread_count: i64,
+    /// Whether the channel is public (browsable + self-joinable).
+    #[serde(default)]
+    pub public: bool,
+    /// Whether the channel is archived (read-only).
+    #[serde(default)]
+    pub archived: bool,
 }
 
 impl Channel {

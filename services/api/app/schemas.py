@@ -71,6 +71,7 @@ class ChannelCreate(BaseModel):
     name: str | None = Field(default=None, max_length=128)
     topic: str | None = Field(default=None, max_length=512)
     member: str | None = Field(default=None, max_length=64)
+    public: bool = False
 
 
 class ChannelOut(BaseModel):
@@ -84,6 +85,16 @@ class ChannelOut(BaseModel):
     created_at: datetime
     members: list[UserSummary]
     unread_count: int = 0
+    public: bool = False
+    archived: bool = False
+
+
+class ChannelPatch(BaseModel):
+    """Rename/retopic/archive a channel (owner or admin). Omitted fields unchanged."""
+
+    name: str | None = Field(default=None, max_length=128)
+    topic: str | None = Field(default=None, max_length=512)
+    archived: bool | None = None
 
 
 class ReadIn(BaseModel):

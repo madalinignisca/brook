@@ -398,3 +398,83 @@ async def test_reaction_requires_membership(client: httpx.AsyncClient) -> None:
         headers=_auth(carol),
     )
     assert resp.status_code == 404  # non-member can't see/react in the channel
+
+
+async def _admin_channel(client: httpx.AsyncClient, alice: str, public: bool = False) -> str:
+    chan = await client.post(
+        f"{API}/channels",
+        json={"kind": "channel", "name": "general", "public": public},
+        headers=_auth(alice),
+    )
+    return chan.json()["id"]
+
+
+async def test_rename_and_archive_channel(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    cid = await _admin_channel(client, alice)
+
+    renamed = await client.patch(
+        f"{API}/channels/{cid}", json={"name": "renamed", "topic": "hi"}, headers=_auth(alice)
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["name"] == "renamed"
+    assert renamed.json()["topic"] == "hi"
+
+    # archive -> sending is blocked
+    await client.patch(f"{API}/channels/{cid}", json={"archived": True}, headers=_auth(alice))
+    blocked = await client.post(
+        f"{API}/channels/{cid}/messages", json={"body": "hi"}, headers=_auth(alice)
+    )
+    assert blocked.status_code == 403
+    # unarchive -> sending works again
+    await client.patch(f"{API}/channels/{cid}", json={"archived": False}, headers=_auth(alice))
+    assert (
+        await client.post(
+            f"{API}/channels/{cid}/messages", json={"body": "hi"}, headers=_auth(alice)
+        )
+    ).status_code == 201
+
+
+async def test_non_owner_cannot_manage_channel(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    cid = await _admin_channel(client, alice)
+    await client.post(f"{API}/channels/{cid}/members", json={"handle": "bob"}, headers=_auth(alice))
+    # bob is a plain member, not owner/admin
+    assert (
+        await client.patch(f"{API}/channels/{cid}", json={"name": "x"}, headers=_auth(bob))
+    ).status_code == 403
+    assert (await client.delete(f"{API}/channels/{cid}", headers=_auth(bob))).status_code == 403
+
+
+async def test_delete_channel(client: httpx.AsyncClient) -> None:
+    alice, _bob = await _two_users(client)
+    cid = await _admin_channel(client, alice)
+    assert (await client.delete(f"{API}/channels/{cid}", headers=_auth(alice))).status_code == 204
+    listed = await client.get(f"{API}/channels", headers=_auth(alice))
+    assert all(c["id"] != cid for c in listed.json())
+
+
+async def test_public_channel_browse_and_join(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    cid = await _admin_channel(client, alice, public=True)
+
+    # bob (not a member) sees it in the public list
+    pub = await client.get(f"{API}/channels/public", headers=_auth(bob))
+    assert cid in [c["id"] for c in pub.json()]
+    assert pub.json()[0]["public"] is True
+
+    # bob joins -> now in his channel list, and no longer in the public (unjoined) list
+    joined = await client.post(f"{API}/channels/{cid}/join", headers=_auth(bob))
+    assert joined.status_code == 200
+    assert cid in [
+        c["id"] for c in (await client.get(f"{API}/channels", headers=_auth(bob))).json()
+    ]
+    assert cid not in [
+        c["id"] for c in (await client.get(f"{API}/channels/public", headers=_auth(bob))).json()
+    ]
+
+
+async def test_cannot_join_private_channel(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    cid = await _admin_channel(client, alice, public=False)
+    assert (await client.post(f"{API}/channels/{cid}/join", headers=_auth(bob))).status_code == 404

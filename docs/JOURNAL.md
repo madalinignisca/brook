@@ -16,6 +16,19 @@ Conventions:
 
 ## 2026-06-19
 
+### P1b channel management + public self-join — server + core (slice A)
+
+One migration (d4e5f6a7b8c9) adds `channels.public` + `archived_at` (features 4 & 5
+share the table). Channel management (admin or owner; never DMs): `PATCH /channels/{id}`
+(rename/topic/archive → `channel.update`), `DELETE /channels/{id}` (cascade →
+`channel.delete`); sending to an archived channel is 403. Public self-join:
+`POST /channels` takes `public`; `GET /channels/public` browses public non-archived
+channels you haven't joined; `POST /channels/{id}/join` self-joins (→ `channel.update`).
+core: `Channel.public`/`archived`, `ServerEvent::ChannelDelete`, client
+`update_channel`/`delete_channel`/`create_public_channel`/`list_public_channels`/`join_channel`.
+Tests: rename/archive-blocks-send/unarchive, non-owner 403, delete, public
+browse+join, can't-join-private 404. 46 server + 9 core. Client UI follows.
+
 ### P1b emoji reactions — both clients (slices B/C), reviewed by Codex/Gemini/Vibe
 
 Reaction chips (emoji + count, highlighted when `me`) under each message + a
