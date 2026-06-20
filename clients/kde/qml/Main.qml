@@ -94,6 +94,29 @@ Kirigami.ApplicationWindow {
             ListModel { id: channelsModel }
             ListModel { id: messagesModel }
             ListModel { id: publicModel }
+            ListModel { id: searchModel }
+
+            function openChannelById(cid) {
+                for (var i = 0; i < channelsModel.count; i++) {
+                    if (channelsModel.get(i).cid === cid) {
+                        page.currentChannel = cid;
+                        page.currentKind = channelsModel.get(i).kind;
+                        page.currentArchived = channelsModel.get(i).archived;
+                        page.cancelReply();
+                        messagesModel.clear();
+                        channelsModel.setProperty(i, "unread", 0);
+                        chat.select_channel(cid);
+                        chat.mark_read(cid);
+                        break;
+                    }
+                }
+            }
+            function channelNameById(cid) {
+                for (var i = 0; i < channelsModel.count; i++)
+                    if (channelsModel.get(i).cid === cid)
+                        return channelsModel.get(i).label;
+                return "channel";
+            }
 
             function channelTitle(c) {
                 if (c.name && c.name.length > 0)
@@ -198,6 +221,17 @@ Kirigami.ApplicationWindow {
                     for (var i = 0; i < arr.length; i++)
                         publicModel.append({ cid: arr[i].id, label: arr[i].name || "channel" });
                 }
+                function onSearch_results_loaded(json) {
+                    searchModel.clear();
+                    var arr = JSON.parse(json);
+                    for (var i = 0; i < arr.length; i++) {
+                        var who = arr[i].author_display_name || arr[i].author_handle || "?";
+                        searchModel.append({
+                            cid: arr[i].channel_id,
+                            line: page.channelNameById(arr[i].channel_id) + " · " + who + ": " + arr[i].body
+                        });
+                    }
+                }
                 function onHistory_loaded(cid, json) {
                     if (cid !== page.currentChannel)
                         return;
@@ -274,6 +308,16 @@ Kirigami.ApplicationWindow {
                             text: "Conversations"
                             level: 4
                             Layout.fillWidth: true
+                        }
+                        Controls.Button {
+                            icon.name: "search"
+                            display: Controls.AbstractButton.IconOnly
+                            text: "Search messages"
+                            onClicked: {
+                                searchModel.clear();
+                                searchField.text = "";
+                                searchSheet.open();
+                            }
                         }
                         Controls.Button {
                             icon.name: "list-add"
@@ -643,6 +687,39 @@ Kirigami.ApplicationWindow {
                 subtitle: "This permanently deletes the channel and its messages."
                 standardButtons: Controls.Dialog.Ok | Controls.Dialog.Cancel
                 onAccepted: chat.delete_channel(page.currentChannel)
+            }
+
+            Kirigami.OverlaySheet {
+                id: searchSheet
+                title: "Search messages"
+                ColumnLayout {
+                    spacing: Kirigami.Units.smallSpacing
+                    Controls.TextField {
+                        id: searchField
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: Kirigami.Units.gridUnit * 20
+                        placeholderText: "Search…"
+                        onAccepted: chat.search(searchField.text)
+                    }
+                    Repeater {
+                        model: searchModel
+                        delegate: Controls.ItemDelegate {
+                            required property string cid
+                            required property string line
+                            Layout.fillWidth: true
+                            text: line
+                            onClicked: {
+                                page.openChannelById(cid);
+                                searchSheet.close();
+                            }
+                        }
+                    }
+                    Controls.Label {
+                        text: "Type a term and press Enter."
+                        visible: searchModel.count === 0
+                        opacity: 0.6
+                    }
+                }
             }
 
             Kirigami.OverlaySheet {

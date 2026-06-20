@@ -71,7 +71,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 | Link to message / copy link | ⬜ | P1b | |
 | Unread / read-state tracking | 🟡 | PN | server+core done (read marker, unread_count, mark-read); client badges ⬜ |
 | Drafts (per channel) | ⬜ | P1b | client-local |
-| Message search | ⬜ | P2 | **decided in** — Postgres full-text search |
+| Message search | 🟢 | P1b | `GET /channels/search?q=` (ILIKE, membership-scoped); search dialog in both clients. Postgres FTS = P2 upgrade |
 | File attachments | ⬜ | P2 | |
 
 ## 4. Presence & realtime (PN — Presence workstream)
@@ -141,8 +141,8 @@ first-class channel participant. ⬜
 | Feature | Status | Phase | Notes |
 |---|---|---|---|
 | Quick switcher (jump to channel/DM) | ⬜ | P1b | keyboard-first |
-| Channel browser (public) | ⬜ | P1b | |
-| Message search | ⬜ | P2 | Postgres FTS |
+| Channel browser (public) | 🟢 | P1b | browse + self-join dialog in both clients |
+| Message search | 🟢 | P1b | substring search shipped; Postgres FTS = P2 |
 
 ## 10. Admin & operator
 

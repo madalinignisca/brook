@@ -36,6 +36,29 @@ Applied review (Codex/Gemini/Vibe):
   existing literal / `is_ok` patterns; `select_channel` not-found — selection
   always maps to a listed channel.
 
+### P1b message search — both clients (slices B/C), reviewed by Codex/Gemini/Vibe
+
+A search button → a dialog: type a term, get matching messages (channel · author:
+body), click one to jump to its channel. GNOME: `AdwAlertDialog` + `SearchEntry`;
+KDE: an `OverlaySheet` + `search` invokable / `search_results_loaded` signal.
+
+Applied review (Codex/Gemini/Vibe):
+- HIGH (Gemini): GNOME search-dialog closures formed a reference cycle that leaked
+  the dialog tree on every open → weak `dialog` (downgrade/upgrade) in the entry +
+  result-button closures.
+- MED (Codex, Gemini): concurrent searches could resolve out of order and show
+  stale results → a generation guard drops superseded responses (GNOME).
+- LOW (Gemini, Vibe): KDE serialize fallback `"[]"` (not `""`) so QML `JSON.parse`
+  never throws.
+- Deferred (Codex/Gemini MED): clicking a result opens the channel but doesn't yet
+  scroll to the specific message (needs load-around-id). Declined: try-catch around
+  the now-safe JSON.parse, clear-before-await, zero-match label, KDE search race
+  (consistent with existing patterns / cosmetic).
+
+**GOAL "full #1" COMPLETE** — all 6 P1b features (edit/delete, quote-reply,
+reactions, channel rename/archive/delete, public self-join, message search) shipped
+full-stack across server + core + both clients, each friends-reviewed.
+
 ### P1b message search — server + core (slice A)
 
 `GET /channels/search?q=` searches message bodies across the caller's channels

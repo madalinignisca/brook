@@ -166,6 +166,15 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
         .build();
     sidebar_header.pack_start(&add_button);
     sidebar_header.set_title_widget(Some(&adw::WindowTitle::new("Brook", "")));
+    let search_button = gtk::Button::builder()
+        .icon_name("system-search-symbolic")
+        .tooltip_text("Search messages")
+        .build();
+    sidebar_header.pack_end(&search_button);
+    search_button.connect_clicked({
+        let chat = chat.clone();
+        move |_| search_dialog(&chat)
+    });
 
     let sidebar_scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
@@ -1350,6 +1359,135 @@ fn join_public(chat: &Rc<Chat>, channel_id: String) {
             refresh_channels(&chat, Some(channel.id));
         }
     });
+}
+
+/// A search dialog: type a term, see matching messages, click one to jump to it.
+fn search_dialog(chat: &Rc<Chat>) {
+    let entry = gtk::SearchEntry::builder().hexpand(true).build();
+    let results = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .build();
+    let scroller = gtk::ScrolledWindow::builder()
+        .min_content_height(280)
+        .min_content_width(360)
+        .child(&results)
+        .build();
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .build();
+    column.append(&entry);
+    column.append(&scroller);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Search messages")
+        .extra_child(&column)
+        .build();
+    dialog.add_response("close", "Close");
+
+    // Generation guard: an older, slower search must not overwrite newer results.
+    let generation = Rc::new(std::cell::Cell::new(0u64));
+    // Weak so the entry's closure doesn't form a cycle that leaks the dialog.
+    let dialog_weak = dialog.downgrade();
+    entry.connect_activate({
+        let chat = chat.clone();
+        let results = results.clone();
+        let generation = generation.clone();
+        move |entry| {
+            let query = entry.text().trim().to_string();
+            if query.is_empty() {
+                return;
+            }
+            let Some(dialog) = dialog_weak.upgrade() else {
+                return;
+            };
+            run_search(&chat, query, results.clone(), dialog, generation.clone());
+        }
+    });
+    dialog.present(Some(&chat.message_list));
+    entry.grab_focus();
+}
+
+/// Run a search and populate the results box; each result jumps to its channel.
+fn run_search(
+    chat: &Rc<Chat>,
+    query: String,
+    results: gtk::Box,
+    dialog: adw::AlertDialog,
+    generation: Rc<std::cell::Cell<u64>>,
+) {
+    let this_gen = generation.get().wrapping_add(1);
+    generation.set(this_gen);
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let handle = chat.runtime.spawn({
+            let client = chat.client.clone();
+            async move { client.search_messages(&query).await }
+        });
+        let Ok(Ok(messages)) = handle.await else {
+            return;
+        };
+        // A newer search has been issued since — drop these stale results.
+        if generation.get() != this_gen {
+            return;
+        }
+        while let Some(child) = results.first_child() {
+            results.remove(&child);
+        }
+        if messages.is_empty() {
+            results.append(&gtk::Label::new(Some("No matches.")));
+            return;
+        }
+        let me = chat.me.borrow().clone().unwrap_or_default();
+        for message in messages {
+            let channel_name = chat
+                .channels
+                .borrow()
+                .iter()
+                .find(|c| c.id == message.channel_id)
+                .map(|c| c.title(&me))
+                .unwrap_or_else(|| "channel".to_string());
+            let author = message
+                .author_display_name
+                .clone()
+                .or_else(|| message.author_handle.clone())
+                .unwrap_or_else(|| "?".to_string());
+            let button = gtk::Button::builder()
+                .label(format!("{channel_name} · {author}: {}", message.body))
+                .has_frame(false)
+                .build();
+            if let Some(label) = button.child().and_downcast::<gtk::Label>() {
+                label.set_xalign(0.0);
+                label.set_wrap(true);
+            }
+            let dialog_weak = dialog.downgrade();
+            button.connect_clicked({
+                let chat = chat.clone();
+                let channel_id = message.channel_id.clone();
+                move |_| {
+                    if let Some(dialog) = dialog_weak.upgrade() {
+                        dialog.close();
+                    }
+                    jump_to_channel(&chat, &channel_id);
+                }
+            });
+            results.append(&button);
+        }
+    });
+}
+
+/// Select a channel's sidebar row (which opens it via `connect_row_selected`).
+fn jump_to_channel(chat: &Rc<Chat>, channel_id: &str) {
+    let idx = chat
+        .channels
+        .borrow()
+        .iter()
+        .position(|c| c.id == channel_id);
+    if let Some(idx) = idx {
+        if let Some(row) = chat.channel_list.row_at_index(idx as i32) {
+            chat.channel_list.select_row(Some(&row));
+        }
+    }
 }
 
 fn open_dm(chat: &Rc<Chat>, handle: String) {

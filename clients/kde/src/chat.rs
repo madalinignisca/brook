@@ -69,6 +69,9 @@ pub mod qobject {
         /// Self-join a public channel, then reload channels.
         #[qinvokable]
         fn join_channel(self: Pin<&mut Self>, channel_id: &QString);
+        /// Search message bodies (emits `search_results_loaded`).
+        #[qinvokable]
+        fn search(self: Pin<&mut Self>, query: &QString);
         /// Add a member (by handle) to a channel, then reload channels.
         #[qinvokable]
         fn add_member(self: Pin<&mut Self>, channel_id: &QString, handle: &QString);
@@ -114,6 +117,8 @@ pub mod qobject {
         fn channel_deleted(self: Pin<&mut Self>, channel_id: QString);
         #[qsignal]
         fn public_channels_loaded(self: Pin<&mut Self>, json: QString);
+        #[qsignal]
+        fn search_results_loaded(self: Pin<&mut Self>, json: QString);
     }
 
     impl cxx_qt::Threading for ChatController {}
@@ -381,6 +386,28 @@ impl qobject::ChatController {
             };
             if client.join_channel(&channel_id).await.is_ok() {
                 emit_channels(&client, &qt).await;
+            }
+        });
+    }
+
+    fn search(self: Pin<&mut Self>, query: &QString) {
+        let qt = self.qt_thread();
+        let query = query.to_string();
+        if query.trim().is_empty() {
+            return;
+        }
+        app::runtime().spawn(async move {
+            let Some(client) = app::client().await else {
+                return;
+            };
+            if let Ok(messages) = client.search_messages(&query).await {
+                // "[]" (not "") on the unlikely serialize failure, so QML's
+                // JSON.parse never throws on an empty string.
+                let json = serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_string());
+                let _ = qt.queue(move |mut this: Pin<&mut Controller>| {
+                    this.as_mut()
+                        .search_results_loaded(QString::from(json.as_str()));
+                });
             }
         });
     }
