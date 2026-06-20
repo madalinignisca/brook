@@ -84,6 +84,8 @@ Kirigami.ApplicationWindow {
             title: "Brook"
 
             property string currentChannel: ""
+            property string currentKind: ""
+            property bool currentArchived: false
             property string replyingTo: ""
             property string replyingToText: ""
 
@@ -91,6 +93,7 @@ Kirigami.ApplicationWindow {
 
             ListModel { id: channelsModel }
             ListModel { id: messagesModel }
+            ListModel { id: publicModel }
 
             function channelTitle(c) {
                 if (c.name && c.name.length > 0)
@@ -165,12 +168,35 @@ Kirigami.ApplicationWindow {
                 function onChannels_loaded(json) {
                     channelsModel.clear();
                     var arr = JSON.parse(json);
-                    for (var i = 0; i < arr.length; i++)
+                    for (var i = 0; i < arr.length; i++) {
                         channelsModel.append({
                             cid: arr[i].id,
                             label: channelTitle(arr[i]),
-                            unread: arr[i].unread_count || 0
+                            unread: arr[i].unread_count || 0,
+                            kind: arr[i].kind,
+                            archived: arr[i].archived || false
                         });
+                        // Re-sync the open channel's state so a live archive/rename
+                        // updates the composer/header without reselecting.
+                        if (arr[i].id === page.currentChannel) {
+                            page.currentKind = arr[i].kind;
+                            page.currentArchived = arr[i].archived || false;
+                        }
+                    }
+                }
+                function onChannel_deleted(cid) {
+                    if (cid === page.currentChannel) {
+                        page.currentChannel = "";
+                        page.currentKind = "";
+                        page.currentArchived = false;
+                        messagesModel.clear();
+                    }
+                }
+                function onPublic_channels_loaded(json) {
+                    publicModel.clear();
+                    var arr = JSON.parse(json);
+                    for (var i = 0; i < arr.length; i++)
+                        publicModel.append({ cid: arr[i].id, label: arr[i].name || "channel" });
                 }
                 function onHistory_loaded(cid, json) {
                     if (cid !== page.currentChannel)
@@ -279,6 +305,8 @@ Kirigami.ApplicationWindow {
                                 }
                                 onClicked: {
                                     page.currentChannel = model.cid;
+                                    page.currentKind = model.kind;
+                                    page.currentArchived = model.archived;
                                     page.cancelReply(); // a pending reply targets the old channel
                                     messagesModel.clear(); // don't show the old channel while loading
                                     channelsModel.setProperty(index, "unread", 0);
@@ -306,7 +334,32 @@ Kirigami.ApplicationWindow {
                             Controls.Button {
                                 text: "Add member"
                                 icon.name: "contact-new"
+                                visible: page.currentKind === "channel"
                                 onClicked: addMemberSheet.open()
+                            }
+                            Controls.Button {
+                                text: "Settings"
+                                icon.name: "configure"
+                                visible: chat.admin && page.currentKind === "channel"
+                                onClicked: channelMenu.open()
+                                Controls.Menu {
+                                    id: channelMenu
+                                    Controls.MenuItem {
+                                        text: "Rename…"
+                                        onTriggered: {
+                                            renameField.text = "";
+                                            renameDialog.open();
+                                        }
+                                    }
+                                    Controls.MenuItem {
+                                        text: page.currentArchived ? "Unarchive" : "Archive"
+                                        onTriggered: chat.set_archived(page.currentChannel, !page.currentArchived)
+                                    }
+                                    Controls.MenuItem {
+                                        text: "Delete channel"
+                                        onTriggered: deleteChannelDialog.open()
+                                    }
+                                }
                             }
                         }
                     }
@@ -450,13 +503,13 @@ Kirigami.ApplicationWindow {
                         Controls.TextField {
                             id: composer
                             Layout.fillWidth: true
-                            placeholderText: "Message…"
-                            enabled: page.currentChannel !== ""
+                            placeholderText: page.currentArchived ? "This channel is archived" : "Message…"
+                            enabled: page.currentChannel !== "" && !page.currentArchived
                             onAccepted: page.sendMessage()
                         }
                         Controls.Button {
                             text: "Send"
-                            enabled: page.currentChannel !== ""
+                            enabled: page.currentChannel !== "" && !page.currentArchived
                             onClicked: page.sendMessage()
                         }
                     }
@@ -483,17 +536,37 @@ Kirigami.ApplicationWindow {
                         }
                     }
                     Kirigami.Separator { Layout.fillWidth: true }
-                    Controls.Label { text: "New channel (admin only)" }
+                    Controls.Button {
+                        text: "Browse public channels"
+                        onClicked: {
+                            chat.browse_public();
+                            newConvSheet.close();
+                            browseSheet.open();
+                        }
+                    }
+                    Kirigami.Separator { Layout.fillWidth: true; visible: chat.admin }
+                    Controls.Label { text: "New channel (admin only)"; visible: chat.admin }
                     Controls.TextField {
                         id: chanField
                         Layout.fillWidth: true
                         placeholderText: "name"
+                        visible: chat.admin
+                    }
+                    Controls.CheckBox {
+                        id: publicCheck
+                        text: "Public (anyone can join)"
+                        visible: chat.admin
                     }
                     Controls.Button {
                         text: "Create channel"
+                        visible: chat.admin
                         onClicked: {
-                            chat.create_channel(chanField.text);
+                            if (publicCheck.checked)
+                                chat.create_public_channel(chanField.text);
+                            else
+                                chat.create_channel(chanField.text);
                             chanField.text = "";
+                            publicCheck.checked = false;
                             newConvSheet.close();
                         }
                     }
@@ -547,6 +620,58 @@ Kirigami.ApplicationWindow {
                 subtitle: "This can't be undone."
                 standardButtons: Controls.Dialog.Ok | Controls.Dialog.Cancel
                 onAccepted: chat.delete_message(deleteDialog.cid, deleteDialog.mid)
+            }
+
+            Kirigami.PromptDialog {
+                id: renameDialog
+                title: "Rename channel"
+                standardButtons: Controls.Dialog.Ok | Controls.Dialog.Cancel
+                onAccepted: {
+                    if (renameField.text.trim().length > 0)
+                        chat.rename_channel(page.currentChannel, renameField.text);
+                }
+                Controls.TextField {
+                    id: renameField
+                    Layout.fillWidth: true
+                    onAccepted: renameDialog.accept()
+                }
+            }
+
+            Kirigami.PromptDialog {
+                id: deleteChannelDialog
+                title: "Delete channel?"
+                subtitle: "This permanently deletes the channel and its messages."
+                standardButtons: Controls.Dialog.Ok | Controls.Dialog.Cancel
+                onAccepted: chat.delete_channel(page.currentChannel)
+            }
+
+            Kirigami.OverlaySheet {
+                id: browseSheet
+                title: "Public channels"
+                ColumnLayout {
+                    spacing: Kirigami.Units.smallSpacing
+                    Repeater {
+                        model: publicModel
+                        delegate: RowLayout {
+                            required property string cid
+                            required property string label
+                            Layout.fillWidth: true
+                            Controls.Label { text: label; Layout.fillWidth: true }
+                            Controls.Button {
+                                text: "Join"
+                                onClicked: {
+                                    chat.join_channel(cid);
+                                    browseSheet.close();
+                                }
+                            }
+                        }
+                    }
+                    Controls.Label {
+                        text: "No public channels to join."
+                        visible: publicModel.count === 0
+                        opacity: 0.6
+                    }
+                }
             }
         }
     }

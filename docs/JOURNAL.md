@@ -16,6 +16,26 @@ Conventions:
 
 ## 2026-06-19
 
+### P1b channel management + public self-join — both clients (slices B/C), reviewed by Codex/Gemini/Vibe
+
+A channel-settings menu (Rename / Archive·Unarchive / Delete) shown to admins on
+real channels; archived channels disable the composer; `channel.delete` clears the
+open view. Browse-public dialog (self-join) + a "public" toggle on channel create.
+core gained `client.is_admin()`; KDE exposes it as an `admin` qproperty to gate the
+UI (GNOME already had `is_admin`).
+
+Applied review (Codex/Gemini/Vibe):
+- MED (Codex, both clients): archiving the OPEN channel left the composer/header
+  stale until reselect → re-sync current-channel chrome on reload (GNOME
+  `apply_channel_chrome` extracted + called from `refresh_channels`; KDE re-syncs
+  `currentKind`/`currentArchived` in `onChannels_loaded`).
+- Declined (Gemini HIGH ×2): "`Some(&name)` won't compile" and "`AdwAlertDialog`
+  has no `.close()`" — both false; the code builds clean (`&String`→`&str` coerces
+  under the expected type; `AdwDialog::close()` exists in adw 1.5).
+- Declined (Vibe): magic "admin" string + silent create errors — consistent with
+  existing literal / `is_ok` patterns; `select_channel` not-found — selection
+  always maps to a listed channel.
+
 ### P1b channel management + public self-join — server + core (slice A)
 
 One migration (d4e5f6a7b8c9) adds `channels.public` + `archived_at` (features 4 & 5

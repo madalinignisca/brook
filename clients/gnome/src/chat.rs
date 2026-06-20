@@ -47,6 +47,8 @@ struct Chat {
     /// The reply banner shown above the composer while replying.
     reply_bar: gtk::Revealer,
     reply_label: gtk::Label,
+    /// Channel settings menu (rename/archive/delete); shown for managed channels.
+    channel_settings: gtk::MenuButton,
     message_list: gtk::ListBox,
     message_scroll: gtk::ScrolledWindow,
     title: adw::WindowTitle,
@@ -125,6 +127,13 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
         .reveal_child(false)
         .build();
 
+    // Bare button now (popover wired after `chat` exists); shown per channel.
+    let channel_settings = gtk::MenuButton::builder()
+        .icon_name("emblem-system-symbolic")
+        .tooltip_text("Channel settings")
+        .visible(false)
+        .build();
+
     let chat = Rc::new(Chat {
         client,
         runtime,
@@ -138,6 +147,7 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
         replying_to: Rc::new(RefCell::new(None)),
         reply_bar: reply_bar.clone(),
         reply_label: reply_label.clone(),
+        channel_settings: channel_settings.clone(),
         message_list: message_list.clone(),
         message_scroll: message_scroll.clone(),
         title: title.clone(),
@@ -175,6 +185,8 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
         .popover(&add_member_popover(&chat))
         .build();
     content_header.pack_end(&add_member_button);
+    channel_settings.set_popover(Some(&channel_settings_popover(&chat)));
+    content_header.pack_end(&channel_settings);
 
     let composer_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -352,6 +364,22 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                 }) => {
                     apply_reaction(&chat, &message_id, &emoji, &user_id, added, count);
                 }
+                Ok(ServerEvent::ChannelDelete { channel_id }) => {
+                    // If the open channel was deleted, clear the conversation view.
+                    if chat.current.borrow().as_deref() == Some(channel_id.as_str()) {
+                        *chat.current.borrow_mut() = None;
+                        chat.message_rows.borrow_mut().clear();
+                        while let Some(row) = chat.message_list.row_at_index(0) {
+                            chat.message_list.remove(&row);
+                        }
+                        chat.title.set_title("Brook");
+                        chat.title.set_subtitle("Pick a conversation");
+                        chat.composer.set_sensitive(false);
+                        chat.send_button.set_sensitive(false);
+                        chat.channel_settings.set_visible(false);
+                    }
+                    refresh_channels(&chat, None);
+                }
                 Ok(ServerEvent::ChannelUpdate(_)) => {
                     // Added to / removed from a channel, or metadata changed:
                     // reload the sidebar so it reflects the change live.
@@ -391,6 +419,11 @@ fn refresh_channels(chat: &Rc<Chat>, select: Option<String>) {
         }
         *chat.channels.borrow_mut() = channels;
 
+        // Re-apply chrome for the open channel so a live rename/archive shows now.
+        if let Some(current) = chat.current.borrow().clone() {
+            apply_channel_chrome(&chat, &current);
+        }
+
         if let Some(id) = select {
             let idx = chat.channels.borrow().iter().position(|c| c.id == id);
             if let Some(idx) = idx {
@@ -403,19 +436,37 @@ fn refresh_channels(chat: &Rc<Chat>, select: Option<String>) {
 }
 
 /// Load and render a channel's history, and enable the composer.
+/// Apply the title, subtitle, settings-button visibility, and composer
+/// sensitivity for `channel_id` from the current channel list (re-applied on
+/// reload so a live archive/rename of the open channel takes effect immediately).
+fn apply_channel_chrome(chat: &Rc<Chat>, channel_id: &str) {
+    let me = chat.me.borrow().clone().unwrap_or_default();
+    let meta = chat
+        .channels
+        .borrow()
+        .iter()
+        .find(|c| c.id == channel_id)
+        .map(|c| (c.is_dm(), c.archived, c.title(&me)));
+    let Some((is_dm, archived, title)) = meta else {
+        return;
+    };
+    chat.title.set_title(&title);
+    chat.title.set_subtitle(if is_dm {
+        "Direct message"
+    } else if archived {
+        "Channel · archived"
+    } else {
+        "Channel"
+    });
+    chat.channel_settings
+        .set_visible(!is_dm && *chat.is_admin.borrow());
+    chat.composer.set_sensitive(!archived);
+    chat.send_button.set_sensitive(!archived);
+}
+
 fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
     *chat.current.borrow_mut() = Some(channel_id.to_string());
-    let me = chat.me.borrow().clone().unwrap_or_default();
-    if let Some(channel) = chat.channels.borrow().iter().find(|c| c.id == channel_id) {
-        chat.title.set_title(&channel.title(&me));
-        chat.title.set_subtitle(if channel.is_dm() {
-            "Direct message"
-        } else {
-            "Channel"
-        });
-    }
-    chat.composer.set_sensitive(true);
-    chat.send_button.set_sensitive(true);
+    apply_channel_chrome(chat, channel_id);
 
     // Opening a channel reads it: clear its unread badge locally and tell the
     // server. Compute idx in its own statement so the immutable borrow is dropped
@@ -885,6 +936,176 @@ fn delete_message_confirm(chat: &Rc<Chat>, channel_id: String, message_id: Strin
     dialog.present(Some(&chat.message_list));
 }
 
+/// The channel-settings menu: rename / archive / unarchive / delete (on `current`).
+fn channel_settings_popover(chat: &Rc<Chat>) -> gtk::Popover {
+    let menu = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(4)
+        .margin_bottom(4)
+        .margin_start(4)
+        .margin_end(4)
+        .build();
+    let popover = gtk::Popover::builder().build();
+    let rename = gtk::Button::builder()
+        .label("Rename…")
+        .has_frame(false)
+        .build();
+    let archive = gtk::Button::builder()
+        .label("Archive")
+        .has_frame(false)
+        .build();
+    let unarchive = gtk::Button::builder()
+        .label("Unarchive")
+        .has_frame(false)
+        .build();
+    let delete = gtk::Button::builder()
+        .label("Delete channel")
+        .has_frame(false)
+        .css_classes(["error"])
+        .build();
+    menu.append(&rename);
+    menu.append(&archive);
+    menu.append(&unarchive);
+    menu.append(&delete);
+    popover.set_child(Some(&menu));
+
+    rename.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        move |_| {
+            popover.popdown();
+            rename_channel_dialog(&chat);
+        }
+    });
+    archive.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        move |_| {
+            popover.popdown();
+            update_channel_async(&chat, None, Some(true));
+        }
+    });
+    unarchive.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        move |_| {
+            popover.popdown();
+            update_channel_async(&chat, None, Some(false));
+        }
+    });
+    delete.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        move |_| {
+            popover.popdown();
+            delete_channel_confirm(&chat);
+        }
+    });
+    popover
+}
+
+/// PATCH the current channel (rename/archive). The `channel.update` echo refreshes.
+fn update_channel_async(chat: &Rc<Chat>, name: Option<String>, archived: Option<bool>) {
+    let Some(channel_id) = chat.current.borrow().clone() else {
+        return;
+    };
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let result = chat
+            .runtime
+            .spawn({
+                let client = chat.client.clone();
+                async move {
+                    client
+                        .update_channel(&channel_id, name.as_deref(), None, archived)
+                        .await
+                }
+            })
+            .await;
+        if let Ok(Err(err)) = result {
+            tracing::warn!(%err, "failed to update channel");
+        }
+    });
+}
+
+/// Rename dialog, prefilled with the current channel's name.
+fn rename_channel_dialog(chat: &Rc<Chat>) {
+    let Some(channel_id) = chat.current.borrow().clone() else {
+        return;
+    };
+    let me = chat.me.borrow().clone().unwrap_or_default();
+    let current_name = chat
+        .channels
+        .borrow()
+        .iter()
+        .find(|c| c.id == channel_id)
+        .map(|c| c.title(&me))
+        .unwrap_or_default();
+    let entry = gtk::Entry::builder()
+        .text(&current_name)
+        .hexpand(true)
+        .build();
+    let dialog = adw::AlertDialog::builder()
+        .heading("Rename channel")
+        .extra_child(&entry)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("save", "Save");
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("save"));
+    dialog.connect_response(None, {
+        let chat = chat.clone();
+        move |_, response| {
+            if response != "save" {
+                return;
+            }
+            let name = entry.text().to_string();
+            if !name.trim().is_empty() {
+                update_channel_async(&chat, Some(name), None);
+            }
+        }
+    });
+    dialog.present(Some(&chat.message_list));
+}
+
+/// Confirm + delete the current channel (the `channel.delete` echo removes it).
+fn delete_channel_confirm(chat: &Rc<Chat>) {
+    let Some(channel_id) = chat.current.borrow().clone() else {
+        return;
+    };
+    let dialog = adw::AlertDialog::new(
+        Some("Delete channel?"),
+        Some("This permanently deletes the channel and its messages."),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("delete", "Delete");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.connect_response(None, {
+        let chat = chat.clone();
+        move |_, response| {
+            if response != "delete" {
+                return;
+            }
+            let chat = chat.clone();
+            let channel_id = channel_id.clone();
+            glib::spawn_future_local(async move {
+                let result = chat
+                    .runtime
+                    .spawn({
+                        let client = chat.client.clone();
+                        async move { client.delete_channel(&channel_id).await }
+                    })
+                    .await;
+                if let Ok(Err(err)) = result {
+                    tracing::warn!(%err, "failed to delete channel");
+                }
+            });
+        }
+    });
+    dialog.present(Some(&chat.message_list));
+}
+
 /// A sidebar row; returns the row and its (initially-styled) unread badge label.
 fn channel_row(title: &str, is_dm: bool, unread: i64) -> (gtk::ListBoxRow, gtk::Label) {
     let row = gtk::Box::builder()
@@ -994,7 +1215,20 @@ fn new_conversation_popover(chat: &Rc<Chat>) -> gtk::Popover {
     column.append(&dm_entry);
     column.append(&dm_button);
 
+    // Browse + self-join public channels (any user).
+    let browse_button = gtk::Button::with_label("Browse public channels");
+    column.append(&browse_button);
+
     let popover = gtk::Popover::builder().child(&column).build();
+
+    browse_button.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        move |_| {
+            popover.popdown();
+            browse_public_channels(&chat);
+        }
+    });
 
     dm_button.connect_clicked({
         let chat = chat.clone();
@@ -1021,26 +1255,101 @@ fn new_conversation_popover(chat: &Rc<Chat>) -> gtk::Popover {
                 .xalign(0.0)
                 .build(),
         );
+        let public_check = gtk::CheckButton::with_label("Public (anyone can join)");
         column.append(&name_entry);
+        column.append(&public_check);
         column.append(&create_button);
 
         create_button.connect_clicked({
             let chat = chat.clone();
             let name_entry = name_entry.clone();
+            let public_check = public_check.clone();
             let popover = popover.clone();
             move |_| {
                 let name = name_entry.text().trim().to_string();
                 if name.is_empty() {
                     return;
                 }
+                let public = public_check.is_active();
                 name_entry.set_text("");
+                public_check.set_active(false);
                 popover.popdown();
-                create_channel(&chat, name);
+                create_channel(&chat, name, public);
             }
         });
     }
 
     popover
+}
+
+/// Fetch + present the public channels, each with a Join button.
+fn browse_public_channels(chat: &Rc<Chat>) {
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let handle = chat.runtime.spawn({
+            let client = chat.client.clone();
+            async move { client.list_public_channels().await }
+        });
+        let Ok(Ok(channels)) = handle.await else {
+            return;
+        };
+        let list = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .build();
+        let dialog = adw::AlertDialog::builder()
+            .heading("Public channels")
+            .build();
+        if channels.is_empty() {
+            list.append(&gtk::Label::new(Some("No public channels to join.")));
+        }
+        for channel in channels {
+            let row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
+                .build();
+            let name = channel
+                .name
+                .clone()
+                .unwrap_or_else(|| "channel".to_string());
+            row.append(
+                &gtk::Label::builder()
+                    .label(&name)
+                    .hexpand(true)
+                    .xalign(0.0)
+                    .build(),
+            );
+            let join = gtk::Button::with_label("Join");
+            join.connect_clicked({
+                let chat = chat.clone();
+                let dialog = dialog.clone();
+                let channel_id = channel.id.clone();
+                move |btn| {
+                    btn.set_sensitive(false);
+                    join_public(&chat, channel_id.clone());
+                    dialog.close();
+                }
+            });
+            row.append(&join);
+            list.append(&row);
+        }
+        dialog.set_extra_child(Some(&list));
+        dialog.add_response("close", "Close");
+        dialog.present(Some(&chat.message_list));
+    });
+}
+
+fn join_public(chat: &Rc<Chat>, channel_id: String) {
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let handle = chat.runtime.spawn({
+            let client = chat.client.clone();
+            async move { client.join_channel(&channel_id).await }
+        });
+        if let Ok(Ok(channel)) = handle.await {
+            refresh_channels(&chat, Some(channel.id));
+        }
+    });
 }
 
 fn open_dm(chat: &Rc<Chat>, handle: String) {
@@ -1056,12 +1365,18 @@ fn open_dm(chat: &Rc<Chat>, handle: String) {
     });
 }
 
-fn create_channel(chat: &Rc<Chat>, name: String) {
+fn create_channel(chat: &Rc<Chat>, name: String, public: bool) {
     let chat = chat.clone();
     glib::spawn_future_local(async move {
         let join = chat.runtime.spawn({
             let client = chat.client.clone();
-            async move { client.create_channel(&name, None).await }
+            async move {
+                if public {
+                    client.create_public_channel(&name).await
+                } else {
+                    client.create_channel(&name, None).await
+                }
+            }
         });
         if let Ok(Ok(channel)) = join.await {
             refresh_channels(&chat, Some(channel.id));

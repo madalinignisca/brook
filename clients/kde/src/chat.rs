@@ -29,6 +29,7 @@ pub mod qobject {
         #[qobject]
         #[qml_element]
         #[qproperty(QString, my_id)]
+        #[qproperty(bool, admin)]
         type ChatController = super::ChatControllerRust;
 
         /// Resolve identity, load channels, and open the realtime stream.
@@ -50,6 +51,24 @@ pub mod qobject {
         /// Create a channel (server enforces admin), then reload channels.
         #[qinvokable]
         fn create_channel(self: Pin<&mut Self>, name: &QString);
+        /// Create a public (self-joinable) channel, then reload channels.
+        #[qinvokable]
+        fn create_public_channel(self: Pin<&mut Self>, name: &QString);
+        /// Rename a channel (admin/owner); the `channel.update` echo refreshes.
+        #[qinvokable]
+        fn rename_channel(self: Pin<&mut Self>, channel_id: &QString, name: &QString);
+        /// Archive or unarchive a channel (admin/owner).
+        #[qinvokable]
+        fn set_archived(self: Pin<&mut Self>, channel_id: &QString, archived: bool);
+        /// Delete a channel (admin/owner); the `channel.delete` echo removes it.
+        #[qinvokable]
+        fn delete_channel(self: Pin<&mut Self>, channel_id: &QString);
+        /// Fetch public channels (emits `public_channels_loaded`).
+        #[qinvokable]
+        fn browse_public(self: Pin<&mut Self>);
+        /// Self-join a public channel, then reload channels.
+        #[qinvokable]
+        fn join_channel(self: Pin<&mut Self>, channel_id: &QString);
         /// Add a member (by handle) to a channel, then reload channels.
         #[qinvokable]
         fn add_member(self: Pin<&mut Self>, channel_id: &QString, handle: &QString);
@@ -91,6 +110,10 @@ pub mod qobject {
         fn message_deleted(self: Pin<&mut Self>, channel_id: QString, message_id: QString);
         #[qsignal]
         fn reaction_updated(self: Pin<&mut Self>, json: QString);
+        #[qsignal]
+        fn channel_deleted(self: Pin<&mut Self>, channel_id: QString);
+        #[qsignal]
+        fn public_channels_loaded(self: Pin<&mut Self>, json: QString);
     }
 
     impl cxx_qt::Threading for ChatController {}
@@ -99,6 +122,7 @@ pub mod qobject {
 #[derive(Default)]
 pub struct ChatControllerRust {
     my_id: QString,
+    admin: bool,
 }
 
 type Controller = qobject::ChatController;
@@ -120,6 +144,10 @@ impl qobject::ChatController {
                     this.as_mut().set_my_id(QString::from(id.as_str()));
                 });
             }
+            let admin = client.is_admin().await;
+            let _ = qt.queue(move |mut this: Pin<&mut Controller>| {
+                this.as_mut().set_admin(admin);
+            });
             // Subscribe BEFORE connecting so no events fired during connect are missed.
             let mut events = client.events();
             if let Err(err) = client.start_realtime().await {
@@ -172,6 +200,15 @@ impl qobject::ChatController {
                         let _ = qt.queue(move |mut this: Pin<&mut Controller>| {
                             this.as_mut().reaction_updated(QString::from(json.as_str()));
                         });
+                    }
+                    Ok(ServerEvent::ChannelDelete { channel_id }) => {
+                        let cid = channel_id.clone();
+                        let _ = qt.queue(move |mut this: Pin<&mut Controller>| {
+                            this.as_mut().channel_deleted(QString::from(cid.as_str()));
+                        });
+                        let client = client.clone();
+                        let qt = qt.clone();
+                        app::runtime().spawn(async move { emit_channels(&client, &qt).await });
                     }
                     Ok(ServerEvent::ChannelUpdate(_)) => {
                         // Reload the list, but detached — don't block the event loop
@@ -258,6 +295,91 @@ impl qobject::ChatController {
                 return;
             };
             if client.create_channel(&name, None).await.is_ok() {
+                emit_channels(&client, &qt).await;
+            }
+        });
+    }
+
+    fn create_public_channel(self: Pin<&mut Self>, name: &QString) {
+        let qt = self.qt_thread();
+        let name = name.to_string();
+        app::runtime().spawn(async move {
+            let Some(client) = app::client().await else {
+                return;
+            };
+            if client.create_public_channel(&name).await.is_ok() {
+                emit_channels(&client, &qt).await;
+            }
+        });
+    }
+
+    fn rename_channel(self: Pin<&mut Self>, channel_id: &QString, name: &QString) {
+        let channel_id = channel_id.to_string();
+        let name = name.to_string();
+        if name.trim().is_empty() {
+            return;
+        }
+        app::runtime().spawn(async move {
+            if let Some(client) = app::client().await {
+                if let Err(err) = client
+                    .update_channel(&channel_id, Some(&name), None, None)
+                    .await
+                {
+                    tracing::warn!(%err, "rename_channel failed");
+                }
+            }
+        });
+    }
+
+    fn set_archived(self: Pin<&mut Self>, channel_id: &QString, archived: bool) {
+        let channel_id = channel_id.to_string();
+        app::runtime().spawn(async move {
+            if let Some(client) = app::client().await {
+                if let Err(err) = client
+                    .update_channel(&channel_id, None, None, Some(archived))
+                    .await
+                {
+                    tracing::warn!(%err, "set_archived failed");
+                }
+            }
+        });
+    }
+
+    fn delete_channel(self: Pin<&mut Self>, channel_id: &QString) {
+        let channel_id = channel_id.to_string();
+        app::runtime().spawn(async move {
+            if let Some(client) = app::client().await {
+                if let Err(err) = client.delete_channel(&channel_id).await {
+                    tracing::warn!(%err, "delete_channel failed");
+                }
+            }
+        });
+    }
+
+    fn browse_public(self: Pin<&mut Self>) {
+        let qt = self.qt_thread();
+        app::runtime().spawn(async move {
+            let Some(client) = app::client().await else {
+                return;
+            };
+            if let Ok(channels) = client.list_public_channels().await {
+                let json = serde_json::to_string(&channels).unwrap_or_default();
+                let _ = qt.queue(move |mut this: Pin<&mut Controller>| {
+                    this.as_mut()
+                        .public_channels_loaded(QString::from(json.as_str()));
+                });
+            }
+        });
+    }
+
+    fn join_channel(self: Pin<&mut Self>, channel_id: &QString) {
+        let qt = self.qt_thread();
+        let channel_id = channel_id.to_string();
+        app::runtime().spawn(async move {
+            let Some(client) = app::client().await else {
+                return;
+            };
+            if client.join_channel(&channel_id).await.is_ok() {
                 emit_channels(&client, &qt).await;
             }
         });

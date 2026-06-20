@@ -131,6 +131,15 @@ impl BrookClient {
             .map(|s| s.user.id.clone())
     }
 
+    /// Whether the logged-in user is a global admin.
+    pub async fn is_admin(&self) -> bool {
+        self.session
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|s| s.user.global_role == "admin")
+    }
+
     /// Channels and DMs the user belongs to.
     pub async fn list_channels(&self) -> Result<Vec<Channel>> {
         let token = self.access_token().await?;

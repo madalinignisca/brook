@@ -43,14 +43,14 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 | 1:1 DM (find-or-create) | ✅ | P1 | |
 | Group DM (multi-person, unnamed) | ⬜ out | — | **decided out** — use a small private channel instead |
 | Private channel (invite-only) | ✅ | P1 | current default |
-| Public channel (browse + self-join) | ⬜ | P1b | **decided in** — discoverable list + join endpoint |
+| Public channel (browse + self-join) | 🟢 | P1b | `public` flag + `GET /channels/public` + `POST /join`; browse dialog + create toggle in both clients |
 | Channel topic / description | 🟡 | P1 | topic stored; no edit UI |
 | Create channel (admin) | ✅ | P1 | |
 | Add member (invite) | ✅ | P1b | API + UI in both clients + live `channel.update` |
 | Remove member / leave channel | ⬜ | P1b | |
-| Rename channel | ⬜ | P1b | |
-| Archive channel | ⬜ | P1b | preferred over delete (keeps history) |
-| Delete channel | ⬜ | P1b | admin only; we currently can create dupes |
+| Rename channel | 🟢 | P1b | `PATCH /channels/{id}` + `channel.update`; settings menu in both clients |
+| Archive channel | 🟢 | P1b | `archived_at`; read-only + composer disabled; settings menu in both clients |
+| Delete channel | 🟢 | P1b | `DELETE /channels/{id}` (admin/owner) + `channel.delete`; settings menu in both clients |
 | Channel roles (owner / member) | 🟡 | P1 | stored; only used for add-member authz |
 | Default / auto-join channels | ⬜ | P1b | e.g. everyone joins #general |
 
@@ -80,7 +80,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 |---|---|---|---|
 | Presence: online / away / offline | ⬜ | PN | ephemeral (in-memory), `presence.update` event |
 | Typing indicators | ⬜ | PN | `typing` command exists in PROTOCOL |
-| **Live channel updates** (added/removed/renamed/archived) | 🟡 | PN | added + DM-create live via `channel.update`; removed/renamed/archived ⬜ |
+| **Live channel updates** (added/removed/renamed/archived) | 🟢 | PN | added/renamed/archived via `channel.update`; deleted via `channel.delete` |
 | Live membership in a channel | ⬜ | PN | |
 | Reconnect forward-sync (`after=`) of missed messages | 🟡 | PN | WS reconnects; client doesn't yet replay misses |
 
