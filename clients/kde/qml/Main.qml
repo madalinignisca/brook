@@ -310,7 +310,7 @@ Kirigami.ApplicationWindow {
                             Layout.fillWidth: true
                         }
                         Controls.Button {
-                            icon.name: "search"
+                            icon.name: "edit-find"
                             display: Controls.AbstractButton.IconOnly
                             text: "Search messages"
                             onClicked: {
@@ -383,7 +383,7 @@ Kirigami.ApplicationWindow {
                             }
                             Controls.Button {
                                 text: "Settings"
-                                icon.name: "configure"
+                                icon.name: "emblem-system"
                                 visible: chat.admin && page.currentKind === "channel"
                                 onClicked: channelMenu.open()
                                 Controls.Menu {
@@ -502,8 +502,10 @@ Kirigami.ApplicationWindow {
                                         }
                                     }
                                     Controls.ToolButton {
-                                        icon.name: "smiley-add"
-                                        display: Controls.AbstractButton.IconOnly
+                                        text: "🙂 React"
+                                        display: Controls.AbstractButton.TextOnly
+                                        flat: true
+                                        font: Kirigami.Theme.smallFont
                                         onClicked: emojiMenu.open()
                                         Controls.Menu {
                                             id: emojiMenu
@@ -537,7 +539,7 @@ Kirigami.ApplicationWindow {
                             Layout.fillWidth: true
                         }
                         Controls.ToolButton {
-                            icon.name: "dialog-close"
+                            icon.name: "window-close"
                             onClicked: page.cancelReply()
                         }
                     }

@@ -36,6 +36,18 @@ Applied review (Codex/Gemini/Vibe):
   existing literal / `is_ok` patterns; `select_channel` not-found — selection
   always maps to a listed channel.
 
+### Fix — KDE buttons invisible on non-Plasma themes (reactions, search, settings)
+
+User on GNOME: KDE reply/edit/delete worked but **reactions were missing**. Root
+cause: the reaction picker was an `IconOnly` ToolButton with `icon.name:
+"smiley-add"` — a Breeze name absent from Adwaita, so it rendered as a zero-size
+empty button (and with no existing reactions, no chips either). Verified against the
+theme: `smiley-add`, `search`, `configure`, `dialog-close` are all MISSING in
+Adwaita. Fix: the react button is now a visible "🙂 React" text label; the other
+three Breeze-only names swapped to freedesktop-standard ones present in BOTH Breeze
+and Adwaita (`edit-find`, `emblem-system`, `window-close`) — fixing the search,
+channel-settings, and reply-cancel buttons too.
+
 ### P1b message search — both clients (slices B/C), reviewed by Codex/Gemini/Vibe
 
 A search button → a dialog: type a term, get matching messages (channel · author:
