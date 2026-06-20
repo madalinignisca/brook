@@ -478,3 +478,47 @@ async def test_cannot_join_private_channel(client: httpx.AsyncClient) -> None:
     alice, bob = await _two_users(client)
     cid = await _admin_channel(client, alice, public=False)
     assert (await client.post(f"{API}/channels/{cid}/join", headers=_auth(bob))).status_code == 404
+
+
+async def test_search_messages(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    cid, _mid = await _dm_with_message(client, alice, bob)  # "original"
+    await client.post(
+        f"{API}/channels/{cid}/messages", json={"body": "deploy the server"}, headers=_auth(alice)
+    )
+    await client.post(
+        f"{API}/channels/{cid}/messages", json={"body": "unrelated chatter"}, headers=_auth(alice)
+    )
+
+    found = await client.get(f"{API}/channels/search", params={"q": "deploy"}, headers=_auth(bob))
+    assert found.status_code == 200
+    assert [m["body"] for m in found.json()] == ["deploy the server"]
+
+    # case-insensitive
+    assert (
+        await client.get(f"{API}/channels/search", params={"q": "DEPLOY"}, headers=_auth(bob))
+    ).json()[0]["body"] == "deploy the server"
+
+
+async def test_search_scoped_to_membership(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    # a channel bob is NOT in
+    cid = await _admin_channel(client, alice)
+    await client.post(
+        f"{API}/channels/{cid}/messages", json={"body": "secret plans"}, headers=_auth(alice)
+    )
+    # bob can't find it
+    assert (
+        await client.get(f"{API}/channels/search", params={"q": "secret"}, headers=_auth(bob))
+    ).json() == []
+    # alice can
+    assert (
+        len(
+            (
+                await client.get(
+                    f"{API}/channels/search", params={"q": "secret"}, headers=_auth(alice)
+                )
+            ).json()
+        )
+        == 1
+    )

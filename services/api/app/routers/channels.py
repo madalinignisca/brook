@@ -201,6 +201,41 @@ async def list_public_channels(user: CurrentUser, session: Session) -> list[Chan
     return [_channel_out(c, await _members(session, c.id)) for c in channels]
 
 
+@router.get("/search", response_model=list[MessageOut])
+async def search_messages(
+    user: CurrentUser,
+    session: Session,
+    q: Annotated[str, Query(min_length=1, max_length=128)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> list[MessageOut]:
+    """Full-text-ish search of message bodies across the caller's channels.
+
+    Phase 1b uses case-insensitive substring match (ILIKE); Postgres FTS is the P2
+    upgrade. Results are newest-first and scoped to channels the caller belongs to.
+    """
+    # Escape LIKE wildcards in the user's term so they're matched literally.
+    term = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    stmt = (
+        select(Message, User)
+        .outerjoin(User, User.id == Message.author_id)
+        .join(
+            Membership,
+            and_(
+                Membership.channel_id == Message.channel_id,
+                Membership.user_id == user.id,
+            ),
+        )
+        .where(
+            Message.deleted_at.is_(None),
+            Message.body.ilike(f"%{term}%", escape="\\"),
+        )
+        .order_by(Message.id.desc())
+        .limit(limit)
+    )
+    rows = (await session.execute(stmt)).all()
+    return [_message_out(m, author) for m, author in rows]
+
+
 @router.post("", response_model=ChannelOut, status_code=status.HTTP_201_CREATED)
 async def create_channel(
     body: ChannelCreate, user: CurrentUser, session: Session, hub: HubDep

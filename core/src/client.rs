@@ -199,6 +199,15 @@ impl BrookClient {
         self.parse(resp).await
     }
 
+    /// Search message bodies across the user's channels (newest first).
+    pub async fn search_messages(&self, query: &str) -> Result<Vec<Message>> {
+        let token = self.access_token().await?;
+        let mut url = self.base.join("api/v1/channels/search")?;
+        url.query_pairs_mut().append_pair("q", query);
+        let resp = self.http.get(url).bearer_auth(token).send().await?;
+        self.parse(resp).await
+    }
+
     /// Self-join a public channel.
     pub async fn join_channel(&self, channel_id: &str) -> Result<Channel> {
         let token = self.access_token().await?;

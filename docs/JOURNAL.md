@@ -36,6 +36,15 @@ Applied review (Codex/Gemini/Vibe):
   existing literal / `is_ok` patterns; `select_channel` not-found — selection
   always maps to a listed channel.
 
+### P1b message search — server + core (slice A)
+
+`GET /channels/search?q=` searches message bodies across the caller's channels
+(case-insensitive ILIKE, LIKE wildcards in the term escaped; non-deleted;
+newest-first; membership-scoped via a join). Postgres FTS is the noted P2 upgrade.
+core: `client.search_messages(q) -> Vec<Message>`. Tests: finds matches
+case-insensitively; results scoped to membership (a non-member can't find a private
+channel's messages). 48 server + 9 core. Client search UI follows.
+
 ### P1b channel management + public self-join — server + core (slice A)
 
 One migration (d4e5f6a7b8c9) adds `channels.public` + `archived_at` (features 4 & 5
