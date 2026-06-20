@@ -16,6 +16,7 @@ serde_json = "1"
 tracing = { workspace = true }
 tracing-subscriber = "0.3"
 notify-rust = "4"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 
 [build-dependencies]
 cxx-qt-build = { version = "0.8", features = ["link_qt_object_files"] }

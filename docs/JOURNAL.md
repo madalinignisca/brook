@@ -14,6 +14,31 @@ Conventions:
 
 ---
 
+## 2026-06-20
+
+### Markdown & code blocks — both clients, reviewed by Codex/Gemini/Vibe
+
+Render-only markdown (bold/italic/inline-code/code-block/link/strikethrough) — no
+server/core change (body stays raw text). GNOME: `pulldown-cmark` → Pango markup
+(text escaped, raw HTML dropped); KDE: a `render_markdown` invokable converts to a
+**safe HTML subset** (raw HTML + images dropped) rendered via `Text.RichText` —
+parity with GNOME rather than Qt's `Text.MarkdownText` (which would pass through raw
+HTML). Links open externally.
+
+Applied three-model review (Codex/Gemini/Vibe — strong consensus on link safety):
+- HIGH (Gemini ×2, Vibe ×2, Codex MED): link clicks ran arbitrary URI schemes
+  (`file:`, `smb:`, `javascript:`) → allowlist `http`/`https`/`mailto` on both.
+- MED (Codex): KDE `Text.MarkdownText` rendered untrusted raw HTML/images → render
+  a sanitized HTML subset in Rust (drop HTML + images) instead.
+- LOW (Codex): GNOME's `pango::parse_markup` guard rejected `<a href>` (a GTK-label
+  extension, not core Pango), so every link fell back to plain text → removed it.
+- MED (Gemini): paragraph newline-at-start broke list items → newline at paragraph
+  *end*. Declined: "markdown is a breaking change" (rendering only; protocol
+  unchanged — noted here); strip `.trim()` (markdown normalizes whitespace).
+
+Note: rendering is a client display change only — `message.body` is still stored
+and transmitted as raw text. Image-proxy/remote-resource hardening is a P2 item.
+
 ## 2026-06-19
 
 ### P1b channel management + public self-join — both clients (slices B/C), reviewed by Codex/Gemini/Vibe

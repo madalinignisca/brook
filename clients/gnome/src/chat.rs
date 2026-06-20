@@ -349,7 +349,7 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     // Update the row in place if the edited message is on screen.
                     let widgets = chat.message_rows.borrow().get(&message.id).cloned();
                     if let Some(widgets) = widgets {
-                        widgets.body.set_label(&message.body);
+                        widgets.body.set_markup(&markdown_to_pango(&message.body));
                         widgets.edited.set_visible(true);
                     }
                 }
@@ -550,6 +550,53 @@ fn send_current(chat: &Rc<Chat>) {
     });
 }
 
+/// Convert a markdown message body to Pango markup (bold / italic / inline code /
+/// code block / link / strikethrough). Text is escaped; raw HTML is dropped.
+fn markdown_to_pango(text: &str) -> String {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    let mut out = String::new();
+    for event in Parser::new_ext(text, options) {
+        match event {
+            Event::Start(Tag::Strong) => out.push_str("<b>"),
+            Event::Start(Tag::Emphasis) => out.push_str("<i>"),
+            Event::Start(Tag::Strikethrough) => out.push_str("<s>"),
+            Event::Start(Tag::CodeBlock(_)) => out.push_str("<tt>"),
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                out.push_str("<a href=\"");
+                out.push_str(glib::markup_escape_text(&dest_url).as_str());
+                out.push_str("\">");
+            }
+            Event::Start(Tag::Item) => out.push_str("\u{2022} "),
+            Event::End(TagEnd::Strong) => out.push_str("</b>"),
+            Event::End(TagEnd::Emphasis) => out.push_str("</i>"),
+            Event::End(TagEnd::Strikethrough) => out.push_str("</s>"),
+            Event::End(TagEnd::CodeBlock) => out.push_str("</tt>"),
+            Event::End(TagEnd::Link) => out.push_str("</a>"),
+            // Blank line between paragraphs; newline after each list item.
+            Event::End(TagEnd::Paragraph) => out.push_str("\n\n"),
+            Event::End(TagEnd::Item) => out.push('\n'),
+            Event::Text(t) => out.push_str(glib::markup_escape_text(&t).as_str()),
+            Event::Code(t) => {
+                out.push_str("<tt>");
+                out.push_str(glib::markup_escape_text(&t).as_str());
+                out.push_str("</tt>");
+            }
+            Event::SoftBreak | Event::HardBreak => out.push('\n'),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Whether a link URI is safe to hand to the system opener (no `file:`, `smb:`,
+/// `javascript:`, etc. — only web + mail).
+fn is_safe_link(uri: &str) -> bool {
+    let lower = uri.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")
+}
+
 /// Append a message row and scroll to the bottom.
 fn append_message(chat: &Rc<Chat>, message: &Message) {
     let author = message
@@ -594,11 +641,21 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
     header.append(&message_actions_button(chat, message, is_own));
 
     let body_label = gtk::Label::builder()
-        .label(&message.body)
+        .label(markdown_to_pango(&message.body))
+        .use_markup(true)
         .xalign(0.0)
         .wrap(true)
         .selectable(true)
         .build();
+    body_label.connect_activate_link(|_, uri| {
+        if is_safe_link(uri) {
+            let _ =
+                gtk::gio::AppInfo::launch_default_for_uri(uri, gtk::gio::AppLaunchContext::NONE);
+        } else {
+            tracing::warn!(%uri, "refusing to open link with an unsafe scheme");
+        }
+        glib::Propagation::Stop
+    });
     row.append(&header);
     // Quoted-reply preview above the body, if this message is a reply.
     if let Some(reply) = &message.reply_to {

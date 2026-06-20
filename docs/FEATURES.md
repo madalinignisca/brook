@@ -62,8 +62,8 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 | History pagination (`before`) | ✅ | P1 | `after`/forward-sync ⬜ |
 | Edit message | 🟢 | P1b | `PATCH /messages/{id}` (author-only) + `message.update`; UI in both clients |
 | Delete message (soft) | 🟢 | P1b | `DELETE /messages/{id}` (author/admin) + `message.delete`; UI in both clients |
-| Markdown formatting (bold/italic/code/links) | ⬜ | P1b | render + compose; keep minimal |
-| Code blocks | ⬜ | P1b | |
+| Markdown formatting (bold/italic/code/links) | 🟢 | P1b | render: GNOME pulldown-cmark→Pango, KDE `Text.MarkdownText`; clickable links |
+| Code blocks | 🟢 | P1b | rendered (monospace/block) in both clients |
 | Mentions (@user, @channel, @here) | ⬜ | PN | drives notifications |
 | Emoji reactions | 🟢 | P1b | `reactions` table + toggle endpoint; chips + quick-react picker in both clients, live via `reaction.update` |
 | Quote-reply (inline, no thread panes) | 🟢 | P1b | `reply_to_id` + resolved excerpt; Reply action, composer banner, inline quote in both clients |

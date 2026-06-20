@@ -134,6 +134,7 @@ Kirigami.ApplicationWindow {
                     authorId: m.author_id,
                     author: m.author_display_name || m.author_handle || "Unknown",
                     body: m.body,
+                    bodyHtml: chat.render_markdown(m.body),
                     edited: m.edited_at ? true : false,
                     replyAuthor: m.reply_to ? (m.reply_to.author_display_name || m.reply_to.author_handle || "Unknown") : "",
                     replyBody: m.reply_to ? m.reply_to.body : "",
@@ -270,6 +271,7 @@ Kirigami.ApplicationWindow {
                     for (var i = 0; i < messagesModel.count; i++) {
                         if (messagesModel.get(i).mid === m.id) {
                             messagesModel.setProperty(i, "body", m.body);
+                            messagesModel.setProperty(i, "bodyHtml", chat.render_markdown(m.body));
                             messagesModel.setProperty(i, "edited", true);
                             break;
                         }
@@ -480,8 +482,14 @@ Kirigami.ApplicationWindow {
                                     Layout.rightMargin: Kirigami.Units.largeSpacing
                                 }
                                 Controls.Label {
-                                    text: model.body
+                                    text: model.bodyHtml
+                                    textFormat: Text.RichText
                                     wrapMode: Text.WordWrap
+                                    // Only open web + mail links (no file:, smb:, …).
+                                    onLinkActivated: (link) => {
+                                        if (/^(https?:|mailto:)/i.test(link))
+                                            Qt.openUrlExternally(link);
+                                    }
                                     Layout.fillWidth: true
                                     Layout.leftMargin: Kirigami.Units.largeSpacing
                                     Layout.rightMargin: Kirigami.Units.largeSpacing

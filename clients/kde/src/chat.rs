@@ -72,6 +72,9 @@ pub mod qobject {
         /// Search message bodies (emits `search_results_loaded`).
         #[qinvokable]
         fn search(self: Pin<&mut Self>, query: &QString);
+        /// Render a markdown body to safe HTML (drops raw HTML + images) for display.
+        #[qinvokable]
+        fn render_markdown(self: Pin<&mut Self>, text: &QString) -> QString;
         /// Add a member (by handle) to a channel, then reload channels.
         #[qinvokable]
         fn add_member(self: Pin<&mut Self>, channel_id: &QString, handle: &QString);
@@ -390,6 +393,10 @@ impl qobject::ChatController {
         });
     }
 
+    fn render_markdown(self: Pin<&mut Self>, text: &QString) -> QString {
+        QString::from(markdown_to_html(&text.to_string()).as_str())
+    }
+
     fn search(self: Pin<&mut Self>, query: &QString) {
         let qt = self.qt_thread();
         let query = query.to_string();
@@ -516,6 +523,27 @@ fn show_notification(summary: String, body: String) {
             tracing::warn!(%err, "desktop notification failed");
         }
     });
+}
+
+/// Render a markdown body to a safe HTML subset for Qt `Text.RichText`. Raw HTML
+/// and images are dropped (untrusted bodies can't inject markup or load remote
+/// resources); an image's alt text is kept.
+fn markdown_to_html(text: &str) -> String {
+    use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    let events = Parser::new_ext(text, options).filter(|event| {
+        !matches!(
+            event,
+            Event::Html(_)
+                | Event::InlineHtml(_)
+                | Event::Start(Tag::Image { .. })
+                | Event::End(TagEnd::Image)
+        )
+    });
+    let mut out = String::new();
+    html::push_html(&mut out, events);
+    out
 }
 
 /// Fetch channels and emit them as JSON on the Qt thread.
