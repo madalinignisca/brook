@@ -529,21 +529,87 @@ fn show_notification(summary: String, body: String) {
 /// and images are dropped (untrusted bodies can't inject markup or load remote
 /// resources); an image's alt text is kept.
 fn markdown_to_html(text: &str) -> String {
-    use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
-    let events = Parser::new_ext(text, options).filter(|event| {
-        !matches!(
-            event,
-            Event::Html(_)
-                | Event::InlineHtml(_)
-                | Event::Start(Tag::Image { .. })
-                | Event::End(TagEnd::Image)
-        )
-    });
     let mut out = String::new();
-    html::push_html(&mut out, events);
-    out
+    let mut in_code = false;
+    for event in Parser::new_ext(text, options) {
+        match event {
+            Event::Start(Tag::Strong) => out.push_str("<b>"),
+            Event::End(TagEnd::Strong) => out.push_str("</b>"),
+            Event::Start(Tag::Emphasis) => out.push_str("<i>"),
+            Event::End(TagEnd::Emphasis) => out.push_str("</i>"),
+            Event::Start(Tag::Strikethrough) => out.push_str("<s>"),
+            Event::End(TagEnd::Strikethrough) => out.push_str("</s>"),
+            Event::Start(Tag::CodeBlock(_)) => {
+                in_code = true;
+                out.push_str("<pre>");
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                in_code = false;
+                out.push_str("</pre>");
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                out.push_str("<a href=\"");
+                out.push_str(&html_escape(&dest_url));
+                out.push_str("\">");
+            }
+            Event::End(TagEnd::Link) => out.push_str("</a>"),
+            Event::Start(Tag::Item) => out.push_str("\u{2022} "),
+            Event::End(TagEnd::Item) => out.push_str("<br>"),
+            Event::End(TagEnd::Paragraph) => out.push_str("<br><br>"),
+            Event::Code(t) => {
+                out.push_str("<code>");
+                out.push_str(&html_escape(&t));
+                out.push_str("</code>");
+            }
+            Event::Text(t) if in_code => out.push_str(&html_escape(&t)),
+            Event::Text(t) => push_html_with_mentions(&mut out, &t),
+            Event::SoftBreak | Event::HardBreak => out.push_str("<br>"),
+            // Raw HTML and images are dropped (they don't match any arm).
+            _ => {}
+        }
+    }
+    out.trim_end_matches("<br>").to_string()
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Push text, escaping plain runs and wrapping `@mention` tokens in a styled span.
+fn push_html_with_mentions(out: &mut String, text: &str) {
+    let chars: Vec<char> = text.chars().collect();
+    // Handles may contain '.'/'-'; the highlight is cosmetic (server resolves
+    // notifications precisely), so we don't trim trailing punctuation.
+    let is_word = |c: char| c.is_alphanumeric() || c == '_' || c == '.' || c == '-';
+    let mut i = 0;
+    let mut plain_start = 0;
+    while i < chars.len() {
+        let boundary = i == 0 || !(is_word(chars[i - 1]) || chars[i - 1] == '@');
+        if chars[i] == '@' && boundary && chars.get(i + 1).is_some_and(|c| is_word(*c)) {
+            let plain: String = chars[plain_start..i].iter().collect();
+            out.push_str(&html_escape(&plain));
+            let start = i;
+            i += 1;
+            while i < chars.len() && is_word(chars[i]) {
+                i += 1;
+            }
+            let token: String = chars[start..i].iter().collect();
+            out.push_str("<span style=\"color:#3584e4;font-weight:bold\">");
+            out.push_str(&html_escape(&token));
+            out.push_str("</span>");
+            plain_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    let plain: String = chars[plain_start..].iter().collect();
+    out.push_str(&html_escape(&plain));
 }
 
 /// Fetch channels and emit them as JSON on the Qt thread.

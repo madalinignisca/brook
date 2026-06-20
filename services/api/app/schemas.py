@@ -159,3 +159,7 @@ class MessageOut(BaseModel):
     reply_to_id: uuid.UUID | None = None
     reply_to: ReplyExcerpt | None = None
     reactions: list[ReactionSummary] = Field(default_factory=list)
+    # Specific @handle mentions resolved to member ids (set only on the live send).
+    mentions: list[uuid.UUID] = Field(default_factory=list)
+    # True when @channel / @here mentioned everyone (avoids listing all member ids).
+    mention_everyone: bool = False

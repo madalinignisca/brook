@@ -64,7 +64,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 | Delete message (soft) | 🟢 | P1b | `DELETE /messages/{id}` (author/admin) + `message.delete`; UI in both clients |
 | Markdown formatting (bold/italic/code/links) | 🟢 | P1b | render: GNOME pulldown-cmark→Pango, KDE `Text.MarkdownText`; clickable links |
 | Code blocks | 🟢 | P1b | rendered (monospace/block) in both clients |
-| Mentions (@user, @channel, @here) | ⬜ | PN | drives notifications |
+| Mentions (@user, @channel, @here) | 🟢 | PN | server-resolved `MessageOut.mentions`; @name highlighted + 'mentioned you' notification (both clients). Mention badge counts ⬜ |
 | Emoji reactions | 🟢 | P1b | `reactions` table + toggle endpoint; chips + quick-react picker in both clients, live via `reaction.update` |
 | Quote-reply (inline, no thread panes) | 🟢 | P1b | `reply_to_id` + resolved excerpt; Reply action, composer banner, inline quote in both clients |
 | Pinned messages | ⬜ | P1b | |

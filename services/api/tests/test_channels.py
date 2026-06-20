@@ -522,3 +522,83 @@ async def test_search_scoped_to_membership(client: httpx.AsyncClient) -> None:
         )
         == 1
     )
+
+
+async def test_mentions_resolved(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    chan = (
+        await client.post(
+            f"{API}/channels", json={"kind": "channel", "name": "general"}, headers=_auth(alice)
+        )
+    ).json()
+    cid = chan["id"]
+    await client.post(f"{API}/channels/{cid}/members", json={"handle": "bob"}, headers=_auth(alice))
+
+    # @bob resolves to bob's id; @nobody is ignored
+    msg = (
+        await client.post(
+            f"{API}/channels/{cid}/messages",
+            json={"body": "hey @bob and @nobody, ping"},
+            headers=_auth(alice),
+        )
+    ).json()
+    members = (await client.get(f"{API}/channels", headers=_auth(bob))).json()[0]["members"]
+    bob_uid = next(m["id"] for m in members if m["handle"] == "bob")
+    assert msg["mentions"] == [bob_uid]
+    assert msg["mention_everyone"] is False
+
+    # @channel sets the everyone flag (rather than listing all member ids)
+    everyone = (
+        await client.post(
+            f"{API}/channels/{cid}/messages",
+            json={"body": "@channel standup now"},
+            headers=_auth(alice),
+        )
+    ).json()
+    assert everyone["mention_everyone"] is True
+    assert everyone["mentions"] == []
+
+
+async def test_email_is_not_a_mention(client: httpx.AsyncClient) -> None:
+    alice, bob = await _two_users(client)
+    dm = (
+        await client.post(
+            f"{API}/channels", json={"kind": "dm", "member": "bob"}, headers=_auth(alice)
+        )
+    ).json()
+    msg = (
+        await client.post(
+            f"{API}/channels/{dm['id']}/messages",
+            json={"body": "mail me at alice@bob.example"},
+            headers=_auth(alice),
+        )
+    ).json()
+    assert msg["mentions"] == []
+
+
+async def test_mention_handle_with_punctuation(client: httpx.AsyncClient) -> None:
+    alice, _bob = await _two_users(client)
+    await _register(client, "jane-doe", headers=_auth(alice))
+    await _register(client, "a.b", headers=_auth(alice))
+    chan = (
+        await client.post(
+            f"{API}/channels", json={"kind": "channel", "name": "general"}, headers=_auth(alice)
+        )
+    ).json()
+    cid = chan["id"]
+    for h in ("jane-doe", "a.b"):
+        await client.post(f"{API}/channels/{cid}/members", json={"handle": h}, headers=_auth(alice))
+
+    members = {
+        m["handle"]: m["id"]
+        for m in (await client.get(f"{API}/channels", headers=_auth(alice))).json()[0]["members"]
+    }
+    # trailing punctuation (the comma + period) is not part of the handle
+    msg = (
+        await client.post(
+            f"{API}/channels/{cid}/messages",
+            json={"body": "ping @jane-doe, and @a.b."},
+            headers=_auth(alice),
+        )
+    ).json()
+    assert set(msg["mentions"]) == {members["jane-doe"], members["a.b"]}

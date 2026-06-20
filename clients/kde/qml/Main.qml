@@ -260,7 +260,8 @@ Kirigami.ApplicationWindow {
                         // it's someone else (don't notify our own messages).
                         if (chat.my_id && m.author_id !== chat.my_id) {
                             var who = m.author_display_name || m.author_handle || "Someone";
-                            chat.notify(label, who + ": " + m.body);
+                            var mentioned = m.mention_everyone || (m.mentions || []).indexOf(chat.my_id) >= 0;
+                            chat.notify(label, mentioned ? (who + " mentioned you: " + m.body) : (who + ": " + m.body));
                         }
                     }
                 }

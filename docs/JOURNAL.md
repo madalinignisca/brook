@@ -16,6 +16,29 @@ Conventions:
 
 ## 2026-06-20
 
+### PN @mentions (slice A) — both clients, reviewed by Codex/Gemini/Vibe
+
+@handle / @channel / @here. Server resolves mentions **only on the live send**
+(`message.new`) — `MessageOut.mentions` = specific member ids, `mention_everyone` =
+@channel/@here flag. Clients: highlight `@name` in blue-bold (outside code spans),
+and a distinct "X mentioned you" notification when `mention_everyone || you ∈ mentions`.
+51 server + 9 core tests.
+
+Applied review (Codex/Gemini/Vibe — several architectural catches):
+- HIGH (Gemini): resolving mentions per **history** read mis-resolves against
+  today's membership + is N+1 → make mentions **send-only** (history/edit/search
+  don't recompute; clients highlight from the body text anyway). Removed code.
+- HIGH (Gemini): `@channel` expanding to all member ids = huge payload → a
+  `mention_everyone` bool instead.
+- MED (Codex): handles are case-sensitive-unique → match `@handle` case-sensitively
+  (keep `@channel`/`@here` case-insensitive) so `Alice`/`alice` can't cross-notify.
+- MED (Codex/Vibe): `\w+` missed `.`/`-` handles (`@jane-doe`) → handle-charset
+  regex (excludes trailing punctuation) + widened client highlighters.
+- Declined: KDE "missing headings/blockquotes/lists" — the custom safe-HTML emitter
+  now matches GNOME's same subset (parity is the goal; text still renders). Deferred
+  (LOW): `@` inside a code block still notifies server-side; Unicode handles (handles
+  are ASCII-only).
+
 ### Markdown & code blocks — both clients, reviewed by Codex/Gemini/Vibe
 
 Render-only markdown (bold/italic/inline-code/code-block/link/strikethrough) — no

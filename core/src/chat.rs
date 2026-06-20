@@ -93,6 +93,12 @@ pub struct Message {
     /// Emoji reaction tallies on this message (with the caller's `me` flag).
     #[serde(default)]
     pub reactions: Vec<ReactionSummary>,
+    /// Specific user ids mentioned (resolved server-side on send).
+    #[serde(default)]
+    pub mentions: Vec<String>,
+    /// True when `@channel`/`@here` mentioned everyone in the channel.
+    #[serde(default)]
+    pub mention_everyone: bool,
 }
 
 /// An emoji's reaction tally on a message, plus whether the caller reacted.

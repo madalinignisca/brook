@@ -7,6 +7,7 @@ paginated by the time-sortable message id (`before=`/`after=`).
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from typing import Annotated, Any
@@ -38,6 +39,10 @@ from ..schemas import (
 
 # Quoted-reply previews are truncated to this many characters.
 _REPLY_EXCERPT_LEN = 140
+
+# An @mention token: @ at a boundary, then a handle (the registration charset, not
+# ending in punctuation) or @channel / @here.
+_MENTION_RE = re.compile(r"(?<![\w@.-])@([A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?)")
 
 router = APIRouter(prefix="/channels", tags=["channels"])
 
@@ -437,6 +442,8 @@ async def history(
     messages = [m for m, _ in rows]
     excerpts = await _reply_excerpts(session, messages)
     reactions = await _reactions_for(session, [m.id for m in messages], user.id)
+    # Mentions are resolved only on the live send (they drive notifications); not
+    # recomputed per history read (that would mis-resolve against today's membership).
     return [
         _message_out(m, author, excerpts.get(m.reply_to_id), reactions.get(m.id))
         for m, author in rows
@@ -485,8 +492,10 @@ async def send_message(
     await session.commit()
     await session.refresh(message)
 
-    out = _message_out(message, user, reply)
-    member_ids = [m.id for m in await _members(session, channel_id)]
+    members = await _members(session, channel_id)
+    mentions, everyone = _mentions_in(message.body, members)
+    out = _message_out(message, user, reply, mentions=mentions, mention_everyone=everyone)
+    member_ids = [m.id for m in members]
     await hub.send_to_users(member_ids, _envelope("message.new", jsonable_encoder(out)))
     return out
 
@@ -528,6 +537,7 @@ async def edit_message(
             reply = _excerpt(quoted, await session.get(User, quoted.author_id))
     reactions = (await _reactions_for(session, [message_id], user.id)).get(message_id, [])
 
+    # Edits don't re-resolve/re-notify mentions (mentions fire on the original send).
     out = _message_out(message, user, reply, reactions)
     member_ids = [m.id for m in await _members(session, channel_id)]
     await hub.send_to_users(member_ids, _envelope("message.update", jsonable_encoder(out)))
@@ -646,11 +656,28 @@ async def mark_read(
         await session.commit()
 
 
+def _mentions_in(body: str, members: list[User]) -> tuple[list[uuid.UUID], bool]:
+    """Resolve a body's mentions to (specific member ids, everyone?).
+
+    `@handle` is matched case-sensitively (handles are case-sensitive-unique);
+    `@channel`/`@here` set the everyone flag rather than listing all member ids.
+    """
+    tokens = {m.group(1) for m in _MENTION_RE.finditer(body)}
+    if not tokens:
+        return [], False
+    everyone = bool({"channel", "here"} & {t.lower() for t in tokens})
+    by_handle = {m.handle: m.id for m in members}
+    specific = [by_handle[t] for t in tokens if t in by_handle]
+    return specific, everyone
+
+
 def _message_out(
     message: Message,
     author: User | None,
     reply: ReplyExcerpt | None = None,
     reactions: list[ReactionSummary] | None = None,
+    mentions: list[uuid.UUID] | None = None,
+    mention_everyone: bool = False,
 ) -> MessageOut:
     return MessageOut(
         id=message.id,
@@ -664,6 +691,8 @@ def _message_out(
         reply_to_id=message.reply_to_id,
         reply_to=reply,
         reactions=reactions or [],
+        mentions=mentions or [],
+        mention_everyone=mention_everyone,
     )
 
 

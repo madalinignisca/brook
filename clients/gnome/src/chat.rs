@@ -337,11 +337,14 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                                 .find(|c| c.id == message.channel_id)
                                 .map(|c| c.title(&me))
                                 .unwrap_or_else(|| "Brook".to_string());
-                            notify(
-                                &message.channel_id,
-                                &title,
-                                &format!("{author}: {}", message.body),
-                            );
+                            let mentioned =
+                                message.mention_everyone || message.mentions.contains(&me);
+                            let body = if mentioned {
+                                format!("{author} mentioned you: {}", message.body)
+                            } else {
+                                format!("{author}: {}", message.body)
+                            };
+                            notify(&message.channel_id, &title, &body);
                         }
                     }
                 }
@@ -557,12 +560,16 @@ fn markdown_to_pango(text: &str) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     let mut out = String::new();
+    let mut in_code = false;
     for event in Parser::new_ext(text, options) {
         match event {
             Event::Start(Tag::Strong) => out.push_str("<b>"),
             Event::Start(Tag::Emphasis) => out.push_str("<i>"),
             Event::Start(Tag::Strikethrough) => out.push_str("<s>"),
-            Event::Start(Tag::CodeBlock(_)) => out.push_str("<tt>"),
+            Event::Start(Tag::CodeBlock(_)) => {
+                in_code = true;
+                out.push_str("<tt>");
+            }
             Event::Start(Tag::Link { dest_url, .. }) => {
                 out.push_str("<a href=\"");
                 out.push_str(glib::markup_escape_text(&dest_url).as_str());
@@ -572,12 +579,22 @@ fn markdown_to_pango(text: &str) -> String {
             Event::End(TagEnd::Strong) => out.push_str("</b>"),
             Event::End(TagEnd::Emphasis) => out.push_str("</i>"),
             Event::End(TagEnd::Strikethrough) => out.push_str("</s>"),
-            Event::End(TagEnd::CodeBlock) => out.push_str("</tt>"),
+            Event::End(TagEnd::CodeBlock) => {
+                in_code = false;
+                out.push_str("</tt>");
+            }
             Event::End(TagEnd::Link) => out.push_str("</a>"),
             // Blank line between paragraphs; newline after each list item.
             Event::End(TagEnd::Paragraph) => out.push_str("\n\n"),
             Event::End(TagEnd::Item) => out.push('\n'),
-            Event::Text(t) => out.push_str(glib::markup_escape_text(&t).as_str()),
+            Event::Text(t) if in_code => out.push_str(glib::markup_escape_text(&t).as_str()),
+            // Highlight @mentions in normal text (not inside code).
+            Event::Text(t) => push_with_mentions(&mut out, &t, |m| {
+                format!(
+                    "<span foreground=\"#3584e4\" weight=\"bold\">{}</span>",
+                    glib::markup_escape_text(m)
+                )
+            }),
             Event::Code(t) => {
                 out.push_str("<tt>");
                 out.push_str(glib::markup_escape_text(&t).as_str());
@@ -588,6 +605,36 @@ fn markdown_to_pango(text: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// Push `text` into `out`, escaping plain runs and wrapping `@mention` tokens with
+/// `wrap` (which receives the raw token and returns escaped, marked-up output).
+fn push_with_mentions(out: &mut String, text: &str, wrap: impl Fn(&str) -> String) {
+    let chars: Vec<char> = text.chars().collect();
+    // Handles may contain '.'/'-'; highlight is cosmetic so we don't trim trailing
+    // punctuation (the server resolves notifications precisely).
+    let is_word = |c: char| c.is_alphanumeric() || c == '_' || c == '.' || c == '-';
+    let mut i = 0;
+    let mut plain_start = 0;
+    while i < chars.len() {
+        let boundary = i == 0 || !(is_word(chars[i - 1]) || chars[i - 1] == '@');
+        if chars[i] == '@' && boundary && chars.get(i + 1).is_some_and(|c| is_word(*c)) {
+            let plain: String = chars[plain_start..i].iter().collect();
+            out.push_str(glib::markup_escape_text(&plain).as_str());
+            let start = i;
+            i += 1;
+            while i < chars.len() && is_word(chars[i]) {
+                i += 1;
+            }
+            let token: String = chars[start..i].iter().collect();
+            out.push_str(&wrap(&token));
+            plain_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    let plain: String = chars[plain_start..].iter().collect();
+    out.push_str(glib::markup_escape_text(&plain).as_str());
 }
 
 /// Whether a link URI is safe to hand to the system opener (no `file:`, `smb:`,
