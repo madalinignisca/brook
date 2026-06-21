@@ -8,6 +8,7 @@ paginated by the time-sortable message id (`before=`/`after=`).
 from __future__ import annotations
 
 import re
+import time
 import uuid
 from datetime import datetime
 from typing import Annotated, Any
@@ -43,6 +44,27 @@ _REPLY_EXCERPT_LEN = 140
 # An @mention token: @ at a boundary, then a handle (the registration charset, not
 # ending in punctuation) or @channel / @here.
 _MENTION_RE = re.compile(r"(?<![\w@.-])@([A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?)")
+
+# Server-side typing throttle: ignore a (user, channel)'s typing signal if it
+# fired within this window, so a client can't bypass its debounce and spam fan-out.
+_TYPING_THROTTLE_SECONDS = 2.0
+_typing_last: dict[tuple[uuid.UUID, uuid.UUID], float] = {}
+
+
+def _typing_allowed(user_id: uuid.UUID, channel_id: uuid.UUID) -> bool:
+    now = time.monotonic()
+    key = (user_id, channel_id)
+    last = _typing_last.get(key)
+    if last is not None and now - last < _TYPING_THROTTLE_SECONDS:
+        return False
+    _typing_last[key] = now
+    # Opportunistic cleanup so the map can't grow without bound.
+    if len(_typing_last) > 10_000:
+        cutoff = now - 60.0
+        for stale in [k for k, t in _typing_last.items() if t < cutoff]:
+            del _typing_last[stale]
+    return True
+
 
 router = APIRouter(prefix="/channels", tags=["channels"])
 
@@ -565,6 +587,28 @@ async def delete_message(
     await hub.send_to_users(
         member_ids,
         _envelope("message.delete", {"id": str(message_id), "channel_id": str(channel_id)}),
+    )
+
+
+@router.post("/{channel_id}/typing", status_code=status.HTTP_204_NO_CONTENT)
+async def typing(channel_id: uuid.UUID, user: CurrentUser, session: Session, hub: HubDep) -> None:
+    """Signal that the caller is typing; fan an ephemeral `typing` event to the
+    channel's other members (no persistence)."""
+    # Throttle first so a spamming client can't force the member query + fan-out.
+    if not _typing_allowed(user.id, channel_id):
+        return
+    await _require_member(session, channel_id, user)
+    others = [m.id for m in await _members(session, channel_id) if m.id != user.id]
+    await hub.send_to_users(
+        others,
+        _envelope(
+            "typing",
+            {
+                "channel_id": str(channel_id),
+                "user_id": str(user.id),
+                "display_name": user.display_name,
+            },
+        ),
     )
 
 

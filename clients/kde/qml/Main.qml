@@ -88,6 +88,21 @@ Kirigami.ApplicationWindow {
             property bool currentArchived: false
             property string replyingTo: ""
             property string replyingToText: ""
+            property string typingText: ""
+            property double lastTyping: 0
+
+            function maybeTyping() {
+                if (composer.text.length > 0 && Date.now() - page.lastTyping > 3000) {
+                    chat.typing(page.currentChannel);
+                    page.lastTyping = Date.now();
+                }
+            }
+
+            Timer {
+                id: typingTimer
+                interval: 4000
+                onTriggered: page.typingText = ""
+            }
 
             Component.onCompleted: chat.start()
 
@@ -103,6 +118,7 @@ Kirigami.ApplicationWindow {
                         page.currentKind = channelsModel.get(i).kind;
                         page.currentArchived = channelsModel.get(i).archived;
                         page.cancelReply();
+                        page.typingText = "";
                         messagesModel.clear();
                         channelsModel.setProperty(i, "unread", 0);
                         chat.select_channel(cid);
@@ -293,6 +309,12 @@ Kirigami.ApplicationWindow {
                 function onReaction_updated(json) {
                     page.applyReaction(JSON.parse(json));
                 }
+                function onTyping_received(cid, name) {
+                    if (cid !== page.currentChannel)
+                        return;
+                    page.typingText = name + " is typing…";
+                    typingTimer.restart();
+                }
             }
 
             RowLayout {
@@ -355,6 +377,7 @@ Kirigami.ApplicationWindow {
                                     page.currentKind = model.kind;
                                     page.currentArchived = model.archived;
                                     page.cancelReply(); // a pending reply targets the old channel
+                                    page.typingText = "";
                                     messagesModel.clear(); // don't show the old channel while loading
                                     channelsModel.setProperty(index, "unread", 0);
                                     chat.select_channel(model.cid);
@@ -533,6 +556,14 @@ Kirigami.ApplicationWindow {
                             onCountChanged: positionViewAtEnd()
                         }
                     }
+                    Controls.Label {
+                        text: page.typingText
+                        textFormat: Text.PlainText // display_name is untrusted
+                        visible: page.typingText !== ""
+                        opacity: 0.7
+                        font: Kirigami.Theme.smallFont
+                        Layout.leftMargin: Kirigami.Units.largeSpacing
+                    }
                     Kirigami.Separator { Layout.fillWidth: true }
                     // Reply banner — shown while quoting a message.
                     RowLayout {
@@ -560,6 +591,7 @@ Kirigami.ApplicationWindow {
                             Layout.fillWidth: true
                             placeholderText: page.currentArchived ? "This channel is archived" : "Message…"
                             enabled: page.currentChannel !== "" && !page.currentArchived
+                            onTextEdited: page.maybeTyping()
                             onAccepted: page.sendMessage()
                         }
                         Controls.Button {

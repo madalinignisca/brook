@@ -208,6 +208,17 @@ impl BrookClient {
         self.parse(resp).await
     }
 
+    /// Signal that we're typing in a channel (ephemeral; debounce on the caller).
+    pub async fn send_typing(&self, channel_id: &str) -> Result<()> {
+        let token = self.access_token().await?;
+        let url = self.base.join(&format!("api/v1/channels/{channel_id}/typing"))?;
+        let resp = self.http.post(url).bearer_auth(token).send().await?;
+        if !resp.status().is_success() {
+            return Err(api_error(resp).await);
+        }
+        Ok(())
+    }
+
     /// Self-join a public channel.
     pub async fn join_channel(&self, channel_id: &str) -> Result<Channel> {
         let token = self.access_token().await?;

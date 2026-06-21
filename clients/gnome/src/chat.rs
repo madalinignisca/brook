@@ -49,6 +49,11 @@ struct Chat {
     reply_label: gtk::Label,
     /// Channel settings menu (rename/archive/delete); shown for managed channels.
     channel_settings: gtk::MenuButton,
+    /// "X is typing…" indicator above the composer + its auto-clear timeout.
+    typing_label: gtk::Label,
+    typing_timeout: Rc<RefCell<Option<glib::SourceId>>>,
+    /// Last time we sent a typing signal (to throttle to ~once per few seconds).
+    last_typing: Rc<RefCell<Option<std::time::Instant>>>,
     message_list: gtk::ListBox,
     message_scroll: gtk::ScrolledWindow,
     title: adw::WindowTitle,
@@ -134,6 +139,13 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
         .visible(false)
         .build();
 
+    let typing_label = gtk::Label::builder()
+        .xalign(0.0)
+        .visible(false)
+        .margin_start(12)
+        .css_classes(["caption", "dim-label"])
+        .build();
+
     let chat = Rc::new(Chat {
         client,
         runtime,
@@ -148,6 +160,9 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
         reply_bar: reply_bar.clone(),
         reply_label: reply_label.clone(),
         channel_settings: channel_settings.clone(),
+        typing_label: typing_label.clone(),
+        typing_timeout: Rc::new(RefCell::new(None)),
+        last_typing: Rc::new(RefCell::new(None)),
         message_list: message_list.clone(),
         message_scroll: message_scroll.clone(),
         title: title.clone(),
@@ -210,8 +225,18 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
 
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content_box.append(&message_scroll);
+    content_box.append(&typing_label);
     content_box.append(&reply_bar);
     content_box.append(&composer_row);
+
+    composer.connect_changed({
+        let chat = chat.clone();
+        move |entry| {
+            if !entry.text().is_empty() {
+                maybe_send_typing(&chat);
+            }
+        }
+    });
 
     reply_cancel.connect_clicked({
         let chat = chat.clone();
@@ -392,6 +417,17 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     }
                     refresh_channels(&chat, None);
                 }
+                Ok(ServerEvent::Typing {
+                    channel_id,
+                    user_id,
+                    display_name,
+                }) => {
+                    let me = chat.me.borrow().clone().unwrap_or_default();
+                    let is_current = chat.current.borrow().as_deref() == Some(channel_id.as_str());
+                    if is_current && user_id != me {
+                        show_typing(&chat, &display_name);
+                    }
+                }
                 Ok(ServerEvent::ChannelUpdate(_)) => {
                     // Added to / removed from a channel, or metadata changed:
                     // reload the sidebar so it reflects the change live.
@@ -496,6 +532,7 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
 
     // A pending reply targets a message in the channel we're leaving — drop it.
     set_reply(chat, None);
+    clear_typing(chat);
     // Clear now, before the await, so live messages that arrive while history is
     // loading are appended to a fresh list rather than wiped by a late clear.
     chat.message_rows.borrow_mut().clear();
@@ -1288,6 +1325,60 @@ fn set_reply(chat: &Rc<Chat>, target: Option<(String, String)>) {
             *chat.replying_to.borrow_mut() = None;
             chat.reply_bar.set_reveal_child(false);
         }
+    }
+}
+
+/// Tell the server we're typing in the current channel, throttled to ~once / 3s.
+fn maybe_send_typing(chat: &Rc<Chat>) {
+    let Some(channel_id) = chat.current.borrow().clone() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let should_send = {
+        let mut last = chat.last_typing.borrow_mut();
+        if last.is_none_or(|t| now.duration_since(t).as_secs() >= 3) {
+            *last = Some(now);
+            true
+        } else {
+            false
+        }
+    };
+    if should_send {
+        let chat = chat.clone();
+        glib::spawn_future_local(async move {
+            let _ = chat
+                .runtime
+                .spawn({
+                    let client = chat.client.clone();
+                    async move { client.send_typing(&channel_id).await }
+                })
+                .await;
+        });
+    }
+}
+
+/// Show "<name> is typing…" and (re)start the 4s auto-clear.
+fn show_typing(chat: &Rc<Chat>, name: &str) {
+    chat.typing_label
+        .set_label(&format!("{name} is typing\u{2026}"));
+    chat.typing_label.set_visible(true);
+    if let Some(id) = chat.typing_timeout.borrow_mut().take() {
+        id.remove();
+    }
+    let chat2 = chat.clone();
+    let id = glib::timeout_add_seconds_local(4, move || {
+        chat2.typing_label.set_visible(false);
+        *chat2.typing_timeout.borrow_mut() = None;
+        glib::ControlFlow::Break
+    });
+    *chat.typing_timeout.borrow_mut() = Some(id);
+}
+
+/// Clear any typing indicator (e.g. on channel switch).
+fn clear_typing(chat: &Rc<Chat>) {
+    chat.typing_label.set_visible(false);
+    if let Some(id) = chat.typing_timeout.borrow_mut().take() {
+        id.remove();
     }
 }
 

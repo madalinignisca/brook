@@ -79,7 +79,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 | Feature | Status | Phase | Notes |
 |---|---|---|---|
 | Presence: online / away / offline | ⬜ | PN | ephemeral (in-memory), `presence.update` event |
-| Typing indicators | ⬜ | PN | `typing` command exists in PROTOCOL |
+| Typing indicators | 🟢 | PN | `POST /channels/{id}/typing` fans an ephemeral `typing` WS event; debounced send + 'X is typing…' in both clients |
 | **Live channel updates** (added/removed/renamed/archived) | 🟢 | PN | added/renamed/archived via `channel.update`; deleted via `channel.delete` |
 | Live membership in a channel | ⬜ | PN | |
 | Reconnect forward-sync (`after=`) of missed messages | 🟡 | PN | WS reconnects; client doesn't yet replay misses |

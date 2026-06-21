@@ -97,6 +97,9 @@ pub mod qobject {
             message_id: &QString,
             emoji: &QString,
         );
+        /// Signal that we're typing in a channel (ephemeral; debounce on the caller).
+        #[qinvokable]
+        fn typing(self: Pin<&mut Self>, channel_id: &QString);
         /// Mark a channel read up to its latest message.
         #[qinvokable]
         fn mark_read(self: Pin<&mut Self>, channel_id: &QString);
@@ -122,6 +125,8 @@ pub mod qobject {
         fn public_channels_loaded(self: Pin<&mut Self>, json: QString);
         #[qsignal]
         fn search_results_loaded(self: Pin<&mut Self>, json: QString);
+        #[qsignal]
+        fn typing_received(self: Pin<&mut Self>, channel_id: QString, display_name: QString);
     }
 
     impl cxx_qt::Threading for ChatController {}
@@ -217,6 +222,18 @@ impl qobject::ChatController {
                         let client = client.clone();
                         let qt = qt.clone();
                         app::runtime().spawn(async move { emit_channels(&client, &qt).await });
+                    }
+                    Ok(ServerEvent::Typing {
+                        channel_id,
+                        display_name,
+                        ..
+                    }) => {
+                        let _ = qt.queue(move |mut this: Pin<&mut Controller>| {
+                            this.as_mut().typing_received(
+                                QString::from(channel_id.as_str()),
+                                QString::from(display_name.as_str()),
+                            );
+                        });
                     }
                     Ok(ServerEvent::ChannelUpdate(_)) => {
                         // Reload the list, but detached — don't block the event loop
@@ -485,6 +502,17 @@ impl qobject::ChatController {
                     .await
                 {
                     tracing::warn!(%err, "toggle_reaction failed");
+                }
+            }
+        });
+    }
+
+    fn typing(self: Pin<&mut Self>, channel_id: &QString) {
+        let channel_id = channel_id.to_string();
+        app::runtime().spawn(async move {
+            if let Some(client) = app::client().await {
+                if let Err(err) = client.send_typing(&channel_id).await {
+                    tracing::warn!(%err, "typing failed");
                 }
             }
         });

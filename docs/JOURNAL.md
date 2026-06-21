@@ -16,6 +16,24 @@ Conventions:
 
 ## 2026-06-20
 
+### PN typing indicators (slice B) — both clients, reviewed by Codex/Gemini/Vibe
+
+Ephemeral, no DB: the composer fires a debounced (~1/3s) `POST /channels/{id}/typing`
+which fans a `typing` WS event to the channel's other members; both clients show
+"X is typing…" above the composer, auto-clearing after 4s and on channel switch.
+core: `client.send_typing`, `ServerEvent::Typing`. 51 server + 9 core.
+
+Applied review (Codex clean):
+- HIGH (Gemini): `/typing` was an unthrottled DB query + O(N) fan-out per request —
+  a client could bypass its debounce and spam it → added a **server-side throttle**
+  (~1 per 2s per user+channel, short-circuits before the member query; bounded map).
+- MED (Gemini): KDE typing label was `AutoText` → HTML in `display_name` injects →
+  `Text.PlainText` (GNOME's label is plain by default).
+- Declined (Vibe): `unwrap_or_default` on `me` "filters valid typing" — the server
+  already excludes the sender, so an empty `me` filters nothing (his fix would drop
+  typing when `me` is unresolved); "timeout callback nulls newer timeouts" — old
+  timeouts are `remove()`d first, so stale callbacks never fire.
+
 ### PN @mentions (slice A) — both clients, reviewed by Codex/Gemini/Vibe
 
 @handle / @channel / @here. Server resolves mentions **only on the live send**

@@ -70,6 +70,16 @@ def test_ws_delivers_message_new(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             assert event["data"]["channel_id"] == dm["id"]
             mid = event["data"]["id"]
 
+            # alice typing fans a `typing` event to bob (the other member)
+            http.post(
+                f"/api/v1/channels/{dm['id']}/typing",
+                headers={"Authorization": f"Bearer {alice}"},
+            )
+            typing = ws.receive_json()
+            assert typing["type"] == "typing"
+            assert typing["data"]["channel_id"] == dm["id"]
+            assert typing["data"]["display_name"] == "Alice"
+
             # editing fans out message.update
             http.patch(
                 f"/api/v1/channels/{dm['id']}/messages/{mid}",

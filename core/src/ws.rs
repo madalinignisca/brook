@@ -59,12 +59,29 @@ pub enum ServerEvent {
         /// The deleted channel's id.
         channel_id: String,
     },
+    /// Someone is typing in a channel (ephemeral; expire client-side).
+    Typing {
+        /// The channel they're typing in.
+        channel_id: String,
+        /// The typing user's id.
+        user_id: String,
+        /// The typing user's display name (for "X is typing…").
+        display_name: String,
+    },
 }
 
 /// Payload of a `channel.delete` envelope.
 #[derive(Deserialize)]
 struct ChannelDeleted {
     id: String,
+}
+
+/// Payload of a `typing` envelope.
+#[derive(Deserialize)]
+struct TypingEvent {
+    channel_id: String,
+    user_id: String,
+    display_name: String,
 }
 
 /// Payload of a `message.delete` envelope.
@@ -171,7 +188,17 @@ async fn run_once(url: &Url, token: &str, tx: &broadcast::Sender<ServerEvent>) -
                         }
                         Err(err) => tracing::warn!(%err, "failed to parse channel.delete payload"),
                     },
-                    _ => {} // typing / presence / call — ignored in Phase 1
+                    "typing" => match serde_json::from_value::<TypingEvent>(env.data) {
+                        Ok(t) => {
+                            let _ = tx.send(ServerEvent::Typing {
+                                channel_id: t.channel_id,
+                                user_id: t.user_id,
+                                display_name: t.display_name,
+                            });
+                        }
+                        Err(err) => tracing::warn!(%err, "failed to parse typing payload"),
+                    },
+                    _ => {} // presence / call — ignored in Phase 1
                 },
                 Err(err) => tracing::warn!(%err, "failed to parse ws envelope"),
             },
