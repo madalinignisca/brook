@@ -1,7 +1,7 @@
 # Application-level secret encryption
 
 > Status: **revised after stage-3 review** — ready for implementation · 2026-09-22
-> Reviewed by: Codex (gpt-5.6-terra), `auth-reviewer` (Fable). Vibe timed out — see §12.
+> Reviewed by: Codex (gpt-5.6-terra), `auth-reviewer` (Fable), Vibe (Mistral, EU) — see §12.
 > Touches: [SECURITY.md](../../SECURITY.md) §4a/§5/§8, [DATA_MODEL.md](../../DATA_MODEL.md),
 > [AUTH.md](../../AUTH.md) §1, [ROADMAP.md](../../ROADMAP.md) Phase 0b
 
@@ -34,18 +34,29 @@ at rest", and the distinction decides whether the design is honest.
   as *the* backup procedure — a plaintext file produced on the encrypted volume and then
   stored wherever backups live.
 - A leaked or misconfigured read replica.
-- SQL injection that can **read** rows but cannot execute code in `api`.
+- SQL injection that can **read** rows but cannot execute code in `api`. This is a narrower
+  case than it sounds: real SQLi often escalates to writes, and a *writable* SQLi adversary
+  bypasses this design entirely (below). Do not lean on this bullet.
 
 **Does not protect against, at all:**
 
 - RCE in `api`, or host/root compromise.
 - Inspection of the container's environment or `/proc/<pid>/environ`.
 - A whole-host backup that captures `deploy/.env` alongside the dump (see §11).
+- **Any adversary with database *write* access.** They forge a `refresh_tokens` row and
+  call `POST /auth/refresh` to mint a session — no password, no 2FA, no interest in the
+  encrypted column. See §5.3; this belongs here, not only buried in the AAD discussion.
 
 Host compromise defeats this completely, and `SECURITY.md` §8 must say so. What this buys is
 narrow and real: of everything in a database dump, the TOTP secret is the **only credential
 usable as-is** — passwords are Argon2id, refresh tokens are SHA-256 of 384-bit randoms. It is
 also precisely the factor meant to survive a phished password.
+
+**That claim is conditional on §7.1.** It holds only if recovery codes ship as Argon2id. If
+Phase 0b ships SHA-256 recovery codes, a dump yields brute-forceable codes, the attacker logs
+in with password + recovery code, and this design buys **nothing** against its own headline
+scenario. §7.1 is not a nice-to-have attached to this spec; it is a precondition of the spec
+being true.
 
 This raises TOTP secrets to the same tier as `BROOK_JWT_SIGNING_KEY`, which already grants
 total auth bypass if leaked. It does not put them above it.
@@ -219,16 +230,28 @@ escape hatch on a box with real enrolments — would otherwise turn the encrypti
 **2FA-bypass switch that flips on operator error, silently**, since users simply stop being
 asked for a code.
 
-Required behaviour:
+**The justification is the silent bypass, not response-shape secrecy.** An earlier draft
+argued a 500 would be "a distinguishable oracle"; that is weak — a 401 is exactly as
+distinguishable to a patient attacker. The reason to fail closed is that the alternative
+silently disables a security control.
+
+Required behaviour **on the login path, for `totp.secret`**:
 
 - `InvalidTag`, unknown key id, unknown format version, missing ring → **401**, generic error
   code, no distinguishing detail to the caller.
-- Logged at ERROR with user id and key id. Never the plaintext, never the ciphertext.
-- Caught **at the call site**. `errors.py`'s `_unhandled_exception` would otherwise render a
-  500 with a traceback — a distinguishable oracle on the login path, and a support ticket.
-- The rewrap CLI reports row counts per key id (`WHERE secret LIKE 'v1.1.%'`) so an operator
-  sees "17 rows still on key 1" *before* dropping it, rather than discovering it as 17
-  locked-out users.
+- Logged at ERROR with user id, key id and an internal reason code. Never the plaintext,
+  never the ciphertext.
+- Caught **at the call site**, so `errors.py`'s `_unhandled_exception` does not render a 500
+  with a traceback on the login path.
+
+**Not for `bots.outbound_secret_enc`.** A decrypt failure there is a *server* fault, not a
+caller authentication failure — returning 401 to a webhook caller lies about whose problem it
+is. Correct behaviour: never sign, never send, return 5xx, and alert. Fail closed in both
+cases; the response differs because the party in front of it differs.
+
+The rewrap CLI reports row counts per key id (`WHERE secret LIKE 'v1.1.%'`) so an operator
+sees "17 rows still on key 1" *before* dropping it, rather than discovering it as 17
+locked-out users.
 
 ### 5.6 Rotation
 
@@ -260,6 +283,29 @@ Migration-free, but not as simple as the first draft implied:
 existed when it was taken. Dropping a key after a verified rewrap is safe for live data and
 **silently breaks older backups**. Retired keys are escrowed for the full backup-retention
 period. This belongs in the admin guide, not folklore.
+
+### 5.8 Detection — how the *operator* finds out
+
+Placed before the startup guard because it is the gap the reviews rated highest, and it is
+about runtime, not boot.
+
+Everything above concerns what the *caller* learns. Almost nothing concerned how the
+**operator** learns, and that is the failure mode this design most needs to survive: a key
+dropped one step too early produces a stream of 401s that looks exactly like ordinary
+credential stuffing, plus ERROR lines nobody reads. It is then discovered at support-ticket
+time — precisely the "17 locked-out users" outcome §5.5 claims to prevent. The rewrap CLI's
+per-key row count is a one-shot pre-flight check, not runtime detection.
+
+Required:
+
+- A **counter of decrypt failures, labelled by internal reason** (`invalid_tag`,
+  `unknown_key_id`, `unknown_version`, `missing_ring`) — distinct from ordinary auth failures
+  so it is not lost in the 4xx noise.
+- An **alert threshold** on that counter. Any sustained non-zero rate is an operator error,
+  not user behaviour; `unknown_key_id` above zero means a key was dropped too early.
+- A **startup canary**: decrypt one known row per encrypted purpose at boot and refuse to
+  serve, loudly, if it fails. This converts "users discover it one at a time over days" into
+  "the deploy does not come up", which is the correct failure for a misconfigured ring.
 
 ### 5.7 Startup guard
 
@@ -305,6 +351,12 @@ document's threat model depends on. Phase 0b must not ship without them:
    reset their own.
 7. **Secret generation:** `secrets.token_bytes(20)`, base32 for the otpauth URI, SHA-1 HMAC
    per RFC 6238 default for authenticator compatibility. Constant-time code comparison.
+
+**These are enforced by prose only, which is not enough.** Item 1 in particular can silently
+nullify this entire design (§2), yet nothing structural stops Phase 0b from shipping SHA-256
+recovery codes. Minimum guard: a test in the Phase 0b suite asserting that a stored recovery
+code verifies as an Argon2id hash and **not** as a hex SHA-256 digest, so a regression fails
+CI rather than review. `ROADMAP.md` Phase 0b should link this section by name.
 
 ## 8. Sequencing
 
@@ -375,6 +427,8 @@ propagate it.
 |---|---|
 | **Codex** (gpt-5.6-terra) | Full review. "The cryptographic primitive is fine." Found: AAD attack described backwards; highest-id-primary is a footgun; lazy rewrap lost-update race; 2^32 stated too casually; invariant unenforceable as written; missing backup/key-retention, redaction, replay, key-source semantics. |
 | **`auth-reviewer`** (Fable) | Four blocking findings: fail-closed semantics unspecified; recovery codes reopen the leaked-dump threat; `totp_pending`/replay/rate-limit unspecified; admin reset lacks authz and audit. Independently found the same AAD error. Verified as sound: the threat model, SHA-256 for refresh tokens, the §3 invariant, the primitive, the startup guard, the sequencing. |
-| **Vibe** | **Did not complete** — killed at a 300 s timeout (exit 143) on a direct CLI invocation, not through the `vibe-reviewer` wrapper. Prompt was ~450 words plus four file reads. Stage 3b is therefore **not satisfied**; re-run when the CLI is fixed. |
+| **Vibe** (Mistral, EU) | Completed on a retry with a ~90-word prompt; the first ~450-word attempt was killed at a 300 s timeout. Found three things the others missed: §2's read-only-SQLi bullet does heavy lifting and DB-write adversaries were missing from the exclusion list; the headline "only credential usable as-is" claim is conditional on §7.1 landing; §5.5's 401 was right but justified by a weak oracle argument and wrongly applied to the bots column. Rated **detection** the biggest remaining gap — now §5.8. |
 
-All findings above are incorporated. The remaining known gap is the missing Vibe pass.
+All three stage-3 reviews are complete and all findings are incorporated. No known gaps
+remain in the design; the next gate is implementation review (`auth-reviewer` re-reviews the
+code, not just this document — see §10).
