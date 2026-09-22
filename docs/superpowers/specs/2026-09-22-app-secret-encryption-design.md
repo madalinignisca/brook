@@ -1,7 +1,9 @@
 # Application-level secret encryption
 
-> Status: **revisions required** — stage-3 review findings in §10 · 2026-09-22
-> Touches: [SECURITY.md](../../SECURITY.md) §4a/§5, [DATA_MODEL.md](../../DATA_MODEL.md), [ROADMAP.md](../../ROADMAP.md) Phase 0b
+> Status: **revised after stage-3 review** — ready for implementation · 2026-09-22
+> Reviewed by: Codex (gpt-5.6-terra), `auth-reviewer` (Fable). Vibe timed out — see §12.
+> Touches: [SECURITY.md](../../SECURITY.md) §4a/§5/§8, [DATA_MODEL.md](../../DATA_MODEL.md),
+> [AUTH.md](../../AUTH.md) §1, [ROADMAP.md](../../ROADMAP.md) Phase 0b
 
 ## 1. Problem
 
@@ -14,105 +16,119 @@ Two specced fields must be stored encrypted and **read back in plaintext** by `a
 
 `SECURITY.md` §5 currently says the outbound secret is *"stored encrypted (envelope
 encryption via the app's key / operator secret store)"* — that clause names three different
-schemes and picks none. `DATA_MODEL.md` marks `totp.secret (enc)` with no scheme at all.
+schemes, picks none, and **"envelope encryption" is the wrong term** for what is needed here
+(see §5.0). `DATA_MODEL.md` marks `totp.secret (enc)` with no scheme at all.
 
 And there is no key: `services/api/app/config.py` holds exactly one piece of key material,
 `jwt_signing_key`. `deploy/.env.example` matches. **Phase 0b cannot be implemented as
 specced.**
 
+## 2. Threat model — state it precisely
+
+This is **application-layer protection against DB-only disclosure**. It is *not* "encryption
+at rest", and the distinction decides whether the design is honest.
+
+**Protects against:**
+
+- A leaked `pg_dump`. `docs/admin-guide.md` documents `pg_dump > brook-backup-$(date).sql`
+  as *the* backup procedure — a plaintext file produced on the encrypted volume and then
+  stored wherever backups live.
+- A leaked or misconfigured read replica.
+- SQL injection that can **read** rows but cannot execute code in `api`.
+
+**Does not protect against, at all:**
+
+- RCE in `api`, or host/root compromise.
+- Inspection of the container's environment or `/proc/<pid>/environ`.
+- A whole-host backup that captures `deploy/.env` alongside the dump (see §11).
+
+Host compromise defeats this completely, and `SECURITY.md` §8 must say so. What this buys is
+narrow and real: of everything in a database dump, the TOTP secret is the **only credential
+usable as-is** — passwords are Argon2id, refresh tokens are SHA-256 of 384-bit randoms. It is
+also precisely the factor meant to survive a phished password.
+
+This raises TOTP secrets to the same tier as `BROOK_JWT_SIGNING_KEY`, which already grants
+total auth bypass if leaked. It does not put them above it.
+
 ### Why disk encryption does not answer this
 
-`SECURITY.md` §4a puts encryption at rest on the operator (encrypted volumes, encrypted
-PostgreSQL, SSE buckets) and requires the app to stay agnostic to it. That is correct for
-bulk data and must not change.
-
-It does not cover these two fields, because **a `pg_dump` taken from an encrypted volume is
-plaintext.** Disk encryption defends against stolen hardware; it does nothing against a
-leaked backup, a misconfigured replica, or an SQL-injection read. For message bodies that is
-acceptable — the operator can read them anyway, per the trust model in §8. For a TOTP secret
-it is not: a leaked TOTP secret grants *future authentication*, silently defeating the second
-factor for every enrolled user, with no signal that it happened.
+A `pg_dump` taken from an encrypted volume is plaintext — the volume is mounted, that is the
+point. Disk encryption defends against stolen hardware. `SECURITY.md` §4a is correct for bulk
+data and does not change.
 
 ### The seam this resolves
 
 §4a ("the app must never depend on at-rest encryption") and §5 ("stored encrypted via the
-app's key") read as a contradiction. They are not — they describe two different things that
-share a name:
+app's key") read as a contradiction. They describe two different things sharing a name:
 
 - **Bulk data** (messages, files, metadata) → the operator's metal. The app stays agnostic.
 - **Re-creatable credentials** (TOTP secrets, bot signing secrets) → the app's key, because
   only the app knows which columns are credentials.
-
-Neither encrypts the other's territory.
-
-## 2. Goals / non-goals
-
-**Goals**
-
-- One small, reviewed primitive for encrypting app-managed secrets at rest in the database.
-- Ciphertexts bound to the row they belong to, so they cannot be relocated between rows.
-- Key rotation without downtime and without a schema migration.
-- Operable by a small-business admin: one environment variable, no external dependency.
-- Startup refuses a missing or weak key, exactly as it already does for the JWT key.
-
-**Non-goals**
-
-- **Not E2EE.** Unchanged non-goal (`SECURITY.md` scope note, §2, §8; `AUTH.md`).
-- **Not** encrypting message bodies, attachments, or files. See the invariant in §3.
-- **Not** a KMS/Vault integration. A provider seam is left open (§5.1); nothing more.
-- **Not** replacing anything currently hashed. `refresh_tokens` (SHA-256),
-  `local_credentials.password_hash` (Argon2id), `totp.recovery_codes`, and
-  `bots.inbound_secret_hash` are verify-only and stay hashed. Hashing is the stronger
-  choice wherever the server never needs the plaintext back.
 
 ## 3. The invariant that keeps this safe
 
 > **This key protects only secrets that can be re-created. Nothing irreplaceable is ever
 > encrypted with it.**
 
-This is the load-bearing rule and it belongs in `SECURITY.md` §5, not just here.
+Lose the key and the damage is bounded: users re-enrol TOTP, bot owners re-issue secrets. No
+history is lost. Encrypt message bodies with the same mechanism and key loss becomes
+permanent data loss — and a self-hosted operator *will* eventually lose the key.
 
-Lose the key today and the blast radius is bounded and recoverable: enrolled users re-enrol
-TOTP (an admin "reset 2FA" path is required anyway, for lost phones), bot owners re-issue
-outbound secrets. No history is lost.
+This is enforced structurally, not by comment: §5.4's closed registry is the only way to
+reach the primitive, and adding an entry is a reviewed change.
 
-The moment message bodies are encrypted with the same mechanism, key loss becomes permanent,
-unrecoverable data loss — and a self-hosted operator *will* eventually lose the key. Writing
-the rule down now is what prevents a well-meaning change in a later phase from turning a
-recoverable incident into a destroyed archive.
+## 4. Goals / non-goals
 
-## 4. Scope
+**Goals** — one reviewed primitive; ciphertexts bound to their field identity; rotation with
+no schema migration; one environment variable; fail-closed startup **and** fail-closed
+decrypt.
 
-In scope, and only these:
+**Non-goals**
 
-- `totp.secret` — AAD `("totp", "secret", <user_id>)`
-- `bots.outbound_secret_enc` — AAD `("bots", "outbound_secret_enc", <bot_id>)`
+- **Not E2EE.** Unchanged (`SECURITY.md` scope note, §2, §8; `AUTH.md`).
+- **Not** encrypting message bodies, attachments, or files (§3).
+- **Not** a KMS/Vault integration. A provider seam only (§5.1).
+- **Not** replacing `local_credentials.password_hash` (Argon2id) or `refresh_tokens.token_hash`.
+  The latter is SHA-256 over `secrets.token_urlsafe(48)` = 384 bits, looked up by indexed
+  equality — brute-force infeasible, no timing signal, correct as-is.
 
-Any future field must be justified against the invariant in §3 before it is added.
+> **Removed in revision:** the original draft listed `bots.inbound_secret_hash` here as
+> "verify-only, stays hashed". That is wrong and must not be propagated into `SECURITY.md`
+> §5 — see §11.
 
 ## 5. Design
 
+### 5.0 What this is not
+
+This is **direct symmetric encryption with a configured data-encryption keyring**. It is
+**not envelope encryption**, which requires a separate wrapping key or KMS layer. `SECURITY.md`
+§5's wording is incorrect and §11 corrects it.
+
 ### 5.1 Key material
 
-A **keyring**: several keys, each with a small integer id. The highest id is the primary and
-is the only key used to encrypt; every key in the ring can decrypt.
+A **keyring**: several keys, each with an integer id. Exactly one is primary and is the only
+key used to encrypt; every key in the ring can decrypt.
 
 ```
 BROOK_SECRET_KEYS=1:<base64url 32 bytes>,2:<base64url 32 bytes>
+BROOK_SECRET_PRIMARY_KEY_ID=2
 ```
 
-- One variable. The primary is **the highest id present** — rotation is "add a key with the
-  next number", and there is no second variable that can point at a key that isn't there.
-- `BROOK_SECRET_KEYS_FILE` is accepted as an alternative source, for Docker secrets and
-  `systemd` credentials. This is the whole of the "provider seam": a future Vault/KMS
-  provider populates the same ring, and nothing above this layer changes.
-- Startup logs the active primary key id (never key material), so a mis-numbered key is
-  visible rather than silent.
-- `make init` generates a ring with a single key `1:<random>`, matching how it already
-  generates `BROOK_JWT_SIGNING_KEY`.
+- **The primary is explicit.** Startup refuses to boot if it is absent from the ring.
+- **Key ids are never reused**, including after retirement — a reused id makes every
+  ciphertext carrying it permanently undecryptable.
+- `BROOK_SECRET_KEYS_FILE` is the preferred source in `deploy/docker-compose.yml`: values in
+  `environment:` are visible via `docker inspect` and `/proc/<pid>/environ`. Precedence,
+  required file mode, and strict parsing (trailing newline, whitespace) are specified below.
+- Held as pydantic `SecretStr`, so `repr`, validation errors and settings dumps never print
+  it. `BROOK_JWT_SIGNING_KEY` should become `SecretStr` at the same time.
+- Startup logs the **primary key id only**, never material.
+- `make init` generates `1:<random>` with `BROOK_SECRET_PRIMARY_KEY_ID=1`, as it already does
+  for `BROOK_JWT_SIGNING_KEY`.
 
-**Rejected:** a separate `BROOK_SECRET_PRIMARY_KEY_ID`. It is one more thing to get wrong,
-and "highest wins" needs no validation beyond "ids are unique".
+> **Revised:** the first draft derived the primary as "highest id present". A key added with
+> a lower id would then be silently ignored while the operator believed rotation had
+> happened. Both reviewers flagged it.
 
 ### 5.2 Ciphertext format
 
@@ -122,207 +138,243 @@ Stored in a `text` column:
 v1.<key_id>.<nonce_b64url>.<ciphertext_b64url>
 ```
 
-- `v1` — format version, so a future change is detectable rather than ambiguous.
-- `<key_id>` — which key encrypted this. This is what makes rotation possible without a
-  migration: old rows say which old key they need.
-- `<nonce>` — 12 random bytes per encryption. AES-GCM with random nonces is safe to roughly
-  2^32 encryptions under one key; a self-hosted Brook will not approach it, and rotation
-  resets the count regardless.
-- base64url without padding, so no `=`, `+` or `/` to escape anywhere.
+`v1` is the format version; `<key_id>` is what makes migration-free rotation possible;
+`<nonce>` is exactly 12 random bytes, enforced on parse. base64url, unpadded.
 
-### 5.3 Algorithm and row binding
+**Nonce bound.** 2^32 is the NIST operational ceiling for random-IV GCM **per key, globally,
+across every process and restart** — a limit, not a target. TOTP enrolments and bot-secret
+writes are orders of magnitude below it; the operational bound is set at 2^24 per key, at
+which point rotation is required. Rotation only resets the count if the new key is genuinely
+new and every writer has it.
 
-**AES-256-GCM**, via `cryptography`'s `AESGCM`, with **AAD** set to the field's identity:
+### 5.3 Algorithm and field binding
+
+**AES-256-GCM** via `cryptography`'s `AESGCM`, with **AAD** set to the field's identity:
 
 ```
-AAD = "brook.v1|<table>|<column>|<row_pk>"
+AAD = "brook.v1|<key_id>|<table>|<column>|<row_pk>"
 ```
 
-The AAD is authenticated but not stored — it is reconstructed at decrypt time from the row
-already in hand.
+Reconstructed at decrypt time from the row in hand; never stored. The key id is authenticated
+too, closing any future downgrade argument if `v2` uses a different algorithm.
 
-This is the reason for choosing AES-GCM over Fernet, which has no AAD. Without row binding,
-an attacker with database **write** access can copy another user's encrypted TOTP secret into
-their own row; it decrypts cleanly, because nothing ties the ciphertext to a user, and they
-authenticate with that user's second factor. With AAD, the same move fails with `InvalidTag`.
+**Honest justification.** The first draft claimed AAD stops an attacker with DB write access
+from stealing a second factor, and described the attack backwards. Both corrections matter:
 
-Row primary keys are UUIDv7 and immutable, so a stable AAD is guaranteed.
+- The described attack does not work. Copying a *victim's* ciphertext into the *attacker's*
+  row leaves the attacker needing the victim's authenticator. The meaningful direction is the
+  reverse — plant a ciphertext whose plaintext the **attacker knows** into the **victim's**
+  row, then log in as the victim with a phished password and the attacker's own authenticator.
+- More importantly, **an attacker with DB write access does not need any of this.** They can
+  insert a `refresh_tokens` row with a `token_hash` they chose and call `POST /auth/refresh`
+  to mint a full session — no password, no 2FA. Or `DELETE FROM totp`, or set
+  `global_role='admin'`. AAD stops none of that and cannot.
 
-### 5.4 API
+So AAD is **not** load-bearing against a DB-write adversary, and under §2's actual threat
+model (read-only disclosure) it is never exercised at all. It is kept because it is free and
+it makes two *other* failures fail closed:
 
-`services/api/app/crypto.py`, deliberately small:
+- An **application bug** that decrypts the wrong row's ciphertext.
+- **Cross-column planting** — a `bots.outbound_secret_enc` value landing in `totp.secret`.
+
+That is a smaller claim than the original, and it is the true one. It does not change the
+choice of AES-GCM over Fernet, which costs nothing.
+
+Row primary keys are immutable, which is the property AAD needs. (`models.py` uses
+`uuid.uuid4`, not the UUIDv7 that `DATA_MODEL.md` claims — immutability holds either way, but
+this document will not assert v7.)
+
+### 5.4 API — a closed registry, not a free-form helper
+
+A free-form `encrypt(plaintext, aad=(...))` lets any caller encrypt anything, which makes §3
+a comment. Callers instead name a registered **purpose**:
 
 ```python
+class Purpose(Enum):
+    TOTP_SECRET         = ("totp", "secret")
+    BOT_OUTBOUND_SECRET = ("bots", "outbound_secret_enc")
+
 class SecretBox:
-    def __init__(self, keys: Mapping[int, bytes]) -> None: ...
-    def encrypt(self, plaintext: str, *, aad: tuple[str, str, str]) -> str: ...
-    def decrypt(self, stored: str, *, aad: tuple[str, str, str]) -> str: ...
+    def __init__(self, keys: Mapping[int, bytes], primary_id: int) -> None: ...
+    def encrypt(self, plaintext: str, *, purpose: Purpose, row_pk: uuid.UUID) -> str: ...
+    def decrypt(self, stored: str, *, purpose: Purpose, row_pk: uuid.UUID) -> str: ...
     def needs_rewrap(self, stored: str) -> bool: ...
 ```
 
-`needs_rewrap` mirrors the existing `needs_rehash` in `security.py`: it returns true when a
-value was encrypted under a non-primary key.
+Adding a `Purpose` is a reviewed change that must be justified against §3, and a test
+enumerates every member so additions are visible in the diff. `needs_rewrap` mirrors the
+existing `needs_rehash` in `security.py`.
 
-### 5.5 Rotation
+Max plaintext length and max ciphertext column length are bounded; malformed input is
+rejected on parse rather than passed to the cipher.
 
-Zero-downtime, four steps, no migration:
+### 5.5 Fail-closed on decrypt failure — the contract that matters most
 
-1. Append a key with the next id. Both keys decrypt; the new one becomes primary.
-2. Restart `api`. New writes use the new key; old rows still read.
-3. **Lazy rewrap:** wherever a secret is decrypted on a normal code path (TOTP verify,
-   outbound webhook signing), `needs_rewrap` triggers a re-encrypt and save. Most rows
-   migrate through ordinary use, the same way Argon2 parameters already upgrade via
-   `needs_rehash`.
-4. An admin command rewraps the remainder; once none are left, drop the old key.
+**Any decrypt failure on `totp.secret` is an authentication failure.** Never a fall-through to
+"not enrolled", never a 500.
 
-### 5.6 Startup guard
+This is the single most important line in the document. Three realistic operator errors —
+an old key dropped before rewrap completed, a corrupted row, a missing ring under the dev
+escape hatch on a box with real enrolments — would otherwise turn the encryption layer into a
+**2FA-bypass switch that flips on operator error, silently**, since users simply stop being
+asked for a code.
 
-Extend the existing `Settings.assert_secure()` rather than introducing a second concept. It
-refuses to boot when the ring is missing, any key is not exactly 32 bytes after decoding, or
-ids are duplicated — unless `BROOK_ALLOW_INSECURE_AUTH=1`, which is already the documented
-local-dev escape hatch for the JWT key.
+Required behaviour:
 
-## 6. Sequencing — why now
+- `InvalidTag`, unknown key id, unknown format version, missing ring → **401**, generic error
+  code, no distinguishing detail to the caller.
+- Logged at ERROR with user id and key id. Never the plaintext, never the ciphertext.
+- Caught **at the call site**. `errors.py`'s `_unhandled_exception` would otherwise render a
+  500 with a traceback — a distinguishable oracle on the login path, and a support ticket.
+- The rewrap CLI reports row counts per key id (`WHERE secret LIKE 'v1.1.%'`) so an operator
+  sees "17 rows still on key 1" *before* dropping it, rather than discovering it as 17
+  locked-out users.
 
-`totp` does not exist yet. Landing this **before** Phase 0b means the column is written
-encrypted from its first row, and there is never a migration that reads plaintext secrets out
-of a live database and writes them back encrypted. Landing it after means exactly that
-migration, on the most sensitive column in the schema.
+### 5.6 Rotation
 
-`bots` (Phase 3) gets the same treatment for free.
+Migration-free, but not as simple as the first draft implied:
 
-## 7. Testing
+1. Append a key with a new, never-before-used id. **Deploy the superset ring to every `api`
+   instance first**, before any instance is told to encrypt with it — otherwise an old
+   instance cannot read what a new one wrote.
+2. Move `BROOK_SECRET_PRIMARY_KEY_ID` to the new key and restart.
+3. **Lazy rewrap**, with compare-and-swap:
 
-Per `docs/QUALITY.md` and the 70/100 target:
+   ```sql
+   UPDATE totp SET secret = :new WHERE user_id = :id AND secret = :old
+   ```
 
-- Round-trip: encrypt → decrypt returns the plaintext.
-- **Row binding:** a ciphertext produced for row A fails with `InvalidTag` when decrypted
-  with row B's AAD. This is the test the whole design exists for.
-- Tampering: flipping a byte in the ciphertext fails; it does not return garbage.
-- Rotation: a value encrypted under key 1 still decrypts after key 2 becomes primary;
-  `needs_rewrap` reports true for it and false after rewrap.
-- Unknown key id and unknown format version each produce a clear, distinguishable error
-  rather than a generic failure.
-- Startup: missing ring, wrong-length key, and duplicate ids each refuse to boot; the
-  documented escape hatch allows dev.
-- **Prove the tests can fail:** remove the AAD argument from the decrypt path and confirm the
-  row-binding test goes red before restoring it. A row-binding test that has never been
-  observed failing is decoration.
+   A failed CAS means someone else updated the row — do nothing. Without this, a request that
+   decrypted before a concurrent re-enrolment will write its stale plaintext back and destroy
+   the new enrolment.
 
-## 8. Risks and accepted costs
+   Rewrap runs **only after a successful TOTP verification**, not merely after a successful
+   decrypt — otherwise every failed login by an unauthenticated party causes a DB write.
+   Rewrap is best-effort maintenance: if it fails, the login still succeeds, and the failure
+   is logged and retried later. A rewrap failure must never poison the request transaction.
 
-- **New dependency:** `cryptography`. Not currently a direct dep — PyJWT on HS256 does not
-  pull it in. Accepted under the stack rule that genuinely hard, well-solved problems (crypto,
-  TLS) use an established package rather than a local implementation. It also becomes
-  available for future asymmetric JWT signing.
-- **`AESGCM` lives under `cryptography.hazmat`.** Mitigated by confining it to one small
-  module with no configurable knobs, and sending that module through `auth-reviewer` (Fable)
-  and `code-reviewer` before merge — the authn/authz escalation trigger applies here.
-- **Key loss** costs TOTP re-enrolment and bot secret re-issue. Bounded by §3 and documented
-  in the admin guide, including the rotation procedure.
-- **Operator burden:** one more secret to back up. Called out in `docs/admin-guide.md`
-  alongside `BROOK_JWT_SIGNING_KEY`, which has the same property.
+4. An admin **CLI** command (not HTTP) rewraps the remainder in batches with CAS and progress
+   by key id, then verifies zero rows remain on the old key before it is dropped.
 
-## 9. Documentation changes this requires
+**Key retention vs. backups.** An old `pg_dump` can only be restored with the ring that
+existed when it was taken. Dropping a key after a verified rewrap is safe for live data and
+**silently breaks older backups**. Retired keys are escrowed for the full backup-retention
+period. This belongs in the admin guide, not folklore.
 
-- `SECURITY.md` §5 — replace the "envelope encryption via the app's key / operator secret
-  store" clause with this scheme, and add the §3 invariant.
-- `SECURITY.md` §4a — one paragraph distinguishing operator-managed bulk data from
-  app-managed credentials, so the two sections stop reading as a contradiction.
-- `SECURITY.md` §7 — key length and rotation expectations alongside the other limits.
-- `DATA_MODEL.md` — document the stored format for `(enc)` columns.
-- `deploy/.env.example` and `make init` — the new variable.
-- `docs/admin-guide.md` — back up the key; rotate the key; what happens if it is lost.
+### 5.7 Startup guard
 
----
+Extends the existing `Settings.assert_secure()`. Refuses to boot when the ring is missing, a
+key is not exactly 32 bytes decoded, ids are duplicated, or the primary id is not in the ring.
 
-## 10. Stage-3 review findings (2026-09-22) — REVISIONS REQUIRED
+`BROOK_ALLOW_INSECURE_AUTH=1` substitutes a **fixed, well-known dev key** — matching the
+existing `_DEV_JWT_KEY` posture. It **must never** mean plaintext storage, and it must never
+mean TOTP is silently disabled.
 
-Reviewed by Codex (gpt-5.6-terra). Vibe timed out; `auth-reviewer` pending. **The design is
-not approved for implementation until §§1–9 are revised per the below.** Verdict on the
-primitive itself: "the cryptographic primitive is fine" — the weaknesses are in framing, key
-management, and rotation.
+## 6. Scope
 
-### Must fix — errors in the current text
+`totp.secret` and `bots.outbound_secret_enc`. Nothing else without a §3 justification.
 
-1. **§5.3's attack description is wrong.** The doc claims an attacker copies a *victim's*
-   ciphertext into their *own* row and thereby passes the victim's 2FA. That does not work:
-   the attacker never holds the victim's plaintext secret, so cannot compute codes from it.
-   The real attack is the inverse — an attacker copies a secret **they already know** (from
-   their own enrolment) into the **victim's** row, then generates valid codes for the
-   victim's account. AAD still stops this, so the conclusion stands, but the justification
-   must be rewritten.
+## 7. Requirements this design places on the Phase 0b TOTP spec
 
-2. **§5.1 "highest key id is primary" is a footgun, not a simplification.** A key added with
-   a lower id is silently ignored while the operator believes rotation happened. A reused id
-   with different material makes every ciphertext under that id permanently undecryptable.
-   Replace with an explicit `BROOK_SECRET_PRIMARY_KEY_ID`, validated at startup (primary
-   exists in ring; ids unique, strictly parsed, never reused even after retirement).
+The reviews surfaced auth issues that are **not** this document's to solve but which this
+document's threat model depends on. Phase 0b must not ship without them:
 
-3. **§5.5 lazy rewrap has a real race.** Request A decrypts the old ciphertext → the user
-   re-enrols TOTP → request A writes back its stale plaintext, destroying the new enrolment.
-   Rewrap must be compare-and-swap (`UPDATE … WHERE user_id = :id AND secret = :old`) or use
-   an optimistic version column; a failed CAS means "someone else updated it, do nothing".
-   Authentication must complete on successful decrypt regardless of whether rewrap succeeds,
-   and a rewrap failure must never turn a successful login into a 500.
+1. **Recovery codes must use Argon2id**, via the existing `PasswordHasher`. Currently
+   `AUTH.md` §1 says "hashed" and `DATA_MODEL.md` says `code_hash`. Human-typeable codes carry
+   ~40–52 bits; SHA-256 of one is GPU-brute-forceable from a leaked dump in hours. An attacker
+   then logs in with password + recovery code and **never touches the encrypted TOTP secret** —
+   which would make this entire design worthless against its own headline threat. They are
+   verified rarely, so Argon2's cost is irrelevant.
+2. **The `{totp_required}` intermediate state needs a real token.** `PROTOCOL.md` defines the
+   two-call flow but nothing says what carries "password already verified". Required: a
+   dedicated `type="totp_pending"` token, ~5 min, bound to `sub`, refused by
+   `get_current_user` (the existing `type == "access"` check is the hook), single-use.
+3. **Replay guard.** RFC 6238 §5.2 — a code accepted once must be refused for the rest of its
+   window. `DATA_MODEL.md`'s `totp` table needs a `last_used_step` column; add it now, while
+   the table shape is being decided.
+4. **Rate limiting on `/auth/totp` is a precondition of the endpoint, not deferred
+   hardening.** With ±1 step tolerance there are ~3 valid codes per million; unthrottled, it
+   falls in ~10^5 requests. Must also cover recovery-code submission.
+5. **Enrolment must not silently overwrite an activated secret** — require the current code or
+   password re-auth, and a full `access` session (not `totp_pending`). The otpauth URI is
+   returned once at enrolment and never by a later `GET`. Pending enrolments expire.
+6. **Admin "reset 2FA"** — §3 leans on it as the key-loss recovery path. It needs: admin
+   re-authentication immediately before use; one user per call over HTTP with bulk only via
+   host CLI; revocation of the target's refresh tokens; an append-only auth event record
+   (enrol, activate, reset-with-actor, recovery-code-used, key rotation); and admins cannot
+   reset their own.
+7. **Secret generation:** `secrets.token_bytes(20)`, base32 for the otpauth URI, SHA-1 HMAC
+   per RFC 6238 default for authenticator compatibility. Constant-time code comparison.
 
-4. **§5.5 "zero downtime" is incomplete for multi-instance deployments.** Every `api`
-   instance must hold the superset ring *before* any instance starts encrypting under the new
-   primary, or an old instance cannot read rows a new one wrote.
+## 8. Sequencing
 
-5. **§5.2's "2^32" is stated too casually.** That is the NIST operational ceiling for
-   random-IV GCM under one key — global per key across all processes and restarts — not a
-   comfortable estimate or a target. Say the volume here is nowhere near it, and state an
-   operational bound well below it.
+`totp` does not exist yet. Landing this **before** Phase 0b means the column is encrypted from
+its first row and no migration ever reads plaintext secrets out of a live database. `bots`
+(Phase 3) gets it free.
 
-6. **§5.6 must not allow a plaintext fallback.** `BROOK_ALLOW_INSECURE_AUTH=1` must never
-   cause a missing or malformed ring to degrade into plaintext storage. Dev uses an explicit
-   test key; production always requires a valid ring.
+## 9. Testing
 
-7. **§3's invariant is currently just a comment.** A free-form `aad: tuple[str, str, str]`
-   lets any caller encrypt anything. Replace with a **closed registry of encrypted-field
-   purposes** — each entry naming field, AAD construction, owner and recovery procedure — and
-   a test enumerating them. Still governance, not a cryptographic guarantee, but enforceable
-   in review.
+- Round-trip; tampered ciphertext fails; 12-byte nonce enforced on parse.
+- Field binding: a ciphertext made for one purpose/row fails under another. Both reviewers
+  noted the test is symmetric and therefore still correct despite the prose error in §5.3.
+- Rotation: key-1 value decrypts after primary moves to key 2; `needs_rewrap` true, then false.
+- CAS rewrap: simulate a concurrent re-enrolment between decrypt and rewrap; assert the new
+  enrolment survives.
+- Unknown key id / unknown version / malformed input each give distinguishable internal errors
+  and an indistinguishable 401 externally.
+- **Fail-closed integration test (the one that matters):** enrol under ring `{1:K1}`, restart
+  with ring `{2:K2}` only, then password + valid code → **401**, not "enrolled=false", not 500.
+- Startup refusal: missing ring, wrong key length, duplicate ids, primary not in ring.
+- **Prove the tests can fail.** Mutating the crypto module is not sufficient — the
+  authorization branch in `login` is what must be observed going red. Delete the
+  TOTP-required branch and confirm a test fails before restoring it.
 
-### Must add — omissions
+## 10. Risks and accepted costs
 
-8. **Backup/key-retention lifecycle.** An old `pg_dump` needs the ring that existed when it
-   was taken. Retiring a key after a verified rewrap makes older backups partially
-   unrestorable unless retired keys are escrowed for the full backup-retention period. This
-   needs an explicit policy in the admin guide.
+- **New dependency:** `cryptography` — not currently direct (PyJWT on HS256 does not pull it
+  in). Accepted under the stack rule for crypto/TLS. Also unlocks asymmetric JWT later.
+- **`AESGCM` is under `cryptography.hazmat`.** Confined to one module with no configurable
+  knobs; the authn/authz escalation trigger applies, so `auth-reviewer` re-reviews the
+  implementation, not just this design.
+- **Key loss** costs TOTP re-enrolment and bot-secret re-issue, the latter requiring the
+  receiving bot operator to coordinate — key loss causes integration outages, not just
+  inconvenience. Break-glass recovery must not itself depend on the affected TOTP population.
+- **Operator burden:** one more secret to back up — **separately** (§11).
 
-9. **Redaction.** TOTP secrets, provisioning URIs/QR payloads and outbound bot secrets must
-   never reach logs, traces, exception output, ORM reprs, or admin exports.
+## 11. Documentation changes this requires
 
-10. **Replay.** AAD binds record identity but not secret *generation*. A DB writer can replay
-    an older ciphertext into the same row. Out of scope for AAD; needs audit/integrity
-    controls if it matters.
+- `SECURITY.md` §5 — replace the "envelope encryption" clause with this scheme (and the
+  correct term), add the §3 invariant, and **remove the claim that a hash of the inbound bot
+  secret can verify an HMAC** (see below).
+- `SECURITY.md` §4a — distinguish operator-managed bulk data from app-managed credentials.
+- `SECURITY.md` §8 — add "DB-only disclosure" as an explicit attacker capability, and state
+  that API/host compromise defeats application secret encryption entirely.
+- `SECURITY.md` §7 — key length, rotation expectations, nonce bound.
+- `DATA_MODEL.md` — stored format for `(enc)` columns; name Argon2id on `recovery_codes`; add
+  `last_used_step` to `totp`.
+- `AUTH.md` §1 — recovery codes are Argon2id, not merely "hashed".
+- `deploy/.env.example`, `deploy/Makefile` (`make init`), `deploy/docker-compose.yml` (use the
+  file source, not `environment:`).
+- `docs/admin-guide.md` — **the key ring is backed up separately from database dumps**
+  (password manager or separate vault), never in the same archive or bucket. Without this
+  sentence the obvious operator move — `tar deploy/ brook-backup-*.sql` — defeats the design
+  in its own headline scenario. Plus: rotation procedure, retired-key escrow, what key loss
+  costs.
 
-11. **Availability under tampering.** A DB writer can corrupt ciphertext or substitute an
-    unknown key id, locking users out. AAD detects this but does not restore access — define
-    alerts and an operator recovery path.
+**Carried forward — an error in `SECURITY.md` §5 this design must not inherit.** §5 says
+the inbound bot secret is stored as a hash because `api` "only needs to verify" an HMAC over
+body + timestamp. **Verifying an HMAC requires the key itself; whatever can verify can forge.**
+A hash of the key verifies nothing. Phase 3 must either switch inbound to a bearer secret in a
+header (then hashing a server-generated >=256-bit token is correct) or move the inbound secret
+into the encrypted set. Not this design's scope, but flagged here so the §11 edit does not
+propagate it.
 
-12. **Key-source semantics.** Precedence and mutual exclusion between `BROOK_SECRET_KEYS` and
-    `BROOK_SECRET_KEYS_FILE`; file permissions/ownership; strict parsing of whitespace and
-    trailing newlines; error messages that do not leak material.
+## 12. Review log
 
-13. **Field/storage constraints.** Maximum plaintext size, ciphertext column length, strict
-    format parsing, and decryption failures mapped to non-enumerating auth responses.
+| Reviewer | Outcome |
+|---|---|
+| **Codex** (gpt-5.6-terra) | Full review. "The cryptographic primitive is fine." Found: AAD attack described backwards; highest-id-primary is a footgun; lazy rewrap lost-update race; 2^32 stated too casually; invariant unenforceable as written; missing backup/key-retention, redaction, replay, key-source semantics. |
+| **`auth-reviewer`** (Fable) | Four blocking findings: fail-closed semantics unspecified; recovery codes reopen the leaked-dump threat; `totp_pending`/replay/rate-limit unspecified; admin reset lacks authz and audit. Independently found the same AAD error. Verified as sound: the threat model, SHA-256 for refresh tokens, the §3 invariant, the primitive, the startup guard, the sequencing. |
+| **Vibe** | **Did not complete** — killed at a 300 s timeout (exit 143) on a direct CLI invocation, not through the `vibe-reviewer` wrapper. Prompt was ~450 words plus four file reads. Stage 3b is therefore **not satisfied**; re-run when the CLI is fixed. |
 
-14. **Recovery must be designed, not asserted.** "Re-creatable" is not satisfied by naming an
-    admin reset path. Key loss needs a break-glass procedure that does not itself depend on
-    the affected TOTP population, plus a definition of who may invoke it. Bot-secret reissue
-    requires coordinating the receiving bot, so key loss causes integration outages.
-
-### Framing corrections
-
-15. Call this **"application-layer protection against DB-only disclosure"**, not "encryption
-    at rest". It protects against a leaked dump, a leaked read replica, or SQL injection that
-    reads but cannot execute. It does **not** protect against API RCE, host/root compromise,
-    container environment inspection, or a whole-host backup that includes deployment
-    secrets. §8 of `SECURITY.md` should gain "DB-only disclosure" as an explicit attacker
-    capability and state plainly that host compromise defeats this entirely.
-
-16. This is **not** envelope encryption — it is direct symmetric encryption with a configured
-    data-encryption keyring. `SECURITY.md` §5's existing wording should be corrected too.
+All findings above are incorporated. The remaining known gap is the missing Vibe pass.
