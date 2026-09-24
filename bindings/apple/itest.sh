@@ -8,13 +8,15 @@
 #   BROOK_TEST_PASSWORD=...
 #   BROOK_TEST_ALLOW_INSECURE_HTTP=1             (only if the server is plain http)
 #   BROOK_TEST_CHANNEL=<channel uuid>            (a channel the account belongs to, for calls)
+# Optional, from the shell: BROOK_TEST_EXPECT_PEER=1 when a second participant publishes in that
+# channel (the live acceptance); its media must then decode here.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$HERE/.itest.env"
 # Every integration suite that must run, with its test count. A suite that is skipped or
 # runs fewer tests fails the whole run.
-SUITES=("LoginIntegrationTests:2" "CallRoundTripTests:2")
+SUITES=("LoginIntegrationTests:2" "CallRoundTripTests:2" "LiveCallTests:1")
 
 [[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE (see header of $0)" >&2; exit 1; }
 # `stat -f '%Lp'` is the BSD/macOS form (GNU stat uses `-c '%a'`); this script runs on the Mac.
