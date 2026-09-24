@@ -444,6 +444,15 @@ struct ApiErrorContent {
 /// Map a non-2xx response into a structured [`Error`].
 async fn api_error(resp: reqwest::Response) -> Error {
     let status = resp.status();
+    // Redirects are never followed (see `BrookClient::new`), and a redirect's body is not
+    // an API error envelope: report the status only, never content the redirecting party
+    // chose — it reaches the UI verbatim.
+    if status.is_redirection() {
+        return Error::Api {
+            code: format!("http_{}", status.as_u16()),
+            message: format!("unexpected redirect (status {})", status.as_u16()),
+        };
+    }
     let body = resp.text().await.unwrap_or_else(|err| {
         tracing::warn!(%err, "failed to read error response body");
         String::new()
@@ -597,6 +606,33 @@ mod tests {
         assert!(
             elsewhere.received_requests().await.unwrap().is_empty(),
             "credentials were re-sent to the redirect target"
+        );
+    }
+
+    /// A redirect's body is not an API error and must not be echoed to the UI: it could
+    /// carry anything the redirecting party chose, including reflected secrets.
+    #[tokio::test]
+    async fn redirect_error_does_not_echo_the_response_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/login"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", "http://elsewhere.invalid/")
+                    .set_body_json(json!({
+                        "error": { "code": "echo", "message": "supersecret" }
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server).await;
+        let err = client.login("alice", "supersecret").await.unwrap_err();
+
+        assert!(!err.to_string().contains("supersecret"), "echoed: {err}");
+        assert!(
+            matches!(&err, Error::Api { code, .. } if code == "http_307"),
+            "{err:?}"
         );
     }
 
