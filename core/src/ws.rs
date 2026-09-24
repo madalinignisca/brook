@@ -163,19 +163,23 @@ async fn run_once(url: &Url, token: &str, tx: &broadcast::Sender<ServerEvent>) -
                         }
                         Err(err) => tracing::warn!(%err, "failed to parse message.delete payload"),
                     },
-                    "reaction.update" => match serde_json::from_value::<ReactionChanged>(env.data) {
-                        Ok(r) => {
-                            let _ = tx.send(ServerEvent::ReactionUpdate {
-                                channel_id: r.channel_id,
-                                message_id: r.message_id,
-                                emoji: r.emoji,
-                                user_id: r.user_id,
-                                added: r.added,
-                                count: r.count,
-                            });
+                    "reaction.update" => {
+                        match serde_json::from_value::<ReactionChanged>(env.data) {
+                            Ok(r) => {
+                                let _ = tx.send(ServerEvent::ReactionUpdate {
+                                    channel_id: r.channel_id,
+                                    message_id: r.message_id,
+                                    emoji: r.emoji,
+                                    user_id: r.user_id,
+                                    added: r.added,
+                                    count: r.count,
+                                });
+                            }
+                            Err(err) => {
+                                tracing::warn!(%err, "failed to parse reaction.update payload")
+                            }
                         }
-                        Err(err) => tracing::warn!(%err, "failed to parse reaction.update payload"),
-                    },
+                    }
                     "channel.update" => match serde_json::from_value::<Channel>(env.data) {
                         Ok(channel) => {
                             let _ = tx.send(ServerEvent::ChannelUpdate(channel));

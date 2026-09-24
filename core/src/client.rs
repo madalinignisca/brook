@@ -211,7 +211,9 @@ impl BrookClient {
     /// Signal that we're typing in a channel (ephemeral; debounce on the caller).
     pub async fn send_typing(&self, channel_id: &str) -> Result<()> {
         let token = self.access_token().await?;
-        let url = self.base.join(&format!("api/v1/channels/{channel_id}/typing"))?;
+        let url = self
+            .base
+            .join(&format!("api/v1/channels/{channel_id}/typing"))?;
         let resp = self.http.post(url).bearer_auth(token).send().await?;
         if !resp.status().is_success() {
             return Err(api_error(resp).await);
@@ -222,7 +224,9 @@ impl BrookClient {
     /// Self-join a public channel.
     pub async fn join_channel(&self, channel_id: &str) -> Result<Channel> {
         let token = self.access_token().await?;
-        let url = self.base.join(&format!("api/v1/channels/{channel_id}/join"))?;
+        let url = self
+            .base
+            .join(&format!("api/v1/channels/{channel_id}/join"))?;
         let resp = self.http.post(url).bearer_auth(token).send().await?;
         self.parse(resp).await
     }
@@ -330,9 +334,9 @@ impl BrookClient {
         body: &str,
     ) -> Result<Message> {
         let token = self.access_token().await?;
-        let url = self
-            .base
-            .join(&format!("api/v1/channels/{channel_id}/messages/{message_id}"))?;
+        let url = self.base.join(&format!(
+            "api/v1/channels/{channel_id}/messages/{message_id}"
+        ))?;
         let resp = self
             .http
             .patch(url)
@@ -352,9 +356,9 @@ impl BrookClient {
         emoji: &str,
     ) -> Result<Vec<ReactionSummary>> {
         let token = self.access_token().await?;
-        let url = self
-            .base
-            .join(&format!("api/v1/channels/{channel_id}/messages/{message_id}/reactions"))?;
+        let url = self.base.join(&format!(
+            "api/v1/channels/{channel_id}/messages/{message_id}/reactions"
+        ))?;
         let resp = self
             .http
             .post(url)
@@ -368,9 +372,9 @@ impl BrookClient {
     /// Delete a message (author or admin).
     pub async fn delete_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
         let token = self.access_token().await?;
-        let url = self
-            .base
-            .join(&format!("api/v1/channels/{channel_id}/messages/{message_id}"))?;
+        let url = self.base.join(&format!(
+            "api/v1/channels/{channel_id}/messages/{message_id}"
+        ))?;
         let resp = self.http.delete(url).bearer_auth(token).send().await?;
         if !resp.status().is_success() {
             return Err(api_error(resp).await);
