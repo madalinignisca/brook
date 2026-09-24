@@ -73,6 +73,11 @@ class Participant:
     # m-lines. Subscriptions and the SubStream.source mapping are per stream, from
     # this table (not from Janus's description round-trip).
     stream_sources: dict[str, str] = field(default_factory=dict)
+    # mid of each publish m-line by position, from the last accepted offer. Janus
+    # 1.4.2 does not support m-line RECYCLING (a rejected slot reused under a new
+    # mid): it answers with the stale mid and the client's PC rejects the answer
+    # ("order of m-lines doesn't match"). Verified with Chrome. Refused up front.
+    pub_mids: list[str] = field(default_factory=list)
     # True once Janus reports this publish PC up ("webrtcup"). Janus refuses to
     # subscribe anyone to a feed before that ("No such feed"), so a participant only
     # counts as a subscribable publisher from then on; "hangup" clears it.
@@ -355,7 +360,17 @@ class CallManager:
     # ---- publish --------------------------------------------------------------
 
     async def publish(self, p: Participant, sdp: str, tracks: Any = None) -> str:
-        sources = _label_streams(_parse_mlines(sdp), tracks)  # CallError on bad labels
+        mlines = _parse_mlines(sdp)
+        for i, (old, new) in enumerate(zip(p.pub_mids, (m.mid for m in mlines), strict=False)):
+            if old != new:
+                raise CallError(
+                    "invalid",
+                    f"m-line {i} changed mid {old!r} -> {new!r}: m-line recycling is not "
+                    "supported; stop sharing with direction inactive, never stop() a "
+                    "publish transceiver",
+                )
+        # CallError on bad labels; p.stream_sources pins the source of live mids.
+        sources = _label_streams(mlines, tracks, p.stream_sources)
         try:
             msg = await self.janus().message(
                 p.sid,
@@ -374,6 +389,7 @@ class CallManager:
             log.warning("SFU rejected a publish offer from %s: %s", p.participant_id, exc)
             raise CallError("invalid", "the SFU rejected the offer") from exc
         p.stream_sources = sources
+        p.pub_mids = [m.mid for m in mlines]
         p.publishing = [
             {"kind": "audio" if src == "mic" else "video", "source": src}
             for src in sources.values()
@@ -445,19 +461,16 @@ class CallManager:
                 try:
                     msg = await janus.message(p.sid, p.sub_hid, body)
                 except JanusError:
-                    if not (add and drop):
-                        log.exception("subscriber update failed for %s", p.participant_id)
-                        return
-                    # A stream its publisher already dropped (stopped screen share, left)
-                    # may be gone from Janus's side too, failing the whole update. Treat
-                    # the unsubscribes as done and retry only the additions.
-                    try:
-                        msg = await janus.message(
-                            p.sid, p.sub_hid, {"request": "update", "subscribe": body["subscribe"]}
-                        )
-                    except JanusError:
-                        log.exception("subscriber update failed for %s", p.participant_id)
-                        return
+                    # Our record of the subscription can no longer be trusted (e.g. a
+                    # stream its publisher dropped is already gone from Janus, or Janus
+                    # renamed a recycled mid in place). Don't guess which part applied:
+                    # drop the subscribe PC and rebuild it from scratch, the same
+                    # recovery a rejected answer uses. The client gets a fresh offer.
+                    log.warning("subscriber update failed for %s; resubscribing", p.participant_id)
+                    await janus.detach(p.sid, p.sub_hid)
+                    p.sub_hid, p.sub_streams = None, set()
+                    self._spawn(self.reconcile(p))
+                    return
             p.sub_streams = desired
             if "jsep" in msg:
                 await self._offer(p, msg)
@@ -739,31 +752,48 @@ def _parse_mlines(sdp: str) -> list[_MLine]:
 _SOURCES = {"audio": {"mic"}, "video": {"camera", "screen"}}
 
 
-def _label_streams(mlines: list[_MLine], tracks: Any) -> dict[str, str]:
+def _label_streams(
+    mlines: list[_MLine], tracks: Any, current: dict[str, str] | None = None
+) -> dict[str, str]:
     """mid -> source for the ACTIVE audio/video m-lines (contract §3.3).
 
     Without ``tracks``: audio is "mic", video "camera" (clients predating screen
-    share). With ``tracks``: it must label every audio/video m-line by mid with a
-    source valid for its kind, and at most one "screen"; anything else is
-    ``invalid`` (a mislabelled screen would show as a camera tile, or vice versa).
+    share). With ``tracks``:
+    - every ACTIVE audio/video m-line must be labelled; inactive or rejected ones
+      MAY be (browsers drop stopped transceivers from their lists, so demanding a
+      label for a rejected m-line would make re-sharing impossible);
+    - each label names an audio/video m-line of this offer, once, with a source
+      valid for its kind;
+    - at most one ACTIVE "screen" (a stopped screen may stay labelled);
+    - a mid that stays active keeps its source (``current``): relabelling a live
+      camera as a screen, or back, is ``invalid``; stop and restart instead.
+    Anything else is ``invalid``: a mislabelled screen would show as a camera
+    tile, or vice versa.
     """
-    media = [m for m in mlines if m.kind in _SOURCES]
+    media = {m.mid: m for m in mlines if m.kind in _SOURCES}
     if tracks is None:
-        return {m.mid: ("mic" if m.kind == "audio" else "camera") for m in media if m.active}
+        return {
+            m.mid: ("mic" if m.kind == "audio" else "camera") for m in media.values() if m.active
+        }
     if not isinstance(tracks, list) or not all(isinstance(t, dict) for t in tracks):
         raise CallError("invalid", "tracks must be a list of {mid, kind, source}")
     labels = {str(t.get("mid")): t for t in tracks}
-    if len(labels) != len(tracks) or set(labels) != {m.mid for m in media}:
-        raise CallError("invalid", "tracks must label every audio/video m-line by mid, once")
-    screens = 0
-    for m in media:
-        t = labels[m.mid]
-        if t.get("kind") != m.kind or t.get("source") not in _SOURCES[m.kind]:
-            raise CallError("invalid", f"track {m.mid}: kind/source do not match its m-line")
-        screens += t.get("source") == "screen"
-    if screens > 1:
-        raise CallError("invalid", "at most one screen track per participant")
-    return {m.mid: str(labels[m.mid]["source"]) for m in media if m.active}
+    if len(labels) != len(tracks) or not set(labels) <= set(media):
+        raise CallError("invalid", "tracks must name this offer's audio/video m-lines, once each")
+    if missing := {mid for mid, m in media.items() if m.active} - set(labels):
+        raise CallError(
+            "invalid", f"tracks must label every active m-line (missing {sorted(missing)})"
+        )
+    for mid, t in labels.items():
+        if t.get("kind") != media[mid].kind or t.get("source") not in _SOURCES[media[mid].kind]:
+            raise CallError("invalid", f"track {mid}: kind/source do not match its m-line")
+    out = {mid: str(labels[mid]["source"]) for mid, m in media.items() if m.active}
+    if sum(src == "screen" for src in out.values()) > 1:
+        raise CallError("invalid", "at most one active screen per participant")
+    for mid, src in out.items():
+        if current and mid in current and current[mid] != src:
+            raise CallError("invalid", f"track {mid}: source cannot change while it is active")
+    return out
 
 
 def _candidate(c: Any) -> dict[str, Any] | None:

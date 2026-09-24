@@ -161,15 +161,26 @@ Every frame in both directions is the §2 envelope `{type, id, ts, data}`.
 
 - Absent: every audio m-line is `mic` and every video m-line is `camera` (clients
   predating screen share keep working).
-- Present: it must label **every** audio/video m-line of the offer by `mid`,
-  exactly once, with a `source` valid for its kind (`audio`: `mic`; `video`:
-  `camera` or `screen`), and at most one `screen`. Anything else is `invalid`.
-- **Start sharing:** add a `sendonly` video m-line to the **same** publish PC and
-  send `call.publish` again with it labelled `screen`. **Stop sharing:** make that
-  m-line `inactive` (or port 0) and publish again. No other commands exist for it.
-- Only **active** m-lines count as published. Peers get the new stream through a
-  normal `call.subscribe.offer` whose `SubStream.source` is `"screen"`, and see it
-  in the sharer's `Participant.publishing`.
+- Present: every **active** audio/video m-line must be labelled; inactive or
+  rejected ones *may* be. Each label names an audio/video m-line of this offer,
+  once, with a `source` valid for its kind (`audio`: `mic`; `video`: `camera` or
+  `screen`). At most one **active** `screen`. A mid that stays active keeps its
+  source: relabelling a live m-line is refused (stop it and share again).
+  Anything else is `invalid`.
+- An m-line is **active** unless its direction is `inactive`/`recvonly`, or its
+  port is 0 **without** `a=bundle-only` (port 0 **with** `a=bundle-only` is live,
+  per RFC 8843, and is how max-bundle clients such as webrtcbin write it).
+- **Start sharing:** add a `sendonly` video m-line to the **same** publish PC,
+  label it `screen`, and send `call.publish` again. **Stop sharing:** set that
+  m-line's direction to `inactive` and publish again. To share again, re-enable
+  that m-line or add a new one.
+- **Never `stop()` a publish transceiver.** That rejects its m-line, and the
+  browser may later **recycle** the slot under a new mid, which the SFU (Janus
+  1.4.2) answers with the stale mid, breaking the PC. The server refuses any
+  offer that changes the mid of an existing m-line position with `invalid`.
+- Peers get a new stream through a normal `call.subscribe.offer` whose
+  `SubStream.source` is `"screen"`, and see it in the sharer's
+  `Participant.publishing`.
 - `call.media` stays mic/camera only: its `video` flag is the camera. Sharing is
   on/off by publishing, never by `call.media`.
 

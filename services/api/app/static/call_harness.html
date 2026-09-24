@@ -181,20 +181,28 @@ async function republish() {
   await pubPc.setRemoteDescription({ type: "answer", sdp: ans.data.sdp });
 }
 
-// Screen share: a third m-line labelled "screen". fake=true reuses a camera clone
+// Screen share: a new m-line labelled "screen". fake=true reuses a camera clone
 // (headless browsers have no screen to capture); otherwise getDisplayMedia.
+// Every share adds a NEW transceiver: when a share stops, the SFU rejects that
+// m-line in its answer (port 0), and libwebrtc then treats it as finished;
+// re-enabling it fails ("order of m-lines in answer doesn't match offer").
 window.brook.shareScreen = async (fake) => {
   const track = fake ? local.getVideoTracks()[0].clone()
                      : (await navigator.mediaDevices.getDisplayMedia({ video: true })).getVideoTracks()[0];
-  if (screenTx) { await screenTx.sender.replaceTrack(track); screenTx.direction = "sendonly"; }
-  else { screenTx = pubPc.addTransceiver(track, { direction: "sendonly" }); pubSources.set(screenTx, "screen"); }
+  screenTx = pubPc.addTransceiver(track, { direction: "sendonly" });
+  pubSources.set(screenTx, "screen");
   await republish(); log("sharing screen");
 };
-window.brook.stopScreen = async () => {
+// hard=false: direction inactive (the m-line stays, labelled). hard=true: stop the
+// transceiver (browsers drop it from getTransceivers, so it goes unlabelled).
+window.brook.stopScreen = async (hard) => {
   if (!screenTx) return;
-  screenTx.direction = "inactive"; await screenTx.sender.replaceTrack(null);
-  await republish(); log("stopped sharing");
+  if (hard) { screenTx.stop(); pubSources.delete(screenTx); }
+  else { screenTx.direction = "inactive"; await screenTx.sender.replaceTrack(null); }
+  screenTx = null;
+  await republish(); log(hard ? "stopped sharing (transceiver stopped)" : "stopped sharing");
 };
+window.brook.publishSdp = () => pubPc.localDescription && pubPc.localDescription.sdp;
 // Decoded video frames per subscribe-PC mid, to prove a specific stream plays.
 window.brook.framesByMid = async () => {
   const out = {};

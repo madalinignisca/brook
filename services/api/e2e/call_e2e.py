@@ -168,6 +168,37 @@ async def main() -> None:
         )
         print("PASS stop sharing: screen stream renegotiated away")
 
+        # Re-share after a (soft, direction-inactive) stop: a NEW transceiver, the
+        # supported pattern. Bob must decode it, with exactly ONE screen stream.
+        await alice.evaluate("window.brook.shareScreen(true)")
+        mid2 = await wait_for(
+            bob,
+            "(Object.entries(window.brook.remote)"
+            ".find(([m, r]) => r.source === 'screen') || [])[0]",
+            "bob receives the re-shared screen",
+        )
+        screens = await bob.evaluate(
+            "Object.values(window.brook.remote).filter(r => r.source === 'screen').length"
+        )
+        assert screens == 1, f"expected exactly one screen stream, bob has {screens}"
+        g1 = (await bob.evaluate("window.brook.framesByMid()")).get(mid2, 0)
+        await asyncio.sleep(2)
+        g2 = (await bob.evaluate("window.brook.framesByMid()")).get(mid2, 0)
+        assert g2 > g1, f"re-shared screen not decoding on mid {mid2}: {g1}->{g2}"
+        print(f"PASS re-share after stop: one screen stream, decoding on mid {mid2}")
+
+        # Unsupported: transceiver.stop() then share again makes Chrome RECYCLE the
+        # rejected m-line under a new mid, which Janus 1.4.2 answers with the stale
+        # mid (breaking the PC). The server must refuse it cleanly as `invalid`.
+        await alice.evaluate("window.brook.stopScreen(true)")
+        refused = await alice.evaluate(
+            "window.brook.shareScreen(true).then(() => null, e => e.code || String(e))"
+        )
+        assert refused == "invalid", f"recycled m-line not refused cleanly: {refused!r}"
+        state = await alice.evaluate("pubPc.connectionState")
+        assert state == "connected", f"alice's publish PC broke: {state}"
+        print("PASS recycled m-line refused as `invalid`; publish PC still connected")
+
         await bob.evaluate("window.brook.leave()")
         await wait_for(
             alice, "Object.keys(window.brook.participants).length === 0", "alice sees bob leave"
