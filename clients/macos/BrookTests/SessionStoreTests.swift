@@ -61,7 +61,7 @@ final class SessionStoreTests: XCTestCase {
     func testSecondSignInWhileSigningInIsIgnored() async {
         let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)), gated: true)
         let (store, _) = store(fake)
-        let first = Task { await store.signIn(server: "https://h", handle: "alice", password: "pw") }
+        let first = Task { _ = await store.signIn(server: "https://h", handle: "alice", password: "pw") }
         await waitForCalls(fake, 1)
         XCTAssertEqual(store.phase, .signingIn)
         await store.signIn(server: "https://h", handle: "alice", password: "pw")
@@ -112,7 +112,7 @@ final class SessionStoreTests: XCTestCase {
         defaults.set("https://previous", forKey: Settings.lastServerKey)
         let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)), gated: true)
         let (store, _) = store(fake)
-        let signIn = Task { await store.signIn(server: "https://new", handle: "alice", password: "pw") }
+        let signIn = Task { _ = await store.signIn(server: "https://new", handle: "alice", password: "pw") }
         await waitForCalls(fake, 1)
         XCTAssertEqual(defaults.string(forKey: Settings.lastServerKey), "https://previous")
         fake.release()

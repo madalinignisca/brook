@@ -45,18 +45,20 @@ final class SessionStore {
     }
 
     /// The password is used exactly as typed: the server hashes it verbatim.
-    func signIn(server: String, handle: String, password: String) async {
-        if case .signingIn = phase { return }
+    /// Returns whether a login was actually attempted (false: rejected locally or ignored).
+    @discardableResult
+    func signIn(server: String, handle: String, password: String) async -> Bool {
+        if case .signingIn = phase { return false }
         let handle = handle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !handle.isEmpty, !password.isEmpty else {
             phase = .signedOut(error: Message.missingFields)
-            return
+            return false
         }
         let address: String
         switch ServerAddress.parse(server) {
         case let .success(parsed): address = parsed
-        case .failure(.invalid): phase = .signedOut(error: Message.invalidAddress); return
-        case .failure(.notJustAnAddress): phase = .signedOut(error: Message.notJustAnAddress); return
+        case .failure(.invalid): phase = .signedOut(error: Message.invalidAddress); return false
+        case .failure(.notJustAnAddress): phase = .signedOut(error: Message.notJustAnAddress); return false
         }
 
         phase = .signingIn
@@ -73,6 +75,7 @@ final class SessionStore {
         } catch {
             phase = .signedOut(error: Message.unexpected)
         }
+        return true
     }
 
     static func message(for error: LoginError, address: String) -> String {
