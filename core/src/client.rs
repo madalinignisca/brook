@@ -10,7 +10,7 @@ use serde_json::json;
 use tokio::sync::{broadcast, watch};
 use url::Url;
 
-use crate::session_store::{RefreshApplied, SessionStore};
+use crate::session_store::{RefreshApplied, Revision, SessionStore};
 use crate::ws::{self, Commands, ServerEvent, Transport};
 use crate::{
     AuthState, Channel, CoreConfig, Error, Message, ReactionSummary, Result, Session, User,
@@ -407,17 +407,19 @@ impl BrookClient {
             .unwrap()
             .take()
             .expect("realtime transport is taken exactly once, guarded by realtime_started");
+        let refresher = Refresher {
+            http: self.http.clone(),
+            base: self.base.clone(),
+            session: self.session.clone(),
+        };
         tokio::spawn(ws::run(
             url,
             self.session.clone(),
             self.events_tx.clone(),
             transport,
+            refresher.clone(),
         ));
-        tokio::spawn(refresh_loop(
-            self.http.clone(),
-            self.base.clone(),
-            self.session.clone(),
-        ));
+        tokio::spawn(refresh_loop(refresher));
         Ok(())
     }
 
@@ -493,15 +495,13 @@ async fn api_error(resp: reqwest::Response) -> Error {
 }
 
 /// Periodically rotate the access token so a long-lived session keeps REST calls
-/// and the WebSocket authorized. Runs for the client's life: when there's no
-/// session (logged out, or the refresh token was rejected) it idles and polls, so
-/// Periodically rotate the access token so a long-lived session keeps REST calls
 /// and the socket authorized. While there is no session it idles and polls.
-async fn refresh_loop(http: reqwest::Client, base: Url, session: SessionStore) {
+async fn refresh_loop(refresher: Refresher) {
     let mut delay = REFRESH_INTERVAL;
     loop {
         tokio::time::sleep(delay).await;
-        delay = match refresh_once(&http, &base, &session).await {
+        let seen = refresher.session.snapshot().await.0;
+        delay = match refresher.refresh(seen).await {
             Ok(RefreshOutcome::Committed) => REFRESH_INTERVAL,
             // Nothing to do, a newer login won, or the token was rejected (session cleared):
             // poll for the next login.
@@ -511,6 +511,33 @@ async fn refresh_loop(http: reqwest::Client, base: Url, session: SessionStore) {
                 REFRESH_RETRY_INTERVAL // transient (network/5xx) → retry before expiry
             }
         };
+    }
+}
+
+/// Everything needed to rotate the session's tokens; shared by the periodic loop and the
+/// socket's recovery after a 1008 auth close.
+#[derive(Clone)]
+pub(crate) struct Refresher {
+    pub(crate) http: reqwest::Client,
+    pub(crate) base: Url,
+    pub(crate) session: SessionStore,
+}
+
+impl Refresher {
+    /// Single-flight refresh. `seen` is the revision the caller considers stale: if another
+    /// refresh (or a login) already moved past it while we waited for the lock, nothing is
+    /// sent and the caller just uses the current credentials.
+    pub(crate) async fn refresh(&self, seen: Revision) -> Result<RefreshOutcome> {
+        let _flight = self.session.refresh_lock.lock().await;
+        let now = self.session.snapshot().await.0;
+        if now != seen {
+            return Ok(if now.epoch == seen.epoch {
+                RefreshOutcome::Committed
+            } else {
+                RefreshOutcome::Discarded
+            });
+        }
+        refresh_once(&self.http, &self.base, &self.session).await
     }
 }
 

@@ -17,6 +17,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use url::Url;
 
+use crate::client::{RefreshOutcome, Refresher};
 use crate::session_store::{Revision, SessionStore};
 use crate::{Channel, Error, Message, Result};
 
@@ -385,18 +386,45 @@ fn dispatch(text: &str, tx: &broadcast::Sender<ServerEvent>) -> bool {
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// How a connection ended.
+#[derive(Debug, PartialEq, Eq)]
+enum RunEnd {
+    /// Closed for a non-auth reason (or dropped); `ready` says whether it ever authenticated.
+    Closed { ready: bool },
+    /// The server closed with 1008 (`auth_failed` | `auth_timeout` | `token_expired`): the
+    /// credentials must be refreshed over REST before reconnecting.
+    AuthRejected { ready: bool },
+    /// The signed-in identity changed; reconnect at once as the new one.
+    SessionChanged,
+}
+
+/// A re-auth in flight on the open socket.
+struct Reauth {
+    id: String,
+    /// The credential revision whose token it carries.
+    rev: u64,
+    deadline: Instant,
+}
+
 /// Run a single connection: auth, then pump events and commands until the socket closes
 /// or the session's identity changes (a login/logout/clear: the socket belongs to the
-/// epoch it authenticated in and must not outlive it). Returns whether it became `ready`.
+/// epoch it authenticated in and must not outlive it). A token rotation within the same
+/// identity re-authenticates this socket instead (no new generation, no resume).
+#[allow(clippy::too_many_arguments)]
 async fn run_once(
     url: &Url,
     token: &str,
-    epoch: u64,
+    rev: Revision,
+    session: &SessionStore,
     revisions: &mut watch::Receiver<Revision>,
     tx: &broadcast::Sender<ServerEvent>,
     transport: &mut Transport,
     generation: &mut u64,
-) -> Result<bool> {
+) -> Result<RunEnd> {
+    let epoch = rev.epoch;
+    // The credential revision this socket is authenticated with.
+    let mut auth_rev = rev.credential_rev;
+    let mut reauth: Option<Reauth> = None;
     let (mut socket, _resp) = connect_async(url.as_str()).await?;
     tracing::info!(%url, "websocket connected; sending auth");
 
@@ -407,13 +435,26 @@ async fn run_once(
     let mut pending: HashMap<String, Pending> = HashMap::new();
     let mut next_id: u64 = 0;
     let result = loop {
-        let next_deadline = pending.values().map(|p| p.deadline).min();
+        let next_deadline = pending
+            .values()
+            .map(|p| p.deadline)
+            .chain(reauth.as_ref().map(|r| r.deadline))
+            .min();
         tokio::select! {
             changed = revisions.changed() => {
-                if changed.is_err() || revisions.borrow_and_update().epoch != epoch {
+                let now = *revisions.borrow_and_update();
+                if changed.is_err() || now.epoch != epoch {
                     tracing::info!("session changed; closing websocket");
                     let _ = socket.close(None).await;
-                    break Ok(ready);
+                    break Ok(RunEnd::SessionChanged);
+                }
+                // Same identity, rotated token: re-auth this socket once it is ready (a
+                // rotation before `ready` is picked up right after it).
+                if ready && reauth.is_none() && now.credential_rev != auth_rev {
+                    match send_reauth(&mut socket, session, *generation, &mut next_id, transport.reply_timeout).await {
+                        Ok(r) => reauth = r,
+                        Err(err) => break Err(err),
+                    }
                 }
             }
             Some(out) = transport.rx.recv() => {
@@ -437,6 +478,11 @@ async fn run_once(
             }
             () = sleep_until_opt(next_deadline) => {
                 let now = Instant::now();
+                if reauth.as_ref().is_some_and(|r| r.deadline <= now) {
+                    tracing::warn!("re-auth not confirmed in time; reconnecting");
+                    let _ = socket.close(None).await;
+                    break Ok(RunEnd::Closed { ready });
+                }
                 let expired: Vec<String> = pending
                     .iter()
                     .filter(|(_, p)| p.deadline <= now)
@@ -449,22 +495,57 @@ async fn run_once(
                 }
             }
             frame = socket.next() => {
-                let Some(frame) = frame else { break Ok(ready) };
+                let Some(frame) = frame else { break Ok(RunEnd::Closed { ready }) };
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(err) => break Err(err.into()),
                 };
                 match frame {
                     WsMessage::Text(text) => {
-                        let outcome = handle_text(text.as_str(), tx, transport, &mut pending, generation, &mut socket, &mut next_id).await;
-                        if outcome {
+                        // Our re-auth's answer: confirmed (`ready` with `re`) or refused.
+                        if let Some(r) = &reauth {
+                            if let Ok(v) = serde_json::from_str::<Value>(text.as_str()) {
+                                if v.get("re").and_then(Value::as_str) == Some(r.id.as_str()) {
+                                    if v["type"] == "ready" {
+                                        auth_rev = r.rev;
+                                        reauth = None;
+                                        tracing::info!("websocket re-authenticated");
+                                        // Rotated again meanwhile: re-auth once more.
+                                        if revisions.borrow().credential_rev != auth_rev {
+                                            match send_reauth(&mut socket, session, *generation, &mut next_id, transport.reply_timeout).await {
+                                                Ok(r) => reauth = r,
+                                                Err(err) => break Err(err),
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    tracing::warn!("re-auth refused; reconnecting");
+                                    let _ = socket.close(None).await;
+                                    break Ok(RunEnd::Closed { ready });
+                                }
+                            }
+                        }
+                        let became_ready = handle_text(text.as_str(), tx, transport, &mut pending, generation, &mut socket, &mut next_id).await;
+                        if became_ready {
                             ready = true;
                             tracing::info!("websocket subscribed (ready)");
+                            // A rotation that happened before `ready` is not lost.
+                            if revisions.borrow().credential_rev != auth_rev {
+                                match send_reauth(&mut socket, session, *generation, &mut next_id, transport.reply_timeout).await {
+                                    Ok(r) => reauth = r,
+                                    Err(err) => break Err(err),
+                                }
+                            }
                         }
                     }
-                    WsMessage::Close(_) => {
-                        tracing::debug!("websocket closed by server");
-                        break Ok(ready);
+                    WsMessage::Close(frame) => {
+                        let code = frame.as_ref().map(|f| u16::from(f.code));
+                        tracing::debug!(?code, "websocket closed by server");
+                        break Ok(if code == Some(1008) {
+                            RunEnd::AuthRejected { ready }
+                        } else {
+                            RunEnd::Closed { ready }
+                        });
                     }
                     _ => {} // ping/pong handled by tungstenite; ignore binary
                 }
@@ -478,6 +559,31 @@ async fn run_once(
         let _ = p.reply.send(Err(CommandError::Unknown));
     }
     result
+}
+
+/// Send the auth frame again with the current token (same identity). The reply is a
+/// `ready` carrying our `id`. Returns `None` if there is no session any more.
+async fn send_reauth(
+    socket: &mut Socket,
+    session: &SessionStore,
+    generation: u64,
+    next_id: &mut u64,
+    timeout: Duration,
+) -> Result<Option<Reauth>> {
+    let (rev, current) = session.snapshot().await;
+    let Some(token) = current.map(|s| s.access_token) else {
+        return Ok(None);
+    };
+    *next_id += 1;
+    let id = format!("{generation}-{next_id}");
+    let frame = json!({ "type": "auth", "id": id, "data": { "access_token": token } });
+    socket.send(WsMessage::Text(frame.to_string())).await?;
+    tracing::debug!("websocket re-auth sent");
+    Ok(Some(Reauth {
+        id,
+        rev: rev.credential_rev,
+        deadline: Instant::now() + timeout,
+    }))
 }
 
 async fn sleep_until_opt(deadline: Option<Instant>) {
@@ -663,13 +769,14 @@ pub(crate) async fn run(
     session: SessionStore,
     tx: broadcast::Sender<ServerEvent>,
     mut transport: Transport,
+    refresher: Refresher,
 ) {
     let mut revisions = session.watch();
     let mut backoff = 1u64;
     let mut generation = 0u64;
     loop {
-        // Read the *current* token and epoch on each (re)connect, so after a refresh or a
-        // new login the socket authenticates as whoever is signed in now.
+        // Read the *current* token and revision on each (re)connect, so after a refresh or
+        // a new login the socket authenticates as whoever is signed in now.
         revisions.mark_unchanged();
         let (rev, current) = session.snapshot().await;
         let Some(token) = current.map(|s| s.access_token) else {
@@ -680,26 +787,39 @@ pub(crate) async fn run(
             }
             continue;
         };
-        match run_once(
+        let end = run_once(
             &url,
             &token,
-            rev.epoch,
+            rev,
+            &session,
             &mut revisions,
             &tx,
             &mut transport,
             &mut generation,
         )
-        .await
-        {
-            // Reset backoff only after a usable (ready) session, so an immediate
-            // auth-close (e.g. expired token) backs off instead of spin-reconnecting.
-            Ok(true) => backoff = 1,
-            Ok(false) => tracing::warn!("websocket closed before becoming ready; backing off"),
+        .await;
+        match end {
+            Ok(RunEnd::SessionChanged) => continue, // reconnect at once as the new identity
+            Ok(RunEnd::AuthRejected { .. }) => {
+                // Refresh over REST before reconnecting; reconnecting with the same token
+                // would just be rejected again until the grace period is gone.
+                match refresher.refresh(rev).await {
+                    Ok(RefreshOutcome::Committed) | Ok(RefreshOutcome::Discarded) => continue,
+                    // Rejected: the session is cleared (LoggedOut published); the loop idles
+                    // until the next login. NoSession: same.
+                    Ok(RefreshOutcome::Rejected) | Ok(RefreshOutcome::NoSession) => continue,
+                    Err(err) => {
+                        tracing::warn!(%err, "refresh after auth close failed; backing off")
+                    }
+                }
+            }
+            // Reset backoff only after a usable (ready) session, so an immediate close
+            // backs off instead of spin-reconnecting.
+            Ok(RunEnd::Closed { ready: true }) => backoff = 1,
+            Ok(RunEnd::Closed { ready: false }) => {
+                tracing::warn!("websocket closed before becoming ready; backing off")
+            }
             Err(err) => tracing::warn!(%err, "websocket connection error; will reconnect"),
-        }
-        // An identity change reconnects at once; anything else backs off.
-        if session.snapshot().await.0.epoch != rev.epoch {
-            continue;
         }
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
