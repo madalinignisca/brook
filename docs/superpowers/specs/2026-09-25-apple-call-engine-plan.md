@@ -108,6 +108,13 @@ Each task ends in a check; tests are written first and seen failing under a name
   wrapper's dealloc removes every renderer added through it. The engine keeps one wrapper per owned
   mid; the loopback test's frame counter failed until it did (0 frames rendered while 241 decoded).
 
+- **E4, signing.** The Finder-launch gate failed on the first Release bundle: under the hardened
+  runtime, library validation refuses the embedded `WebRTC.framework` when neither the app nor the
+  framework carries a Team ID (ad-hoc signing). Release is now signed with the owner's Developer ID
+  identity (owner's choice), kept in a gitignored `clients/macos/Local.xcconfig` via an optional
+  include in `Signing.xcconfig`; `build.sh release` refuses to run without it. No
+  `disable-library-validation`.
+
 ## Where this fails
 
 | Point | Failure | Response |
