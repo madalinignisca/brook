@@ -9,7 +9,8 @@ Tasks run in order; each ends in a check that must be seen passing (and, for tes
 Test numbers refer to the rows of the spec's §3.2 table (1 runtime hop, 2 tokens, 3 rejected,
 4 stalled listener, 5 no duplicates, 6 initial snapshot, 7 cancellation, 8 insecure-http flag).
 
-**Linux gate (`LG`)** — used by T1 and T7: an `ubuntu:24.04` container (same distro as
+**Linux gate (`LG`)** — *used once at T1; retired afterwards by owner decision (this machine builds
+Apple arm64 targets only); GitHub Actions `rust.yml` is the Linux check from here on.* Was: an `ubuntu:24.04` container (same distro as
 `ubuntu-latest`; GTK 4.14 / libadwaita 1.5 satisfy GNOME's `v4_10` / `v1_4` features — Debian
 Bookworm's 4.8 / 1.2 do not) with `libgtk-4-dev libadwaita-1-dev`, rustup stable + `rustfmt`
 `clippy`, and `cargo-deny`, running exactly `rust.yml`'s steps:
@@ -71,8 +72,8 @@ Swift evidence. The Swift checks always go through `itest.sh`, which **runs
     holds a lock-protected `cancelled` flag set **before** calling `Subscription.cancel()`, and
     drops any `onState` that arrives after it is set. This is the object Step 3's `@Observable`
     store builds on.
-- **Check:** script run twice (idempotent); the xcframework `Info.plist` lists exactly 3 libraries
-  (macos-arm64, ios-arm64, ios-arm64-simulator); `swift build` succeeds.
+- **Check:** script run twice (idempotent); the xcframework `Info.plist` lists exactly 1 library
+  (macos-arm64 only for now); `swift build` succeeds.
 
 ### T5 — Swift tests (written here, executed through `itest.sh` in T6)
 - `RedactionTests` (no server): sentinel tokens never appear in `print`/`debugPrint`/`dump`/
@@ -103,9 +104,8 @@ Swift evidence. The Swift checks always go through `itest.sh`, which **runs
 - **Startup:** `up -d --build --wait` (fresh API image from current `services/api`), assert Compose
   ≥ 2.24.4 (first release with `!override`) **before** `up`, assert the only published binding is `127.0.0.1:18080`, `/health` (timeout 60 s),
   register (non-201 aborts).
-- **Run:** `build-xcframework.sh`, then `swift test` (plain env), then `xcodebuild test` on an
-  available iPhone simulator (chosen via `simctl list -j`; none → fail) with `TEST_RUNNER_` vars;
-  fail on any skip or fewer integration tests than expected, on either platform.
+- **Run:** `build-xcframework.sh`, then `swift test` (plain env) on macOS; fail on any skip or fewer
+  integration tests than expected. (Simulator run with `TEST_RUNNER_` vars returns with iOS.)
 - **Check:** passes end-to-end; a run with the api container killed mid-run fails (not skips);
   after both, `docker compose ls -a --filter name=<this run's project>` and
   `docker volume ls --filter label=com.docker.compose.project=<this run's project>` are empty —
@@ -151,3 +151,8 @@ Swift-side cancellation guard (`AuthStateObserver`) added with its own test.
 **Round 2 — Codex.** Six of seven resolved. Fixed: cleanup assertions scoped to this run's project
 (#4); stale-project sweep removed (unsafe — cannot tell interrupted from live runs); Compose
 minimum raised to 2.24.4 and checked before `up`. Plan gate closed.
+
+**Scope change (owner):** macOS first — T4/T6 build and test the macOS arm64 slice only; iOS slices and
+the simulator run move to the iOS client. T7 becomes: push, and read `rust.yml` on GitHub (the
+`deny` job's pre-existing GNOME-wildcard failure is the baseline). Next step after T8 is the macOS
+app shell, with a human test against the server-side test environment.

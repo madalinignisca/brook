@@ -31,7 +31,7 @@ macOS and the iOS simulator?** Everything later (Keychain, UI, chat) rests on th
 2. `bindings/apple/build-xcframework.sh` produces `BrookCoreFFI.xcframework` per the artifact
    contract in §3.3, consumed by the local Swift package `BrookCore`.
 3. `bindings/apple/itest.sh` exits 0, which requires **all** of the following, run against a fresh,
-   isolated server stack (§3.4) — on macOS (`swift test`) **and** on an iOS simulator (`xcodebuild test`):
+   isolated server stack (§3.4) — on macOS (`swift test`). (iOS slices and the simulator run are deferred: macOS ships first.)
    - `login` with valid credentials returns `LoginResult.loggedIn(session)` whose `user.handle`
      matches, whose `accessToken` and `refreshToken` are non-empty and different, and whose
      `accessToken` **works against the server** (`GET /api/v1/auth/me` from Swift → 200, same handle).
@@ -140,12 +140,13 @@ bindings/apple/
     Tests/BrookCoreTests/             ← checked in
 ```
 
-- `cargo build --release` for the three targets → **static** `libbrook_ffi.a` per target
-  (a dylib is not an iOS distribution artifact).
+- `cargo build --release --target aarch64-apple-darwin` → **static** `libbrook_ffi.a`. **arm64 only, Apple targets only** —
+  no x86_64 slice is ever built. iOS (`aarch64-apple-ios`, `aarch64-apple-ios-sim`) slices are added
+  when the iOS client starts; the script is written so adding them is one list entry.
 - Library-mode bindgen from the host `cdylib` → `brook_ffi.swift`, `brook_ffiFFI.h`,
   `brook_ffiFFI.modulemap` (renamed `module.modulemap`).
-- `xcodebuild -create-xcframework` with **three separate library entries** — macOS arm64,
-  iOS arm64, iOS-simulator arm64 — each `-library <.a> -headers <dir with header + module.modulemap>`.
+- `xcodebuild -create-xcframework` with one library entry per slice (macOS arm64 now; iOS arm64 and
+  iOS-simulator arm64 later), each `-library <.a> -headers <dir with header + module.modulemap>`.
 - `Package.swift`: `.binaryTarget(name: "BrookCoreFFI", path: …xcframework)`; the
   `BrookCore` source target depends on it; platforms `.macOS(.v15)`, `.iOS(.v18)`.
 - `set -euo pipefail`; missing target or tool fails loudly; idempotent (cleans its outputs).
@@ -165,9 +166,9 @@ Nothing in Step 1 creates an Xcode project.
 2. Waits for `GET /health`; registers a random handle via `POST /api/v1/auth/register`. The DB is
    fresh, so this is the bootstrap first user (admin) — any non-201 aborts the run.
 3. Runs `swift test` (macOS) with `BROOK_REQUIRE_ITEST=1`, `BROOK_TEST_SERVER`, `BROOK_TEST_HANDLE`,
-   `BROOK_TEST_PASSWORD` in the environment, then `xcodebuild test` on a simulator with the same
-   values as **`TEST_RUNNER_`-prefixed** variables (Xcode strips the prefix into the test
-   runner's environment; plain shell exports do not reach the simulator).
+   `BROOK_TEST_PASSWORD` in the environment. (With the iOS client: `xcodebuild test` on a simulator
+   with the same values as **`TEST_RUNNER_`-prefixed** variables — plain shell exports do not reach
+   the simulator's test runner.)
 4. Fails if either run reports any skipped test or fewer than the expected number of
    integration tests executed.
 5. `trap`: `docker compose -p brook-itest down -v` on every exit.
@@ -180,7 +181,8 @@ device is out of scope.
 - No change to `brook-core` (refresh, logout, restore, `LoginResult` in core itself) — those
   are Step 2 and are announced to the server session first because GNOME shares core.
 - No Keychain, no session persistence, no app targets, no UI, no Xcode projects.
-- No Intel (`x86_64`) slices; Apple Silicon only until someone needs Intel.
+- No Intel (`x86_64`) slices, ever built on this machine; Apple Silicon only.
+- No iOS in Step 1: macOS client ships first; iOS slices + simulator tests arrive with the iOS client.
 - No Apple CI job yet (macOS runners); added with the app targets in Step 3. Until then, §2.3 is
   run locally and its output pasted into the PR.
 - No TOTP/OIDC/LDAP, WebSocket, push, CallKit.
@@ -215,3 +217,7 @@ owner: **at most one late callback**, non-blocking `cancel()`, Swift wrapper dro
 (§3.1). New defects fixed: compose override must *replace* ports (`!override`) and the binding is
 asserted; the duplicate-delivery and initial-snapshot tests rewritten so their mutations actually
 fail them. Spec gate closed.
+
+**Scope change (owner, after approval):** macOS first. iOS slices and the simulator integration run
+are deferred to the iOS client; arm64 Apple targets only. The Linux CI gate is not run locally
+(Apple-only builds on this machine); GitHub Actions is the Linux check.
