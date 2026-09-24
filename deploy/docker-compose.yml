@@ -82,7 +82,11 @@ services:
     restart: unless-stopped
     environment:
       # Shared with api only; every Janus API request must carry it.
-      JANUS_API_SECRET: ${JANUS_API_SECRET:?set JANUS_API_SECRET in .env (make init generates it)}
+      # Not `:?` here: Compose interpolates EVERY service, even ones whose profile is
+      # off, so a required variable broke plain `make up` for any .env made before
+      # calls existed. Janus still refuses to start without it: services/sfu/
+      # entrypoint.sh exits on a missing or empty JANUS_API_SECRET.
+      JANUS_API_SECRET: ${JANUS_API_SECRET:-}
       # The address clients send media to. Defaults to the media bind address.
       JANUS_PUBLIC_IP: ${BROOK_MEDIA_PUBLIC_IP:-${BROOK_MEDIA_BIND:-127.0.0.1}}
       JANUS_RTP_PORTS: ${BROOK_MEDIA_RTP_PORTS:-20000-20099}

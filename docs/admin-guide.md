@@ -53,6 +53,10 @@ curl http://<BROOK_HTTP_BIND>:8080/health      # {"status":"ok","version":"..."}
 > existed doesn't have it, so the server falls back to loopback and **LAN clients can
 > no longer connect**. Add `BROOK_HTTP_BIND=<LAN IP>` to `.env` and `make up`.
 
+> **Calls (`make media`)** need `JANUS_API_SECRET` in `.env`. A `.env` created before
+> calls existed doesn't have it; `make media` adds a random one on first run. Plain
+> `make up` doesn't start the media server and doesn't need it.
+
 ### Create the first administrator
 
 The **first** account created becomes the global **admin**:
