@@ -17,6 +17,10 @@ struct LoginView: View {
                     .textContentType(.password)
             }
             .formStyle(.grouped)
+            // A grouped Form grows to fill the window; size it to its rows instead so the
+            // button and messages sit right under the fields.
+            .scrollDisabled(true)
+            .fixedSize(horizontal: false, vertical: true)
             .disabled(form.isBusy)
             .onSubmit(submit)
 
@@ -41,7 +45,7 @@ struct LoginView: View {
             }
         }
         .padding(24)
-        .frame(maxWidth: 420)
+        .frame(maxWidth: 420, maxHeight: .infinity)
     }
 
     private func submit() {
