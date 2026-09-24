@@ -12,9 +12,10 @@ command -v xcodegen >/dev/null || { echo "xcodegen not found (brew install xcode
 "$ROOT/bindings/apple/build-xcframework.sh"
 (cd "$HERE" && xcodegen --quiet)
 
-action=build
-[[ "${1:-}" == "test" ]] && action=test
+args=(build)
+# A test that deadlocks must fail, not hang the run: cap each test at 60 s.
+[[ "${1:-}" == "test" ]] && args=(test -test-timeouts-enabled YES -maximum-test-execution-time-allowance 60)
 xcodebuild -project "$HERE/Brook.xcodeproj" -scheme Brook -configuration Debug \
-  -derivedDataPath "$HERE/build" "$action"
+  -derivedDataPath "$HERE/build" "${args[@]}"
 
 echo "app: $HERE/build/Build/Products/Debug/Brook.app"

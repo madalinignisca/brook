@@ -14,12 +14,12 @@ final class SettingsTests: XCTestCase {
         defaults.removePersistentDomain(forName: suite)
     }
 
-    func testServerPrefillPrefersEnvironmentThenLastGoodThenLocalhost() {
+    /// The address survives restarts; nothing from the environment overrides it.
+    func testServerPrefillIsTheSavedAddressElseLocalhost() {
         XCTAssertEqual(Settings(defaults: defaults, environment: [:]).serverPrefill, "https://localhost")
         defaults.set("https://last.example", forKey: Settings.lastServerKey)
-        XCTAssertEqual(Settings(defaults: defaults, environment: [:]).serverPrefill, "https://last.example")
         let env = ["BROOK_SERVER": "https://env.example"]
-        XCTAssertEqual(Settings(defaults: defaults, environment: env).serverPrefill, "https://env.example")
+        XCTAssertEqual(Settings(defaults: defaults, environment: env).serverPrefill, "https://last.example")
     }
 
     func testInsecureHTTPFromEnvironmentOrHiddenDefaultOnly() {

@@ -1,8 +1,10 @@
 import Foundation
 
-/// Where the login form's configuration comes from. Environment variables match the GNOME
-/// client (`BROOK_SERVER`, `BROOK_ALLOW_INSECURE_HTTP=1`); the defaults are the
-/// Finder-launch equivalents, since an app opened from Finder has no environment.
+/// Where the login form's configuration comes from. The server address is what the user
+/// typed, remembered across launches (there is deliberately no environment override: it
+/// would silently replace the saved choice). The plain-http opt-in matches the GNOME
+/// client's `BROOK_ALLOW_INSECURE_HTTP=1`, with a hidden default as the Finder-launch
+/// equivalent, since an app opened from Finder has no environment.
 struct Settings {
     static let lastServerKey = "LastServer"
     /// Hidden, no UI: `defaults write dev.brook.Brook AllowInsecureHTTP -bool YES`.
@@ -18,8 +20,7 @@ struct Settings {
     }
 
     var serverPrefill: String {
-        if let env = environment["BROOK_SERVER"], !env.isEmpty { return env }
-        return defaults.string(forKey: Self.lastServerKey) ?? Self.fallbackServer
+        defaults.string(forKey: Self.lastServerKey) ?? Self.fallbackServer
     }
 
     /// Plain http to any host: the password travels unencrypted. Dev/testing only.
