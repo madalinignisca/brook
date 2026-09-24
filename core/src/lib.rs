@@ -13,6 +13,7 @@ mod client;
 mod config;
 mod error;
 mod session;
+mod session_store;
 mod state;
 #[cfg(test)]
 mod test_support;
