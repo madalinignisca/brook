@@ -25,6 +25,10 @@ use crate::{Error, Result};
 
 type CmdResult = std::result::Result<Reply, CommandError>;
 
+/// How long `leave()` waits for the server to confirm, so "await leave(); exit" does not
+/// drop the socket before the server has removed us. Errors and timeouts are ignored.
+const LEAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// A live call. Dropping it leaves the call.
 pub struct CallHandle {
     input: mpsc::UnboundedSender<Input>,
@@ -63,7 +67,9 @@ impl CallHandle {
         self.ask(Input::Republish).await
     }
 
-    /// Leave the call. Local media stops immediately; the server is told best-effort.
+    /// Leave the call. Local media stops and the status becomes `Ended(Left)` immediately;
+    /// this resolves once the server confirmed (or after a few seconds at most), so an app
+    /// can await it and then quit.
     pub async fn leave(&self) -> Result<()> {
         self.ask(Input::Leave).await
     }
@@ -587,8 +593,24 @@ impl Task {
                 }
             }
             Input::Leave(reply) => {
-                self.finish(EndReason::Left, true);
-                let _ = reply.send(Ok(()));
+                // Start `call.leave` with its reply kept (the transport skips requests whose
+                // receiver is gone), then tear down locally without waiting for it.
+                let confirm = if self.connected && !self.ended {
+                    let frame =
+                        json!({ "type": "call.leave", "data": { "call_id": self.call_id } });
+                    self.commands
+                        .start(self.generation, frame, "call.ok", None)
+                        .ok()
+                } else {
+                    None
+                };
+                self.finish(EndReason::Left, confirm.is_none());
+                tokio::spawn(async move {
+                    if let Some(rx) = confirm {
+                        let _ = tokio::time::timeout(LEAVE_WAIT, rx).await;
+                    }
+                    let _ = reply.send(Ok(()));
+                });
             }
             Input::HandleDropped => self.finish(EndReason::Left, true),
             Input::Done(done) => self.on_done(done),
