@@ -4,7 +4,7 @@
 //! GUI.
 //!
 //! ```sh
-//! BROOK_SERVER=http://192.168.1.192:8080 BROOK_HANDLE=... BROOK_PASSWORD=... \
+//! BROOK_SERVER=http://<server>:8080 BROOK_HANDLE=... BROOK_PASSWORD=... \
 //! BROOK_CHANNEL=<uuid> [BROOK_CAMERA=test|auto|/dev/videoN] [BROOK_MIC=test|auto|none] \
 //! [BROOK_SECONDS=120] cargo run -p brook-media-gst --example call_participant
 //! ```

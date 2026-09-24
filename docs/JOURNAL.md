@@ -47,7 +47,7 @@ leave races it.
 
 ### P4 calls: GstEngine implements core's MediaEngine, reviewed by Vibe
 
-Branch `feat/gtk-calls` = `feat/gtk-media-engine` + brook-ios's
+Branch `feat/gtk-calls` = `feat/gtk-media-engine` + the core side's
 `feat/core-call-signaling` (P4 public types). `brook-media-gst` now uses core's
 `PcKind`/`IceCandidate`/`IceServer`/`SubStream` (one definition) and implements
 `brook_core::MediaEngine`. Contract obligations met and tested
@@ -60,7 +60,7 @@ material.
 
 ### P4 calls: webrtcbin <-> Janus interop proven (local stack)
 
-Ran brook's `feat/calls` (api + Janus 1.4.2 VideoRoom) in local docker
+Ran the server side's `feat/calls` (api + Janus 1.4.2 VideoRoom) in local docker
 (`docker compose -p brookcalls --profile media`, separate project so the dev
 stack's volumes are untouched) and a new ignored test,
 `clients/gst-media/tests/janus_interop.rs`, with a minimal in-test signaling
@@ -75,7 +75,7 @@ decoder per active mid and fails without the fix. Vibe: nothing material.
 
 ### KDE: return to login on mid-session sign-out, reviewed by Vibe
 
-Same requirement as GNOME (brook-ios, before core's session-epoch fix merges):
+Same requirement as GNOME (from the core side, before core's session-epoch fix merges):
 a watcher on the core `AuthState` flips `logged_in` back on `LoggedOut`, so
 Kirigami swaps the chat page for the login page; the shared client is cleared.
 The chat realtime listener now uses a generation counter instead of a
@@ -94,7 +94,7 @@ form gets a Server row; the server of the last *successful* login is saved to
 `$XDG_CONFIG_HOME/brook/gnome.ini` (GKeyFile, not GSettings: an uninstalled
 `cargo run` has no compiled schema); `BROOK_SERVER` still overrides. A client
 is created per server; its auth watcher stops once replaced. Requested by
-brook-ios before core's session-epoch fix (C1b P1) merges: a mid-session
+the core side before core's session-epoch fix (C1b P1) merges: a mid-session
 `LoggedOut` now tears the chat view down and returns to login; the chat
 realtime loop stops once its view is gone (else a rebuilt view on the same
 client double-handles events, e.g. duplicate notifications). **Not run on
@@ -124,8 +124,8 @@ frees everything); "`RUST_LOG=error` gets raised to info for tungstenite"
 
 ### P4 calls: Linux media engine (`clients/gst-media`), reviewed by Vibe
 
-Coordinated P4 with the server (brook) and Apple (brook-ios) agents: wire
-contract = PROTOCOL.md §3 (PR #10), signaling lives in `core` (brook-ios, C1b),
+Coordinated P4 with the server and core/Apple sides: wire
+contract = PROTOCOL.md §3 (PR #10), signaling lives in `core` (C1b),
 media is per client. New toolkit-free crate `brook-media-gst` on GStreamer
 `webrtcbin`: publish PC (sendonly, client offers, H.264 advertised
 `profile-level-id=42e01f` pmode=1 + Opus; VP8 fallback) and subscribe PC
