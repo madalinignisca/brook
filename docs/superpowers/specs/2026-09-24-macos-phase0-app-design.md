@@ -43,8 +43,10 @@ logout. The macOS app does the same, the macOS way.
   notarization is the distribution path (as for the owner's other macOS app), added with packaging.
 
 ### 3.2 Configuration
-- **Server address**: a field on the login form, prefilled from, in order: `BROOK_SERVER` env var
-  (dev), the last address that logged in successfully (`UserDefaults`), else `https://localhost`.
+- **Server address**: a field on the login form, prefilled with the last address that logged in
+  successfully (`UserDefaults`, so it survives restarts), else `https://localhost`. **No environment
+  override** (owner decision after approval: people set the server they use and expect it kept; an
+  env var would silently replace that choice).
   Deviation from GNOME (which has no field): a Finder-launched Mac app has no environment, so
   without a field the app could only reach `localhost`. **Parked for the GTK client** as a parity
   question, not changed there.
