@@ -13,6 +13,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
+use brook_core::{BrookClient, CallHandle, CallState, CallStatus, EndReason, MediaEngine};
 use brook_media_gst::{
     CameraSource, EngineConfig, EngineEvent, GstEngine, MicSource, PcKind, SinkFactory, TrackKind,
     VideoCodec,
@@ -242,7 +243,6 @@ impl CallView {
     }
 
     /// Rename a tile (e.g. once the roster maps its mid to a participant).
-    #[allow(dead_code)] // wired to the roster once core's CallHandle lands
     pub fn set_tile_name(&self, mid: &str, name: &str) {
         if let Some(tile) = self.tiles.borrow().get(mid) {
             tile.label.set_text(name);
@@ -250,7 +250,6 @@ impl CallView {
     }
 
     /// Remove a remote stream's tile (it left the latest subscribe offer).
-    #[allow(dead_code)] // wired to the roster once core's CallHandle lands
     pub fn remove_tile(&self, mid: &str) {
         if let Some(tile) = self.tiles.borrow_mut().remove(mid) {
             self.grid.remove(&tile.child);
@@ -282,6 +281,11 @@ impl CallView {
     /// Called when the user hangs up.
     pub fn connect_hangup(&self, f: impl Fn() + 'static) {
         self.hangup_button.connect_clicked(move |_| f());
+    }
+
+    /// Mids that currently have a tile.
+    fn tile_mids(&self) -> Vec<String> {
+        self.tiles.borrow().keys().cloned().collect()
     }
 
     fn refresh_empty(&self) {
@@ -467,6 +471,228 @@ pub fn present_loopback(app: &adw::Application, runtime: &Handle) {
             Ok(Ok(())) => {}
             Ok(Err(err)) => view.set_status(&format!("Negotiation failed: {err}")),
             Err(err) => view.set_status(&format!("Negotiation task failed: {err}")),
+        }
+    });
+}
+
+/// Why a call ended, for the status banner.
+fn end_text(reason: &EndReason) -> String {
+    match reason {
+        EndReason::Left => "You left the call.".into(),
+        EndReason::SfuRestart => "The call ended: the media server restarted.".into(),
+        EndReason::Removed => "You were removed from this channel.".into(),
+        EndReason::Replaced => "You joined this call from another window or device.".into(),
+        EndReason::Expired => "Lost connection to the call.".into(),
+        EndReason::SessionChanged => "You were signed out.".into(),
+        EndReason::EngineFailed(msg) => format!("Camera/microphone failure: {msg}"),
+        EndReason::Server(code) => match code.as_str() {
+            "call_full" => "This call is full.".into(),
+            "sfu_unavailable" => "Calls are unavailable right now.".into(),
+            _ => format!("The server ended the call ({code})."),
+        },
+        _ => "The call ended.".into(),
+    }
+}
+
+/// Open a call window for `channel_id` and join its call through core.
+/// Closing the window (or hanging up) leaves the call.
+pub fn open_call(
+    parent: Option<&gtk::Window>,
+    client: Arc<BrookClient>,
+    runtime: Handle,
+    channel_id: String,
+    title: &str,
+) -> adw::Window {
+    let view = CallView::new(title);
+    let window = adw::Window::builder()
+        .title(format!("Call - {title}"))
+        .default_width(960)
+        .default_height(640)
+        .content(view.widget())
+        .build();
+    window.set_transient_for(parent);
+    window.present();
+
+    let config = match engine_config_from_env() {
+        Ok(c) => c,
+        Err(err) => {
+            view.set_status(&format!("Media engine unavailable: {err}"));
+            return window;
+        }
+    };
+    let (engine, mut engine_events) = match GstEngine::new(config) {
+        Ok(e) => e,
+        Err(err) => {
+            view.set_status(&format!("Media engine unavailable: {err}"));
+            return window;
+        }
+    };
+    view.set_status("Joining...");
+
+    // The handle, once joined; dropped (-> leave) when the window goes away.
+    let handle: Rc<RefCell<Option<Arc<CallHandle>>>> = Rc::default();
+    // mid -> participant id, from the latest applied subscribe offer.
+    let mids: Rc<RefCell<HashMap<String, String>>> = Rc::default();
+    // The latest call state (roster names).
+    let state: Rc<RefCell<Option<CallState>>> = Rc::default();
+
+    let name_of = {
+        let (mids, state) = (mids.clone(), state.clone());
+        move |mid: &str| -> String {
+            let pid = mids.borrow().get(mid).cloned();
+            state
+                .borrow()
+                .as_ref()
+                .and_then(|s| {
+                    s.participants
+                        .iter()
+                        .find(|p| Some(&p.participant_id) == pid.as_ref())
+                        .map(|p| p.display_name.clone())
+                })
+                .unwrap_or_default()
+        }
+    };
+    let name_of = Rc::new(name_of);
+
+    // Controls.
+    view.connect_media_toggled({
+        let (handle, runtime) = (handle.clone(), runtime.clone());
+        move |audio, video| {
+            if let Some(h) = handle.borrow().clone() {
+                runtime.spawn(async move {
+                    if let Err(err) = h.set_media(audio, video).await {
+                        tracing::warn!(%err, "set_media");
+                    }
+                });
+            }
+        }
+    });
+    view.connect_hangup({
+        let window = window.downgrade();
+        move || {
+            if let Some(w) = window.upgrade() {
+                w.close();
+            }
+        }
+    });
+    window.connect_close_request({
+        let (handle, runtime) = (handle.clone(), runtime.clone());
+        move |_| {
+            if let Some(h) = handle.borrow_mut().take() {
+                runtime.spawn(async move {
+                    let _ = h.leave().await;
+                });
+            }
+            glib::Propagation::Proceed
+        }
+    });
+
+    // Join, then pump engine events into core and the view. Events emitted
+    // before the handle exists (publish candidates) wait in the channel.
+    glib::spawn_future_local({
+        let (view, handle, mids, state, name_of) = (
+            view.clone(),
+            handle.clone(),
+            mids.clone(),
+            state.clone(),
+            name_of.clone(),
+        );
+        let window = window.downgrade();
+        async move {
+            let engine_dyn: Arc<dyn MediaEngine> = engine.clone();
+            let joined = runtime
+                .spawn({
+                    let client = client.clone();
+                    async move { client.join_call(&channel_id, engine_dyn, true).await }
+                })
+                .await;
+            let call = match joined {
+                Ok(Ok(call)) => call,
+                Ok(Err(err)) => {
+                    engine.close();
+                    view.set_status(&format!("Couldn't join the call: {err}"));
+                    return;
+                }
+                Err(err) => {
+                    engine.close();
+                    view.set_status(&format!("Couldn't join the call: {err}"));
+                    return;
+                }
+            };
+            // The window may have been closed while joining: leave at once.
+            if window.upgrade().is_none() {
+                runtime.spawn(async move {
+                    let _ = call.leave().await;
+                });
+                return;
+            }
+            *handle.borrow_mut() = Some(call.clone());
+            watch_call_state(&view, &call, &state, &name_of);
+
+            while let Some(ev) = engine_events.recv().await {
+                match ev {
+                    EngineEvent::LocalCandidate { pc, candidate } => {
+                        call.local_candidate(pc, candidate)
+                    }
+                    EngineEvent::LocalPreview { sink } => view.set_self_view(&sink),
+                    EngineEvent::SubscribeStreams(streams) => {
+                        let video: HashMap<String, String> = streams
+                            .iter()
+                            .map(|s| (s.mid.clone(), s.participant_id.clone()))
+                            .collect();
+                        *mids.borrow_mut() = video;
+                        // Tiles for mids no longer in the offer are gone.
+                        for mid in view.tile_mids() {
+                            if !mids.borrow().contains_key(&mid) {
+                                view.remove_tile(&mid);
+                            } else {
+                                view.set_tile_name(&mid, &name_of(&mid));
+                            }
+                        }
+                    }
+                    EngineEvent::RemoteTrack {
+                        mid,
+                        kind: TrackKind::Video,
+                        sink,
+                    } => view.set_remote_video(&mid, &sink, &name_of(&mid)),
+                    EngineEvent::Error { message, .. } => {
+                        tracing::warn!(%message, "media engine error");
+                        call.engine_failed(message);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+    window
+}
+
+/// Reflect core's call state: status banner, tile names, end of call.
+fn watch_call_state(
+    view: &CallView,
+    call: &Arc<CallHandle>,
+    state: &Rc<RefCell<Option<CallState>>>,
+    name_of: &Rc<impl Fn(&str) -> String + 'static>,
+) {
+    let mut rx = call.state();
+    let (view, state, name_of) = (view.clone(), state.clone(), name_of.clone());
+    glib::spawn_future_local(async move {
+        loop {
+            let current = rx.borrow_and_update().clone();
+            match &current.status {
+                CallStatus::Joining => view.set_status("Joining..."),
+                CallStatus::Connected => view.set_status(""),
+                CallStatus::Reconnecting => view.set_status("Reconnecting..."),
+                CallStatus::Ended(reason) => view.set_status(&end_text(reason)),
+            }
+            let ended = matches!(current.status, CallStatus::Ended(_));
+            *state.borrow_mut() = Some(current);
+            for mid in view.tile_mids() {
+                view.set_tile_name(&mid, &name_of(&mid));
+            }
+            if ended || rx.changed().await.is_err() {
+                break;
+            }
         }
     });
 }

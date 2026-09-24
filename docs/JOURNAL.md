@@ -16,6 +16,23 @@ Conventions:
 
 ## 2026-09-24
 
+### P4 calls: GNOME joins real calls through core, reviewed by Vibe
+
+Chat header gets a call button ("Start a call" / "Join call (N)" from
+`channel.call`; insensitive on archived channels). It opens a call window
+driven by `BrookClient::join_call` + `GstEngine`: engine candidates ->
+`local_candidate`, engine errors -> `engine_failed`, `SubscribeStreams` +
+`CallState` roster -> tile names / tile removal, status banner for
+Joining/Reconnecting/Ended(reason), mic/camera -> `set_media`, hang up / close
+window -> `leave`. Core's awaited `leave()` fix verified: the back-to-back
+live test now passes 3/3 (it failed every time before). **Not run on screen yet** (libadwaita
+missing); the same engine + core path is proven headless by `core_call.rs`.
+
+Friends review: only Vibe ran. Declined all three (engine.close() on window
+close / close-during-join / engine error): core's MediaEngine contract calls
+close() exactly once on every end path (leave, engine_failed, handle drop);
+the UI closes it itself only when join fails, before a handle exists.
+
 ### P4 calls: live call through core's signaling (C1b acceptance on Linux)
 
 `clients/gst-media/tests/core_call.rs` (ignored, live): two `BrookClient`s +
