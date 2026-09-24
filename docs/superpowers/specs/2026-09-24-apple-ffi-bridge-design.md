@@ -148,7 +148,7 @@ bindings/apple/
 - `xcodebuild -create-xcframework` with one library entry per slice (macOS arm64 now; iOS arm64 and
   iOS-simulator arm64 later), each `-library <.a> -headers <dir with header + module.modulemap>`.
 - `Package.swift`: `.binaryTarget(name: "BrookCoreFFI", path: …xcframework)`; the
-  `BrookCore` source target depends on it; platforms `.macOS(.v15)`, `.iOS(.v18)`.
+  `BrookCore` source target depends on it; platforms `.macOS(.v26)` (tools 6.2; matches `MACOSX_DEPLOYMENT_TARGET=26.0` in the build script), iOS added with the iOS client.
 - `set -euo pipefail`; missing target or tool fails loudly; idempotent (cleans its outputs).
 
 Nothing in Step 1 creates an Xcode project.

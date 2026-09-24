@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Integration tests of the Swift bindings against the shared test server (a real Brook
+# stack on the Linux VM, operated by the server side). No local server is started here.
+#
+# Reads bindings/apple/.itest.env (gitignored, mode 600, filled in by a human):
+#   BROOK_TEST_SERVER=http://host:port           (base URL, no /api/v1)
+#   BROOK_TEST_HANDLE=itest-mac
+#   BROOK_TEST_PASSWORD=...
+#   BROOK_TEST_ALLOW_INSECURE_HTTP=1             (only if the server is plain http)
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="$HERE/.itest.env"
+EXPECTED_TESTS=2
+
+[[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE (see header of $0)" >&2; exit 1; }
+if [[ "$(stat -f '%Lp' "$ENV_FILE")" != "600" ]]; then
+  echo "$ENV_FILE must be mode 600 (it holds a password): chmod 600 $ENV_FILE" >&2; exit 1
+fi
+set -a; source "$ENV_FILE"; set +a
+for v in BROOK_TEST_SERVER BROOK_TEST_HANDLE BROOK_TEST_PASSWORD; do
+  [[ -n "${!v:-}" ]] || { echo "$v is not set in $ENV_FILE" >&2; exit 1; }
+done
+
+health="${BROOK_TEST_SERVER%/}/health"
+curl -fsS --max-time 10 "$health" >/dev/null || { echo "server not reachable: $health" >&2; exit 1; }
+
+"$HERE/build-xcframework.sh"
+
+cd "$HERE/swift/BrookCore"
+log="$(mktemp)"; trap 'rm -f "$log"' EXIT
+set +e
+BROOK_REQUIRE_ITEST=1 swift test 2>&1 | tee "$log"
+status=${PIPESTATUS[0]}
+set -e
+
+# A green `swift test` is not enough: the integration tests must actually have run.
+# XCTest prints the suite summary on the line after "Test Suite '<name>' passed|failed".
+line="$(awk "/Test Suite 'LoginIntegrationTests' (passed|failed)/{getline; print; exit}" "$log")"
+ran="$(sed -nE 's/.*Executed ([0-9]+) tests?.*/\1/p' <<<"$line")"
+skipped="$(sed -nE 's/.* ([0-9]+) tests? skipped.*/\1/p' <<<"$line")"
+if (( status != 0 )); then echo "FAIL: swift test exited $status" >&2; exit "$status"; fi
+if [[ "${ran:-0}" != "$EXPECTED_TESTS" || "${skipped:-0}" != "0" ]]; then
+  echo "FAIL: expected $EXPECTED_TESTS integration tests run, 0 skipped; got ran=${ran:-0} skipped=${skipped:-0}" >&2
+  exit 1
+fi
+echo "PASS: $EXPECTED_TESTS integration tests ran against $BROOK_TEST_SERVER"
