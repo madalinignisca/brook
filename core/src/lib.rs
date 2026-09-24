@@ -21,8 +21,9 @@ mod log_secrecy_tests;
 mod session;
 mod session_store;
 mod state;
-#[cfg(test)]
-mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
 mod ws;
 
 pub use call::CallHandle;

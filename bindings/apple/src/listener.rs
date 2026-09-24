@@ -46,6 +46,16 @@ impl Subscription {
     }
 }
 
+impl Subscription {
+    /// A subscription backed by `task`, which must check `cancelled` before each delivery.
+    pub(crate) fn from_task(cancelled: Arc<AtomicBool>, task: JoinHandle<()>) -> Arc<Self> {
+        Arc::new(Self {
+            cancelled,
+            task: Mutex::new(Some(task)),
+        })
+    }
+}
+
 impl Drop for Subscription {
     fn drop(&mut self) {
         self.cancel();

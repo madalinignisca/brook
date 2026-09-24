@@ -363,6 +363,7 @@ dependencies = [
 name = "brook-ffi"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "brook-core",
  "futures",
  "serde_json",

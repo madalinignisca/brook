@@ -27,11 +27,14 @@ cli = ["uniffi/cli"]
 brook-core = { path = "../../core", version = "0.0.0" }
 # Exact pin: generated Swift and the scaffolding must come from the same UniFFI release.
 uniffi = "=0.32.2"
+async-trait = "0.1"
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync"] }
 
 [dev-dependencies]
-futures = "0.3"
+# The in-process test origin (REST + /ws) from core.
+brook-core = { path = "../../core", version = "0.0.0", features = ["test-support"] }
 serde_json = { workspace = true }
+futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
 wiremock = "0.6"
