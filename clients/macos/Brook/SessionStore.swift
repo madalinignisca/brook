@@ -25,6 +25,7 @@ final class SessionStore {
         static let unreachableLAN = "Couldn't reach the server. If macOS asked to allow local network access, allow it and try again."
         static let insecure = "The server address must start with https://"
         static let unexpected = "The server sent an unexpected response."
+        static let signedOut = "You're signed out. Sign in again."
     }
 
     typealias ClientFactory = (_ server: String, _ allowInsecureHttp: Bool) throws -> FfiBrookClient
@@ -87,6 +88,7 @@ final class SessionStore {
         case .InsecureServerUrl: Message.insecure
         case .InvalidServerUrl: Message.invalidAddress
         case .UnexpectedResponse: Message.unexpected
+        case .NotAuthenticated: Message.signedOut
         }
     }
 

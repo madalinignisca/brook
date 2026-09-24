@@ -94,6 +94,7 @@ final class SessionStoreTests: XCTestCase {
             (.Network(message: "refused"), SessionStore.Message.unreachable),
             (.InvalidServerUrl(message: "x"), SessionStore.Message.invalidAddress),
             (.UnexpectedResponse, SessionStore.Message.unexpected),
+            (.NotAuthenticated, SessionStore.Message.signedOut),
         ]
         for (error, expected) in cases {
             let (store, _) = store(FakeClient(result: .failure(error)))
