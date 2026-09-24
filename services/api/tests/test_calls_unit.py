@@ -119,3 +119,22 @@ def test_resume_token_lookback() -> None:
     assert _token_ok("prev", "cur", "prev")  # reply to the last resume was lost
     assert not _token_ok("older", "cur", "prev")
     assert not _token_ok("", "cur", None)
+
+
+async def test_post_reply_work_never_raises_into_the_command(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Work after a reply runs via _spawn; a failure there must be logged, never
+    propagate (it would reach ws.py and send a SECOND reply to the same command)."""
+    import asyncio
+
+    from app.calls import CallManager
+
+    async def boom() -> None:
+        raise RuntimeError("fan-out failed")
+
+    mgr = CallManager()
+    mgr._spawn(boom())
+    await asyncio.sleep(0.05)
+    assert "background call task failed" in caplog.text
+    assert not mgr._tasks  # done and released

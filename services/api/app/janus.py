@@ -52,6 +52,7 @@ class JanusClient:
         self._ack_is_final: set[str] = set()  # transactions answered by their ack
         self._listeners: dict[int, EventListener] = {}
         self._keepalives: dict[int, asyncio.Task[None]] = {}
+        self._chains: dict[int, asyncio.Task[None]] = {}  # last listener task per handle
         self._connect_lock = asyncio.Lock()
         self.on_disconnect: Callable[[], Awaitable[None]] | None = None
 
@@ -81,11 +82,8 @@ class JanusClient:
                     continue
                 sender = msg.get("sender")
                 listener = self._listeners.get(sender) if isinstance(sender, int) else None
-                if listener is not None:
-                    try:
-                        await listener(msg)
-                    except Exception:
-                        log.exception("janus event listener failed")
+                if listener is not None and isinstance(sender, int):
+                    self._dispatch(sender, listener, msg)
         except websockets.WebSocketException:
             log.warning("janus connection lost")
         finally:
@@ -103,6 +101,33 @@ class JanusClient:
             if self.on_disconnect is not None:
                 with contextlib.suppress(Exception):
                     await self.on_disconnect()
+
+    def _dispatch(self, hid: int, listener: EventListener, msg: dict[str, Any]) -> None:
+        """Run a listener OFF the read loop, in order per handle.
+
+        Listeners may wait for locks held by code that is itself waiting for a
+        Janus reply, and only this read loop can deliver that reply. Awaiting a
+        listener inline therefore stalled ALL Janus traffic (every call, every
+        keepalive) until a request timed out. Each event becomes a task chained
+        after the previous one for the same handle, so the loop never blocks and
+        per-handle order (candidates, offers) is kept.
+        """
+        prev = self._chains.get(hid)
+
+        async def run() -> None:
+            if prev is not None:
+                with contextlib.suppress(Exception):
+                    await prev
+            try:
+                await listener(msg)
+            except Exception:
+                log.exception("janus event listener failed")
+
+        task = asyncio.create_task(run())
+        self._chains[hid] = task
+        task.add_done_callback(
+            lambda t: self._chains.pop(hid, None) if self._chains.get(hid) is t else None
+        )
 
     async def request(self, body: dict[str, Any], ack_is_final: bool = False) -> dict[str, Any]:
         """Send one request and wait for its final answer (the ack, if ``ack_is_final``)."""

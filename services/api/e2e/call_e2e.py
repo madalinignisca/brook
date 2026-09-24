@@ -90,9 +90,9 @@ async def _media_flowing(page: Page, who: str) -> dict[str, int]:
     s1 = await page.evaluate("window.brook.stats()")
     await asyncio.sleep(2)
     s2 = await page.evaluate("window.brook.stats()")
-    assert (
-        s2["inboundVideoBytes"] > s1["inboundVideoBytes"] > 0
-    ), f"{who}: no inbound video {s1}->{s2}"
+    assert s2["inboundVideoBytes"] > s1["inboundVideoBytes"] > 0, (
+        f"{who}: no inbound video {s1}->{s2}"
+    )
     assert s2["framesDecoded"] > s1["framesDecoded"], f"{who}: no frames decoded {s1}->{s2}"
     return s2
 
@@ -139,9 +139,9 @@ async def main() -> None:
         names = await alice.evaluate(
             "Object.values(window.brook.participants).map(p => [p.participant_id, p.display_name])"
         )
-        assert [n for pid, n in names if pid == owner] == [
-            "Bob"
-        ], f"mid mapping wrong: {owner} {names}"
+        assert [n for pid, n in names if pid == owner] == ["Bob"], (
+            f"mid mapping wrong: {owner} {names}"
+        )
         print("PASS remote video on alice's side is attributed to Bob")
 
         await bob.evaluate("window.brook.leave()")

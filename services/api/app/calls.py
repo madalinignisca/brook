@@ -31,7 +31,7 @@ from .config import get_settings
 from .db import get_sessionmaker
 from .hub import get_hub
 from .janus import JanusClient, JanusError
-from .models import Membership, User
+from .models import Channel, Membership, User
 from .routers.ws import (
     Connection,
     connect_hooks,
@@ -138,8 +138,18 @@ class CallManager:
         return self._janus
 
     def _spawn(self, coro: Any) -> None:
+        """Run work in the background. Used for everything that happens *after* a
+        command's reply, so a failure there is logged instead of turning into a
+        second reply to the same command (contract §3.2: exactly one reply)."""
+
+        async def guarded() -> None:
+            try:
+                await coro
+            except Exception:
+                log.exception("background call task failed")
+
         # Keep a reference: an unreferenced task can be garbage-collected mid-flight.
-        task: asyncio.Task[None] = asyncio.create_task(coro)
+        task: asyncio.Task[None] = asyncio.create_task(guarded())
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
@@ -180,15 +190,28 @@ class CallManager:
     # ---- join / leave ---------------------------------------------------------
 
     async def join(self, conn: Connection, channel_id: uuid.UUID) -> tuple[Call, Participant]:
+        # Membership is checked here, once per join, by design. Losing membership
+        # later must end the call explicitly: channel delete calls end_channel(); any
+        # future member-removal or user-deactivation path must call end_for_user().
         async with get_sessionmaker()() as session:
             member = await session.get(Membership, (channel_id, conn.user_id))
             user = await session.get(User, conn.user_id)
-        if member is None or user is None:
+            channel = await session.get(Channel, channel_id)
+        if member is None or user is None or channel is None:
             raise CallError("not_member", "not a member of that channel")
+        if channel.archived_at is not None:
+            # Same rule as messages: an archived channel is read-only.
+            raise CallError("bad_state", "channel is archived")
         janus = self.janus()
         async with self._lock(channel_id):
             call = self.by_channel.get(channel_id)
             if call is not None:
+                # One participant per socket per call: several *devices* of one user
+                # may join (contract §3.1), but one socket joining repeatedly could
+                # fill the call, and its extra participants would be unreachable
+                # (commands resolve the participant by socket).
+                if any(o.conn is conn for o in call.participants.values()):
+                    raise CallError("bad_state", "this connection is already in the call")
                 if len(call.participants) >= MAX_PARTICIPANTS:
                     raise CallError("call_full", f"calls are limited to {MAX_PARTICIPANTS}")
             else:
@@ -216,15 +239,19 @@ class CallManager:
                 data = joined["plugindata"]["data"]
                 p.feed_id, p.private_id = int(data["id"]), int(data["private_id"])
             except (JanusError, KeyError, ValueError) as exc:
+                log.warning("SFU refused a join in %s: %s", channel_id, exc)
+                if p.pub_hid:
+                    janus.detach_listener(p.pub_hid)  # else the closure pins p and conn
                 if p.sid:
                     await janus.destroy_session(p.sid)
                 if not call.participants:
                     await self._destroy_call(call)
-                raise CallError("sfu_unavailable", f"SFU refused the join: {exc}") from exc
+                raise CallError("sfu_unavailable", "the SFU refused the join") from exc
             call.participants[p.participant_id] = p
         return call, p
 
     async def _create_call(self, janus: JanusClient, channel_id: uuid.UUID) -> Call:
+        sid = 0
         try:
             sid = await janus.create_session()
             hid = await janus.attach(sid)
@@ -246,7 +273,12 @@ class CallManager:
                 },
             )
         except (JanusError, KeyError) as exc:
-            raise CallError("sfu_unavailable", f"SFU refused the room: {exc}") from exc
+            # create_session() starts a keepalive: without this, a failed room create
+            # leaked a Janus session kept alive forever by nobody's keepalive task.
+            if sid:
+                await janus.destroy_session(sid)
+            log.warning("SFU refused a room for %s: %s", channel_id, exc)
+            raise CallError("sfu_unavailable", "the SFU refused the room") from exc
         call = Call(
             call_id=str(uuid.uuid4()),
             channel_id=channel_id,
@@ -268,18 +300,27 @@ class CallManager:
                 )
             await self._janus.destroy_session(call.admin_sid)
 
-    async def remove(self, p: Participant) -> None:
+    async def remove(self, p: Participant, only_if_detached: bool = False) -> None:
+        """Remove a participant. ``only_if_detached`` (grace expiry) aborts if the
+        participant was resumed while this removal waited for the channel lock:
+        otherwise a client could get a successful call.joined and then be torn
+        down silently (the "left" broadcast skips the participant itself)."""
         call = p.call
         async with self._lock(call.channel_id):
+            if only_if_detached and p.conn is not None:
+                return
             if call.participants.pop(p.participant_id, None) is None:
                 return
             if p.grace is not None:
                 p.grace.cancel()
-            if self._janus is not None:
-                self._janus.detach_listener(p.pub_hid)
-                if p.sub_hid is not None:
-                    self._janus.detach_listener(p.sub_hid)
-                await self._janus.destroy_session(p.sid)  # drops both handles
+            # Under p.lock: never destroy the session under an in-flight reconcile or
+            # subscribe answer that is still waiting for Janus on it.
+            async with p.lock:
+                if self._janus is not None:
+                    self._janus.detach_listener(p.pub_hid)
+                    if p.sub_hid is not None:
+                        self._janus.detach_listener(p.sub_hid)
+                    await self._janus.destroy_session(p.sid)  # drops both handles
             left = envelope(
                 "call.participant",
                 {"call_id": call.call_id, "event": "left", "participant": p.view()},
@@ -302,7 +343,8 @@ class CallManager:
             )
             answer = msg["jsep"]["sdp"]
         except (JanusError, KeyError) as exc:
-            raise CallError("invalid", f"SFU rejected the offer: {exc}") from exc
+            log.warning("SFU rejected a publish offer from %s: %s", p.participant_id, exc)
+            raise CallError("invalid", "the SFU rejected the offer") from exc
         p.publishing = _publishing_from_sdp(sdp)
         p.audio = any(x["kind"] == "audio" for x in p.publishing)
         p.video = any(x["kind"] == "video" for x in p.publishing)
@@ -425,7 +467,15 @@ class CallManager:
                     res.get("plugindata", {}).get("data"),
                 )
             except JanusError as exc:
-                raise CallError("invalid", f"SFU rejected the answer: {exc}") from exc
+                # Don't leave sub_pending set: every later reconcile would defer to
+                # it and this participant would never get another subscribe offer.
+                # Start over with a fresh subscriber handle and a fresh offer.
+                if p.sub_hid is not None:
+                    await self.janus().detach(p.sid, p.sub_hid)
+                p.sub_hid, p.sub_feeds, p.sub_pending, p.sub_dirty = None, set(), None, False
+                self._spawn(self.reconcile(p))
+                log.warning("SFU rejected a subscribe answer from %s: %s", p.participant_id, exc)
+                raise CallError("invalid", "the SFU rejected the answer") from exc
             p.sub_pending = None
             replay, p.sub_dirty = p.sub_dirty, False
         if replay:
@@ -540,30 +590,40 @@ class CallManager:
     async def _grace_expiry(self, p: Participant) -> None:
         await asyncio.sleep(RESUME_GRACE_S)
         p.grace = None
-        await self.remove(p)
+        await self.remove(p, only_if_detached=True)
 
     async def resume(
         self, conn: Connection, call_id: Any, participant_id: Any, token: Any
     ) -> Participant:
         call = self.by_id.get(call_id) if isinstance(call_id, str) else None
-        p = None
-        if call is not None and isinstance(participant_id, str):
-            p = call.participants.get(participant_id)
-        # Same user AND the secret handed to this participant only. Constant-time
-        # compare; every mismatch is the same not_in_call, so a guess learns nothing.
-        if (
-            p is None
-            or p.user_id != conn.user_id
-            or not isinstance(token, str)
-            or not _token_ok(token, p.resume_token, p.prev_resume_token)
-        ):
+        if call is None or not isinstance(participant_id, str):
             raise CallError("not_in_call", "no such participant to resume")
-        if p.grace is not None:
-            p.grace.cancel()
-            p.grace = None
-        p.conn = conn
-        p.prev_resume_token = token  # the one this client holds, even if our reply is lost
-        p.resume_token = secrets.token_urlsafe(24)
+        # Under the channel lock, so it cannot interleave with a grace-expiry
+        # removal: either the removal ran first (the participant is gone and this
+        # is not_in_call) or this runs first (and the removal sees p.conn set).
+        async with self._lock(call.channel_id):
+            p = call.participants.get(participant_id)
+            # Same user AND the secret handed to this participant only. Every
+            # mismatch is the same not_in_call, so a guess learns nothing.
+            if (
+                p is None
+                or p.user_id != conn.user_id
+                or not isinstance(token, str)
+                or not _token_ok(token, p.resume_token, p.prev_resume_token)
+            ):
+                raise CallError("not_in_call", "no such participant to resume")
+            if p.grace is not None:
+                p.grace.cancel()
+                p.grace = None
+            displaced, p.conn = p.conn, conn
+            p.prev_resume_token = token  # the one this client holds, even if our reply is lost
+            p.resume_token = secrets.token_urlsafe(24)
+        if displaced is not None and displaced is not conn:
+            # A still-open older socket (a half-open TCP session, or a duplicate
+            # device) no longer owns the participant: tell it, so it shows the
+            # right state instead of believing it is still in the call.
+            ended = envelope("call.ended", {"call_id": call.call_id, "reason": "replaced"})
+            self._spawn(displaced.send(ended))
         return p
 
 
@@ -575,6 +635,8 @@ def _token_ok(given: str, current: str, previous: str | None) -> bool:
 
     Both comparisons always run, so timing does not reveal which one matched.
     """
+    if not given.isascii():
+        return False  # compare_digest raises on non-ASCII str; our tokens are ASCII
     ok_current = secrets.compare_digest(given, current)
     ok_previous = secrets.compare_digest(given, previous) if previous else False
     return ok_current or ok_previous
@@ -654,15 +716,13 @@ async def _join(conn: Connection, frame: dict[str, Any], re: str | None) -> None
             re=re,
         )
     )
-    await manager._broadcast(
-        call,
-        envelope(
-            "call.participant",
-            {"call_id": call.call_id, "event": "joined", "participant": p.view()},
-        ),
-        skip=p,
+    # After the reply: nothing below may produce a second reply (see _spawn).
+    joined = envelope(
+        "call.participant",
+        {"call_id": call.call_id, "event": "joined", "participant": p.view()},
     )
-    await manager._announce_channel_call(channel_id)
+    manager._spawn(manager._broadcast(call, joined, skip=p))
+    manager._spawn(manager._announce_channel_call(channel_id))
     manager._reconcile_all(call)
 
 
@@ -705,14 +765,11 @@ async def _media(conn: Connection, frame: dict[str, Any], re: str | None) -> Non
     p = manager._participant_of(conn, data["call_id"])
     p.audio, p.video = bool(data["audio"]), bool(data["video"])
     await conn.send(envelope("call.ok", {}, re=re))
-    await manager._broadcast(
-        p.call,
-        envelope(
-            "call.participant",
-            {"call_id": p.call.call_id, "event": "updated", "participant": p.view()},
-        ),
-        skip=p,
+    updated = envelope(
+        "call.participant",
+        {"call_id": p.call.call_id, "event": "updated", "participant": p.view()},
     )
+    manager._spawn(manager._broadcast(p.call, updated, skip=p))
 
 
 @_cmd("call.leave")
@@ -720,7 +777,7 @@ async def _leave(conn: Connection, frame: dict[str, Any], re: str | None) -> Non
     data = _require(frame, "call_id")
     p = manager._participant_of(conn, data["call_id"])
     await conn.send(envelope("call.ok", {}, re=re))
-    await manager.remove(p)
+    manager._spawn(manager.remove(p))
 
 
 @_cmd("call.resume")
@@ -741,7 +798,7 @@ async def _resume(conn: Connection, frame: dict[str, Any], re: str | None) -> No
         )
     )
     if p.sub_pending is not None:
-        await conn.send(p.sub_pending)
+        manager._spawn(conn.send(p.sub_pending))
 
 
 disconnect_hooks.append(manager.on_disconnect)

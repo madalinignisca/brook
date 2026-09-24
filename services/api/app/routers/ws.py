@@ -171,6 +171,10 @@ async def ws_endpoint(ws: WebSocket) -> None:
         return
     except WebSocketDisconnect:
         return
+    except KeyError:
+        # A binary first frame: Starlette's receive_text() raises KeyError("text").
+        await ws.close(code=status.WS_1003_UNSUPPORTED_DATA, reason="auth_failed")
+        return
     try:
         first = json.loads(raw)
     except ValueError:
