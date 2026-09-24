@@ -331,6 +331,8 @@ dependencies = [
 name = "brook-media-gst"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "brook-core",
  "futures-util",
  "gstreamer",
  "gstreamer-sdp",

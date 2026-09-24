@@ -14,12 +14,18 @@
 //! [`SinkFactory`] (GTK: `gtk4paintablesink`, tests: `fakesink`), and everything
 //! it has to say (local ICE, new remote tracks, errors) is sent as an
 //! [`EngineEvent`] on a channel. Every method is safe to call from any thread.
+//!
+//! [`GstEngine`] implements core's [`brook_core::MediaEngine`], so a client
+//! hands it to `BrookClient::join_call` and core drives it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gst::prelude::*;
 use tokio::sync::{mpsc, oneshot};
+
+pub use brook_core::{IceCandidate, IceServer, PcKind, SubStream};
 
 /// Result alias for engine operations.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -34,29 +40,16 @@ pub enum Error {
     /// SDP could not be parsed or was rejected by webrtcbin.
     #[error("sdp: {0}")]
     Sdp(String),
-    /// A method was called in the wrong order (e.g. an answer before an offer).
+    /// A method was called in the wrong order (e.g. an answer before an offer),
+    /// or after [`GstEngine::close`].
     #[error("bad state: {0}")]
     State(&'static str),
 }
 
-/// Which of the two PeerConnections something refers to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PcKind {
-    /// Our outgoing `sendonly` PC.
-    Publish,
-    /// The incoming `recvonly` PC carrying every remote stream.
-    Subscribe,
-}
-
-/// An ICE candidate as WebRTC produces it (`RTCIceCandidateInit`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IceCandidate {
-    /// The `candidate:` attribute line.
-    pub candidate: String,
-    /// The media id it belongs to, if known.
-    pub sdp_mid: Option<String>,
-    /// The m-line index it belongs to, if known.
-    pub sdp_mline_index: Option<u32>,
+impl From<Error> for brook_core::EngineError {
+    fn from(err: Error) -> Self {
+        brook_core::EngineError(err.to_string())
+    }
 }
 
 /// Media kind of a track.
@@ -99,17 +92,6 @@ pub enum VideoCodec {
     H264,
     /// VP8 (software), for machines without a usable H.264 encoder.
     Vp8,
-}
-
-/// A STUN/TURN server as delivered in `ice_servers` (additive, PROTOCOL.md §3.6).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IceServer {
-    /// `stun:host:port`, `turn:host:port?transport=udp`, `turns:host:443`, ...
-    pub url: String,
-    /// TURN username (short-lived REST credential).
-    pub username: Option<String>,
-    /// TURN password.
-    pub credential: Option<String>,
 }
 
 /// Builds the element a decoded (or local preview) video stream renders into.
@@ -178,6 +160,10 @@ pub enum EngineEvent {
         /// The sink element the decoded stream feeds.
         sink: gst::Element,
     },
+    /// The subscribe PC applied an offer whose mids map to these streams (a
+    /// mid absent here is inactive: drop its tile). Sent before the answer is
+    /// returned, so it precedes that offer's [`EngineEvent::RemoteTrack`]s.
+    SubscribeStreams(Vec<SubStream>),
     /// A PC's connection state changed (`new`, `connecting`, `connected`,
     /// `disconnected`, `failed`, `closed`).
     ConnectionState {
@@ -201,6 +187,10 @@ pub struct GstEngine {
     events: mpsc::UnboundedSender<EngineEvent>,
     publish: Mutex<Option<Pc>>,
     subscribe: Mutex<Option<Pc>>,
+    /// STUN/TURN for PCs built from now on ([`GstEngine::set_ice_servers`]).
+    ice_servers: Mutex<Vec<IceServer>>,
+    /// Set by [`GstEngine::close`]: nothing builds a PC or succeeds afterwards.
+    closed: AtomicBool,
 }
 
 /// One PeerConnection: a pipeline with a `webrtcbin` named `webrtc`.
@@ -230,10 +220,12 @@ impl GstEngine {
         let (tx, rx) = mpsc::unbounded_channel();
         Ok((
             Arc::new(Self {
+                ice_servers: Mutex::new(config.ice_servers.clone()),
                 config,
                 events: tx,
                 publish: Mutex::new(None),
                 subscribe: Mutex::new(None),
+                closed: AtomicBool::new(false),
             }),
             rx,
         ))
@@ -244,12 +236,14 @@ impl GstEngine {
     pub async fn create_publish_offer(&self) -> Result<String> {
         let webrtc = {
             let mut guard = self.publish.lock().unwrap();
+            self.ensure_open()?;
             if guard.is_none() {
                 *guard = Some(self.build_publish()?);
             }
             guard.as_ref().unwrap().webrtc.clone()
         };
-        wait_for_sink_caps(&webrtc).await;
+        wait_for_sink_caps(&webrtc, &self.closed).await;
+        self.ensure_open()?;
         // The publish PC only sends (PROTOCOL.md §3.1).
         for t in transceivers(&webrtc) {
             t.set_property(
@@ -260,6 +254,7 @@ impl GstEngine {
 
         let offer = create_description(&webrtc, "create-offer", "offer").await?;
         set_description(&webrtc, "set-local-description", &offer).await?;
+        self.ensure_open()?;
         sdp_text(&offer)
     }
 
@@ -269,14 +264,21 @@ impl GstEngine {
             .webrtc(PcKind::Publish)
             .ok_or(Error::State("publish answer before offer"))?;
         let answer = parse_description(gst_webrtc::WebRTCSDPType::Answer, sdp)?;
-        set_description(&webrtc, "set-remote-description", &answer).await
+        set_description(&webrtc, "set-remote-description", &answer).await?;
+        self.ensure_open()
     }
 
     /// Apply an SFU offer on the subscribe PC (first or renegotiation) and
-    /// return our answer.
-    pub async fn apply_subscribe_offer(&self, sdp: &str) -> Result<String> {
+    /// return our answer. `streams` maps the offer's mids to participants and
+    /// is re-emitted as [`EngineEvent::SubscribeStreams`] for the UI.
+    pub async fn apply_subscribe_offer(
+        &self,
+        sdp: &str,
+        streams: Vec<SubStream>,
+    ) -> Result<String> {
         let webrtc = {
             let mut guard = self.subscribe.lock().unwrap();
+            self.ensure_open()?;
             if guard.is_none() {
                 *guard = Some(self.build_subscribe()?);
             }
@@ -286,6 +288,8 @@ impl GstEngine {
         set_description(&webrtc, "set-remote-description", &offer).await?;
         let answer = create_description(&webrtc, "create-answer", "answer").await?;
         set_description(&webrtc, "set-local-description", &answer).await?;
+        self.ensure_open()?;
+        let _ = self.events.send(EngineEvent::SubscribeStreams(streams));
         sdp_text(&answer)
     }
 
@@ -341,10 +345,27 @@ impl GstEngine {
             .count()
     }
 
-    /// Tear both PCs down (leave / call ended).
+    /// STUN/TURN servers for PCs created from now on (an existing PC keeps
+    /// its own; the SFU is reachable without them on a LAN).
+    pub fn set_ice_servers(&self, servers: Vec<IceServer>) {
+        *self.ice_servers.lock().unwrap() = servers;
+    }
+
+    /// Tear both PCs down (leave / call ended) and fence the engine: any
+    /// operation still in flight, or started later, fails with
+    /// [`Error::State`] and builds nothing.
     pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         self.publish.lock().unwrap().take();
         self.subscribe.lock().unwrap().take();
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            Err(Error::State("engine closed"))
+        } else {
+            Ok(())
+        }
     }
 
     fn webrtc(&self, pc: PcKind) -> Option<gst::Element> {
@@ -458,7 +479,7 @@ impl GstEngine {
 
     /// Common PC wiring: ICE servers, local candidates, state and bus errors.
     fn wire_pc(&self, kind: PcKind, pipeline: &gst::Pipeline, webrtc: &gst::Element) -> Result<()> {
-        apply_ice_servers(webrtc, &self.config.ice_servers);
+        apply_ice_servers(webrtc, &self.ice_servers.lock().unwrap());
 
         let events = self.events.clone();
         webrtc.connect("on-ice-candidate", false, move |values| {
@@ -780,8 +801,10 @@ fn has(factory: &str) -> bool {
 }
 
 fn apply_ice_servers(webrtc: &gst::Element, servers: &[IceServer]) {
-    for server in servers {
-        let url = server.url.as_str();
+    for (server, url) in servers
+        .iter()
+        .flat_map(|s| s.urls.iter().map(move |u| (s, u.as_str())))
+    {
         if let Some(rest) = url.strip_prefix("stun:") {
             webrtc.set_property(
                 "stun-server",
@@ -852,9 +875,12 @@ fn request_keyframe(pipeline: &gst::Pipeline) {
 
 /// Wait (bounded) until every webrtcbin sink pad knows its caps, so the offer
 /// carries real codec parameters (profile-level-id, packetization-mode).
-async fn wait_for_sink_caps(webrtc: &gst::Element) {
+async fn wait_for_sink_caps(webrtc: &gst::Element, closed: &AtomicBool) {
     let deadline = tokio::time::Instant::now() + CAPS_TIMEOUT;
     loop {
+        if closed.load(Ordering::SeqCst) {
+            return; // the caller's fence check fails the operation
+        }
         let ready = webrtc
             .sink_pads()
             .iter()
@@ -930,6 +956,57 @@ fn promise_error(s: &gst::StructureRef, context: &str) -> String {
     match s.get::<gst::glib::Error>("error") {
         Ok(e) => format!("{context}: {}", e.message()),
         Err(_) => format!("{context}: unexpected reply {s}"),
+    }
+}
+
+/// Core drives the engine through this; the inherent methods do the work.
+#[async_trait::async_trait]
+impl brook_core::MediaEngine for GstEngine {
+    async fn create_publish_offer(&self) -> std::result::Result<String, brook_core::EngineError> {
+        Ok(GstEngine::create_publish_offer(self).await?)
+    }
+
+    async fn apply_publish_answer(
+        &self,
+        sdp: String,
+    ) -> std::result::Result<(), brook_core::EngineError> {
+        Ok(GstEngine::apply_publish_answer(self, &sdp).await?)
+    }
+
+    async fn apply_subscribe_offer(
+        &self,
+        sdp: String,
+        streams: Vec<SubStream>,
+    ) -> std::result::Result<String, brook_core::EngineError> {
+        Ok(GstEngine::apply_subscribe_offer(self, &sdp, streams).await?)
+    }
+
+    fn add_remote_candidate(
+        &self,
+        pc: PcKind,
+        candidate: Option<IceCandidate>,
+    ) -> std::result::Result<(), brook_core::EngineError> {
+        Ok(GstEngine::add_remote_candidate(
+            self,
+            pc,
+            candidate.as_ref(),
+        )?)
+    }
+
+    fn set_local_media(
+        &self,
+        audio: bool,
+        video: bool,
+    ) -> std::result::Result<(), brook_core::EngineError> {
+        Ok(GstEngine::set_local_media(self, audio, video)?)
+    }
+
+    fn set_ice_servers(&self, servers: Vec<IceServer>) {
+        GstEngine::set_ice_servers(self, servers);
+    }
+
+    async fn close(&self) {
+        GstEngine::close(self);
     }
 }
 

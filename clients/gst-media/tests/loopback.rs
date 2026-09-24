@@ -70,7 +70,10 @@ async fn loopback(codec: VideoCodec) {
         offer.to_lowercase().contains("opus/48000"),
         "offer lacks Opus:\n{offer}"
     );
-    let answer = subscriber.apply_subscribe_offer(&offer).await.unwrap();
+    let answer = subscriber
+        .apply_subscribe_offer(&offer, vec![])
+        .await
+        .unwrap();
     publisher.apply_publish_answer(&answer).await.unwrap();
 
     // Trickle ICE both ways; collect remote tracks.

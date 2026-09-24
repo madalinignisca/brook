@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The MediaEngine trait + call types (PcKind, IceCandidate, IceServer, SubStream).
+brook-core = { path = "../../core", version = "0.0.0" }
+async-trait = "0.1"
 gst = { package = "gstreamer", version = "0.23" }
 gst-webrtc = { package = "gstreamer-webrtc", version = "0.23" }
 gst-sdp = { package = "gstreamer-sdp", version = "0.23" }

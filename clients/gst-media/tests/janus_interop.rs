@@ -283,7 +283,9 @@ impl Participant {
                             println!("[{name}] subscribe offer v{version}: {map:?}");
                             *streams.lock().unwrap() = map;
                             let sdp = data["sdp"].as_str().unwrap();
-                            match engine.apply_subscribe_offer(sdp).await {
+                            let subs =
+                                serde_json::from_value(data["streams"].clone()).unwrap_or_default();
+                            match engine.apply_subscribe_offer(sdp, subs).await {
                                 Ok(answer) => {
                                     let (tx, rx) = oneshot::channel();
                                     let _ = cmd.send((

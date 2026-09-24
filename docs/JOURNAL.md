@@ -16,6 +16,19 @@ Conventions:
 
 ## 2026-09-24
 
+### P4 calls: GstEngine implements core's MediaEngine, reviewed by Vibe
+
+Branch `feat/gtk-calls` = `feat/gtk-media-engine` + brook-ios's
+`feat/core-call-signaling` (P4 public types). `brook-media-gst` now uses core's
+`PcKind`/`IceCandidate`/`IceServer`/`SubStream` (one definition) and implements
+`brook_core::MediaEngine`. Contract obligations met and tested
+(`tests/engine_contract.rs`): usable as `Arc<dyn MediaEngine>`; `close()`
+fences the engine (later or in-flight operations fail and build nothing; the
+fence tests fail with the fence disabled); `set_ice_servers` applies to PCs
+built afterwards; new `EngineEvent::SubscribeStreams` hands the UI each applied
+offer's mid -> participant map. Live Janus interop still passes. Vibe: nothing
+material.
+
 ### P4 calls: webrtcbin <-> Janus interop proven (local stack)
 
 Ran brook's `feat/calls` (api + Janus 1.4.2 VideoRoom) in local docker

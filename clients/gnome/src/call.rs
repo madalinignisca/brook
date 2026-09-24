@@ -459,7 +459,7 @@ pub fn present_loopback(app: &adw::Application, runtime: &Handle) {
         let result = runtime
             .spawn(async move {
                 let offer = publisher.create_publish_offer().await?;
-                let answer = subscriber.apply_subscribe_offer(&offer).await?;
+                let answer = subscriber.apply_subscribe_offer(&offer, vec![]).await?;
                 publisher.apply_publish_answer(&answer).await
             })
             .await;
