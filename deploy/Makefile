@@ -28,7 +28,7 @@ init: ## Create .env with random secrets — only if it doesn't exist yet
 up: ## Start the core stack (postgres + api + caddy)
 	@[ -f $(ENV) ] || $(MAKE) init
 	$(COMPOSE) up -d --build
-	@echo "Brook API is up on host port $$(grep -E '^BROOK_HTTP_PORT=' $(ENV) | cut -d= -f2)."
+	@echo "Brook API is up on $$(grep -E '^BROOK_HTTP_BIND=' $(ENV) | cut -d= -f2 | grep . || echo 127.0.0.1):$$(grep -E '^BROOK_HTTP_PORT=' $(ENV) | cut -d= -f2) (BROOK_HTTP_BIND / BROOK_HTTP_PORT in .env)."
 
 down: ## Stop the stack (data is kept)
 	$(COMPOSE) down

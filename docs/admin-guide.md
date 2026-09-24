@@ -32,12 +32,22 @@ make up       # builds and starts: postgres + api + caddy
 make ps       # confirm services are healthy
 ```
 
-The API is now reachable on the host at **`http://<host-ip>:8080`** (port set by
-`BROOK_HTTP_PORT` in `.env`). Verify:
+By default the API listens on **loopback only**: `http://127.0.0.1:8080`, reachable
+from the server itself. To serve your LAN, set `BROOK_HTTP_BIND` in `.env` to the
+server's LAN address (e.g. `BROOK_HTTP_BIND=192.168.1.10`) and run `make up` again.
+The port is `BROOK_HTTP_PORT`. Verify from a client machine:
 
 ```bash
-curl http://<host-ip>:8080/health      # {"status":"ok","version":"..."}
+curl http://<BROOK_HTTP_BIND>:8080/health      # {"status":"ok","version":"..."}
 ```
+
+> **Don't set `BROOK_HTTP_BIND=0.0.0.0`.** Docker Compose then publishes the port on
+> every interface **including IPv6**. On a host with a public IPv6 address, that puts
+> the server on the internet even when the LAN is behind NAT. Bind one LAN address.
+
+> **Upgrading from an older release:** a `.env` created before `BROOK_HTTP_BIND`
+> existed doesn't have it, so the server falls back to loopback and **LAN clients can
+> no longer connect**. Add `BROOK_HTTP_BIND=<LAN IP>` to `.env` and `make up`.
 
 ### Create the first administrator
 
@@ -104,8 +114,8 @@ Object storage (when MinIO is enabled in Phase 2) lives in the `miniodata` volum
 
 ## Networking & TLS
 
-- Phase 0 serves **plain HTTP on your LAN** (trusted-network assumption). Don't
-  expose it to the internet as-is.
+- Phase 0 serves **plain HTTP** (trusted-network assumption), on loopback unless
+  `BROOK_HTTP_BIND` names a LAN address. Don't expose it to the internet as-is.
 - Moving to **TLS** is a one-file change in `services/gateway/Caddyfile` — switch
   the `:80` block to a real domain (automatic Let's Encrypt) or `tls internal`
   for a self-signed LAN certificate. No compose change needed.
@@ -126,7 +136,7 @@ places).
 | `api` exits immediately, logs mention the signing key | `BROOK_JWT_SIGNING_KEY` is weak/default. `make init` sets a strong one; ensure `.env` has a ≥32-char value. |
 | `api` can't connect to the database after editing `.env` | The DB password in `.env` no longer matches the `pgdata` volume. Restore the old password, or `make reset` to rebuild. |
 | Port 8080 already in use | Set `BROOK_HTTP_PORT` in `.env` to a free port, then `make up`. |
-| Client can't reach the server | Check the host firewall allows the port, and that you used the host's LAN IP. |
+| Client can't reach the server | `BROOK_HTTP_BIND` must be the server's LAN IP (the default `127.0.0.1` is local-only), and the host firewall must allow the port. |
 
 ## See also
 
