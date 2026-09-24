@@ -16,6 +16,23 @@ Conventions:
 
 ## 2026-09-24
 
+### P4 calls: GNOME call view + dev loopback, reviewed by Vibe
+
+`clients/gnome/src/call.rs`: video tile grid (`gtk4paintablesink` ->
+`gtk::Picture`), self-view overlay, mic/camera/hang-up controls, status banner;
+`BROOK_CALL_LOOPBACK=1` runs a call with yourself through two engines (no
+server). Logging now caps `tungstenite`/`tokio_tungstenite` at `info` even under
+`RUST_LOG=trace` (they dump whole frames incl. tokens; verified in a scratch
+program). **Not yet run on screen**: libadwaita is currently uninstalled on the
+bench, so this is type-checked + clippy-clean only.
+
+Friends review: only Vibe CLI 2.14 ran (Codex login expired, Gemini no API key).
+Applied: preflight `gtk4paintablesink`/`autoaudiosink` instead of panicking on a
+GStreamer thread; log failed loopback ICE adds. Declined: "publisher leaks when
+the second engine fails" (engines build pipelines lazily, dropping the `Arc`
+frees everything); "`RUST_LOG=error` gets raised to info for tungstenite"
+(harmless: info carries no frames; the directive exists to cap trace).
+
 ### P4 calls: Linux media engine (`clients/gst-media`), reviewed by Vibe
 
 Coordinated P4 with the server (brook) and Apple (brook-ios) agents: wire

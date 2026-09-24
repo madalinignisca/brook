@@ -8,6 +8,7 @@
 //! back by hand. All GTK widgets are captured by **weak** reference inside async
 //! tasks and signal handlers so nothing keeps the window graph alive (no cycles).
 
+mod call;
 mod chat;
 
 use std::rc::Rc;
@@ -21,7 +22,7 @@ const APP_ID: &str = "dev.brook.Brook";
 const DEFAULT_SERVER: &str = "https://localhost";
 
 fn main() -> glib::ExitCode {
-    tracing_subscriber::fmt::init();
+    init_logging();
 
     // One multi-thread Tokio runtime drives all networking; kept alive for the
     // lifetime of the app (until `run()` returns).
@@ -31,6 +32,18 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(move |app| build_ui(app, &handle));
     app.run()
+}
+
+/// Log to stderr, filtered by `RUST_LOG` (default `info`). The WebSocket
+/// libraries are always capped at `info`, even under `RUST_LOG=trace`: at trace
+/// they dump whole frames, which carry access and call resume tokens.
+fn init_logging() {
+    use tracing_subscriber::EnvFilter;
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    for directive in ["tungstenite=info", "tokio_tungstenite=info"] {
+        filter = filter.add_directive(directive.parse().expect("static directive"));
+    }
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 /// Present a minimal error window so startup failures are visible to the user.
@@ -54,6 +67,11 @@ fn present_error(app: &adw::Application, message: &str) {
 }
 
 fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
+    // Dev-only: a call with yourself through the media engine, no server needed.
+    if std::env::var("BROOK_CALL_LOOPBACK").as_deref() == Ok("1") {
+        call::present_loopback(app, runtime);
+        return;
+    }
     let server = std::env::var("BROOK_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string());
     // Dev-only: allow a plain-http LAN server (e.g. a homelab VM without TLS yet).
     let allow_insecure_http = std::env::var("BROOK_ALLOW_INSECURE_HTTP").as_deref() == Ok("1");
