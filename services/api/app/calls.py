@@ -776,8 +776,10 @@ async def _media(conn: Connection, frame: dict[str, Any], re: str | None) -> Non
 async def _leave(conn: Connection, frame: dict[str, Any], re: str | None) -> None:
     data = _require(frame, "call_id")
     p = manager._participant_of(conn, data["call_id"])
-    await conn.send(envelope("call.ok", {}, re=re))
+    # Act first, reply second: the removal must not depend on the reply being
+    # deliverable (the client may already be gone).
     manager._spawn(manager.remove(p))
+    await conn.send(envelope("call.ok", {}, re=re))
 
 
 @_cmd("call.resume")

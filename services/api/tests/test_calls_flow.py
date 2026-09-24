@@ -325,3 +325,29 @@ def test_archived_channel_refuses_calls(sync_client: TestClient, fake: FakeJanus
     with _ws(sync_client, a) as wa:
         r2 = cmd(wa, "call.join", {"channel_id": ch})
         assert (r2["type"], r2["data"]["code"]) == ("error", "bad_state")
+
+
+def test_leave_from_a_client_already_gone_leaves_no_ghost(
+    sync_client: TestClient, fake: FakeJanus
+) -> None:
+    """Found by the live core call test: an app quitting right after call.leave.
+    The reply cannot be delivered; the participant must still be removed at once,
+    not linger in everyone's roster for the whole reconnect grace."""
+    a, b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa:
+        ja = cmd(wa, "call.join", {"channel_id": ch})["data"]
+        call_id = ja["call_id"]
+        with _ws(sync_client, b) as wb:
+            jb = cmd(wb, "call.join", {"channel_id": ch})["data"]
+            pb = _participant(call_id, jb["self"]["participant_id"])
+
+            async def gone(frame: dict[str, Any]) -> None:
+                raise RuntimeError('Cannot call "send" once a close message has been sent.')
+
+            # The socket write fails exactly as Starlette's does for a gone client.
+            pb.conn.ws.send_json = gone  # type: ignore[method-assign,union-attr]
+            wb.send_json({"type": "call.leave", "id": "bye", "data": {"call_id": call_id}})
+            time.sleep(0.3)
+            assert jb["self"]["participant_id"] not in calls.manager.by_id[call_id].participants
+        left = [p for p in of(collect(wa), "call.participant") if p["event"] == "left"]
+        assert left and left[-1]["participant"]["participant_id"] == jb["self"]["participant_id"]

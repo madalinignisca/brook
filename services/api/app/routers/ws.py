@@ -80,9 +80,20 @@ class Connection:
     expiry: asyncio.Task[None] | None = None
 
     async def send(self, frame: dict[str, Any]) -> None:
+        """Best effort: a send to a client that has gone never raises.
+
+        Clients may close right after a command (an app quitting after
+        call.leave). If a send there raised, the handler stopped before its real
+        work and state went stale: a "left" participant lingered as a ghost for
+        the whole reconnect grace. Mark the socket closed instead; the read loop
+        and the disconnect hooks do the cleanup.
+        """
         if self.closed:
             return  # never write after close; Starlette raises if we do
-        await get_hub().send(self.ws, frame)
+        try:
+            await get_hub().send(self.ws, frame)
+        except Exception:  # noqa: BLE001 - the peer is gone; nothing to tell it
+            self.closed = True
 
     async def close(self, code: int, reason: str) -> None:
         """Close once. The read loop checks ``closed`` and stops handling frames:
