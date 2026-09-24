@@ -36,7 +36,7 @@
 
 ## 2. WebSocket (realtime plane) — `wss://<host>/ws`
 
-**Authentication:** the access token is sent in the **first message** after the socket opens (an `auth` command), **not** as a query parameter (query strings leak into logs/proxies). The server rejects (closes) the socket if the first frame is not a valid `auth` within a short timeout. Tokens are re-validated; an expired token closes the socket and the client refreshes + reconnects.
+**Authentication:** the access token is sent in the **first message** after the socket opens (an `auth` command), **not** as a query parameter (query strings leak into logs/proxies). The server rejects (closes) the socket if the first frame is not a valid `auth` within a short timeout (close `4401` bad token, `4408` timeout). The socket closes with `4401` when its access token expires. To avoid that, the client may send `auth {token}` **again on the open socket** with a fresh token for the same user (reply `auth.ok`); a token for another user closes the socket. Right after `auth.ok`, the server sends one `channel.call` per call already in progress in the user's channels. Client → server frames are capped at **64 KiB** (close `1009`); server → client frames are not capped (an 8-participant subscribe offer is ~15 KiB).
 
 Messages are tagged envelopes:
 
@@ -76,10 +76,15 @@ Messages are tagged envelopes:
 - **One call per channel.** A call is keyed by `channel_id`. The first `call.join`
   starts it; it ends when the last participant leaves (or the cleanup timeout in
   [SECURITY.md](SECURITY.md) §7 fires). **Authorization = channel membership**,
-  checked by `api` on every call command.
+  checked by `api` on every call command; a member removed from the channel is
+  removed from its call (`call.ended {reason: "removed"}`). One user may join the
+  same call from several devices; each device is its own participant.
 - **Two PeerConnections per participant**, both terminated by the SFU:
   - **publish** — `sendonly`: the participant's mic, camera, and later screen.
-    The **client offers**, the server answers.
+    The **client offers**, the server answers. The client may **renegotiate** the
+    same PC at any time (camera turned on later, a track added) by sending
+    `call.publish` again with a new offer; it gets a new `call.publish.answer`.
+    Publishing is optional: a listen-only participant never sends `call.publish`.
   - **subscribe** — `recvonly`: **all** remote streams in one PeerConnection.
     The **server offers**, the client answers. Whenever the set of remote streams
     changes, the server sends a **new offer** on the same PeerConnection (renegotiation).
@@ -122,7 +127,7 @@ Every frame in both directions is the §2 envelope `{type, id, ts, data}`.
 | `call.ice` | `{call_id, pc: "publish"\|"subscribe", candidate}` | none (fire-and-forget) |
 | `call.media` | `{call_id, audio: bool, video: bool}` (mute state as the user sees it) | `call.ok` |
 | `call.leave` | `{call_id}` | `call.ok` |
-| `call.resume` | `{call_id}` (after a WS reconnect, §3.5) | `call.joined` |
+| `call.resume` | `{call_id, participant_id, resume_token}` (after a WS reconnect, §3.5) | `call.joined` |
 
 `candidate` is `{candidate, sdpMid, sdpMLineIndex}` as produced by WebRTC, or `null`
 for end-of-candidates.
@@ -137,18 +142,19 @@ its candidates in the SDP, so server → client trickle is rare but allowed.)
 
 | type | data | when |
 |---|---|---|
-| `call.joined` | `{call_id, channel_id, self: {participant_id}, participants: [Participant]}` | reply to `call.join` / `call.resume` |
+| `call.joined` | `{call_id, channel_id, self: {participant_id, resume_token}, participants: [Participant]}` | reply to `call.join` / `call.resume` |
 | `call.publish.answer` | `{call_id, sdp}` | reply to `call.publish` |
-| `call.subscribe.offer` | `{call_id, sdp, version, streams: [SubStream]}` | whenever remote streams change; answer with `call.subscribe.answer` |
+| `call.subscribe.offer` | `{call_id, sdp, version, streams: [SubStream]}` | any time after `call.joined`, independent of your own publishing, whenever the set of remote streams changes; answer with `call.subscribe.answer` |
 | `call.ice` | `{call_id, pc, candidate}` | SFU's trickled candidates |
 | `call.participant` | `{call_id, event: "joined"\|"updated"\|"left", participant: Participant}` | roster change (excluding self) |
 | `call.ok` | `{}` | generic success reply |
-| `call.ended` | `{call_id, reason}` | call torn down under the participant (e.g. SFU restart) |
+| `call.ended` | `{call_id, reason: "sfu_restart"\|"removed"}` | your participation ended without `call.leave`: the SFU restarted, or you were removed from the channel. Later commands for that call get `not_in_call` |
 | `channel.call` | `{channel_id, call_id\|null, participant_count}` | sent to **all** channel members (in the call or not) so UIs can show "call in progress · join" |
 
 ```text
 Participant = { participant_id, user_id, display_name,
-                audio: bool, video: bool,             // mute state from call.media
+                audio: bool, video: bool,             // false until published; then from
+                                                      // the publish offer; then call.media
                 publishing: [ { kind: "audio"|"video", source: "mic"|"camera"|"screen" } ] }
 SubStream   = { mid, participant_id, kind: "audio"|"video", source }
 ```
@@ -157,7 +163,9 @@ SubStream   = { mid, participant_id, kind: "audio"|"video", source }
 per receiver, which is why the mapping travels with each `call.subscribe.offer`
 rather than inside `Participant`: it lets the client map an incoming track
 (`transceiver.mid`) to its participant without parsing SDP. A mid absent from the
-latest `streams` is inactive. `version` increases monotonically. The client answers
+latest `streams` is inactive. `version` is **per participant**: it starts at 1 for the first offer after
+`call.join`, increases by one per offer, and continues across `call.resume` (a new
+`call.join` is a new participant and starts again at 1). The client answers
 only the latest offer and echoes its `version`; the server rejects an answer whose
 `version` is not the latest with `error: stale` (the client then answers the newer
 offer it has, or will shortly receive). Each PC has one fixed offerer, so there
@@ -174,7 +182,7 @@ C → call.publish {call_id, sdp: offer}          (publish PC, sendonly)
 S → call.publish.answer {call_id, sdp: answer}
 C ⇄ S  call.ice {pc: "publish"} …               (trickle, both directions)
 S → call.subscribe.offer {call_id, sdp, version} (only if anyone else publishes)
-C → call.subscribe.answer {call_id, sdp}
+C → call.subscribe.answer {call_id, version, sdp}
 C ⇄ S  call.ice {pc: "subscribe"} …
 ```
 
@@ -184,12 +192,17 @@ C ⇄ S  call.ice {pc: "subscribe"} …
 
 **WS drops mid-call.** Media keeps flowing (it doesn't use the WS). The server keeps
 the participant for a **30 s grace**. The client reconnects, sends `auth`, then
-`call.resume {call_id}`; the server replies `call.joined` (fresh roster) and re-sends
+`call.resume {call_id, participant_id, resume_token}` using the values from the
+last `call.joined`; the server replies `call.joined` (fresh roster and a **new**
+`resume_token`: the old one is spent) and re-sends
 the latest `call.subscribe.offer` if it is still unanswered. The **publish PC is
 untouched** by a WS reconnect (its media never used the WS), so there is no
 publish renegotiation and no re-sent `call.publish.answer`. After the grace
 the participant is removed as if it had sent `call.leave`; a later `call.resume`
-gets `error: not_in_call` and the client must `call.join` again.
+gets `error: not_in_call` and the client must `call.join` again. The
+`resume_token` is what proves this device *is* that participant: `user_id` alone
+would let a second device of the same user take the first one's place. A wrong
+token, participant or user is always the same `not_in_call`.
 
 ### 3.6 Limits (MVP)
 
