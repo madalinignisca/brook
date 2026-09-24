@@ -590,3 +590,42 @@ async fn leave_tells_the_server_and_later_calls_fail() {
     assert_eq!(call.recv_type("call.leave").await["data"]["call_id"], "k1");
     assert!(call.handle.set_media(true, true).await.is_err());
 }
+
+/// `leave()` resolves only once the server confirmed, so an app can await it and quit
+/// without racing its own leave; media stops and the status ends immediately.
+#[tokio::test]
+async fn leave_waits_for_the_server_before_resolving() {
+    let mut call = join(false, |_| {}).await;
+    let h = call.handle.clone();
+    let leaving = tokio::spawn(async move { h.leave().await });
+    let leave = call.recv_type("call.leave").await;
+    call.wait_status(|s| *s == CallStatus::Ended(EndReason::Left))
+        .await;
+    call.eventually("engine closed at once", |l| l.iter().any(|e| e == "close"))
+        .await;
+    tokio::time::sleep(QUIET).await;
+    assert!(
+        !leaving.is_finished(),
+        "leave() resolved before the server confirmed"
+    );
+    call.ok(&leave).await;
+    tokio::time::timeout(WAIT, leaving)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+/// No confirmation: `leave()` still resolves, after the bounded wait.
+#[tokio::test]
+async fn leave_without_confirmation_resolves_after_the_bounded_wait() {
+    let mut call = join(false, |_| {}).await;
+    let h = call.handle.clone();
+    let leaving = tokio::spawn(async move { h.leave().await });
+    call.recv_type("call.leave").await; // never confirmed
+    tokio::time::timeout(Duration::from_secs(5), leaving)
+        .await
+        .expect("leave() hung")
+        .unwrap()
+        .unwrap();
+}

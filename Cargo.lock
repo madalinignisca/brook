@@ -282,6 +282,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "futures-util",
  "reqwest",
  "serde",
@@ -290,6 +291,8 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.24.0",
  "tracing",
+ "tracing-log",
+ "tracing-subscriber",
  "url",
  "wiremock",
 ]
