@@ -183,9 +183,10 @@ offer; `Offering`/`ApplyingAnswer` (an engine op in flight) → let it complete 
 the resulting state (an offer completed in `Offering` is sent on the new generation); a pending
 subscribe answer → resend it (the server re-sends the latest unanswered offer, handled by the version rules). No call
 command other than `call.resume` is written on the new generation before this `call.joined`.
-`not_in_call` → `Ended(Expired)`. A lost `call.joined` after the server rotated the token leaves core
-with a spent token; the next resume then ends the call as `Expired` unless the server adopts the
-one-step lookback proposed to it — a documented limit, not silent recovery.
+`not_in_call` → `Ended(Expired)`. **Lost `call.joined` after rotation** is recoverable: the server accepts
+both the current token and the one last used (one-step lookback, PR #10 @ 6a56aed). Core always sends
+the newest token it has *received*; if the reply carrying a new one was lost, that is still the token it
+last sent, which the server accepts once more — no special client logic.
 
 **Mute.** `set_media` calls are serialized (one `call.media` in flight; a newer intent replaces a queued
 one). `engine.set_local_media` first; on success `call.media{call_id, audio, video}`. An **error reply**
@@ -233,7 +234,7 @@ trace-level subscriber on core's targets and asserts neither token appears raw, 
 | 1008 loops beyond the 30 s grace | single-flight REST refresh before reconnecting |
 | Token / resume token in logs | `Secret` type; type-only frame logs; dependency log cap documented and set by clients |
 | Double / missing `engine.close()` | one `finish()` path, flag-guarded, immediate |
-| Lost resume reply after rotation | documented limit → `Expired`; lookback proposed to the server side |
+| Lost resume reply after rotation | server's one-step token lookback (contract); core resends its newest received token |
 
 ## 6. Tests (in-process WS server + fake engine; each seen failing under its mutation)
 
@@ -293,5 +294,5 @@ directly; abandoned joins skipped or left; `call.joined` delivered through the m
 initialization; full publish/subscribe failure policy; `close()` fences outstanding engine operations;
 publish `ApplyingAnswer` state and in-flight-aware resume; session **epoch** (identity) split from
 **credential revision** (rotation); serialized mute with rollback only on rejection; version-guarded,
-monotonic subscribe acknowledgements. "No ICE restart in v1" stays dependent on the server side
-confirming it in the contract.
+monotonic subscribe acknowledgements. Contract confirmed by the server side (PR #10 @ 6a56aed): token
+lookback, no ICE restarts in v1, `call.ice` exempt from replies, exact wire keys, replay keeps the version.
