@@ -1,6 +1,6 @@
 # Apple call engine + macOS call UI (C2/C3)
 
-> Status: **draft** — awaiting review · 2026-09-24
+> Status: **revised after Heavy review round 1** (Codex + Vibe) · 2026-09-25
 > Review dial: **Heavy** — camera/microphone access, a wider sandbox (incoming network), a third-party
 > binary in the app. Both external models, given evidence.
 > Builds on: core call signaling (PR #13, live-proven on GStreamer), Apple FFI bridge (#7), macOS app (#11).
@@ -39,50 +39,78 @@ shared test server; can mute, turn the camera off, and leave. iOS reuses the eng
   `FfiIceServer`, `FfiChannel`; enums with `Unknown` fallbacks.
 
 ### 3.2 Swift package layout
-`bindings/apple/swift/BrookCore/Package.swift` gains:
+`bindings/apple/swift/BrookCore/Package.swift` gains (and `build-xcframework.sh` generates into
+`Sources/BrookCoreGenerated/` instead of `Sources/BrookCore/Generated/`, cleaning the old path):
 - target **`BrookCoreGenerated`** — the UniFFI Swift, **Swift 5 language mode** (spike: it does not
   compile in 6); depends on the `BrookCoreFFI` binary target.
-- target **`BrookCore`** — hand-written, Swift 6, depends on `BrookCoreGenerated` and re-exports it.
+- target **`BrookCore`** — hand-written, Swift 6, depends on `BrookCoreGenerated` and re-exports it
+  (`@_exported import`); the token-redaction extensions move with it and are declared
+  `@retroactive` (conformances on another module's types).
 - target **`BrookMedia`** — the libwebrtc engine, Swift 6, depends on `BrookCore` and
-  `.binaryTarget(name: "WebRTC", url: <stasel 153.0.0 zip>, checksum: "3e3a8946…2b78f")`.
-- The macOS app embeds `WebRTC.framework`; a build phase **thins it to arm64** (`lipo -thin arm64`)
-  before signing, so the shipped app contains no x86_64 code (the prebuilt slice is universal).
+  `.binaryTarget(name: "WebRTC", url: <stasel 153.0.0 zip>, checksum: "3e3a8946…2b78f")`;
+  exported as a **`BrookMedia` product**, linked by the app in `project.yml`.
+- The macOS app embeds `WebRTC.framework` once. A post-embed build phase **thins the embedded copy**
+  (never SwiftPM's downloaded artifact) to arm64 and **re-signs that nested framework** with the app's
+  identity before the app itself is signed. Verified on the Release bundle: `lipo -archs` = arm64,
+  `codesign -v --deep --strict` passes, the app launches. No library-validation exception.
 
 ### 3.3 `BrookMedia.WebRTCEngine` (implements `MediaEngine`)
-- One `RTCPeerConnectionFactory` (default encoder/decoder factories → H.264 via VideoToolbox,
-  VP8 fallback, Opus). Unified Plan.
-- **Publish PC** (sendonly): audio track from the default audio device module (WebRTC's AEC3 on
-  macOS — spike-noted: not Apple voice processing; measured in §6), video from `RTCCameraVideoCapturer`
-  on the default camera at ≤ 720p30 (contract cap 1.5 Mbps / 720p). `create_publish_offer` = create
-  offer + set local description; capture start is bounded (≤ 5 s) and fenced by `close()`.
-- **Subscribe PC** (recvonly), created lazily on the first `apply_subscribe_offer`; the same PC is
-  kept across re-offers (proven model: empty re-offer after leave keeps the PC).
-- Local ICE candidates and fatal errors are pushed into the `FfiCallHandle` once it exists; before
-  that they are buffered in the engine (the GTK adapter does the same: join returns after the engine
-  may already have produced candidates).
-- Remote tracks → a `mid → RTCVideoTrack/RTCAudioTrack` map published to the UI (`@Observable`),
-  keyed by the latest `streams` mapping; a re-offer that reuses a mid rebinds the tile.
-- `set_local_media`: `track.isEnabled` for audio/video (no renegotiation).
-- `close()`: stops capture, closes both PCs, and sets a fence flag checked when every async op
-  resumes (a capture that finishes starting after close is stopped immediately and the op errors).
-- Threading: WebRTC callbacks arrive on its signaling thread; the engine's state is guarded by a
-  `Mutex`; UI updates hop to the main actor; nothing blocks the Rust worker threads that call the
-  sync methods.
+- **Engine-owned serial queue.** Every WebRTC call runs on one engine `DispatchQueue`. The sync
+  trait methods (`add_remote_candidate`, `set_local_media`, `set_ice_servers`) only **enqueue** and
+  return — WebRTC setters can block on WebRTC's own threads, and core calls these inline in its call
+  task. Async methods enqueue and await the result. No lock is held across any WebRTC call or any
+  call into Rust. A failure of deferred work is reported through `engine_failed`.
+- One `RTCPeerConnectionFactory` (default encoder/decoder factories → H.264 via VideoToolbox, VP8
+  fallback, Opus). Unified Plan; **every transceiver's direction set explicitly** (the default is
+  sendrecv).
+- **Publish PC** (sendonly): audio track from the default audio device module (WebRTC AEC3 on
+  macOS — measured in §6), video from `RTCCameraVideoCapturer` at ≤ 720p30. `create_publish_offer` =
+  create offer + set local description; capture start is bounded (≤ 5 s).
+- **Subscribe PC** (recvonly), created lazily on the first `apply_subscribe_offer` (full
+  remote-description → answer → local-description transition); kept across re-offers; transceivers
+  reused, and mid ownership updated from the **latest** `streams` even when no new track callback fires.
+- **Handle attachment:** candidates and fatal errors produced before the handle exists are buffered;
+  `attach(handle)` drains them atomically, in order (including end-of-candidates), then forwards
+  live. The engine holds the handle **weakly** — a strong reference would keep the call alive after
+  the UI dropped it (the call task retains the engine), defeating core's drop-to-leave.
+- **Camera off** stops `RTCCameraVideoCapturer` (the camera and its privacy indicator turn off) and
+  keeps the track/transceiver, so turning it back on restarts capture without renegotiation.
+  **Mute** sets the audio track's `isEnabled = false`: silence is sent, the microphone stays open
+  (its indicator stays on) — the same as other call apps, stated in the UI tooltip. If a track does not
+  exist (permission denied), `set_local_media` reports that through `engine_failed`-free return:
+  the enqueued work returns an error the next async op surfaces, and the UI disables the control.
+- **`close()` and the fence:** the fence flag is set **first**, then capture is stopped (awaited), both
+  PCs are closed, and late UI updates are discarded. Every operation checks the fence at entry, after
+  each await, and before installing any resource; a capture that finishes starting after the fence is
+  stopped immediately and the op errors. The engine publishes an observable **`closed`** completion.
+- **Every end path closes the engine:** core's single `finish()` calls `close()` for local leave,
+  handle drop, engine failure, remote `call.ended`, `Expired`, session change. The app adds the one
+  path core cannot see: **app quit** (`applicationShouldTerminate` → `leave()` and await `closed`,
+  bounded).
+- Threading: WebRTC delegate callbacks hop onto the engine queue; UI state is published to the main
+  actor; the Rust worker threads that call the sync methods never wait on either.
 
 ### 3.4 Permissions and entitlements (macOS)
 - Entitlements: `app-sandbox`, `network.client`, **`network.server`** (UDP ICE — §2),
-  `device.camera`, `device.audio-input`. Nothing else.
+  `device.camera`, `device.audio-input`. Nothing else. **What `network.server` opens:** the process
+  (including the WebRTC framework) may accept incoming TCP connections and receive UDP on any port it
+  binds; it does not itself create listeners or bypass the firewall or TCC. Brook binds only the
+  ICE sockets libwebrtc creates for a call, and they are closed on every end path (§3.3).
 - Info.plist: `NSCameraUsageDescription`, `NSMicrophoneUsageDescription` ("…for calls in Brook").
-- Permission is requested **only when the user joins a call with publish**, never at launch. Denied
-  camera → join audio-only (video track absent) and say so; denied microphone → join listen-only
-  (`publish = false`) and say so.
+- Permission is resolved **before** `join_call(…, publish:)` — the prompt's human time never eats
+  into the engine's capture budget — and only when the user joins, never at launch. The microphone
+  is asked first: denied/restricted/cancelled → join listen-only (`publish = false`), camera not asked,
+  and say so. Microphone granted, camera denied → join audio-only (no video track) and say so.
+  Unavailable controls are disabled: core cannot promote a listen-only call to publishing
+  (`republish` needs an established publish PC), so a listen-only user rejoins to publish.
 
 ### 3.5 macOS UI (C3, minimal)
 - After sign-in: a `NavigationSplitView` sidebar of channels (`list_channels`), each showing
   "● Call · N" from `ChannelCall` events; a **Join call** button.
 - Call window: a grid of video tiles (`RTCMTLNSVideoView` wrapped in `NSViewRepresentable`) labelled
   from the roster; self-view; controls: mute, camera, leave (⌘⇧M, ⌘⇧V, ⌘W); status banner for
-  Reconnecting / Ended(reason). Closing the window awaits `leave()` (bounded) before it closes.
+  Reconnecting / Ended(reason). Closing the window (or quitting) awaits `leave()` **and** the
+  engine's `closed` (bounded) before it closes, so capture has provably stopped.
 
 ## 4. Not doing
 - iOS app, CallKit, push (later; the engine is written to be shared).
@@ -90,13 +118,25 @@ shared test server; can mute, turn the camera off, and leave. iOS reuses the eng
 - Chat UI (messages) — only the channel list needed to join a call.
 
 ## 5. Tests
-- Rust (bindings): the call API round-trips through the FFI types; adapter maps engine errors.
-- Swift unit: `WebRTCEngine` against a **loopback**: publish PC's offer applied as a subscribe offer
-  on a second engine instance (no server) — both reach connected, a remote video track arrives,
-  `close()` fences a capture start held open, `set_local_media` toggles `isEnabled`.
-- Swift integration (itest, shared test server): join → Connected; publish answer applied; a
-  subscribe offer from a second participant (browser harness or GTK) answered; leave → Ended(Left).
-- Mutations per the usual rule on the engine's fence, buffering-before-handle, mid→track mapping.
+- Rust (bindings): the call API round-trips through the FFI types; the adapter forwards **every**
+  trait method (incl. `set_ice_servers`) and maps engine errors.
+- **Swift→Rust→Swift round trip** in a clean build: a Swift `MediaEngine` awaited by core through the
+  split package (proves the mixed-language-mode package links and runs).
+- Swift unit, `WebRTCEngine` **loopback** (no server): engine A's publish offer applied as engine B's
+  subscribe offer, the answer and trickled candidates exchanged **both ways**; assert a selected
+  candidate pair, **decoded video frames** (frame counter rising) and **received audio** (inbound
+  RTP audio bytes/levels rising) — not merely `connected` or a track object.
+- Fence: each description op held at a gate while `close()` runs → the op errors, capture stays
+  stopped (capture-session state checked, not `isEnabled`), and `closed` completes.
+- Camera off → capture session not running; back on → running, no renegotiation.
+- Sync methods return while the engine queue is deliberately stalled (core keeps signaling).
+- Handle attachment racing buffered candidates incl. end-of-candidates → delivered once, in order.
+- Mid reuse and removal across re-offers updates tile ownership.
+- `itest.sh` requires the new call suite by name (not only the login suite); a skipped call test fails
+  the run. Plus the signed, sandboxed, Finder-launched acceptance (§6) — `swift test` cannot prove
+  packaging, entitlements or permission prompts.
+- Mutations per the usual rule on the queue (inline WebRTC call), the fence, weak attachment,
+  camera-off (disable instead of stop), and mid mapping.
 
 ## 6. Acceptance (human + measured)
 1. A Finder-launched Brook.app joins a call on the test server with a GTK participant: both see and
@@ -117,3 +157,20 @@ shared test server; can mute, turn the camera off, and leave. iOS reuses the eng
 | AEC3 echo on speakers | acceptance §6.2 measures it; fallback path named |
 | Camera/mic prompts at a surprising time | only on join-with-publish; denial degrades, never crashes |
 | Engine callbacks on arbitrary threads racing UI | Mutex-guarded state; UI via main actor |
+
+## 8. Review log
+
+**Round 1 — Codex + Vibe (Heavy).** Codex requested changes; all accepted: engine-owned serial queue
+(WebRTC setters can block; core calls the sync methods inline); camera-off stops capture (disabling the
+track left the camera and its indicator on), mute's open-microphone behaviour stated; engine `closed`
+completion as the capture-stop barrier, fence set first and checked at entry/resume/install, weak
+handle attachment (a strong one defeats drop-to-leave); stronger tests (decoded frames, received audio,
+selected pair, capture state, both-way loopback, held-op races, attachment race, mid reuse, itest
+requires the call suite, Finder acceptance kept); package split wiring (generator path, `BrookMedia`
+product, `@retroactive` redaction, round-trip test); explicit transceiver directions; forward
+`set_ice_servers`; permissions resolved before join, microphone first, listen-only cannot be promoted.
+Vibe: every end path through `close()` — already core's single `finish()`, stated; the one missing
+path, app quit, added. `network.server` exposure documented. Thinned framework re-signed as the
+embedded copy, verified on the Release bundle. Echo acceptance gates the merge. "Tear down the
+subscribe PC when no streams remain" — rejected: the proven model keeps the PC across an empty re-offer
+(it is reused when someone joins again).
