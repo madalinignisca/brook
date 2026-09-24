@@ -27,7 +27,7 @@
 | `POST /channels/{id}/files` | begin upload → **S3 POST Policy** (`{url, fields}` with a `content-length-range`) + `file_id` (state `pending`) |
 | `POST /files/{id}/commit` | finalize: server confirms the object exists + type ok → state `committed` (attachable) |
 | `GET  /files/{id}` · `DELETE /files/{id}` | request **presigned GET** → `{download_url}` · delete |
-| `POST /channels/{id}/calls` | join call → `{room_id}` (signaling then over WS; api-proxied, no client Janus token) |
+| ~~`POST /channels/{id}/calls`~~ | superseded: calls are joined over the WS with `call.join` (§3), one path, no REST step |
 | `POST /devices` · `DELETE /devices/{id}` | register/unregister an APNs/FCM push token (mobile) |
 | `GET  /bots` · `POST /bots` | list / register bots (returns signing secret once) |
 | `GET /bots/{id}` · `PATCH /bots/{id}` · `DELETE /bots/{id}` | get / update (url, regen secret) / delete |
@@ -53,8 +53,7 @@ Messages are tagged envelopes:
 | `typing` | channel id, user id |
 | `channel.update` | membership / metadata change |
 | `bot.message` | message authored by a bot participant |
-| `call.signal` | **relayed SDP/ICE** from SFU/peer (see §3) |
-| `call.participant` | join/leave/mute in a room |
+| `call.*`, `channel.call` | call signaling events, see §3.4 |
 
 ### Client → server commands
 > **Sending messages is REST-only** (`POST /channels/{id}/messages`), never a WS command — one send path avoids races between HTTP retries and WS reconnect-replay, and simplifies dedup. The WS carries only ephemeral signals (typing, call) and **receives** fan-out.
@@ -63,21 +62,136 @@ Messages are tagged envelopes:
 |---|---|
 | `auth` | access token (**required first frame**, see above) |
 | `typing` | channel id |
-| `call.join` / `call.leave` | room id |
-| `call.signal` | SDP offer/answer, ICE candidates (to SFU) |
+| `call.*` | call signaling commands, see §3.3 |
 | `slash.command` | channel id, raw text (e.g. `/botname hello`) → triggers outbound webhook |
 
 ## 3. Call signaling (over the WS, relayed to Janus)
 
-`core` runs the signaling state machine; the WS is just the transport between client and `api`, which proxies to the Janus VideoRoom API.
+> **Contract v1 (2026-09-24).** The shape the server (`services/api`) and the client
+> (`core`, via FFI) build against in parallel. Changing a message here is a
+> coordinated change: announce it to the other side before it lands.
 
-```
-client.core ──call.join(room)──► api ──► Janus: join room
-client.core ◄─call.signal(SDP/ICE)─ api ◄─ Janus negotiation
-   ... DTLS/SRTP media flows CLIENT ↔ SFU directly (not via api) ...
+### 3.1 Model
+
+- **One call per channel.** A call is keyed by `channel_id`. The first `call.join`
+  starts it; it ends when the last participant leaves (or the cleanup timeout in
+  [SECURITY.md](SECURITY.md) §7 fires). **Authorization = channel membership**,
+  checked by `api` on every call command.
+- **Two PeerConnections per participant**, both terminated by the SFU:
+  - **publish** — `sendonly`: the participant's mic, camera, and later screen.
+    The **client offers**, the server answers.
+  - **subscribe** — `recvonly`: **all** remote streams in one PeerConnection.
+    The **server offers**, the client answers. Whenever the set of remote streams
+    changes, the server sends a **new offer** on the same PeerConnection (renegotiation).
+- `api` owns every Janus session and handle; the client never sees Janus ids or
+  Janus messages (ARCHITECTURE.md §Signaling model). Media (SRTP/DTLS) flows
+  client ↔ SFU directly.
+- Codecs: **Opus** audio, **H.264** video (constrained baseline, `profile-level-id=42e01f`)
+  with VP8 as negotiated fallback. See [MEDIA.md](MEDIA.md).
+
+### 3.2 Envelope, correlation, errors
+
+Every frame in both directions is the §2 envelope `{type, id, ts, data}`.
+
+- A client **command** carries a fresh `id`. The server's **direct reply** to it
+  carries `re: <that id>` (sibling of `data`), so the client can match reply to
+  request. Unsolicited server events have no `re`.
+- A failed command gets `{"type":"error","re":"<id>","data":{"code":"…","message":"…"}}`.
+  `message` is for logs, not UI. Codes:
+
+| code | meaning |
+|---|---|
+| `invalid` | malformed frame / missing field / bad SDP |
+| `not_member` | caller is not a member of the channel |
+| `not_in_call` | command refers to a call the caller hasn't joined |
+| `call_full` | participant limit reached (§3.6) |
+| `bad_state` | command out of order (e.g. `call.publish` before `call.joined`) |
+| `sfu_unavailable` | Janus unreachable or refused; retry later |
+
+### 3.3 Client → server commands
+
+| type | data | reply |
+|---|---|---|
+| `call.join` | `{channel_id}` | `call.joined` |
+| `call.publish` | `{call_id, sdp}` (publish-PC **offer**) | `call.publish.answer` |
+| `call.subscribe.answer` | `{call_id, sdp}` (subscribe-PC **answer** to the server's latest offer) | `call.ok` |
+| `call.ice` | `{call_id, pc: "publish"\|"subscribe", candidate}` | none (fire-and-forget) |
+| `call.media` | `{call_id, audio: bool, video: bool}` (mute state as the user sees it) | `call.ok` |
+| `call.leave` | `{call_id}` | `call.ok` |
+| `call.resume` | `{call_id}` (after a WS reconnect, §3.5) | `call.joined` |
+
+`candidate` is `{candidate, sdpMid, sdpMLineIndex}` as produced by WebRTC, or `null`
+for end-of-candidates.
+
+### 3.4 Server → client events
+
+| type | data | when |
+|---|---|---|
+| `call.joined` | `{call_id, channel_id, self: {participant_id}, participants: [Participant]}` | reply to `call.join` / `call.resume` |
+| `call.publish.answer` | `{call_id, sdp}` | reply to `call.publish` |
+| `call.subscribe.offer` | `{call_id, sdp, version}` | whenever remote streams change; answer with `call.subscribe.answer` |
+| `call.ice` | `{call_id, pc, candidate}` | SFU's trickled candidates |
+| `call.participant` | `{call_id, event: "joined"\|"updated"\|"left", participant: Participant}` | roster change (excluding self) |
+| `call.ok` | `{}` | generic success reply |
+| `call.ended` | `{call_id, reason}` | call torn down under the participant (e.g. SFU restart) |
+| `channel.call` | `{channel_id, call_id\|null, participant_count}` | sent to **all** channel members (in the call or not) so UIs can show "call in progress · join" |
+
+```text
+Participant = { participant_id, user_id, display_name,
+                audio: bool, video: bool,           // mute state from call.media
+                streams: [ { mid, kind: "audio"|"video", source: "mic"|"camera"|"screen" } ] }
 ```
 
-The client's **media engine** produces the SDP/tracks and consumes remote tracks; `core` only shuttles signaling. See [MEDIA.md](MEDIA.md).
+`mid` values in `streams` are the **subscribe-PC** mids, so the client can map an
+incoming track to its participant without reading the SDP. `version` on
+`call.subscribe.offer` increases monotonically; answer only the latest.
+
+### 3.5 Sequences
+
+**Join and publish**
+
+```text
+C → call.join {channel_id}
+S → call.joined {call_id, self, participants}
+C → call.publish {call_id, sdp: offer}          (publish PC, sendonly)
+S → call.publish.answer {call_id, sdp: answer}
+C ⇄ S  call.ice {pc: "publish"} …               (trickle, both directions)
+S → call.subscribe.offer {call_id, sdp, version} (only if anyone else publishes)
+C → call.subscribe.answer {call_id, sdp}
+C ⇄ S  call.ice {pc: "subscribe"} …
+```
+
+**Someone else joins/publishes**: `S → call.participant {event:"joined"}`, then a new
+`S → call.subscribe.offer` including their streams. **They leave**:
+`S → call.participant {event:"left"}` and a new offer without their streams.
+
+**WS drops mid-call.** Media keeps flowing (it doesn't use the WS). The server keeps
+the participant for a **30 s grace**. The client reconnects, sends `auth`, then
+`call.resume {call_id}`; the server replies `call.joined` (fresh roster) and re-sends
+the latest `call.subscribe.offer` if the client may have missed it. After the grace
+the participant is removed as if it had sent `call.leave`; a later `call.resume`
+gets `error: not_in_call` and the client must `call.join` again.
+
+### 3.6 Limits (MVP)
+
+- **8 participants** per call (`call_full` beyond).
+- Per-publisher cap **1.5 Mbps video / 720p** set in the SFU room config, until
+  simulcast lands ([MEDIA.md](MEDIA.md) §5).
+- One camera + one mic per participant. Screen share is a later additive change
+  (a third `source`), not in v1.
+- ICE: host candidates suffice on the shared LAN test server; STUN/TURN delivery
+  (`ice_servers` in `call.joined`) is added with coturn, as an **additive** field.
+
+### 3.7 Implementation notes (server-internal, not contract)
+
+`call.join` → Janus session + VideoRoom handle, `join` as `publisher` → the
+`joined` event yields the publisher id and `private_id` (kept server-side).
+`call.publish` → `configure` with the client's offer. The subscribe PC is a
+second handle joined as `subscriber` with `streams:[{feed}]` and the
+`private_id`; Janus's offer becomes `call.subscribe.offer`, the client's answer
+goes to `start`, and later roster changes use `update`
+(`subscribe`/`unsubscribe`). Janus event handlers (not WS close) are
+authoritative for "participant gone" ([SECURITY.md](SECURITY.md) §7).
 
 ## 3a. Push & mobile background (decided)
 
