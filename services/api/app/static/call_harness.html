@@ -37,6 +37,8 @@ const fail = (e) => { window.brook.errors.push(String(e && (e.message || JSON.st
 const rid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 
 let ws, callId, pubPc, subPc, local;
+const pubSources = new Map();   // publish transceiver -> "mic" | "camera" | "screen"
+let screenTx = null;
 const pending = new Map();
 let subChain = Promise.resolve();          // subscribe offers are handled strictly in order
 let subVersion = 0, subStreams = [];
@@ -110,7 +112,8 @@ async function onSubOffer(d) {
 
 function attach(mid, track) {
   const s = subStreams.find((x) => x.mid === mid);
-  window.brook.remote[mid] = { kind: track.kind, participant_id: s && s.participant_id };
+  window.brook.remote[mid] = { kind: track.kind, participant_id: s && s.participant_id,
+                               source: s && s.source };
   if (track.kind !== "video") { const a = new Audio(); a.srcObject = new MediaStream([track]); a.play().catch(() => {}); return; }
   const fig = document.createElement("figure"); fig.id = "v-" + mid;
   const v = document.createElement("video"); v.autoplay = true; v.muted = true; v.playsInline = true;
@@ -158,15 +161,48 @@ async function join({ handle, password, channel }) {
   pubPc = new RTCPeerConnection();
   pubPc.onicecandidate = (e) => send("call.ice", { call_id: callId, pc: "publish",
     candidate: e.candidate ? e.candidate.toJSON() : null });
-  for (const t of local.getTracks()) pubPc.addTransceiver(t, { direction: "sendonly" });
-  const offer = await pubPc.createOffer();
-  await pubPc.setLocalDescription(offer);
-  const ans = await request("call.publish", { call_id: callId, sdp: offer.sdp });
-  await pubPc.setRemoteDescription({ type: "answer", sdp: ans.data.sdp });
+  for (const t of local.getTracks()) {
+    const tx = pubPc.addTransceiver(t, { direction: "sendonly" });
+    pubSources.set(tx, t.kind === "audio" ? "mic" : "camera");
+  }
+  await republish();
   await flushIce(pubPc, "publish");
   window.brook.state = "published"; log("publishing");
   document.getElementById("leave").disabled = false;
 }
+
+// (Re)publish on the same PC, labelling EVERY m-line by mid (PROTOCOL.md §3.3).
+async function republish() {
+  const offer = await pubPc.createOffer();
+  await pubPc.setLocalDescription(offer);
+  const tracks = pubPc.getTransceivers().filter((tx) => pubSources.has(tx)).map((tx) => ({
+    mid: tx.mid, kind: pubSources.get(tx) === "mic" ? "audio" : "video", source: pubSources.get(tx) }));
+  const ans = await request("call.publish", { call_id: callId, sdp: offer.sdp, tracks });
+  await pubPc.setRemoteDescription({ type: "answer", sdp: ans.data.sdp });
+}
+
+// Screen share: a third m-line labelled "screen". fake=true reuses a camera clone
+// (headless browsers have no screen to capture); otherwise getDisplayMedia.
+window.brook.shareScreen = async (fake) => {
+  const track = fake ? local.getVideoTracks()[0].clone()
+                     : (await navigator.mediaDevices.getDisplayMedia({ video: true })).getVideoTracks()[0];
+  if (screenTx) { await screenTx.sender.replaceTrack(track); screenTx.direction = "sendonly"; }
+  else { screenTx = pubPc.addTransceiver(track, { direction: "sendonly" }); pubSources.set(screenTx, "screen"); }
+  await republish(); log("sharing screen");
+};
+window.brook.stopScreen = async () => {
+  if (!screenTx) return;
+  screenTx.direction = "inactive"; await screenTx.sender.replaceTrack(null);
+  await republish(); log("stopped sharing");
+};
+// Decoded video frames per subscribe-PC mid, to prove a specific stream plays.
+window.brook.framesByMid = async () => {
+  const out = {};
+  if (subPc) (await subPc.getStats()).forEach((r) => {
+    if (r.type === "inbound-rtp" && r.kind === "video" && r.mid !== undefined) out[r.mid] = r.framesDecoded || 0;
+  });
+  return out;
+};
 
 async function leave() {
   try { await request("call.leave", { call_id: callId }); } catch (e) { fail(e); }

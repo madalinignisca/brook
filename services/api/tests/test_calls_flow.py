@@ -422,3 +422,122 @@ def test_unchanged_call_media_is_not_broadcast(sync_client: TestClient, fake: Fa
         r = cmd(wb, "call.media", {"call_id": call_id, "audio": False, "video": True})
         assert r["type"] == "call.ok"
         assert of(collect(wa), "call.participant") == []
+
+
+def _sdp(*mlines: tuple[str, str, bool]) -> str:
+    """An offer with (kind, mid, active) m-lines."""
+    out = ["v=0"]
+    for kind, mid, active in mlines:
+        out += [f"m={kind} {9 if active else 0} UDP/TLS/RTP/SAVPF 96", f"a=mid:{mid}"]
+        out += ["a=sendonly" if active else "a=inactive"]
+    return "\r\n".join(out) + "\r\n"
+
+
+AV = (("audio", "0", True), ("video", "1", True))
+AV_TRACKS = [
+    {"mid": "0", "kind": "audio", "source": "mic"},
+    {"mid": "1", "kind": "video", "source": "camera"},
+]
+
+
+@pytest.mark.parametrize(
+    "tracks",
+    [
+        [AV_TRACKS[0]],  # an m-line left unlabelled
+        [AV_TRACKS[0], {"mid": "1", "kind": "audio", "source": "mic"}],  # kind mismatch
+        [{"mid": "0", "kind": "audio", "source": "screen"}, AV_TRACKS[1]],  # audio "screen"
+        [*AV_TRACKS, {"mid": "1", "kind": "video", "source": "screen"}],  # mid labelled twice
+        "not-a-list",
+    ],
+)
+def test_bad_track_labels_are_invalid(
+    sync_client: TestClient, fake: FakeJanus, tracks: Any
+) -> None:
+    a, _b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa:
+        call_id = cmd(wa, "call.join", {"channel_id": ch})["data"]["call_id"]
+        r = cmd(wa, "call.publish", {"call_id": call_id, "sdp": _sdp(*AV), "tracks": tracks})
+        assert (r["type"], r["data"]["code"]) == ("error", "invalid"), r
+        # A deliberate refusal, not a crash turned into the generic "internal error".
+        assert r["data"]["message"] != "internal error", r
+
+
+def test_two_screens_are_invalid(sync_client: TestClient, fake: FakeJanus) -> None:
+    a, _b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa:
+        call_id = cmd(wa, "call.join", {"channel_id": ch})["data"]["call_id"]
+        sdp = _sdp(("video", "0", True), ("video", "1", True))
+        tracks = [
+            {"mid": "0", "kind": "video", "source": "screen"},
+            {"mid": "1", "kind": "video", "source": "screen"},
+        ]
+        r = cmd(wa, "call.publish", {"call_id": call_id, "sdp": sdp, "tracks": tracks})
+        assert (r["type"], r["data"]["code"]) == ("error", "invalid")
+
+
+def test_screen_share_start_and_stop_mid_call(sync_client: TestClient, fake: FakeJanus) -> None:
+    """Janus does not add a stream a publisher adds mid-call to existing
+    subscriptions (verified on Janus 1.4.2), so the server must subscribe peers to
+    the new (feed, mid) itself, and label it "screen" from the publisher's tracks."""
+    a, b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa, _ws(sync_client, b) as wb:
+        ja = cmd(wa, "call.join", {"channel_id": ch})["data"]
+        call_id, pa = ja["call_id"], ja["self"]["participant_id"]
+        cmd(wb, "call.join", {"channel_id": ch})
+        r = cmd(wa, "call.publish", {"call_id": call_id, "sdp": _sdp(*AV), "tracks": AV_TRACKS})
+        assert r["type"] == "call.publish.answer"
+        sync_client.portal.call(fake.fire, _participant(call_id, pa).pub_hid, {"janus": "webrtcup"})
+        first = of(collect(wb), "call.subscribe.offer")[-1]
+        cmd(
+            wb,
+            "call.subscribe.answer",
+            {"call_id": call_id, "version": first["version"], "sdp": "a"},
+        )
+        assert sorted(s["source"] for s in first["streams"]) == ["camera", "mic"]
+
+        # start sharing: same publish PC, a third m-line labelled screen
+        share = (*AV, ("video", "2", True))
+        tracks = [*AV_TRACKS, {"mid": "2", "kind": "video", "source": "screen"}]
+        r = cmd(wa, "call.publish", {"call_id": call_id, "sdp": _sdp(*share), "tracks": tracks})
+        assert r["type"] == "call.publish.answer"
+        frames = collect(wb)
+        who = of(frames, "call.participant")[-1]["participant"]
+        assert {"kind": "video", "source": "screen"} in who["publishing"]
+        offer = of(frames, "call.subscribe.offer")[-1]
+        assert offer["version"] == first["version"] + 1
+        assert sorted(s["source"] for s in offer["streams"]) == ["camera", "mic", "screen"]
+        screen = next(s for s in offer["streams"] if s["source"] == "screen")
+        assert (screen["participant_id"], screen["kind"]) == (pa, "video")
+        cmd(
+            wb,
+            "call.subscribe.answer",
+            {"call_id": call_id, "version": offer["version"], "sdp": "a"},
+        )
+
+        # call.media is mic/camera only: camera off leaves the screen alone
+        cmd(wa, "call.media", {"call_id": call_id, "audio": True, "video": False})
+        who = of(collect(wb), "call.participant")[-1]["participant"]
+        assert (who["audio"], who["video"]) == (True, False)
+        assert {"kind": "video", "source": "screen"} in who["publishing"]
+
+        # stop sharing: the m-line goes inactive, the stream disappears for peers
+        stopped = (*AV, ("video", "2", False))
+        r = cmd(wa, "call.publish", {"call_id": call_id, "sdp": _sdp(*stopped), "tracks": tracks})
+        assert r["type"] == "call.publish.answer"
+        frames = collect(wb)
+        who = of(frames, "call.participant")[-1]["participant"]
+        assert all(x["source"] != "screen" for x in who["publishing"])
+        last = of(frames, "call.subscribe.offer")[-1]
+        assert sorted(s["source"] for s in last["streams"]) == ["camera", "mic"]
+
+
+def test_audio_and_screen_without_camera(sync_client: TestClient, fake: FakeJanus) -> None:
+    """Sharing a screen with no camera: `video` (the camera flag) stays false."""
+    a, b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa, _ws(sync_client, b) as wb:
+        call_id = cmd(wa, "call.join", {"channel_id": ch})["data"]["call_id"]
+        cmd(wb, "call.join", {"channel_id": ch})
+        tracks = [AV_TRACKS[0], {"mid": "1", "kind": "video", "source": "screen"}]
+        cmd(wa, "call.publish", {"call_id": call_id, "sdp": _sdp(*AV), "tracks": tracks})
+        who = of(collect(wb), "call.participant")[-1]["participant"]
+        assert (who["audio"], who["video"]) == (True, False)

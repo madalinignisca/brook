@@ -149,12 +149,29 @@ Every frame in both directions is the §2 envelope `{type, id, ts, data}`.
 | type | data | reply |
 |---|---|---|
 | `call.join` | `{channel_id}` | `call.joined` |
-| `call.publish` | `{call_id, sdp}` (publish-PC **offer**) | `call.publish.answer` |
+| `call.publish` | `{call_id, sdp, tracks?}` (publish-PC **offer**; `tracks` labels its m-lines, see below) | `call.publish.answer` |
 | `call.subscribe.answer` | `{call_id, version, sdp}` (subscribe-PC **answer** to the offer with that `version`) | `call.ok` or `error: stale` |
 | `call.ice` | `{call_id, pc: "publish"\|"subscribe", candidate}` | none (fire-and-forget) |
 | `call.media` | `{call_id, audio: bool, video: bool}` (mute state the user wants; the server announces each as *wanted AND published*, so an unpublished kind stays `false`, and a mute sent before the publish completes is kept when it does) | `call.ok` |
 | `call.leave` | `{call_id}` | `call.ok` |
 | `call.resume` | `{call_id, participant_id, resume_token}` (after a WS reconnect, §3.5) | `call.joined` |
+
+**Track labels and screen share.** `tracks` is an optional list of
+`{mid, kind: "audio"|"video", source}` labelling the offer's m-lines:
+
+- Absent: every audio m-line is `mic` and every video m-line is `camera` (clients
+  predating screen share keep working).
+- Present: it must label **every** audio/video m-line of the offer by `mid`,
+  exactly once, with a `source` valid for its kind (`audio`: `mic`; `video`:
+  `camera` or `screen`), and at most one `screen`. Anything else is `invalid`.
+- **Start sharing:** add a `sendonly` video m-line to the **same** publish PC and
+  send `call.publish` again with it labelled `screen`. **Stop sharing:** make that
+  m-line `inactive` (or port 0) and publish again. No other commands exist for it.
+- Only **active** m-lines count as published. Peers get the new stream through a
+  normal `call.subscribe.offer` whose `SubStream.source` is `"screen"`, and see it
+  in the sharer's `Participant.publishing`.
+- `call.media` stays mic/camera only: its `video` flag is the camera. Sharing is
+  on/off by publishing, never by `call.media`.
 
 `candidate` is `{candidate, sdpMid, sdpMLineIndex}` (exactly these keys, as WebRTC's
 `RTCIceCandidate.toJSON()` produces), or `null` for end-of-candidates; `pc` is the
@@ -184,8 +201,8 @@ its candidates in the SDP, so server → client trickle is rare but allowed.)
 
 ```text
 Participant = { participant_id, user_id, display_name,
-                audio: bool, video: bool,             // wanted (last call.media, default on)
-                                                      // AND published; false until published
+                audio: bool, video: bool,             // mic / camera: wanted (last call.media,
+                                                      // default on) AND published
                 publishing: [ { kind: "audio"|"video", source: "mic"|"camera"|"screen" } ] }
 SubStream   = { mid, participant_id, kind: "audio"|"video", source }
 ```
@@ -244,8 +261,8 @@ token, participant or user is always the same `not_in_call`.
 - **8 participants** per call (`call_full` beyond).
 - Per-publisher cap **1.5 Mbps video / 720p** set in the SFU room config, until
   simulcast lands ([MEDIA.md](MEDIA.md) §5).
-- One camera + one mic per participant. Screen share is a later additive change
-  (a third `source`), not in v1.
+- One mic, one camera and at most one screen per participant. The per-publisher
+  bitrate cap applies; send the screen at a low frame rate (MEDIA.md).
 - ICE: host candidates suffice on the shared LAN test server; STUN/TURN delivery
   (`ice_servers` in `call.joined`) is added with coturn, as an **additive** field.
 

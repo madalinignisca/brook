@@ -69,6 +69,10 @@ class Participant:
     feed_id: int = 0  # Janus publisher id
     private_id: int = 0
     publishing: list[dict[str, str]] = field(default_factory=list)
+    # mid -> source ("mic" | "camera" | "screen") of this participant's ACTIVE publish
+    # m-lines. Subscriptions and the SubStream.source mapping are per stream, from
+    # this table (not from Janus's description round-trip).
+    stream_sources: dict[str, str] = field(default_factory=dict)
     # True once Janus reports this publish PC up ("webrtcup"). Janus refuses to
     # subscribe anyone to a feed before that ("No such feed"), so a participant only
     # counts as a subscribable publisher from then on; "hangup" clears it.
@@ -92,7 +96,11 @@ class Participant:
     # client still holds only the old one and must not lose the call over it.
     prev_resume_token: str | None = None
     sub_hid: int | None = None
-    sub_feeds: set[int] = field(default_factory=set)
+    # (feed, mid) this participant's subscribe PC carries. Per STREAM, not per feed:
+    # Janus does not add a stream a publisher adds mid-call (e.g. a screen share) to
+    # an existing feed-level subscription (verified against Janus 1.4.2), so every
+    # stream is subscribed explicitly.
+    sub_streams: set[tuple[int, str]] = field(default_factory=set)
     sub_version: int = 0
     sub_pending: dict[str, Any] | None = None  # the unanswered offer frame, if any
     sub_dirty: bool = False
@@ -101,9 +109,10 @@ class Participant:
 
     def refresh_media(self) -> None:
         """audio/video = what the user wants AND what is actually published."""
-        kinds = {x["kind"] for x in self.publishing}
-        self.audio = self.audio_intent and "audio" in kinds
-        self.video = self.video_intent and "video" in kinds
+        # call.media covers mic and camera only; a screen share is on/off by publish.
+        sources = set(self.stream_sources.values())
+        self.audio = self.audio_intent and "mic" in sources
+        self.video = self.video_intent and "camera" in sources
 
     def view(self) -> dict[str, Any]:
         return {
@@ -345,19 +354,30 @@ class CallManager:
 
     # ---- publish --------------------------------------------------------------
 
-    async def publish(self, p: Participant, sdp: str) -> str:
+    async def publish(self, p: Participant, sdp: str, tracks: Any = None) -> str:
+        sources = _label_streams(_parse_mlines(sdp), tracks)  # CallError on bad labels
         try:
             msg = await self.janus().message(
                 p.sid,
                 p.pub_hid,
-                {"request": "configure", "audio": True, "video": True},
+                {
+                    "request": "configure",
+                    "audio": True,
+                    "video": True,
+                    # Janus-side labels (for logs/tools); our mapping uses stream_sources.
+                    "descriptions": [{"mid": m, "description": s} for m, s in sources.items()],
+                },
                 jsep={"type": "offer", "sdp": sdp},
             )
             answer = msg["jsep"]["sdp"]
         except (JanusError, KeyError) as exc:
             log.warning("SFU rejected a publish offer from %s: %s", p.participant_id, exc)
             raise CallError("invalid", "the SFU rejected the offer") from exc
-        p.publishing = _publishing_from_sdp(sdp)
+        p.stream_sources = sources
+        p.publishing = [
+            {"kind": "audio" if src == "mic" else "video", "source": src}
+            for src in sources.values()
+        ]
         p.refresh_media()  # keeps a mute sent before this publish landed
         await self._broadcast(
             p.call,
@@ -385,11 +405,12 @@ class CallManager:
                 p.sub_dirty = True  # replayed after the client answers
                 return
             desired = {
-                o.feed_id
+                (o.feed_id, mid)
                 for o in p.call.participants.values()
-                if o is not p and o.publishing and o.media_up
+                if o is not p and o.media_up
+                for mid in o.stream_sources
             }
-            if desired == p.sub_feeds:
+            if desired == p.sub_streams:
                 return
             janus = self.janus()
             if p.sub_hid is None:
@@ -403,7 +424,7 @@ class CallManager:
                             "ptype": "subscriber",
                             "room": p.call.room,
                             "private_id": p.private_id,
-                            "streams": [{"feed": f} for f in sorted(desired)],
+                            "streams": [{"feed": f, "mid": m} for f, m in sorted(desired)],
                         },
                     )
                 except JanusError:
@@ -414,17 +435,30 @@ class CallManager:
                     return
                 p.sub_hid = hid
             else:
+                add = desired - p.sub_streams
+                drop = p.sub_streams - desired
                 body: dict[str, Any] = {"request": "update"}
-                if add := desired - p.sub_feeds:
-                    body["subscribe"] = [{"feed": f} for f in sorted(add)]
-                if drop := p.sub_feeds - desired:
-                    body["unsubscribe"] = [{"feed": f} for f in sorted(drop)]
+                if add:
+                    body["subscribe"] = [{"feed": f, "mid": m} for f, m in sorted(add)]
+                if drop:
+                    body["unsubscribe"] = [{"feed": f, "mid": m} for f, m in sorted(drop)]
                 try:
                     msg = await janus.message(p.sid, p.sub_hid, body)
                 except JanusError:
-                    log.exception("subscriber update failed for %s", p.participant_id)
-                    return
-            p.sub_feeds = desired
+                    if not (add and drop):
+                        log.exception("subscriber update failed for %s", p.participant_id)
+                        return
+                    # A stream its publisher already dropped (stopped screen share, left)
+                    # may be gone from Janus's side too, failing the whole update. Treat
+                    # the unsubscribes as done and retry only the additions.
+                    try:
+                        msg = await janus.message(
+                            p.sid, p.sub_hid, {"request": "update", "subscribe": body["subscribe"]}
+                        )
+                    except JanusError:
+                        log.exception("subscriber update failed for %s", p.participant_id)
+                        return
+            p.sub_streams = desired
             if "jsep" in msg:
                 await self._offer(p, msg)
 
@@ -441,12 +475,13 @@ class CallManager:
                 or s.get("type") not in ("audio", "video")
             ):
                 continue
+            default = "mic" if s["type"] == "audio" else "camera"
             streams.append(
                 {
                     "mid": str(s["mid"]),
                     "participant_id": owner.participant_id,
                     "kind": s["type"],
-                    "source": "mic" if s["type"] == "audio" else "camera",
+                    "source": owner.stream_sources.get(str(s.get("feed_mid")), default),
                 }
             )
         frame = envelope(
@@ -483,7 +518,7 @@ class CallManager:
                 # Start over with a fresh subscriber handle and a fresh offer.
                 if p.sub_hid is not None:
                     await self.janus().detach(p.sid, p.sub_hid)
-                p.sub_hid, p.sub_feeds, p.sub_pending, p.sub_dirty = None, set(), None, False
+                p.sub_hid, p.sub_streams, p.sub_pending, p.sub_dirty = None, set(), None, False
                 self._spawn(self.reconcile(p))
                 log.warning("SFU rejected a subscribe answer from %s: %s", p.participant_id, exc)
                 raise CallError("invalid", "the SFU rejected the answer") from exc
@@ -653,24 +688,66 @@ def _token_ok(given: str, current: str, previous: str | None) -> bool:
     return ok_current or ok_previous
 
 
-def _publishing_from_sdp(sdp: str) -> list[dict[str, str]]:
-    """What a publish offer sends: one entry per non-inactive audio/video m-line."""
-    out: list[dict[str, str]] = []
-    kind: str | None = None
-    direction_ok = True
+@dataclass(frozen=True)
+class _MLine:
+    mid: str
+    kind: str  # "audio" | "video" | other (e.g. "application")
+    active: bool  # sends media: port != 0 and not inactive/recvonly
+
+
+def _parse_mlines(sdp: str) -> list[_MLine]:
+    """The offer's m-lines with their mid, kind and whether they are active."""
+    out: list[_MLine] = []
+    cur: dict[str, Any] | None = None
 
     def flush() -> None:
-        if kind in ("audio", "video") and direction_ok:
-            out.append({"kind": kind, "source": "mic" if kind == "audio" else "camera"})
+        if cur is not None:
+            out.append(_MLine(cur["mid"], cur["kind"], cur["active"]))
 
-    for line in sdp.splitlines():
+    for raw in sdp.splitlines():
+        line = raw.strip()
         if line.startswith("m="):
             flush()
-            kind, direction_ok = line[2:].split(" ", 1)[0], True
-        elif line.strip() in ("a=inactive", "a=recvonly"):
-            direction_ok = False
+            parts = line[2:].split()
+            kind = parts[0] if parts else ""
+            port_zero = len(parts) > 1 and parts[1] == "0"
+            cur = {"mid": str(len(out)), "kind": kind, "active": not port_zero}
+        elif cur is not None and line.startswith("a=mid:"):
+            cur["mid"] = line[len("a=mid:") :]
+        elif cur is not None and line in ("a=inactive", "a=recvonly"):
+            cur["active"] = False
     flush()
     return out
+
+
+_SOURCES = {"audio": {"mic"}, "video": {"camera", "screen"}}
+
+
+def _label_streams(mlines: list[_MLine], tracks: Any) -> dict[str, str]:
+    """mid -> source for the ACTIVE audio/video m-lines (contract §3.3).
+
+    Without ``tracks``: audio is "mic", video "camera" (clients predating screen
+    share). With ``tracks``: it must label every audio/video m-line by mid with a
+    source valid for its kind, and at most one "screen"; anything else is
+    ``invalid`` (a mislabelled screen would show as a camera tile, or vice versa).
+    """
+    media = [m for m in mlines if m.kind in _SOURCES]
+    if tracks is None:
+        return {m.mid: ("mic" if m.kind == "audio" else "camera") for m in media if m.active}
+    if not isinstance(tracks, list) or not all(isinstance(t, dict) for t in tracks):
+        raise CallError("invalid", "tracks must be a list of {mid, kind, source}")
+    labels = {str(t.get("mid")): t for t in tracks}
+    if len(labels) != len(tracks) or set(labels) != {m.mid for m in media}:
+        raise CallError("invalid", "tracks must label every audio/video m-line by mid, once")
+    screens = 0
+    for m in media:
+        t = labels[m.mid]
+        if t.get("kind") != m.kind or t.get("source") not in _SOURCES[m.kind]:
+            raise CallError("invalid", f"track {m.mid}: kind/source do not match its m-line")
+        screens += t.get("source") == "screen"
+    if screens > 1:
+        raise CallError("invalid", "at most one screen track per participant")
+    return {m.mid: str(labels[m.mid]["source"]) for m in media if m.active}
 
 
 def _candidate(c: Any) -> dict[str, Any] | None:
@@ -741,7 +818,7 @@ async def _join(conn: Connection, frame: dict[str, Any], re: str | None) -> None
 async def _publish(conn: Connection, frame: dict[str, Any], re: str | None) -> None:
     data = _require(frame, "call_id", "sdp")
     p = manager._participant_of(conn, data["call_id"])
-    answer = await manager.publish(p, str(data["sdp"]))
+    answer = await manager.publish(p, str(data["sdp"]), data.get("tracks"))
     await conn.send(
         envelope("call.publish.answer", {"call_id": p.call.call_id, "sdp": answer}, re=re)
     )

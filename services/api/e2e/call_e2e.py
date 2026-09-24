@@ -90,7 +90,8 @@ async def _media_flowing(page: Page, who: str) -> dict[str, int]:
     s1 = await page.evaluate("window.brook.stats()")
     await asyncio.sleep(2)
     s2 = await page.evaluate("window.brook.stats()")
-    assert s2["inboundVideoBytes"] > s1["inboundVideoBytes"] > 0, (
+    # Only growth is required: the first sample may legitimately still be 0.
+    assert s2["inboundVideoBytes"] > s1["inboundVideoBytes"] and s2["inboundVideoBytes"] > 0, (
         f"{who}: no inbound video {s1}->{s2}"
     )
     assert s2["framesDecoded"] > s1["framesDecoded"], f"{who}: no frames decoded {s1}->{s2}"
@@ -144,6 +145,29 @@ async def main() -> None:
         )
         print("PASS remote video on alice's side is attributed to Bob")
 
+        # Screen share (PROTOCOL.md §3.3 `tracks`): alice adds a third m-line labelled
+        # "screen" on her SAME publish PC. Janus does not add it to bob's existing
+        # subscription by itself; the server must, and bob must DECODE it.
+        await alice.evaluate("window.brook.shareScreen(true)")
+        screen_mid = await wait_for(
+            bob,
+            "(Object.entries(window.brook.remote)"
+            ".find(([m, r]) => r.source === 'screen') || [])[0]",
+            "bob receives alice's screen stream",
+        )
+        f1 = (await bob.evaluate("window.brook.framesByMid()")).get(screen_mid, 0)
+        await asyncio.sleep(2)
+        f2 = (await bob.evaluate("window.brook.framesByMid()")).get(screen_mid, 0)
+        assert f2 > f1, f"screen stream not decoding on mid {screen_mid}: {f1}->{f2}"
+        print(f"PASS screen share: bob decodes alice's screen on mid {screen_mid} ({f2} frames)")
+        await alice.evaluate("window.brook.stopScreen()")
+        await wait_for(
+            bob,
+            "!Object.values(window.brook.remote).some(r => r.source === 'screen')",
+            "bob's screen stream goes away when alice stops sharing",
+        )
+        print("PASS stop sharing: screen stream renegotiated away")
+
         await bob.evaluate("window.brook.leave()")
         await wait_for(
             alice, "Object.keys(window.brook.participants).length === 0", "alice sees bob leave"
@@ -157,4 +181,5 @@ async def main() -> None:
         await browser.close()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

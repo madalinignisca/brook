@@ -21,7 +21,10 @@ class FakeJanus:
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.destroyed: list[int] = []
         self.fail: set[str] = set()  # request names that raise JanusError
-        self.subs: dict[int, set[int]] = {}  # subscriber handle -> feeds
+        # subscriber handle -> subscribed (feed, mid), like Janus multistream
+        self.subs: dict[int, set[tuple[int, str]]] = {}
+        self.pub_feed: dict[int, int] = {}  # publisher handle -> its feed id
+        self.feed_streams: dict[int, dict[str, str]] = {}  # feed -> {mid: kind}, from configure
         self.on_disconnect: Any = None
 
     async def create_session(self) -> int:
@@ -36,15 +39,16 @@ class FakeJanus:
         return hid
 
     def _offer(self, hid: int) -> dict[str, Any]:
-        feeds = sorted(self.subs[hid])
+        """An offer for exactly the subscribed (feed, mid) streams; mids are this
+        subscriber's own (0, 1, 2 ...), feed_mid is the publisher's."""
         streams = []
-        for i, feed in enumerate(feeds):
-            streams.append({"mid": str(2 * i), "type": "audio", "feed_id": feed, "active": True})
+        for i, (feed, mid) in enumerate(sorted(self.subs[hid])):
+            kind = self.feed_streams.get(feed, {}).get(mid, "video")
             streams.append(
-                {"mid": str(2 * i + 1), "type": "video", "feed_id": feed, "active": True}
+                {"mid": str(i), "type": kind, "feed_id": feed, "feed_mid": mid, "active": True}
             )
         return {
-            "jsep": {"type": "offer", "sdp": f"v=0 fake-offer feeds={feeds}"},
+            "jsep": {"type": "offer", "sdp": f"v=0 fake-offer {sorted(self.subs[hid])}"},
             "plugindata": {"data": {"videoroom": "attached", "streams": streams}},
         }
 
@@ -56,17 +60,25 @@ class FakeJanus:
         if req in self.fail:
             raise JanusError(f"fake: {req} refused")
         if req == "join" and body.get("ptype") == "publisher":
-            data = {"videoroom": "joined", "id": next(self._ids), "private_id": next(self._ids)}
+            feed = next(self._ids)
+            self.pub_feed[hid] = feed
+            data = {"videoroom": "joined", "id": feed, "private_id": next(self._ids)}
             return {"plugindata": {"data": data}}
         if req == "join" and body.get("ptype") == "subscriber":
-            self.subs[hid] = {s["feed"] for s in body["streams"]}
+            self.subs[hid] = {(s["feed"], s["mid"]) for s in body["streams"]}
             return self._offer(hid)
         if req == "update":
-            feeds = self.subs.setdefault(hid, set())
-            feeds |= {s["feed"] for s in body.get("subscribe", [])}
-            feeds -= {s["feed"] for s in body.get("unsubscribe", [])}
+            subs = self.subs.setdefault(hid, set())
+            subs |= {(s["feed"], s["mid"]) for s in body.get("subscribe", [])}
+            subs -= {(s["feed"], s["mid"]) for s in body.get("unsubscribe", [])}
             return self._offer(hid)
         if req == "configure":
+            from app.calls import _parse_mlines  # the server's own parser, for the kinds
+
+            if jsep is not None and hid in self.pub_feed:
+                self.feed_streams[self.pub_feed[hid]] = {
+                    m.mid: m.kind for m in _parse_mlines(jsep["sdp"]) if m.active
+                }
             return {
                 "jsep": {"type": "answer", "sdp": "v=0 fake-answer"},
                 "plugindata": {"data": {}},
