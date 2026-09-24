@@ -152,7 +152,7 @@ Every frame in both directions is the §2 envelope `{type, id, ts, data}`.
 | `call.publish` | `{call_id, sdp}` (publish-PC **offer**) | `call.publish.answer` |
 | `call.subscribe.answer` | `{call_id, version, sdp}` (subscribe-PC **answer** to the offer with that `version`) | `call.ok` or `error: stale` |
 | `call.ice` | `{call_id, pc: "publish"\|"subscribe", candidate}` | none (fire-and-forget) |
-| `call.media` | `{call_id, audio: bool, video: bool}` (mute state as the user sees it) | `call.ok` |
+| `call.media` | `{call_id, audio: bool, video: bool}` (mute state the user wants; the server announces each as *wanted AND published*, so an unpublished kind stays `false`, and a mute sent before the publish completes is kept when it does) | `call.ok` |
 | `call.leave` | `{call_id}` | `call.ok` |
 | `call.resume` | `{call_id, participant_id, resume_token}` (after a WS reconnect, §3.5) | `call.joined` |
 
@@ -184,8 +184,8 @@ its candidates in the SDP, so server → client trickle is rare but allowed.)
 
 ```text
 Participant = { participant_id, user_id, display_name,
-                audio: bool, video: bool,             // false until published; then from
-                                                      // the publish offer; then call.media
+                audio: bool, video: bool,             // wanted (last call.media, default on)
+                                                      // AND published; false until published
                 publishing: [ { kind: "audio"|"video", source: "mic"|"camera"|"screen" } ] }
 SubStream   = { mid, participant_id, kind: "audio"|"video", source }
 ```
