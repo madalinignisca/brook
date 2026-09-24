@@ -271,4 +271,380 @@ mod tests {
         assert!(client.current_user_id().await.is_none());
         assert_eq!(server.refresh_calls(), 1);
     }
+
+    // ---- P2: command path ----
+
+    use crate::ws::{CallFrame, CommandError};
+    use tokio::sync::mpsc;
+
+    /// Logged in, realtime started, first socket authenticated; returns the client, the
+    /// server end, and the ready generation.
+    async fn connected(
+        server: &mut TestServer,
+        configure: impl FnOnce(&mut crate::ws::Transport),
+    ) -> (Arc<BrookClient>, WsPeer, u64) {
+        let client = Arc::new(server.client());
+        client.login("alice", "pw").await.unwrap();
+        client.with_transport(configure);
+        client.start_realtime().await.unwrap();
+        let mut peer = server.accept().await;
+        peer.accept_auth().await;
+        let mut conn = client.commands.conn();
+        let conn = conn.wait_for(|c| c.ready).await.unwrap();
+        let generation = conn.generation;
+        (client, peer, generation)
+    }
+
+    fn cmd(ty: &str) -> Value {
+        json!({ "type": ty, "data": {} })
+    }
+
+    #[tokio::test]
+    async fn replies_are_matched_by_re_not_by_order() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, generation) = connected(&mut server, |_| {}).await;
+        let c1 = client.clone();
+        let first = tokio::spawn(async move {
+            c1.commands
+                .request(generation, cmd("call.media"), "call.ok", None)
+                .await
+        });
+        let a = peer.recv().await;
+        let c2 = client.clone();
+        let second = tokio::spawn(async move {
+            c2.commands
+                .request(generation, cmd("call.leave"), "call.ok", None)
+                .await
+        });
+        let b = peer.recv().await;
+        peer.send(json!({ "type": "call.ok", "re": b["id"], "data": { "which": "second" } }))
+            .await;
+        peer.send(json!({ "type": "call.ok", "re": a["id"], "data": { "which": "first" } }))
+            .await;
+        assert_eq!(first.await.unwrap().unwrap().data["which"], "first");
+        assert_eq!(second.await.unwrap().unwrap().data["which"], "second");
+    }
+
+    #[tokio::test]
+    async fn reply_of_the_wrong_type_is_rejected() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, generation) = connected(&mut server, |_| {}).await;
+        let c = client.clone();
+        let req = tokio::spawn(async move {
+            c.commands
+                .request(generation, cmd("call.join"), "call.joined", None)
+                .await
+        });
+        let f = peer.recv().await;
+        peer.send(json!({ "type": "call.ok", "re": f["id"], "data": {} }))
+            .await;
+        assert_eq!(req.await.unwrap(), Err(CommandError::UnexpectedReply));
+    }
+
+    #[tokio::test]
+    async fn error_reply_carries_the_server_code() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, generation) = connected(&mut server, |_| {}).await;
+        let c = client.clone();
+        let req = tokio::spawn(async move {
+            c.commands
+                .request(generation, cmd("call.join"), "call.joined", None)
+                .await
+        });
+        let f = peer.recv().await;
+        peer.send(json!({ "type": "error", "re": f["id"], "data": { "code": "call_full", "message": "x" } })).await;
+        assert_eq!(
+            req.await.unwrap(),
+            Err(CommandError::Rejected {
+                code: "call_full".into(),
+                message: "x".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_generation_is_not_sent_and_nothing_leaks_to_the_next_socket() {
+        let mut server = TestServer::start().await;
+        let (client, peer, generation) = connected(&mut server, |_| {}).await;
+        peer.close(1000, "drop").await;
+        let mut conn = client.commands.conn();
+        conn.wait_for(|c| !c.ready).await.unwrap();
+        // Submitted while disconnected: fails immediately, never queued.
+        let err = client
+            .commands
+            .request(generation, cmd("call.media"), "call.ok", None)
+            .await;
+        assert_eq!(err, Err(CommandError::NotSent));
+        let mut next = server.accept().await;
+        next.accept_auth().await;
+        conn.wait_for(|c| c.ready).await.unwrap();
+        // The new socket receives our next command, and nothing before it.
+        let new_gen = conn.borrow().generation;
+        assert!(new_gen > generation);
+        let c = client.clone();
+        tokio::spawn(async move {
+            c.commands
+                .request(new_gen, cmd("call.leave"), "call.ok", None)
+                .await
+        });
+        assert_eq!(next.recv().await["type"], "call.leave");
+    }
+
+    #[tokio::test]
+    async fn socket_drop_with_a_command_in_flight_is_unknown() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, generation) = connected(&mut server, |_| {}).await;
+        let c = client.clone();
+        let req = tokio::spawn(async move {
+            c.commands
+                .request(generation, cmd("call.media"), "call.ok", None)
+                .await
+        });
+        peer.recv().await; // written
+        peer.close(1000, "drop").await;
+        let res = tokio::time::timeout(Duration::from_secs(5), req)
+            .await
+            .expect("pending leaked");
+        assert_eq!(res.unwrap(), Err(CommandError::Unknown));
+    }
+
+    #[tokio::test]
+    async fn no_reply_times_out() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, generation) = connected(&mut server, |t| {
+            t.reply_timeout = Duration::from_millis(300)
+        })
+        .await;
+        let c = client.clone();
+        let req = tokio::spawn(async move {
+            c.commands
+                .request(generation, cmd("call.media"), "call.ok", None)
+                .await
+        });
+        peer.recv().await;
+        let res = tokio::time::timeout(Duration::from_secs(5), req)
+            .await
+            .expect("never timed out");
+        assert_eq!(res.unwrap(), Err(CommandError::Timeout));
+    }
+
+    /// The reply window starts when the frame is written, not when it was submitted: a
+    /// command held before the write for longer than the timeout still gets a full window.
+    #[tokio::test]
+    async fn timeout_counts_from_the_write() {
+        let mut server = TestServer::start().await;
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        let h = hold.clone();
+        let (client, mut peer, generation) = connected(&mut server, move |t| {
+            t.reply_timeout = Duration::from_millis(400);
+            t.hold_writes = Some(h);
+        })
+        .await;
+        let c = client.clone();
+        let req = tokio::spawn(async move {
+            c.commands
+                .request(generation, cmd("call.media"), "call.ok", None)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(700)).await; // longer than the timeout
+        hold.add_permits(1);
+        let f = peer.recv().await;
+        tokio::time::sleep(Duration::from_millis(100)).await; // well inside a window from the write
+        peer.send(json!({ "type": "call.ok", "re": f["id"], "data": {} }))
+            .await;
+        assert!(req.await.unwrap().is_ok());
+    }
+
+    /// A command accepted on socket A but held before its write, then released only after
+    /// socket B is ready, must not be written on B.
+    #[tokio::test]
+    async fn command_held_across_a_reconnect_is_never_written() {
+        let mut server = TestServer::start().await;
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        let h = hold.clone();
+        let (client, peer, generation) =
+            connected(&mut server, move |t| t.hold_writes = Some(h)).await;
+        let c = client.clone();
+        let req = tokio::spawn(async move {
+            c.commands
+                .request(generation, cmd("call.media"), "call.ok", None)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await; // accepted, held before the write
+        peer.close(1000, "drop").await;
+        let mut next = server.accept().await;
+        next.accept_auth().await;
+        let mut conn = client.commands.conn();
+        conn.wait_for(|c| c.ready && c.generation > generation)
+            .await
+            .unwrap();
+        hold.add_permits(100); // release only now that B is the current socket
+        let res = tokio::time::timeout(Duration::from_secs(5), req)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(res, Err(CommandError::NotSent));
+        let new_gen = conn.borrow().generation;
+        let c = client.clone();
+        tokio::spawn(async move {
+            c.commands
+                .request(new_gen, cmd("call.leave"), "call.ok", None)
+                .await
+        });
+        assert_eq!(
+            next.recv().await["type"],
+            "call.leave",
+            "the held command leaked to the new socket"
+        );
+    }
+
+    /// `call.joined` and the first offer back-to-back while the call task is not reading:
+    /// the transport installed the route while handling `call.joined`, so the offer is
+    /// waiting in the task's mailbox, right after `call.joined`.
+    #[tokio::test]
+    async fn offer_right_behind_call_joined_reaches_the_call_task() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, generation) = connected(&mut server, |_| {}).await;
+        let (route, mut mailbox) = mpsc::unbounded_channel::<CallFrame>();
+        let c = client.clone();
+        let join = tokio::spawn(async move {
+            c.commands
+                .request(
+                    generation,
+                    json!({"type": "call.join", "data": {"channel_id": "ch"}}),
+                    "call.joined",
+                    Some(route),
+                )
+                .await
+        });
+        let f = peer.recv().await;
+        peer.send(json!({ "type": "call.joined", "re": f["id"], "data": { "call_id": "k1", "channel_id": "ch" } })).await;
+        peer.send(json!({ "type": "call.subscribe.offer", "data": { "call_id": "k1", "version": 1, "sdp": "v=0" } })).await;
+        join.await.unwrap().unwrap();
+        // Give the transport time to have handled the offer, then read the mailbox.
+        let first = tokio::time::timeout(Duration::from_secs(5), mailbox.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), mailbox.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.ty, "call.joined");
+        assert_eq!(second.ty, "call.subscribe.offer");
+    }
+
+    #[tokio::test]
+    async fn event_for_an_unknown_call_is_dropped() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, generation) = connected(&mut server, |_| {}).await;
+        let (route, mut mailbox) = mpsc::unbounded_channel::<CallFrame>();
+        let c = client.clone();
+        let join = tokio::spawn(async move {
+            c.commands
+                .request(
+                    generation,
+                    json!({"type": "call.join", "data": {"channel_id": "ch"}}),
+                    "call.joined",
+                    Some(route),
+                )
+                .await
+        });
+        let f = peer.recv().await;
+        peer.send(json!({ "type": "call.joined", "re": f["id"], "data": { "call_id": "k1" } }))
+            .await;
+        join.await.unwrap().unwrap();
+        peer.send(json!({ "type": "call.participant", "data": { "call_id": "OTHER", "event": "joined" } })).await;
+        peer.send(
+            json!({ "type": "call.participant", "data": { "call_id": "k1", "event": "joined" } }),
+        )
+        .await;
+        let _joined = mailbox.recv().await.unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), mailbox.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.data["call_id"], "k1");
+    }
+
+    #[tokio::test]
+    async fn abandoned_join_is_left_immediately() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, generation) = connected(&mut server, |_| {}).await;
+        let (route, _mailbox) = mpsc::unbounded_channel::<CallFrame>();
+        let c = client.clone();
+        let join = tokio::spawn(async move {
+            c.commands
+                .request(
+                    generation,
+                    json!({"type": "call.join", "data": {"channel_id": "ch"}}),
+                    "call.joined",
+                    Some(route),
+                )
+                .await
+        });
+        let f = peer.recv().await;
+        join.abort(); // the joiner walks away after `call.join` was written
+        let _ = join.await;
+        peer.send(json!({ "type": "call.joined", "re": f["id"], "data": { "call_id": "k9" } }))
+            .await;
+        let leave = peer.recv().await;
+        assert_eq!(leave["type"], "call.leave");
+        assert_eq!(leave["data"]["call_id"], "k9");
+        assert!(client.commands.routes.lock().unwrap().get("k9").is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_is_refused_locally() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, generation) = connected(&mut server, |_| {}).await;
+        let big = json!({ "type": "call.publish", "data": { "sdp": "x".repeat(70 * 1024) } });
+        assert_eq!(
+            client
+                .commands
+                .request(generation, big, "call.publish.answer", None)
+                .await,
+            Err(CommandError::TooLarge)
+        );
+        let c = client.clone();
+        tokio::spawn(async move {
+            c.commands
+                .request(generation, cmd("call.leave"), "call.ok", None)
+                .await
+        });
+        assert_eq!(peer.recv().await["type"], "call.leave");
+    }
+
+    #[tokio::test]
+    async fn channel_call_is_broadcast() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, _generation) = connected(&mut server, |_| {}).await;
+        let mut events = client.events();
+        peer.send(json!({ "type": "channel.call", "data": { "channel_id": "ch", "call_id": "k1", "participant_count": 2 } })).await;
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            event,
+            ServerEvent::ChannelCall {
+                channel_id: "ch".into(),
+                call_id: Some("k1".into()),
+                participant_count: 2
+            }
+        );
+    }
+
+    /// `call.ice` is fire-and-forget: written on the current socket, refused on a stale one.
+    #[tokio::test]
+    async fn notify_writes_on_the_current_socket_only() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, generation) = connected(&mut server, |_| {}).await;
+        assert_eq!(
+            client.commands.notify(generation + 1, cmd("call.ice")),
+            Err(CommandError::NotSent)
+        );
+        client.commands.notify(generation, cmd("call.ice")).unwrap();
+        assert_eq!(peer.recv().await["type"], "call.ice");
+    }
 }
