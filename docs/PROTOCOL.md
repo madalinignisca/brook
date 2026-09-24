@@ -36,7 +36,33 @@
 
 ## 2. WebSocket (realtime plane) — `wss://<host>/ws`
 
-**Authentication:** the access token is sent in the **first message** after the socket opens (an `auth` command), **not** as a query parameter (query strings leak into logs/proxies). The server rejects (closes) the socket if the first frame is not a valid `auth` within a short timeout (close `4401` bad token, `4408` timeout). The socket closes with `4401` when its access token expires. To avoid that, the client may send `auth {token}` **again on the open socket** with a fresh token for the same user (reply `auth.ok`); a token for another user closes the socket. Right after `auth.ok`, the server sends one `channel.call` per call already in progress in the user's channels. Client → server frames are capped at **64 KiB** (close `1009`); server → client frames are not capped (an 8-participant subscribe offer is ~15 KiB).
+**Authentication** (matches `core/src/ws.rs` and `services/api/app/routers/ws.py`):
+
+- The first frame must be `{"type":"auth","data":{"access_token":"…"}}`, sent within
+  **5 s** of opening (SECURITY.md §7), never as a query parameter (query strings leak
+  into logs/proxies). The server answers `{"type":"ready","data":{"user_id":…}}`.
+- Any auth failure (missing/garbled frame, bad or non-access token, timeout)
+  **closes with `1008`**; the close *reason* says which: `auth_failed`,
+  `auth_timeout`. The client's remedy is the same for all: refresh over REST, then
+  reconnect.
+- The socket also closes with `1008` / `token_expired` when its access token
+  expires. To avoid that, the client may send the same `auth` frame **again on the
+  open socket** with a fresh token for the same user; the server answers another
+  `ready` (with `re`, see below) and extends the socket's life. A token for a
+  different user closes the socket.
+- Right after `ready`, the server sends one `channel.call` per call already in
+  progress in the user's channels (§3.4), so a client that just (re)connected sees
+  them.
+- Client → server frames are capped at **64 KiB** (close `1009`); server → client
+  frames are not (an 8-participant subscribe offer is ~15 KiB).
+
+**Commands and replies.** A client → server frame other than `auth` is a
+**command**: it carries a fresh `id`, and the server sends **exactly one** direct
+reply carrying `re: <that id>`: its success frame, or
+`{"type":"error","re":…,"data":{"code":…,"message":…}}` (codes in §3.2). An
+unknown `type` or a malformed frame gets `error` with code `invalid`; the socket
+stays open. `auth` may carry an `id` too, in which case its `ready` carries `re`.
+Unsolicited events never carry `re`.
 
 Messages are tagged envelopes:
 
@@ -60,7 +86,7 @@ Messages are tagged envelopes:
 
 | type | data |
 |---|---|
-| `auth` | access token (**required first frame**, see above) |
+| `auth` | `{access_token}`: **required first frame**; may be re-sent to refresh (see above) |
 | `typing` | channel id |
 | `call.*` | call signaling commands, see §3.3 |
 | `slash.command` | channel id, raw text (e.g. `/botname hello`) → triggers outbound webhook |
