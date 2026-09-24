@@ -60,3 +60,54 @@ async fn close_fences_an_in_flight_offer() {
         "offer succeeded after close"
     );
 }
+
+/// The machine's real camera through `CameraSource::Auto` produces frames.
+/// Ignored: needs a camera (run on a dev machine).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a real camera"]
+async fn auto_camera_produces_frames() {
+    use gst::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let frames = Arc::new(AtomicUsize::new(0));
+    let counter = frames.clone();
+    let sink = Arc::new(move |_| {
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("signal-handoffs", true)
+            .build()
+            .unwrap();
+        let c = counter.clone();
+        sink.connect("handoff", false, move |_| {
+            c.fetch_add(1, Ordering::Relaxed);
+            None
+        });
+        sink
+    });
+    let (engine, mut events) = GstEngine::new(EngineConfig {
+        camera: CameraSource::Auto,
+        mic: MicSource::None,
+        codec: VideoCodec::H264,
+        hardware_encode: true,
+        video_kbps: 1500,
+        ice_servers: vec![],
+        video_sink: sink.clone(),
+        audio_sink: Some(sink),
+    })
+    .unwrap();
+    let offer = engine
+        .create_publish_offer()
+        .await
+        .expect("offer with a real camera");
+    assert!(offer.contains("H264/90000"));
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    while let Ok(ev) = events.try_recv() {
+        if let brook_media_gst::EngineEvent::Error { message, .. } = ev {
+            panic!("camera pipeline error: {message}");
+        }
+    }
+    assert!(
+        frames.load(Ordering::Relaxed) > 20,
+        "self-view got too few frames"
+    );
+    engine.close();
+}

@@ -64,7 +64,10 @@ pub enum TrackKind {
 /// Where the outgoing video comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CameraSource {
-    /// Let GStreamer pick the default camera (`autovideosrc`).
+    /// The first V4L2 camera the device monitor reports, else
+    /// `autovideosrc ! decodebin`.
+    /// (`autovideosrc` alone picks an untargeted `pipewiresrc`, which fails to
+    /// negotiate MJPEG/YUYV webcams on some desktops.)
     Auto,
     /// A specific V4L2 device, e.g. `/dev/video0`.
     Device(String),
@@ -201,7 +204,9 @@ struct Pc {
 
 impl Drop for Pc {
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        if let Err(err) = self.pipeline.set_state(gst::State::Null) {
+            tracing::warn!(%err, "media pipeline did not stop cleanly");
+        }
     }
 }
 
@@ -572,7 +577,10 @@ fn publish_description(config: &EngineConfig) -> Result<String> {
     }
 
     let video_src = match &config.camera {
-        CameraSource::Auto => Some("autovideosrc".to_string()),
+        CameraSource::Auto => Some(match find_v4l2_camera() {
+            Some(path) => format!("v4l2src device={} ! decodebin", launch_quote(&path)),
+            None => "autovideosrc ! decodebin".to_string(),
+        }),
         CameraSource::Device(path) => {
             Some(format!("v4l2src device={} ! decodebin", launch_quote(path)))
         }
@@ -794,6 +802,26 @@ fn make(factory: &str) -> Result<gst::Element> {
 /// Quote a value for a `gst-launch` description (`"..."`, `\` and `"` escaped).
 fn launch_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// The first V4L2 capture device (`/dev/videoN`) the device monitor reports,
+/// through either the PipeWire or the V4L2 provider.
+fn find_v4l2_camera() -> Option<String> {
+    let monitor = gst::DeviceMonitor::new();
+    monitor.add_filter(Some("Video/Source"), None);
+    if monitor.start().is_err() {
+        return None;
+    }
+    let path = monitor.devices().iter().find_map(|device| {
+        let props = device.properties()?;
+        props
+            .get::<String>("api.v4l2.path")
+            .or_else(|_| props.get::<String>("device.path"))
+            .ok()
+    });
+    monitor.stop();
+    tracing::debug!(camera = ?path, "resolved camera");
+    path
 }
 
 fn has(factory: &str) -> bool {
