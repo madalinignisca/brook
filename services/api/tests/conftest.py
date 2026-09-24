@@ -8,11 +8,12 @@ created and dropped per test for isolation.
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from app import config, db
 from app.main import create_app
@@ -47,6 +48,37 @@ async def client(
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.drop_all)
         await engine.dispose()
+    db._engine = None
+    db._sessionmaker = None
+    config.get_settings.cache_clear()
+
+
+@pytest.fixture
+def sync_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    """A Starlette TestClient (needed for WebSocket tests) on a fresh database.
+
+    The app's lifespan runs inside the TestClient's own event loop, so the engine
+    is created there; sharing an engine across loops breaks asyncpg.
+    """
+    external = os.environ.get("BROOK_TEST_DATABASE_URL")
+    monkeypatch.setenv(
+        "BROOK_DATABASE_URL", external or f"sqlite+aiosqlite:///{tmp_path / 'sync.db'}"
+    )
+    monkeypatch.setenv("BROOK_JWT_SIGNING_KEY", "test-signing-key-at-least-32-bytes-long!")
+    config.get_settings.cache_clear()
+    db._engine = None
+    db._sessionmaker = None
+
+    async def _drop_all() -> None:
+        engine = db._engine
+        if engine is not None:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.drop_all)
+            await engine.dispose()
+
+    with TestClient(create_app()) as tc:
+        yield tc
+        tc.portal.call(_drop_all)
     db._engine = None
     db._sessionmaker = None
     config.get_settings.cache_clear()
