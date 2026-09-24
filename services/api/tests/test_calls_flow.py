@@ -541,3 +541,63 @@ def test_audio_and_screen_without_camera(sync_client: TestClient, fake: FakeJanu
         cmd(wa, "call.publish", {"call_id": call_id, "sdp": _sdp(*AV), "tracks": tracks})
         who = of(collect(wb), "call.participant")[-1]["participant"]
         assert (who["audio"], who["video"]) == (True, False)
+
+
+def test_bundle_only_mlines_are_active() -> None:
+    """Found live by the Linux client review: webrtcbin (max-bundle) writes every
+    m-line after the first as `m=video 0 ... a=bundle-only`. Per RFC 8843 that is
+    ACTIVE (it rides the bundle); only port 0 WITHOUT bundle-only, or an
+    inactive/recvonly direction, means not sending."""
+    from app.calls import _parse_mlines
+
+    sdp = (
+        "\r\n".join(
+            [
+                "v=0",
+                "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+                "a=mid:audio0",
+                "a=sendonly",
+                "m=video 0 UDP/TLS/RTP/SAVPF 96",
+                "a=bundle-only",
+                "a=mid:video1",
+                "a=sendonly",
+                "m=video 0 UDP/TLS/RTP/SAVPF 96",
+                "a=bundle-only",
+                "a=mid:video2",
+                "a=inactive",
+                "m=video 0 UDP/TLS/RTP/SAVPF 96",
+                "a=mid:video3",  # port 0, no bundle-only
+            ]
+        )
+        + "\r\n"
+    )
+    got = {m.mid: m.active for m in _parse_mlines(sdp)}
+    assert got == {"audio0": True, "video1": True, "video2": False, "video3": False}, got
+
+
+def test_webrtcbin_style_offer_publishes_camera(sync_client: TestClient, fake: FakeJanus) -> None:
+    """End to end in-process: a max-bundle offer's camera must reach subscribers."""
+    a, b, _c, ch = _setup(sync_client)
+    sdp = (
+        "\r\n".join(
+            [
+                "v=0",
+                "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+                "a=mid:0",
+                "a=sendonly",
+                "m=video 0 UDP/TLS/RTP/SAVPF 96",
+                "a=bundle-only",
+                "a=mid:1",
+                "a=sendonly",
+            ]
+        )
+        + "\r\n"
+    )
+    with _ws(sync_client, a) as wa, _ws(sync_client, b) as wb:
+        ja = cmd(wa, "call.join", {"channel_id": ch})["data"]
+        cmd(wb, "call.join", {"channel_id": ch})
+        cmd(wa, "call.publish", {"call_id": ja["call_id"], "sdp": sdp})
+        pa = _participant(ja["call_id"], ja["self"]["participant_id"])
+        sync_client.portal.call(fake.fire, pa.pub_hid, {"janus": "webrtcup"})
+        offer = of(collect(wb), "call.subscribe.offer")[-1]
+        assert sorted(s["source"] for s in offer["streams"]) == ["camera", "mic"]

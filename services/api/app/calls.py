@@ -692,17 +692,25 @@ def _token_ok(given: str, current: str, previous: str | None) -> bool:
 class _MLine:
     mid: str
     kind: str  # "audio" | "video" | other (e.g. "application")
-    active: bool  # sends media: port != 0 and not inactive/recvonly
+    active: bool  # sends media (see _parse_mlines for the rule)
 
 
 def _parse_mlines(sdp: str) -> list[_MLine]:
-    """The offer's m-lines with their mid, kind and whether they are active."""
+    """The offer's m-lines with their mid, kind and whether they are active.
+
+    Active = not `inactive`/`recvonly`, and not port 0 UNLESS `a=bundle-only`.
+    Port 0 with bundle-only (RFC 8843) is a live m-line riding the bundle: it is
+    how GStreamer's webrtcbin (max-bundle) writes every m-line after the first.
+    Treating plain "port 0" as inactive dropped native clients' cameras (Chrome
+    uses port 9, so browser tests never saw it).
+    """
     out: list[_MLine] = []
     cur: dict[str, Any] | None = None
 
     def flush() -> None:
         if cur is not None:
-            out.append(_MLine(cur["mid"], cur["kind"], cur["active"]))
+            parked = cur["port_zero"] and not cur["bundle_only"]
+            out.append(_MLine(cur["mid"], cur["kind"], cur["sending"] and not parked))
 
     for raw in sdp.splitlines():
         line = raw.strip()
@@ -711,11 +719,19 @@ def _parse_mlines(sdp: str) -> list[_MLine]:
             parts = line[2:].split()
             kind = parts[0] if parts else ""
             port_zero = len(parts) > 1 and parts[1] == "0"
-            cur = {"mid": str(len(out)), "kind": kind, "active": not port_zero}
+            cur = {
+                "mid": str(len(out)),
+                "kind": kind,
+                "port_zero": port_zero,
+                "bundle_only": False,
+                "sending": True,
+            }
         elif cur is not None and line.startswith("a=mid:"):
             cur["mid"] = line[len("a=mid:") :]
+        elif cur is not None and line == "a=bundle-only":
+            cur["bundle_only"] = True
         elif cur is not None and line in ("a=inactive", "a=recvonly"):
-            cur["active"] = False
+            cur["sending"] = False
     flush()
     return out
 
