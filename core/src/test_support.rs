@@ -647,4 +647,94 @@ mod tests {
         client.commands.notify(generation, cmd("call.ice")).unwrap();
         assert_eq!(peer.recv().await["type"], "call.ice");
     }
+
+    // ---- P3: re-auth and 1008 recovery ----
+
+    /// A same-user token rotation re-authenticates the open socket: the same `auth` frame
+    /// with the new token and an `id`; `ready` with `re` confirms. No new generation.
+    #[tokio::test]
+    async fn refresh_reauths_the_same_socket() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, generation) = connected(&mut server, |_| {}).await;
+        client.refresh_now().await.unwrap();
+        let reauth = peer.recv().await;
+        assert_eq!(reauth["type"], "auth");
+        assert_eq!(reauth["data"]["access_token"], "access-2");
+        let id = reauth["id"].clone();
+        assert!(id.is_string(), "re-auth must carry an id: {reauth}");
+        peer.send(json!({ "type": "ready", "re": id, "data": { "user_id": "id-alice" } }))
+            .await;
+        // Still the same socket and generation: a later command arrives here.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(client.commands.conn().borrow().generation, generation);
+        client.commands.notify(generation, cmd("call.ice")).unwrap();
+        assert_eq!(peer.recv().await["type"], "call.ice");
+    }
+
+    /// A rotation that happens before the socket is ready is applied right after `ready`.
+    #[tokio::test]
+    async fn rotation_before_ready_reauths_after_ready() {
+        let mut server = TestServer::start().await;
+        let client = server.client();
+        client.login("alice", "pw").await.unwrap();
+        client.start_realtime().await.unwrap();
+        let mut peer = server.accept().await;
+        let auth = peer.recv().await;
+        assert_eq!(auth["data"]["access_token"], "access-1");
+        client.refresh_now().await.unwrap(); // rotated while not yet ready
+        peer.send(json!({ "type": "ready", "data": { "user_id": "id-alice" } }))
+            .await;
+        let reauth = peer.recv().await;
+        assert_eq!(reauth["type"], "auth");
+        assert_eq!(reauth["data"]["access_token"], "access-2");
+    }
+
+    /// 1008 (e.g. `token_expired`): refresh over REST first, then reconnect with the new
+    /// token — never reconnect with the rejected one.
+    #[tokio::test]
+    async fn auth_close_refreshes_before_reconnecting() {
+        let mut server = TestServer::start().await;
+        let (_client, peer, _generation) = connected(&mut server, |_| {}).await;
+        assert_eq!(server.refresh_calls(), 0);
+        peer.close(1008, "token_expired").await;
+        let mut next = server.accept().await;
+        assert_eq!(server.refresh_calls(), 1, "reconnected before refreshing");
+        assert_eq!(next.accept_auth().await["data"]["access_token"], "access-2");
+    }
+
+    /// A refused re-auth (different user / invalid) closes the socket and reconnects.
+    #[tokio::test]
+    async fn refused_reauth_reconnects() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, _generation) = connected(&mut server, |_| {}).await;
+        client.refresh_now().await.unwrap();
+        let reauth = peer.recv().await;
+        peer.send(json!({ "type": "error", "re": reauth["id"], "data": { "code": "auth_failed", "message": "no" } })).await;
+        peer.expect_closed().await;
+        let mut next = server.accept().await;
+        next.accept_auth().await;
+    }
+
+    /// 1008 and the refresh token is rejected too: signed out, and no reconnect loop.
+    #[tokio::test]
+    async fn auth_close_with_rejected_refresh_signs_out() {
+        let mut server = TestServer::start().await;
+        let (client, peer, _generation) = connected(&mut server, |_| {}).await;
+        server.set_refresh_mode(RefreshMode::Fail(401));
+        peer.close(1008, "token_expired").await;
+        let mut state = client.state();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            state.wait_for(|s| *s == AuthState::LoggedOut),
+        )
+        .await
+        .expect("never signed out")
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), server.sockets.recv())
+                .await
+                .is_err(),
+            "reconnected without a session"
+        );
+    }
 }

@@ -42,6 +42,9 @@ pub(crate) enum RefreshApplied {
 #[derive(Clone)]
 pub(crate) struct SessionStore {
     cell: Arc<RwLock<Cell>>,
+    /// Serializes refreshes (the periodic loop and the socket's 1008 recovery), so a
+    /// token is rotated once, not once per caller.
+    pub(crate) refresh_lock: Arc<tokio::sync::Mutex<()>>,
     rev_tx: Arc<watch::Sender<Revision>>,
     state_tx: Arc<watch::Sender<AuthState>>,
 }
@@ -51,6 +54,7 @@ impl SessionStore {
         let (rev_tx, _) = watch::channel(Revision::default());
         Self {
             cell: Arc::new(RwLock::new(Cell::default())),
+            refresh_lock: Arc::default(),
             rev_tx: Arc::new(rev_tx),
             state_tx,
         }
