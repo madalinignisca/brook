@@ -129,7 +129,7 @@ for end-of-candidates.
 |---|---|---|
 | `call.joined` | `{call_id, channel_id, self: {participant_id}, participants: [Participant]}` | reply to `call.join` / `call.resume` |
 | `call.publish.answer` | `{call_id, sdp}` | reply to `call.publish` |
-| `call.subscribe.offer` | `{call_id, sdp, version}` | whenever remote streams change; answer with `call.subscribe.answer` |
+| `call.subscribe.offer` | `{call_id, sdp, version, streams: [SubStream]}` | whenever remote streams change; answer with `call.subscribe.answer` |
 | `call.ice` | `{call_id, pc, candidate}` | SFU's trickled candidates |
 | `call.participant` | `{call_id, event: "joined"\|"updated"\|"left", participant: Participant}` | roster change (excluding self) |
 | `call.ok` | `{}` | generic success reply |
@@ -138,13 +138,17 @@ for end-of-candidates.
 
 ```text
 Participant = { participant_id, user_id, display_name,
-                audio: bool, video: bool,           // mute state from call.media
-                streams: [ { mid, kind: "audio"|"video", source: "mic"|"camera"|"screen" } ] }
+                audio: bool, video: bool,             // mute state from call.media
+                publishing: [ { kind: "audio"|"video", source: "mic"|"camera"|"screen" } ] }
+SubStream   = { mid, participant_id, kind: "audio"|"video", source }
 ```
 
-`mid` values in `streams` are the **subscribe-PC** mids, so the client can map an
-incoming track to its participant without reading the SDP. `version` on
-`call.subscribe.offer` increases monotonically; answer only the latest.
+`SubStream.mid` is a mid **in the receiving client's own subscribe PC**. Mids differ
+per receiver, which is why the mapping travels with each `call.subscribe.offer`
+rather than inside `Participant`: it lets the client map an incoming track
+(`transceiver.mid`) to its participant without parsing SDP. A mid absent from the
+latest `streams` is inactive. `version` increases monotonically; answer only the
+latest.
 
 ### 3.5 Sequences
 
