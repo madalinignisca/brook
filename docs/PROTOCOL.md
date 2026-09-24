@@ -58,7 +58,8 @@
 
 **Commands and replies.** A client → server frame other than `auth` is a
 **command**: it carries a fresh `id`, and the server sends **exactly one** direct
-reply carrying `re: <that id>`: its success frame, or
+reply carrying `re: <that id>` (the one exception is `call.ice`, which has no
+reply): its success frame, or
 `{"type":"error","re":…,"data":{"code":…,"message":…}}` (codes in §3.2). An
 unknown `type` or a malformed frame gets `error` with code `invalid`; the socket
 stays open. `auth` may carry an `id` too, in which case its `ready` carries `re`.
@@ -155,8 +156,12 @@ Every frame in both directions is the §2 envelope `{type, id, ts, data}`.
 | `call.leave` | `{call_id}` | `call.ok` |
 | `call.resume` | `{call_id, participant_id, resume_token}` (after a WS reconnect, §3.5) | `call.joined` |
 
-`candidate` is `{candidate, sdpMid, sdpMLineIndex}` as produced by WebRTC, or `null`
-for end-of-candidates.
+`candidate` is `{candidate, sdpMid, sdpMLineIndex}` (exactly these keys, as WebRTC's
+`RTCIceCandidate.toJSON()` produces), or `null` for end-of-candidates; `pc` is the
+lowercase string `"publish"` or `"subscribe"`. **No ICE restarts in v1:** every
+`call.ice` belongs to the current ICE session of that PC, and candidates are
+relayed in order per PC, so a client buffers by `mid` (until a description
+containing that mid is applied) and never needs to reason about ICE generations.
 
 **Who buffers ICE.** The server relays client candidates to the SFU immediately;
 the SFU accepts them before or after the SDP. The **client** buffers any
@@ -220,8 +225,12 @@ C ⇄ S  call.ice {pc: "subscribe"} …
 the participant for a **30 s grace**. The client reconnects, sends `auth`, then
 `call.resume {call_id, participant_id, resume_token}` using the values from the
 last `call.joined`; the server replies `call.joined` (fresh roster and a **new**
-`resume_token`: the old one is spent) and re-sends
-the latest `call.subscribe.offer` if it is still unanswered. The **publish PC is
+`resume_token`) and re-sends the latest `call.subscribe.offer` if it is still
+unanswered: the **same frame, same `version`**, so a client that already answered
+it may resend its retained answer.
+The server accepts the new `resume_token` **and the one the client last used**
+(one step of lookback): if the `call.joined` carrying a new token is lost to a
+second drop, the client still resumes with the token it holds. The **publish PC is
 untouched** by a WS reconnect (its media never used the WS), so there is no
 publish renegotiation and no re-sent `call.publish.answer`. After the grace
 the participant is removed as if it had sent `call.leave`; a later `call.resume`
