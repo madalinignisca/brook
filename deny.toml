@@ -9,7 +9,12 @@ all-features = true
 [advisories]
 # Fail on known security advisories and yanked crates.
 yanked = "deny"
-ignore = []
+ignore = [
+  # paste: unmaintained (not a vulnerability), compile-time proc-macro only,
+  # pulled in by gstreamer-rs 0.23 (clients/gst-media, clients/gnome). Drop this
+  # when moving to gstreamer-rs 0.24+ (needs gtk4-rs 0.10 / glib 0.21).
+  { id = "RUSTSEC-2024-0436", reason = "unmaintained compile-time macro via gstreamer-rs 0.23; no fix without a gtk-rs major upgrade" },
+]
 
 [bans]
 # Surface accidental heavy/duplicate dependencies without failing initially.
