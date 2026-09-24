@@ -327,6 +327,20 @@ impl GstEngine {
         Ok(())
     }
 
+    /// Number of remote decode chains (decodebins) in the subscribe pipeline.
+    /// For tests: retired chains must not accumulate across re-offers.
+    #[doc(hidden)]
+    pub fn subscribe_decoder_count(&self) -> usize {
+        let guard = self.subscribe.lock().unwrap();
+        let Some(pc) = guard.as_ref() else { return 0 };
+        pc.pipeline
+            .iterate_elements()
+            .into_iter()
+            .flatten()
+            .filter(|e| e.factory().is_some_and(|f| f.name() == "decodebin"))
+            .count()
+    }
+
     /// Tear both PCs down (leave / call ended).
     pub fn close(&self) {
         self.publish.lock().unwrap().take();
@@ -384,7 +398,9 @@ impl GstEngine {
         let events = self.events.clone();
         let video_sink = self.config.video_sink.clone();
         let audio_sink = self.config.audio_sink.clone();
+        let chains = Chains::default();
         let pipeline_weak = pipeline.downgrade();
+        let added_chains = chains.clone();
         webrtc.connect_pad_added(move |_webrtc, pad| {
             if pad.direction() != gst::PadDirection::Src {
                 return;
@@ -396,10 +412,17 @@ impl GstEngine {
                 .property::<Option<gst_webrtc::WebRTCRTPTransceiver>>("transceiver")
                 .and_then(|t| t.property::<Option<String>>("mid"))
                 .unwrap_or_default();
+            // The SFU reuses mids across re-offers (a participant leaves, a
+            // new one takes the m-line): retire the previous decode chain.
+            let old = added_chains.lock().unwrap().remove(&mid);
+            if let Some(old) = old {
+                teardown(&pipeline, old);
+            }
             if let Err(err) = link_remote(
                 &pipeline,
                 pad,
                 mid,
+                &added_chains,
                 video_sink.clone(),
                 audio_sink.clone(),
                 events.clone(),
@@ -408,6 +431,21 @@ impl GstEngine {
                     pc: PcKind::Subscribe,
                     message: err.to_string(),
                 });
+            }
+        });
+
+        let pipeline_weak = pipeline.downgrade();
+        webrtc.connect_pad_removed(move |_webrtc, pad| {
+            let Some(pipeline) = pipeline_weak.upgrade() else {
+                return;
+            };
+            let mut chains = chains.lock().unwrap();
+            let mid = chains
+                .iter()
+                .find(|(_, c)| &c.pad == pad)
+                .map(|(mid, _)| mid.clone());
+            if let Some(chain) = mid.and_then(|mid| chains.remove(&mid)) {
+                teardown(&pipeline, chain);
             }
         });
 
@@ -591,15 +629,52 @@ fn video_encoder(config: &EngineConfig) -> Result<String> {
 }
 
 /// Decode a new remote pad and render it into an app-provided sink.
+/// The decode chain behind one remote webrtcbin pad, by mid.
+struct Chain {
+    pad: gst::Pad,
+    elements: Vec<gst::Element>,
+}
+
+type Chains = Arc<Mutex<std::collections::HashMap<String, Chain>>>;
+
+/// Stop and remove a retired decode chain. Runs via `call_async`: this is
+/// reached from webrtcbin's streaming thread, which also feeds the chain, so
+/// stopping it inline could deadlock.
+fn teardown(pipeline: &gst::Pipeline, chain: Chain) {
+    pipeline.call_async(move |pipeline| {
+        let Some(pipeline) = pipeline.downcast_ref::<gst::Pipeline>() else {
+            return;
+        };
+        if let Some(peer) = chain.pad.peer() {
+            let _ = chain.pad.unlink(&peer);
+        }
+        for e in &chain.elements {
+            let _ = e.set_state(gst::State::Null);
+        }
+        let _ = pipeline.remove_many(&chain.elements);
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn link_remote(
     pipeline: &gst::Pipeline,
     pad: &gst::Pad,
     mid: String,
+    chains: &Chains,
     video_sink: SinkFactory,
     audio_sink: Option<SinkFactory>,
     events: mpsc::UnboundedSender<EngineEvent>,
 ) -> Result<()> {
     let decodebin = make("decodebin")?;
+    chains.lock().unwrap().insert(
+        mid.clone(),
+        Chain {
+            pad: pad.clone(),
+            elements: vec![decodebin.clone()],
+        },
+    );
+    let chains = chains.clone();
+    let chain_pad = pad.clone();
     let pipeline_weak = pipeline.downgrade();
     decodebin.connect_pad_added(move |_db, src| {
         let Some(pipeline) = pipeline_weak.upgrade() else {
@@ -649,6 +724,23 @@ fn link_remote(
         }
         for e in &elements {
             let _ = e.sync_state_with_parent();
+        }
+        // Record them for teardown, unless the mid was already reassigned.
+        match chains.lock().unwrap().get_mut(&mid) {
+            Some(chain) if chain.pad == chain_pad => {
+                chain.elements.extend(elements.iter().cloned())
+            }
+            _ => {
+                let pipeline = pipeline.clone();
+                teardown(
+                    &pipeline,
+                    Chain {
+                        pad: chain_pad.clone(),
+                        elements: elements.clone(),
+                    },
+                );
+                return;
+            }
         }
         let sinkpad = elements[0].static_pad("sink").expect("queue sink pad");
         if src.link(&sinkpad).is_err() {

@@ -414,6 +414,15 @@ async fn two_participants_and_renegotiation() {
     let bob = Participant::join(&env, &b.0, &b.1).await;
     alice.wait_video(30).await;
     bob.wait_video(30).await;
+    // Janus reused alice's mids for the new bob: the first bob's decode
+    // chains must have been retired (torn down asynchronously).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mids = alice.streams.lock().unwrap().len();
+    assert_eq!(
+        alice.engine.subscribe_decoder_count(),
+        mids,
+        "stale decoders left behind"
+    );
 
     // Bob leaves: Alice gets a re-offer without his streams.
     let answered = alice.answered.load(Ordering::SeqCst);
@@ -437,6 +446,15 @@ async fn two_participants_and_renegotiation() {
     let bob = Participant::join(&env, &b.0, &b.1).await;
     alice.wait_video(30).await;
     bob.wait_video(30).await;
+    // Janus reused alice's mids for the new bob: the first bob's decode
+    // chains must have been retired (torn down asynchronously).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mids = alice.streams.lock().unwrap().len();
+    assert_eq!(
+        alice.engine.subscribe_decoder_count(),
+        mids,
+        "stale decoders left behind"
+    );
 
     bob.leave().await;
     alice.leave().await;

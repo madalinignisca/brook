@@ -26,8 +26,10 @@ client (not the product's: that is core's C1b). Result, two GStreamer engines
 (alice, bob; synthetic H.264 + Opus): both decode each other's video through
 Janus; bob leaving -> alice gets re-offer v2 with no streams, answer `call.ok`;
 bob rejoining -> re-offer v3 on alice's SAME subscribe PC (Janus reuses mids
-0/1), webrtcbin emits new remote pads and decoding resumes. Open: decode
-chains of superseded pads are not torn down yet (small leak per re-offer).
+0/1), webrtcbin emits new remote pads and decoding resumes. Follow-up fix:
+decode chains of superseded pads are now retired (per-mid chains, torn down
+via `call_async` off the streaming thread); the interop test asserts one
+decoder per active mid and fails without the fix. Vibe: nothing material.
 
 ### KDE: return to login on mid-session sign-out, reviewed by Vibe
 
