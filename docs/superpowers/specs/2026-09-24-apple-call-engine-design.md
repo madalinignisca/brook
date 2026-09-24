@@ -77,8 +77,8 @@ shared test server; can mute, turn the camera off, and leave. iOS reuses the eng
   keeps the track/transceiver, so turning it back on restarts capture without renegotiation.
   **Mute** sets the audio track's `isEnabled = false`: silence is sent, the microphone stays open
   (its indicator stays on) — the same as other call apps, stated in the UI tooltip. If a track does not
-  exist (permission denied), `set_local_media` reports that through `engine_failed`-free return:
-  the enqueued work returns an error the next async op surfaces, and the UI disables the control.
+  exist (permission denied), `set_local_media` returns `Err` **immediately** — whether a track exists
+  is plain engine state, read without calling WebRTC — and the UI keeps that control disabled.
 - **`close()` and the fence:** the fence flag is set **first**, then capture is stopped (awaited), both
   PCs are closed, and late UI updates are discarded. Every operation checks the fence at entry, after
   each await, and before installing any resource; a capture that finishes starting after the fence is
