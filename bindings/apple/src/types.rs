@@ -93,6 +93,9 @@ pub enum LoginError {
     Api { code: String, message: String },
     #[error("unexpected response from server")]
     UnexpectedResponse,
+    /// The call needs a signed-in session and there is none.
+    #[error("not signed in")]
+    NotAuthenticated,
 }
 
 impl From<Error> for LoginError {
@@ -110,6 +113,11 @@ impl From<Error> for LoginError {
             Error::InsecureServerUrl => Self::InsecureServerUrl,
             Error::Api { code, message } => Self::Api { code, message },
             Error::UnexpectedResponse => Self::UnexpectedResponse,
+            Error::NotAuthenticated => Self::NotAuthenticated,
+            // The realtime socket is transport, like HTTP: surface it as a network error.
+            Error::WebSocket(err) => Self::Network {
+                message: err.to_string(),
+            },
         }
     }
 }
