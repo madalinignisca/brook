@@ -30,8 +30,8 @@ macOS and the iOS simulator?** Everything later (Keychain, UI, chat) rests on th
    and committed.
 2. `bindings/apple/build-xcframework.sh` produces `BrookCoreFFI.xcframework` per the artifact
    contract in §3.3, consumed by the local Swift package `BrookCore`.
-3. `bindings/apple/itest.sh` exits 0, which requires **all** of the following, run against a fresh,
-   isolated server stack (§3.4) — on macOS (`swift test`). (iOS slices and the simulator run are deferred: macOS ships first.)
+3. `bindings/apple/itest.sh` exits 0, which requires **all** of the following, run against the shared
+   test server (§3.4) — on macOS (`swift test`). (iOS slices and the simulator run are deferred: macOS ships first.)
    - `login` with valid credentials returns `LoginResult.loggedIn(session)` whose `user.handle`
      matches, whose `accessToken` and `refreshToken` are non-empty and different, and whose
      `accessToken` **works against the server** (`GET /api/v1/auth/me` from Swift → 200, same handle).
@@ -153,28 +153,24 @@ bindings/apple/
 
 Nothing in Step 1 creates an Xcode project.
 
-### 3.4 Integration test against a real, isolated server
+### 3.4 Integration test against the shared test server
 
-`itest.sh` never touches a developer's existing stack and never exposes a port to the LAN:
+**Superseded (owner decision):** no local Docker stack on the Mac. All clients — macOS from this
+machine, Linux later — test against **one real server on the Linux VM**, deployed and operated by
+the server session. `itest.sh`:
 
-1. Brings up an **isolated compose project** (`docker compose -p brook-itest`) from `deploy/`,
-   with a scratch override file (not committed to `deploy/`) that **replaces** the base port list —
-   `ports: !override ["127.0.0.1:18080:80"]` (Compose ≥ 2.24; a plain `ports:` entry would be
-   *merged* with the base `${BROOK_HTTP_PORT:-8080}:80` and still publish on all interfaces) —
-   and uses fresh volumes. `itest.sh` asserts the Compose version, and after `up` asserts via
-   `docker compose -p brook-itest port` that the only binding is `127.0.0.1:18080`.
-2. Waits for `GET /health`; registers a random handle via `POST /api/v1/auth/register`. The DB is
-   fresh, so this is the bootstrap first user (admin) — any non-201 aborts the run.
-3. Runs `swift test` (macOS) with `BROOK_REQUIRE_ITEST=1`, `BROOK_TEST_SERVER`, `BROOK_TEST_HANDLE`,
-   `BROOK_TEST_PASSWORD` in the environment. (With the iOS client: `xcodebuild test` on a simulator
-   with the same values as **`TEST_RUNNER_`-prefixed** variables — plain shell exports do not reach
-   the simulator's test runner.)
-4. Fails if either run reports any skipped test or fewer than the expected number of
-   integration tests executed.
-5. `trap`: `docker compose -p brook-itest down -v` on every exit.
+1. Reads `BROOK_TEST_SERVER`, `BROOK_TEST_HANDLE`, `BROOK_TEST_PASSWORD` and optional
+   `BROOK_TEST_ALLOW_INSECURE_HTTP=1` from `bindings/apple/.itest.env` (gitignored, mode 600,
+   filled in by the owner — the password never travels through an agent channel or the repo).
+   A missing file or variable is a hard failure.
+2. Checks `GET /health` on the server; unreachable → fail with the URL it tried.
+3. Runs `build-xcframework.sh`, then `swift test` with those values plus `BROOK_REQUIRE_ITEST=1`.
+4. Fails if any integration test is skipped or fewer than expected ran.
 
-The iOS simulator shares the host's loopback, so `127.0.0.1:18080` works there; a physical
-device is out of scope.
+It does not register accounts or mutate server state beyond logging in: the test account is
+created once by the admin. If the server is plain `http`, the tests pass
+`allow_insecure_http = true` only when `BROOK_TEST_ALLOW_INSECURE_HTTP=1` is set, mirroring the
+GNOME client's `BROOK_ALLOW_INSECURE_HTTP=1`.
 
 ## 4. Not doing (this step)
 

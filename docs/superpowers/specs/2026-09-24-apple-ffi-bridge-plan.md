@@ -87,27 +87,14 @@ Swift evidence. The Swift checks always go through `itest.sh`, which **runs
 - **Check:** unit tests pass via `swift test --filter` after `build-xcframework.sh`; integration
   tests are only considered proven once T6 runs them.
 
-### T6 — `itest.sh` against an isolated stack
-- **Env:** a generated scratch `--env-file` (mktemp, mode 600, deleted on exit) with random
-  `POSTGRES_PASSWORD`, a random 64-char `BROOK_JWT_SIGNING_KEY`, and `MINIO_ROOT_PASSWORD` (the
-  `minio` service is profiled off but still interpolated). Never reads `deploy/.env`; never calls
-  `deploy/Makefile`.
-- **Files:** `-f <abs>/deploy/docker-compose.yml -f <scratch override>` — deploy file **first**, so
-  the api build context (`../services/api`) and Caddy mount resolve relative to `deploy/`.
-  Override: `caddy.ports: !override ["127.0.0.1:18080:80"]`.
-- **Fresh state:** project name `brook-itest-<random>` per run, so volumes are unique; teardown
-  (`trap`, identical `-p`/`-f`/`--env-file` args) runs `down -v --remove-orphans`. **No sweep of
-  other runs' projects** — a prefix cannot tell an interrupted run from a live one. If teardown
-  itself fails, the script prints the exact `down -v` command for its own project and exits non-zero.
-- **Startup:** `up -d --build --wait` (fresh API image from current `services/api`), assert Compose
-  ≥ 2.24.4 (first release with `!override`) **before** `up`, assert the only published binding is `127.0.0.1:18080`, `/health` (timeout 60 s),
-  register (non-201 aborts).
-- **Run:** `build-xcframework.sh`, then `swift test` (plain env) on macOS; fail on any skip or fewer
-  integration tests than expected. (Simulator run with `TEST_RUNNER_` vars returns with iOS.)
-- **Check:** passes end-to-end; a run with the api container killed mid-run fails (not skips);
-  after both, `docker compose ls -a --filter name=<this run's project>` and
-  `docker volume ls --filter label=com.docker.compose.project=<this run's project>` are empty —
-  scoped to this run, so an unrelated developer stack never affects the result.
+### T6 — `itest.sh` against the shared test server
+- Per spec §3.4 (superseded version): credentials from gitignored `bindings/apple/.itest.env`,
+  `/health` check, `build-xcframework.sh`, `swift test` with `BROOK_REQUIRE_ITEST=1`, skip/count
+  checks. No Docker, no account creation.
+- **Depends on:** the server session deploying the stack on the VM and the owner creating the test
+  account and filling `.itest.env`.
+- **Check:** passes end-to-end; with the server URL pointed at a closed port, the script fails
+  (not skips); with `.itest.env` absent, it fails naming the missing file.
 
 ### T7 — Final Linux gate
 - Re-run `LG` on the final tree. If it forces a dependency change (e.g. an advisory bump), re-run
