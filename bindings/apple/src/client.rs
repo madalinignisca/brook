@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use brook_core::{BrookClient, CoreConfig};
 
+use crate::listener::{subscribe_receiver, AuthStateListener, Subscription};
 use crate::runtime::runtime;
 use crate::types::{LoginError, LoginResult};
 
@@ -23,6 +24,11 @@ impl FfiBrookClient {
         Ok(Arc::new(Self {
             inner: Arc::new(BrookClient::new(config)?),
         }))
+    }
+
+    /// Observe authentication state (latest state wins; see [`AuthStateListener`]).
+    pub fn subscribe(&self, listener: Arc<dyn AuthStateListener>) -> Arc<Subscription> {
+        subscribe_receiver(self.inner.state(), listener)
     }
 
     /// Log in with a local handle + password.

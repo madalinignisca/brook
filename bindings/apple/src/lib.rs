@@ -5,10 +5,12 @@
 //! here. See `docs/superpowers/specs/2026-09-24-apple-ffi-bridge-design.md`.
 
 mod client;
+mod listener;
 mod runtime;
 mod types;
 
 pub use client::FfiBrookClient;
+pub use listener::{AuthStateListener, Subscription};
 pub use types::{FfiAuthState, FfiSession, FfiUser, LoginError, LoginResult};
 
 uniffi::setup_scaffolding!();
