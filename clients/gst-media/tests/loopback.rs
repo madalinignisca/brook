@@ -33,12 +33,12 @@ fn counting_sink(video: Arc<AtomicUsize>, audio: Arc<AtomicUsize>) -> SinkFactor
     })
 }
 
-fn config(codec: VideoCodec, sink: SinkFactory) -> EngineConfig {
+fn config(codec: VideoCodec, hardware: bool, sink: SinkFactory) -> EngineConfig {
     EngineConfig {
         camera: CameraSource::Test,
         mic: MicSource::Test,
         codec,
-        hardware_encode: false,
+        hardware_encode: hardware,
         video_kbps: 1500,
         ice_servers: vec![],
         video_sink: sink.clone(),
@@ -46,13 +46,17 @@ fn config(codec: VideoCodec, sink: SinkFactory) -> EngineConfig {
     }
 }
 
-async fn loopback(codec: VideoCodec) {
+async fn loopback(codec: VideoCodec, hardware: bool) {
     let (pub_v, pub_a) = (Arc::default(), Arc::default());
     let (sub_v, sub_a): (Arc<AtomicUsize>, Arc<AtomicUsize>) = (Arc::default(), Arc::default());
     let (publisher, mut pub_events) =
-        GstEngine::new(config(codec, counting_sink(pub_v, pub_a))).unwrap();
-    let (subscriber, mut sub_events) =
-        GstEngine::new(config(codec, counting_sink(sub_v.clone(), sub_a.clone()))).unwrap();
+        GstEngine::new(config(codec, hardware, counting_sink(pub_v, pub_a))).unwrap();
+    let (subscriber, mut sub_events) = GstEngine::new(config(
+        codec,
+        hardware,
+        counting_sink(sub_v.clone(), sub_a.clone()),
+    ))
+    .unwrap();
 
     // Signaling, as core does it: publisher offers, the "SFU" (here: the
     // subscriber engine) answers.
@@ -158,10 +162,24 @@ async fn loopback(codec: VideoCodec) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn loopback_h264_opus() {
-    loopback(VideoCodec::H264).await;
+    loopback(VideoCodec::H264, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn loopback_vp8_opus() {
-    loopback(VideoCodec::Vp8).await;
+    loopback(VideoCodec::Vp8, false).await;
+}
+
+/// VA-API hardware H.264 (Intel/AMD). Skips where no VA encoder is installed.
+#[tokio::test(flavor = "multi_thread")]
+async fn loopback_h264_vaapi() {
+    gst::init().unwrap();
+    if ["vah264lpenc", "vah264enc"]
+        .iter()
+        .all(|f| gst::ElementFactory::find(f).is_none())
+    {
+        eprintln!("skipped: no VA-API H.264 encoder");
+        return;
+    }
+    loopback(VideoCodec::H264, true).await;
 }
