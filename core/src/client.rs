@@ -38,7 +38,6 @@ pub struct BrookClient {
     /// Guards against starting the realtime task more than once.
     realtime_started: AtomicBool,
     /// Sends commands over the realtime socket (calls).
-    #[cfg_attr(not(test), allow(dead_code))] // used by the call layer (C1b P4)
     pub(crate) commands: Commands,
     /// The socket side of `commands`, handed to the realtime task when it starts.
     transport: std::sync::Mutex<Option<Transport>>,
@@ -421,6 +420,25 @@ impl BrookClient {
         ));
         tokio::spawn(refresh_loop(refresher));
         Ok(())
+    }
+
+    /// Join the call in `channel_id` (starting it if none is running), driving `engine`.
+    /// `publish`: send our mic/camera (false: listen only). Requires the realtime socket to
+    /// be connected ([`BrookClient::start_realtime`]); returns once the server confirmed.
+    pub async fn join_call(
+        &self,
+        channel_id: &str,
+        engine: Arc<dyn crate::MediaEngine>,
+        publish: bool,
+    ) -> Result<Arc<crate::CallHandle>> {
+        crate::call::join(
+            self.commands.clone(),
+            self.session.watch(),
+            channel_id,
+            engine,
+            publish,
+        )
+        .await
     }
 
     /// Configure the transport before `start_realtime` (tests only).

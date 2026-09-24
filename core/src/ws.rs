@@ -228,6 +228,30 @@ impl Commands {
         rx.await.unwrap_or(Err(CommandError::Unknown))
     }
 
+    /// Like [`Commands::request`], but the command is queued **now** (synchronously) and the
+    /// reply is awaited separately. The queue is FIFO, so a caller that starts command A and
+    /// then notifies B gets A written before B.
+    pub(crate) fn start(
+        &self,
+        generation: u64,
+        frame: Value,
+        expect: &'static str,
+        route: Option<CallRoute>,
+    ) -> std::result::Result<
+        oneshot::Receiver<std::result::Result<Reply, CommandError>>,
+        CommandError,
+    > {
+        let (reply, rx) = oneshot::channel();
+        self.submit(Outgoing {
+            frame,
+            expect: Some(expect),
+            generation,
+            reply: Some(reply),
+            route,
+        })?;
+        Ok(rx)
+    }
+
     /// Fire-and-forget (`call.ice`): written on `generation` if it is still current.
     pub(crate) fn notify(
         &self,
