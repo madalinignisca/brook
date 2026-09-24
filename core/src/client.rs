@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, watch};
 use url::Url;
 
 use crate::session_store::{RefreshApplied, SessionStore};
-use crate::ws::{self, ServerEvent};
+use crate::ws::{self, Commands, ServerEvent, Transport};
 use crate::{
     AuthState, Channel, CoreConfig, Error, Message, ReactionSummary, Result, Session, User,
 };
@@ -37,6 +37,11 @@ pub struct BrookClient {
     events_tx: broadcast::Sender<ServerEvent>,
     /// Guards against starting the realtime task more than once.
     realtime_started: AtomicBool,
+    /// Sends commands over the realtime socket (calls).
+    #[cfg_attr(not(test), allow(dead_code))] // used by the call layer (C1b P4)
+    pub(crate) commands: Commands,
+    /// The socket side of `commands`, handed to the realtime task when it starts.
+    transport: std::sync::Mutex<Option<Transport>>,
 }
 
 impl BrookClient {
@@ -45,6 +50,7 @@ impl BrookClient {
         let http = reqwest::Client::builder().build()?;
         let (state_tx, state_rx) = watch::channel(AuthState::LoggedOut);
         let state_tx = Arc::new(state_tx);
+        let (commands, transport) = ws::command_channel();
         let (events_tx, _) = broadcast::channel(256);
         Ok(Self {
             base: config.base_url,
@@ -54,6 +60,8 @@ impl BrookClient {
             state_rx,
             events_tx,
             realtime_started: AtomicBool::new(false),
+            commands,
+            transport: std::sync::Mutex::new(Some(transport)),
         })
     }
 
@@ -393,13 +401,35 @@ impl BrookClient {
         // The WS reads the current token from the shared session on each (re)connect,
         // and a background loop refreshes the access token before it expires — so a
         // long-lived session keeps both REST calls and the socket authorized.
-        tokio::spawn(ws::run(url, self.session.clone(), self.events_tx.clone()));
+        let transport = self
+            .transport
+            .lock()
+            .unwrap()
+            .take()
+            .expect("realtime transport is taken exactly once, guarded by realtime_started");
+        tokio::spawn(ws::run(
+            url,
+            self.session.clone(),
+            self.events_tx.clone(),
+            transport,
+        ));
         tokio::spawn(refresh_loop(
             self.http.clone(),
             self.base.clone(),
             self.session.clone(),
         ));
         Ok(())
+    }
+
+    /// Configure the transport before `start_realtime` (tests only).
+    #[cfg(test)]
+    pub(crate) fn with_transport(&self, f: impl FnOnce(&mut Transport)) {
+        f(self
+            .transport
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("before start_realtime"));
     }
 
     /// Run one refresh now (tests drive the refresh path without waiting for the loop).
