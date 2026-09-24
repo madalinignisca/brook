@@ -422,3 +422,284 @@ def test_unchanged_call_media_is_not_broadcast(sync_client: TestClient, fake: Fa
         r = cmd(wb, "call.media", {"call_id": call_id, "audio": False, "video": True})
         assert r["type"] == "call.ok"
         assert of(collect(wa), "call.participant") == []
+
+
+def _sdp(*mlines: tuple[str, str, bool]) -> str:
+    """An offer with (kind, mid, active) m-lines."""
+    out = ["v=0"]
+    for kind, mid, active in mlines:
+        out += [f"m={kind} {9 if active else 0} UDP/TLS/RTP/SAVPF 96", f"a=mid:{mid}"]
+        out += ["a=sendonly" if active else "a=inactive"]
+    return "\r\n".join(out) + "\r\n"
+
+
+AV = (("audio", "0", True), ("video", "1", True))
+AV_TRACKS = [
+    {"mid": "0", "kind": "audio", "source": "mic"},
+    {"mid": "1", "kind": "video", "source": "camera"},
+]
+
+
+@pytest.mark.parametrize(
+    "tracks",
+    [
+        [AV_TRACKS[0]],  # an m-line left unlabelled
+        [AV_TRACKS[0], {"mid": "1", "kind": "audio", "source": "mic"}],  # kind mismatch
+        [{"mid": "0", "kind": "audio", "source": "screen"}, AV_TRACKS[1]],  # audio "screen"
+        [*AV_TRACKS, {"mid": "1", "kind": "video", "source": "screen"}],  # mid labelled twice
+        "not-a-list",
+    ],
+)
+def test_bad_track_labels_are_invalid(
+    sync_client: TestClient, fake: FakeJanus, tracks: Any
+) -> None:
+    a, _b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa:
+        call_id = cmd(wa, "call.join", {"channel_id": ch})["data"]["call_id"]
+        r = cmd(wa, "call.publish", {"call_id": call_id, "sdp": _sdp(*AV), "tracks": tracks})
+        assert (r["type"], r["data"]["code"]) == ("error", "invalid"), r
+        # A deliberate refusal, not a crash turned into the generic "internal error".
+        assert r["data"]["message"] != "internal error", r
+
+
+def test_two_screens_are_invalid(sync_client: TestClient, fake: FakeJanus) -> None:
+    a, _b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa:
+        call_id = cmd(wa, "call.join", {"channel_id": ch})["data"]["call_id"]
+        sdp = _sdp(("video", "0", True), ("video", "1", True))
+        tracks = [
+            {"mid": "0", "kind": "video", "source": "screen"},
+            {"mid": "1", "kind": "video", "source": "screen"},
+        ]
+        r = cmd(wa, "call.publish", {"call_id": call_id, "sdp": sdp, "tracks": tracks})
+        assert (r["type"], r["data"]["code"]) == ("error", "invalid")
+
+
+def test_screen_share_start_and_stop_mid_call(sync_client: TestClient, fake: FakeJanus) -> None:
+    """Janus does not add a stream a publisher adds mid-call to existing
+    subscriptions (verified on Janus 1.4.2), so the server must subscribe peers to
+    the new (feed, mid) itself, and label it "screen" from the publisher's tracks."""
+    a, b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa, _ws(sync_client, b) as wb:
+        ja = cmd(wa, "call.join", {"channel_id": ch})["data"]
+        call_id, pa = ja["call_id"], ja["self"]["participant_id"]
+        cmd(wb, "call.join", {"channel_id": ch})
+        r = cmd(wa, "call.publish", {"call_id": call_id, "sdp": _sdp(*AV), "tracks": AV_TRACKS})
+        assert r["type"] == "call.publish.answer"
+        sync_client.portal.call(fake.fire, _participant(call_id, pa).pub_hid, {"janus": "webrtcup"})
+        first = of(collect(wb), "call.subscribe.offer")[-1]
+        cmd(
+            wb,
+            "call.subscribe.answer",
+            {"call_id": call_id, "version": first["version"], "sdp": "a"},
+        )
+        assert sorted(s["source"] for s in first["streams"]) == ["camera", "mic"]
+
+        # start sharing: same publish PC, a third m-line labelled screen
+        share = (*AV, ("video", "2", True))
+        tracks = [*AV_TRACKS, {"mid": "2", "kind": "video", "source": "screen"}]
+        r = cmd(wa, "call.publish", {"call_id": call_id, "sdp": _sdp(*share), "tracks": tracks})
+        assert r["type"] == "call.publish.answer"
+        frames = collect(wb)
+        who = of(frames, "call.participant")[-1]["participant"]
+        assert {"kind": "video", "source": "screen"} in who["publishing"]
+        offer = of(frames, "call.subscribe.offer")[-1]
+        assert offer["version"] == first["version"] + 1
+        assert sorted(s["source"] for s in offer["streams"]) == ["camera", "mic", "screen"]
+        screen = next(s for s in offer["streams"] if s["source"] == "screen")
+        assert (screen["participant_id"], screen["kind"]) == (pa, "video")
+        cmd(
+            wb,
+            "call.subscribe.answer",
+            {"call_id": call_id, "version": offer["version"], "sdp": "a"},
+        )
+
+        # call.media is mic/camera only: camera off leaves the screen alone
+        cmd(wa, "call.media", {"call_id": call_id, "audio": True, "video": False})
+        who = of(collect(wb), "call.participant")[-1]["participant"]
+        assert (who["audio"], who["video"]) == (True, False)
+        assert {"kind": "video", "source": "screen"} in who["publishing"]
+
+        # stop sharing: the m-line goes inactive, the stream disappears for peers
+        stopped = (*AV, ("video", "2", False))
+        r = cmd(wa, "call.publish", {"call_id": call_id, "sdp": _sdp(*stopped), "tracks": tracks})
+        assert r["type"] == "call.publish.answer"
+        frames = collect(wb)
+        who = of(frames, "call.participant")[-1]["participant"]
+        assert all(x["source"] != "screen" for x in who["publishing"])
+        last = of(frames, "call.subscribe.offer")[-1]
+        assert sorted(s["source"] for s in last["streams"]) == ["camera", "mic"]
+
+
+def test_audio_and_screen_without_camera(sync_client: TestClient, fake: FakeJanus) -> None:
+    """Sharing a screen with no camera: `video` (the camera flag) stays false."""
+    a, b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa, _ws(sync_client, b) as wb:
+        call_id = cmd(wa, "call.join", {"channel_id": ch})["data"]["call_id"]
+        cmd(wb, "call.join", {"channel_id": ch})
+        tracks = [AV_TRACKS[0], {"mid": "1", "kind": "video", "source": "screen"}]
+        cmd(wa, "call.publish", {"call_id": call_id, "sdp": _sdp(*AV), "tracks": tracks})
+        who = of(collect(wb), "call.participant")[-1]["participant"]
+        assert (who["audio"], who["video"]) == (True, False)
+
+
+def test_bundle_only_mlines_are_active() -> None:
+    """Found live by the Linux client review: webrtcbin (max-bundle) writes every
+    m-line after the first as `m=video 0 ... a=bundle-only`. Per RFC 8843 that is
+    ACTIVE (it rides the bundle); only port 0 WITHOUT bundle-only, or an
+    inactive/recvonly direction, means not sending."""
+    from app.calls import _parse_mlines
+
+    sdp = (
+        "\r\n".join(
+            [
+                "v=0",
+                "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+                "a=mid:audio0",
+                "a=sendonly",
+                "m=video 0 UDP/TLS/RTP/SAVPF 96",
+                "a=bundle-only",
+                "a=mid:video1",
+                "a=sendonly",
+                "m=video 0 UDP/TLS/RTP/SAVPF 96",
+                "a=bundle-only",
+                "a=mid:video2",
+                "a=inactive",
+                "m=video 0 UDP/TLS/RTP/SAVPF 96",
+                "a=mid:video3",  # port 0, no bundle-only
+            ]
+        )
+        + "\r\n"
+    )
+    got = {m.mid: m.active for m in _parse_mlines(sdp)}
+    assert got == {"audio0": True, "video1": True, "video2": False, "video3": False}, got
+
+
+def test_webrtcbin_style_offer_publishes_camera(sync_client: TestClient, fake: FakeJanus) -> None:
+    """End to end in-process: a max-bundle offer's camera must reach subscribers."""
+    a, b, _c, ch = _setup(sync_client)
+    sdp = (
+        "\r\n".join(
+            [
+                "v=0",
+                "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+                "a=mid:0",
+                "a=sendonly",
+                "m=video 0 UDP/TLS/RTP/SAVPF 96",
+                "a=bundle-only",
+                "a=mid:1",
+                "a=sendonly",
+            ]
+        )
+        + "\r\n"
+    )
+    with _ws(sync_client, a) as wa, _ws(sync_client, b) as wb:
+        ja = cmd(wa, "call.join", {"channel_id": ch})["data"]
+        cmd(wb, "call.join", {"channel_id": ch})
+        cmd(wa, "call.publish", {"call_id": ja["call_id"], "sdp": sdp})
+        pa = _participant(ja["call_id"], ja["self"]["participant_id"])
+        sync_client.portal.call(fake.fire, pa.pub_hid, {"janus": "webrtcup"})
+        offer = of(collect(wb), "call.subscribe.offer")[-1]
+        assert sorted(s["source"] for s in offer["streams"]) == ["camera", "mic"]
+
+
+def _pub(ws: Any, call_id: str, mlines: tuple[tuple[str, str, bool], ...], tracks: Any) -> Any:
+    return cmd(ws, "call.publish", {"call_id": call_id, "sdp": _sdp(*mlines), "tracks": tracks})
+
+
+SCREEN = {"kind": "video", "source": "screen"}
+
+
+def test_reshare_on_a_new_mid_with_the_old_screen_still_labelled(
+    sync_client: TestClient, fake: FakeJanus
+) -> None:
+    """Only ACTIVE screens count toward the one-screen limit, and inactive m-lines
+    may be labelled or not: re-sharing on a new transceiver must work whether the
+    client still labels the stopped one or has dropped it from its list."""
+    a, _b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa:
+        call_id = cmd(wa, "call.join", {"channel_id": ch})["data"]["call_id"]
+        old_stopped_new_live = (*AV, ("video", "2", False), ("video", "3", True))
+        labelled = [*AV_TRACKS, {"mid": "2", **SCREEN}, {"mid": "3", **SCREEN}]
+        assert _pub(wa, call_id, old_stopped_new_live, labelled)["type"] == "call.publish.answer"
+        unlabelled_old = [*AV_TRACKS, {"mid": "3", **SCREEN}]
+        assert _pub(wa, call_id, old_stopped_new_live, unlabelled_old)["type"] == (
+            "call.publish.answer"
+        )
+
+
+def test_a_live_mid_cannot_change_source(sync_client: TestClient, fake: FakeJanus) -> None:
+    a, _b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa:
+        call_id = cmd(wa, "call.join", {"channel_id": ch})["data"]["call_id"]
+        assert _pub(wa, call_id, AV, AV_TRACKS)["type"] == "call.publish.answer"
+        relabel = [AV_TRACKS[0], {"mid": "1", **SCREEN}]  # live camera -> "screen"
+        r = _pub(wa, call_id, AV, relabel)
+        assert (r["type"], r["data"]["code"]) == ("error", "invalid"), r
+        assert r["data"]["message"] != "internal error"
+        # stop it, and the mid may come back later as a screen
+        stopped = (AV[0], ("video", "1", False))
+        assert _pub(wa, call_id, stopped, AV_TRACKS)["type"] == "call.publish.answer"
+        restarted = (AV[0], ("video", "1", True))
+        assert _pub(wa, call_id, restarted, relabel)["type"] == "call.publish.answer"
+
+
+def test_failed_subscriber_update_resubscribes_from_scratch(
+    sync_client: TestClient, fake: FakeJanus
+) -> None:
+    """A failed `update` leaves our record of the subscription untrustworthy
+    (drop-only never recorded the drop; add+drop could duplicate). The server now
+    rebuilds the subscribe PC: a fresh join, a fresh offer with the right streams."""
+    a, b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa, _ws(sync_client, b) as wb:
+        ja = cmd(wa, "call.join", {"channel_id": ch})["data"]
+        call_id, pa = ja["call_id"], ja["self"]["participant_id"]
+        cmd(wb, "call.join", {"channel_id": ch})
+        assert _pub(wa, call_id, AV, AV_TRACKS)["type"] == "call.publish.answer"
+        sync_client.portal.call(fake.fire, _participant(call_id, pa).pub_hid, {"janus": "webrtcup"})
+        first = of(collect(wb), "call.subscribe.offer")[-1]
+        cmd(
+            wb,
+            "call.subscribe.answer",
+            {"call_id": call_id, "version": first["version"], "sdp": "a"},
+        )
+        joins_before = sum(
+            1 for n, body in fake.requests if n == "join" and body.get("ptype") == "subscriber"
+        )
+        fake.fail.add("update")  # Janus refuses the incremental change
+        share = (*AV, ("video", "2", True))
+        assert _pub(wa, call_id, share, [*AV_TRACKS, {"mid": "2", **SCREEN}])["type"] == (
+            "call.publish.answer"
+        )
+        offer = of(collect(wb), "call.subscribe.offer")[-1]
+        joins_after = sum(
+            1 for n, body in fake.requests if n == "join" and body.get("ptype") == "subscriber"
+        )
+        assert joins_after == joins_before + 1, "expected a fresh subscriber join"
+        assert sorted(s["source"] for s in offer["streams"]) == ["camera", "mic", "screen"]
+        assert len(offer["streams"]) == 3  # no duplicates
+
+
+def test_recycled_mline_is_refused_cleanly(sync_client: TestClient, fake: FakeJanus) -> None:
+    """Janus 1.4.2 answers a recycled m-line (rejected slot reused under a new mid)
+    with the stale mid, and the client's PC rejects that answer: its publish PC is
+    then broken. Verified with Chrome (transceiver.stop() then a new share). The
+    server refuses such an offer with a clear `invalid` before it reaches Janus."""
+    a, _b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa:
+        call_id = cmd(wa, "call.join", {"channel_id": ch})["data"]["call_id"]
+        share = (*AV, ("video", "3", True))
+        assert _pub(wa, call_id, share, [*AV_TRACKS, {"mid": "3", **SCREEN}])["type"] == (
+            "call.publish.answer"
+        )
+        configures = sum(1 for n, _ in fake.requests if n == "configure")
+        recycled = (*AV, ("video", "4", True))  # same slot, new mid
+        r = _pub(wa, call_id, recycled, [*AV_TRACKS, {"mid": "4", **SCREEN}])
+        assert (r["type"], r["data"]["code"]) == ("error", "invalid"), r
+        assert "recycling" in r["data"]["message"]
+        assert sum(1 for n, _ in fake.requests if n == "configure") == configures  # never sent
+        # appending a new m-line instead is fine
+        appended = (*AV, ("video", "3", False), ("video", "4", True))
+        assert _pub(wa, call_id, appended, [*AV_TRACKS, {"mid": "4", **SCREEN}])["type"] == (
+            "call.publish.answer"
+        )
