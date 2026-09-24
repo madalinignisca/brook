@@ -29,6 +29,7 @@ struct FakeEngine {
     offers: AtomicUsize,
     subscribe_applies: AtomicUsize,
     fail_media: AtomicBool,
+    fail_candidates: AtomicBool,
 }
 
 impl FakeEngine {
@@ -83,6 +84,9 @@ impl MediaEngine for FakeEngine {
         Ok(format!("answer-to-{sdp}"))
     }
     fn add_remote_candidate(&self, pc: PcKind, c: Option<IceCandidate>) -> Result<(), EngineError> {
+        if self.fail_candidates.load(Ordering::SeqCst) {
+            return Err(EngineError("ice failed".into()));
+        }
         let what = c.map(|c| c.candidate).unwrap_or_else(|| "end".into());
         self.record(format!("remote:{pc:?}:{what}"));
         Ok(())
@@ -120,7 +124,15 @@ struct Call {
 }
 
 async fn connected(server: &mut TestServer) -> (Arc<BrookClient>, WsPeer) {
+    connected_with(server, |_| {}).await
+}
+
+async fn connected_with(
+    server: &mut TestServer,
+    tweak: impl FnOnce(&BrookClient),
+) -> (Arc<BrookClient>, WsPeer) {
     let client = Arc::new(server.client());
+    tweak(&client);
     client.login("alice", "pw").await.unwrap();
     client.start_realtime().await.unwrap();
     let mut peer = server.accept().await;
@@ -140,8 +152,16 @@ fn joined(re: &Value, token: &str) -> Value {
 
 /// A joined call. `publish`: whether we publish. `setup` configures the engine first.
 async fn join(publish: bool, setup: impl FnOnce(&FakeEngine)) -> Call {
+    join_with(publish, setup, |_| {}).await
+}
+
+async fn join_with(
+    publish: bool,
+    setup: impl FnOnce(&FakeEngine),
+    tweak: impl FnOnce(&BrookClient),
+) -> Call {
     let mut server = TestServer::start().await;
-    let (client, mut peer) = connected(&mut server).await;
+    let (client, mut peer) = connected_with(&mut server, tweak).await;
     let engine = Arc::new(FakeEngine::default());
     setup(&engine);
     let (c, e) = (client.clone(), engine.clone());
@@ -194,6 +214,24 @@ impl Call {
             "first call frame on a new socket must be call.resume"
         );
         resume
+    }
+    async fn answer_publish(&mut self, publish: &Value) {
+        self.peer
+            .send(json!({ "type": "call.publish.answer", "re": publish["id"],
+                "data": { "call_id": "k1", "sdp": "pub-answer\na=mid:0" } }))
+            .await;
+        self.eventually("answer applied", |l| {
+            l.iter().any(|e| e.starts_with("apply_publish_answer"))
+        })
+        .await;
+    }
+    /// Frames are written in order, so if the next frame after a leave is `call.leave`, the
+    /// client sent nothing else in between.
+    async fn assert_nothing_before_leave(&mut self) {
+        let h = self.handle.clone();
+        tokio::spawn(async move { h.leave().await });
+        let next = self.peer.recv().await;
+        assert_eq!(next["type"], "call.leave", "unexpected frame {next}");
     }
     async fn wait_status(&self, want: impl Fn(&CallStatus) -> bool) {
         let mut st = self.handle.state();
@@ -509,6 +547,137 @@ async fn rejected_mute_rolls_the_engine_back() {
         ["media:false:true", "media:true:true"],
         "not rolled back"
     );
+}
+
+/// A mute made while the publish is in flight is re-announced once the publish is applied:
+/// a server may derive the announced state from the publish offer, and the user's intent must
+/// win. The re-announcement is sent once.
+#[tokio::test]
+async fn media_intent_is_reannounced_after_publish_lands() {
+    let mut call = join(true, |_| {}).await;
+    let publish = call.recv_type("call.publish").await;
+    let h = call.handle.clone();
+    let res = tokio::spawn(async move { h.set_media(false, true).await });
+    let m = call.recv_type("call.media").await;
+    call.ok(&m).await;
+    res.await.unwrap().unwrap();
+    call.answer_publish(&publish).await;
+    let again = call.recv_type("call.media").await;
+    assert_eq!(
+        again["data"],
+        json!({ "call_id": "k1", "audio": false, "video": true })
+    );
+    call.ok(&again).await;
+    tokio::time::sleep(QUIET).await;
+    call.assert_nothing_before_leave().await;
+}
+
+#[tokio::test]
+async fn no_media_frame_after_publish_without_an_intent() {
+    let mut call = join(true, |_| {}).await;
+    let publish = call.recv_type("call.publish").await;
+    call.answer_publish(&publish).await;
+    call.assert_nothing_before_leave().await;
+}
+
+/// The publish lands while a `call.media` is unanswered: one at a time, so the intent goes
+/// out again only after that one is acknowledged, and only once.
+#[tokio::test]
+async fn media_intent_in_flight_when_publish_lands_is_sent_after_the_ack() {
+    let mut call = join(true, |_| {}).await;
+    let publish = call.recv_type("call.publish").await;
+    let h = call.handle.clone();
+    let res = tokio::spawn(async move { h.set_media(true, false).await });
+    let m = call.recv_type("call.media").await;
+    call.answer_publish(&publish).await;
+    // One `call.media` at a time: nothing more until `m` is acknowledged.
+    let early = tokio::time::timeout(QUIET, call.peer.recv()).await;
+    assert!(early.is_err(), "sent before the ack: {:?}", early.ok());
+    call.ok(&m).await;
+    res.await.unwrap().unwrap();
+    let again = call.recv_type("call.media").await;
+    assert_eq!(
+        again["data"],
+        json!({ "call_id": "k1", "audio": true, "video": false })
+    );
+    call.ok(&again).await;
+    tokio::time::sleep(QUIET).await;
+    call.assert_nothing_before_leave().await;
+}
+
+/// An unanswered `call.media` on a live socket is not retried on that socket (its outcome is
+/// unknown; the resume path re-sends it), so it cannot loop.
+#[tokio::test]
+async fn unanswered_media_is_not_resent_on_the_same_socket() {
+    let mut call = join_with(
+        true,
+        |_| {},
+        |c| c.with_transport(|t| t.reply_timeout = Duration::from_millis(150)),
+    )
+    .await;
+    let publish = call.recv_type("call.publish").await;
+    call.answer_publish(&publish).await;
+    let h = call.handle.clone();
+    let res = tokio::spawn(async move { h.set_media(false, true).await });
+    call.recv_type("call.media").await; // never answered
+    assert!(res.await.unwrap().is_err(), "timed out");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    call.assert_nothing_before_leave().await;
+}
+
+/// A re-announcement pending behind an in-flight `call.media` survives a queued newer intent
+/// that the engine rejects: the engine's state is what gets announced.
+#[tokio::test]
+async fn pending_reannouncement_survives_a_failed_queued_intent() {
+    let mut call = join(true, |_| {}).await;
+    let publish = call.recv_type("call.publish").await;
+    let h = call.handle.clone();
+    let first = tokio::spawn(async move { h.set_media(false, true).await });
+    let m = call.recv_type("call.media").await;
+    call.answer_publish(&publish).await; // re-announcement now pending behind `m`
+    let h = call.handle.clone();
+    let queued = tokio::spawn(async move { h.set_media(true, true).await });
+    tokio::time::sleep(QUIET).await; // queued behind `m`
+    call.engine.fail_media.store(true, Ordering::SeqCst);
+    call.ok(&m).await;
+    first.await.unwrap().unwrap();
+    assert!(queued.await.unwrap().is_err(), "engine refused it");
+    let again = call.recv_type("call.media").await;
+    assert_eq!(
+        again["data"],
+        json!({ "call_id": "k1", "audio": false, "video": true })
+    );
+}
+
+/// The publish completion can end the call (a buffered remote candidate the engine refuses):
+/// nothing is announced after `call.leave`.
+#[tokio::test]
+async fn no_reannouncement_after_the_call_ended() {
+    let mut call = join(true, |e| e.fail_candidates.store(true, Ordering::SeqCst)).await;
+    let publish = call.recv_type("call.publish").await;
+    let h = call.handle.clone();
+    let res = tokio::spawn(async move { h.set_media(false, true).await });
+    let m = call.recv_type("call.media").await;
+    call.ok(&m).await;
+    res.await.unwrap().unwrap();
+    // Buffered until the answer applies mid 0, then refused by the engine.
+    call.peer
+        .send(
+            json!({ "type": "call.ice", "data": { "call_id": "k1", "pc": "publish",
+            "candidate": cand("c-pub", "0") } }),
+        )
+        .await;
+    tokio::time::sleep(QUIET).await;
+    call.peer
+        .send(json!({ "type": "call.publish.answer", "re": publish["id"],
+            "data": { "call_id": "k1", "sdp": "pub-answer\na=mid:0" } }))
+        .await;
+    let leave = call.recv_type("call.leave").await;
+    call.ok(&leave).await;
+    call.wait_status(|s| matches!(s, CallStatus::Ended(_)))
+        .await;
+    let after = tokio::time::timeout(Duration::from_millis(500), call.peer.recv()).await;
+    assert!(after.is_err(), "sent after leave: {:?}", after.ok());
 }
 
 #[tokio::test]

@@ -247,6 +247,11 @@ struct Media {
     queued: Option<(bool, bool, oneshot::Sender<Result<()>>)>,
     /// The server may not have the latest intent (e.g. dropped socket): re-send after resume.
     dirty: bool,
+    /// A publish landed after the user set media: the server may have derived its announced
+    /// state from the offer, so the engine's intent is sent once more on this socket. Kept
+    /// apart from `dirty`, which means "outcome unknown" and is never retried on the same
+    /// socket (a timed-out frame would otherwise be re-sent forever).
+    reannounce: bool,
 }
 
 struct Task {
@@ -637,6 +642,29 @@ impl Task {
         self.send_media(audio, video, prev, Some(reply));
     }
 
+    /// Re-send the user's media intent after a publish lands. A server may derive the
+    /// announced mute state from the publish offer (older ones reset it to "all published
+    /// kinds on"), and a mute made while the offer was in flight must win. Nothing is sent
+    /// when the user never set media: the default is already what the publish implies.
+    fn reannounce_media(&mut self) {
+        if self.media.engine.is_some() {
+            self.media.reannounce = true;
+            self.flush_reannounce();
+        }
+    }
+
+    /// Send a pending re-announcement once nothing is in flight (a queued intent only exists
+    /// behind an in-flight one, and when it goes out it supersedes this). Offline, the resume
+    /// path re-sends instead.
+    fn flush_reannounce(&mut self) {
+        if !self.media.reannounce || self.ended || self.media.in_flight || !self.connected {
+            return;
+        }
+        if let Some((a, v)) = self.media.engine {
+            self.send_media(a, v, (a, v), None);
+        }
+    }
+
     /// Tell the server the media state the engine already has.
     fn send_media(
         &mut self,
@@ -656,6 +684,8 @@ impl Task {
         };
         match started {
             Some(rx) => {
+                // Whatever goes out now is the latest intent: nothing left to re-announce.
+                self.media.reannounce = false;
                 self.media.in_flight = true;
                 self.media_reply = reply;
                 let intent = (audio, video);
@@ -664,6 +694,7 @@ impl Task {
             None => {
                 // Not connected: the engine has it; the server gets it after resume.
                 self.media.dirty = true;
+                self.media.reannounce = false;
                 if let Some(r) = reply {
                     let _ = r.send(Ok(()));
                 }
@@ -712,6 +743,7 @@ impl Task {
                         self.applied_mids.insert(PcKind::Publish, mids_of(&sdp));
                         self.publish = Publish::Stable;
                         self.flush_remote(PcKind::Publish);
+                        self.reannounce_media();
                     }
                     Err(err) => self.finish(EndReason::EngineFailed(err.0), true),
                 }
@@ -828,6 +860,8 @@ impl Task {
                 if let Some((a, v, r)) = self.media.queued.take() {
                     self.set_media(a, v, r);
                 }
+                // The queued intent may have been refused by the engine and sent nothing.
+                self.flush_reannounce();
             }
         }
     }
@@ -880,6 +914,7 @@ impl Task {
                 self.send_media(a, v, (a, v), None);
             }
         }
+        self.flush_reannounce();
     }
 
     // ---- helpers ----
