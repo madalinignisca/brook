@@ -18,5 +18,7 @@ tracing = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
+# Single-origin test server (REST + /ws upgrade), as the client derives both from one base URL.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "test-util", "net"] }
 wiremock = "0.6"
