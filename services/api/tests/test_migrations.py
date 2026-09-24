@@ -15,10 +15,10 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine
-
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import create_engine
+
 from app import config, db
 from app.models import Base
 

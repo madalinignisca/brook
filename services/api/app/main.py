@@ -24,7 +24,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     """Build and configure the FastAPI app."""
-    app = FastAPI(title="Brook API", version=__version__, lifespan=lifespan)
+    # redirect_slashes=False: a JSON API never redirects. FastAPI's default 307 on a
+    # trailing slash re-sends the body (passwords included) to the Location URL, and
+    # behind TLS-terminating Caddy that URL is http:// -- an https->http downgrade.
+    # A wrong path is a 404. Guarded by tests/test_no_redirects.py.
+    app = FastAPI(title="Brook API", version=__version__, lifespan=lifespan, redirect_slashes=False)
     register_error_handlers(app)
     app.include_router(health.router)
     app.include_router(auth.router, prefix="/api/v1")

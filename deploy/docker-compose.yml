@@ -41,8 +41,12 @@ services:
     depends_on:
       - api
     ports:
-      # Plain HTTP on the LAN (Phase 0). Switch the Caddyfile to TLS later.
-      - "${BROOK_HTTP_PORT:-8080}:80"
+      # Plain HTTP (Phase 0). Switch the Caddyfile to TLS later.
+      # Always IP:host:container. The short "8080:80" form makes Compose bind 0.0.0.0
+      # AND [::], and Compose ignores the daemon's "ip" default, so on a host with a
+      # public IPv6 address and no firewall the API would be on the internet.
+      # Loopback by default; set BROOK_HTTP_BIND to one LAN address to serve a LAN.
+      - "${BROOK_HTTP_BIND:-127.0.0.1}:${BROOK_HTTP_PORT:-8080}:80"
     volumes:
       - ../services/gateway/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -60,7 +64,8 @@ services:
     volumes:
       - miniodata:/data
     ports:
-      - "${BROOK_MINIO_CONSOLE_PORT:-9001}:9001"
+      # Admin console: loopback unless explicitly opened (see the caddy note above).
+      - "${BROOK_MINIO_CONSOLE_BIND:-127.0.0.1}:${BROOK_MINIO_CONSOLE_PORT:-9001}:9001"
 
   # --- Phase 4: media SFU (Janus). Enable with `make media`. Config lands in Phase 4. ---
   janus:

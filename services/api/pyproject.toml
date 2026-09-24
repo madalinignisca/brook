@@ -44,6 +44,12 @@ extend-exclude = ["alembic/versions"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "S"]
 
+[tool.ruff.lint.isort]
+# The local `alembic/` migrations directory makes ruff classify a bare `import alembic`
+# as first-party while `alembic.config` stays third-party, which splits one package
+# across two import groups and made the sort unstable. It is the third-party library.
+known-third-party = ["alembic"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S105", "S106"]  # asserts + test-only secret literals
 
