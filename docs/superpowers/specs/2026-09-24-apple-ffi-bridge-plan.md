@@ -10,9 +10,7 @@ Test numbers refer to the rows of the spec's §3.2 table (1 runtime hop, 2 token
 4 stalled listener, 5 no duplicates, 6 initial snapshot, 7 cancellation, 8 insecure-http flag).
 
 **Linux gate (`LG`)** — *used once at T1; retired afterwards by owner decision (this machine builds
-Apple arm64 targets only); GitHub Actions `rust.yml` is the Linux check from here on.* Was: an `ubuntu:24.04` container (same distro as
-`ubuntu-latest`; GTK 4.14 / libadwaita 1.5 satisfy GNOME's `v4_10` / `v1_4` features — Debian
-Bookworm's 4.8 / 1.2 do not) with `libgtk-4-dev libadwaita-1-dev`, rustup stable + `rustfmt`
+Apple arm64 targets only); GitHub Actions `rust.yml` is the Linux check from here on.* Was: an `ubuntu:24.04` container (mirrors the `ubuntu-latest` CI runner) with `libgtk-4-dev libadwaita-1-dev`, rustup stable + `rustfmt`
 `clippy`, and `cargo-deny`, running exactly `rust.yml`'s steps:
 `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
 `cargo test --workspace --locked`, `cargo deny check advisories bans sources`.
@@ -141,8 +139,7 @@ stale lockfile that `--locked` rejects. T2–T6 add files only under `bindings/a
 
 ## Review log
 
-**Round 1 — Codex.** Seven findings, all accepted: Linux gate moved to Ubuntu 24.04 (Bookworm's
-GTK/libadwaita are too old for GNOME) and run at T1, with the lockfile committed in the same
+**Round 1 — Codex.** Seven findings, all accepted: Linux gate container aligned with the CI runner image and run at T1, with the lockfile committed in the same
 commit; complete rollback recipe; `itest.sh` env-file, file ordering, `--build`, per-run project
 names, and project-scoped cleanup checks; rebuild rule so Swift never tests a stale framework, and
 T6 re-run after any late dependency change; test numbering corrected (config test = 8);
