@@ -57,6 +57,8 @@ struct TileView: View {
         }
         .aspectRatio(16 / 9, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 10))
+        // The tile is always black: its icon and name chip use dark-scheme colours in light mode too.
+        .environment(\.colorScheme, .dark)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(tile.name)
     }

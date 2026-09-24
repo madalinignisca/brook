@@ -22,7 +22,13 @@ final class ScreenshotRenderer: XCTestCase {
         let rep = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
         host.cacheDisplay(in: host.bounds, to: rep)
         let png = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
-        try png.write(to: dir.appending(path: "\(name)-\(dark ? "dark" : "light").png"))
+        let file = "\(name)-\(dark ? "dark" : "light").png"
+        try png.write(to: dir.appending(path: file))
+        // The container is unreadable from outside the sandbox (app-data protection): the log
+        // carries a copy when asked, for a script to decode.
+        if ProcessInfo.processInfo.environment["BROOK_SCREENSHOTS_STDOUT"] == "1" {
+            print("BROOK_PNG \(file) \(png.base64EncodedString())")
+        }
     }
 
     func testRenderScreens() async throws {
