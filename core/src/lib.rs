@@ -16,6 +16,8 @@ mod chat;
 mod client;
 mod config;
 mod error;
+#[cfg(test)]
+mod log_secrecy_tests;
 mod session;
 mod session_store;
 mod state;
