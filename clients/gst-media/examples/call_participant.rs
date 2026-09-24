@@ -383,6 +383,8 @@ mod echo_check {
             .map(|(s, &c)| if c > 0 { (s / c as f64).sqrt() } else { 0.0 })
             .collect();
         let fps = (1000 / FRAME_MS) as usize;
+        // The clip's speech runs 20-140 s; 22-138 s keeps syllable edges and
+        // join/leave transients out (116 of the 120 s).
         let active = (SILENCE_SECONDS as usize + 2) * fps..(CLIP_SECONDS as usize - 2) * fps;
         let lags = 0..(1500 / FRAME_MS as usize);
         let best = |a: &[f64]| {
@@ -415,16 +417,21 @@ mod echo_check {
         // anywhere in 0-1.5 s means it played us out loud and its mic picked
         // it up. (Timestamps mark capture, so the delay excludes our own
         // jitter buffer.)
-        let verdict = if peak > (3.0 * chance).max(0.2) {
-            "ECHO: our clip comes back"
-        } else {
-            "no echo detected"
+        // Correlation ignores scale, so also require the clip to raise the
+        // received level: an AEC that suppresses echo leaves a correlated
+        // residual that barely lifts the level above the room's.
+        let (silent_db, playing_db) = (db(silence.clone()), db(active.clone()));
+        let lift = playing_db - silent_db; // +inf if the silent window was digital silence
+        let verdict = match (peak > (3.0 * chance).max(0.2), lift >= 6.0) {
+            (true, true) => "ECHO: our clip comes back",
+            (true, false) => "residual echo only (correlated, but < 6 dB above the silent window)",
+            (false, _) => "no echo detected",
         };
         format!(
  "echo check: {verdict}: peak envelope correlation {peak:.3} at {} ms (chance level {chance:.3}); received level {:.1} dBFS while our clip was silent vs {:.1} dBFS while it played; {received_frames} frames of received audio",
             lag * FRAME_MS as usize,
-            db(silence),
-            db(active)
+            silent_db,
+            playing_db
         )
     }
 }
