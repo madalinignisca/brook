@@ -14,6 +14,8 @@ mod config;
 mod error;
 mod session;
 mod state;
+#[cfg(test)]
+mod test_support;
 mod ws;
 
 pub use chat::{Channel, ChannelMember, Message, ReactionSummary, ReplyExcerpt};
