@@ -89,6 +89,8 @@ final class SessionStore {
         case .InvalidServerUrl: Message.invalidAddress
         case .UnexpectedResponse: Message.unexpected
         case .NotAuthenticated: Message.signedOut
+        case .Disconnected, .Timeout: Message.unreachable
+        case .CallEnded, .Busy, .TooLarge: Message.unexpected
         }
     }
 
