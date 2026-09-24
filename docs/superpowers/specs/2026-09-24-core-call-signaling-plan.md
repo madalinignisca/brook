@@ -91,7 +91,7 @@ named mutation. Test infrastructure first, because every later task depends on i
 
 | Point | Failure | Response |
 |---|---|---|
-| P0 | a scripted WS server that yields between frames hides the back-to-back race | harness writes both frames to the sink before flushing; the race test asserts on that |
+| P0 | server-side flushing alone cannot force the routing race (client scheduling decides) | the reply-consumer gate holds the call task; the delayed-route mutation must provably lose the offer |
 | P1 | epoch change while a REST chat call is in flight | the in-flight REST call finishes with the old token (server may 401); acceptable, not part of calls |
 | P2 | tungstenite split sink/stream + select! cancellation drops a half-written frame | writes go through a single writer task; select! only on channel receives |
 | P4 | test flakiness from real timers | tokio `start_paused` time for timeout tests; barriers, never sleeps, for ordering |
