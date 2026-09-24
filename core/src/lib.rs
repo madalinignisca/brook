@@ -8,6 +8,7 @@
 //! DMs, send and page message history, and observe realtime [`ServerEvent`]s over
 //! a WebSocket — plus the observable [`AuthState`] the UI watches.
 
+mod call_types;
 mod chat;
 mod client;
 mod config;
@@ -19,6 +20,10 @@ mod state;
 mod test_support;
 mod ws;
 
+pub use call_types::{
+    CallState, CallStatus, EndReason, EngineError, IceCandidate, IceServer, MediaEngine, MediaKind,
+    MediaSource, Participant, PcKind, Publishing, SubStream,
+};
 pub use chat::{Channel, ChannelMember, Message, ReactionSummary, ReplyExcerpt};
 pub use client::BrookClient;
 pub use config::CoreConfig;
