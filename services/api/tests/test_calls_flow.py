@@ -377,3 +377,26 @@ def test_call_media_cannot_announce_unpublished_media(
         cmd(wb, "call.media", {"call_id": call_id, "audio": True, "video": True})
         seen = of(collect(wa), "call.participant")[-1]["participant"]
         assert (seen["audio"], seen["video"]) == (True, False), seen
+
+
+def test_mute_before_publish_sticks(sync_client: TestClient, fake: FakeJanus) -> None:
+    """Found in review: the GNOME client sends call.media as soon as the user
+    toggles, which can be before call.publish is answered. The publish used to
+    set audio/video from the offer and overwrite that mute, so everyone saw an
+    unmuted participant whose mic was actually off."""
+    a, b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa, _ws(sync_client, b) as wb:
+        call_id = cmd(wa, "call.join", {"channel_id": ch})["data"]["call_id"]
+        cmd(wb, "call.join", {"channel_id": ch})
+        collect(wa)
+        # bob mutes his mic while still joining, then his publish lands
+        cmd(wb, "call.media", {"call_id": call_id, "audio": False, "video": True})
+        assert cmd(wb, "call.publish", {"call_id": call_id, "sdp": SDP_AV})["type"] == (
+            "call.publish.answer"
+        )
+        seen = of(collect(wa), "call.participant")[-1]["participant"]
+        assert (seen["audio"], seen["video"]) == (False, True), seen
+        # unmuting later works as usual
+        cmd(wb, "call.media", {"call_id": call_id, "audio": True, "video": True})
+        seen = of(collect(wa), "call.participant")[-1]["participant"]
+        assert (seen["audio"], seen["video"]) == (True, True), seen
