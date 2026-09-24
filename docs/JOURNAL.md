@@ -16,6 +16,24 @@ Conventions:
 
 ## 2026-09-24
 
+### GNOME login: remembered Server field + mid-session sign-out, reviewed by Vibe
+
+Parity with macOS (user asked for a server field kept across restarts): login
+form gets a Server row; the server of the last *successful* login is saved to
+`$XDG_CONFIG_HOME/brook/gnome.ini` (GKeyFile, not GSettings: an uninstalled
+`cargo run` has no compiled schema); `BROOK_SERVER` still overrides. A client
+is created per server; its auth watcher stops once replaced. Requested by
+brook-ios before core's session-epoch fix (C1b P1) merges: a mid-session
+`LoggedOut` now tears the chat view down and returns to login; the chat
+realtime loop stops once its view is gone (else a rebuilt view on the same
+client double-handles events, e.g. duplicate notifications). **Not run on
+screen yet** (libadwaita missing on the bench).
+
+Friends review: only Vibe CLI 2.14 ran. Applied: rebuild chat after a
+server switch (via the sign-out teardown), stop superseded auth watchers.
+Declined: "curly quotes may render incorrectly" (UTF-8 in GTK is fine; the
+codebase already uses them).
+
 ### P4 calls: GNOME call view + dev loopback, reviewed by Vibe
 
 `clients/gnome/src/call.rs`: video tile grid (`gtk4paintablesink` ->

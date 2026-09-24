@@ -324,7 +324,14 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
     let mut events = chat.client.events();
     glib::spawn_future_local(async move {
         loop {
-            match events.recv().await {
+            let event = events.recv().await;
+            // The view was torn down (signed out mid-session): stop, or a
+            // rebuilt view on the same client would double-handle every event
+            // (duplicate notifications).
+            if chat.message_list.root().is_none() {
+                break;
+            }
+            match event {
                 Ok(ServerEvent::MessageNew(message)) => {
                     let is_current = chat
                         .current
