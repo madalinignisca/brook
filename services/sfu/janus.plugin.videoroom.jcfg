@@ -1,0 +1,7 @@
+# No static rooms: `api` creates one room per active call and destroys it when the
+# call ends (docs/PROTOCOL.md §3.1). Room limits (participants, bitrate, codecs)
+# are set by `api` in each `create` request, so they live next to the code that
+# enforces them.
+general: {
+	string_ids = false
+}

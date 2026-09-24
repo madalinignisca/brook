@@ -1,0 +1,31 @@
+# Brook SFU core config. Deployment values (API secret, public IP, RTP range) come
+# from env via entrypoint.sh flags; nothing here is secret or host-specific.
+general: {
+	configs_folder = "/opt/janus/etc/janus"
+	plugins_folder = "/opt/janus/lib/janus/plugins"
+	transports_folder = "/opt/janus/lib/janus/transports"
+	log_to_stdout = true
+	debug_level = 4
+	server_name = "brook-sfu"
+	# api owns every session and keeps it alive; a session api forgot about (api
+	# crash) is reaped after this many seconds instead of leaking rooms forever.
+	session_timeout = 60
+}
+
+media: {
+	# LAN/IPv4 media only for now; see docs/MEDIA.md §6a before enabling IPv6.
+	ipv6 = false
+	dtls_mtu = 1200
+	no_media_timer = 1
+}
+
+nat: {
+	# Clients are never mDNS-only on our networks; resolving .local names just adds delay.
+	ignore_mdns = true
+}
+
+plugins: {
+}
+
+transports: {
+}

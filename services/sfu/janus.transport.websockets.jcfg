@@ -1,0 +1,14 @@
+# Janus API over WebSocket, for `api` only. Listens inside the container; compose
+# never publishes this port, so it is reachable only on the internal network.
+general: {
+	json = "compact"
+	ws = true
+	ws_port = 8188
+	wss = false
+}
+
+admin: {
+	# The Janus Admin API is never exposed (ARCHITECTURE.md §Signaling model).
+	admin_ws = false
+	admin_wss = false
+}
