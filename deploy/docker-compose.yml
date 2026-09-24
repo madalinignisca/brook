@@ -33,6 +33,9 @@ services:
       # `sfu_unavailable` until `make media` brings the SFU up.
       BROOK_JANUS_URL: ws://janus:8188
       BROOK_JANUS_API_SECRET: ${JANUS_API_SECRET:-}
+      # Dev/test only: serves the browser call harness at /dev/call. Keep false in
+      # anything user-facing; it is a test tool, not a client.
+      BROOK_DEV_HARNESS: ${BROOK_DEV_HARNESS:-false}
     depends_on:
       postgres:
         condition: service_healthy

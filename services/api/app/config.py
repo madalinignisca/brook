@@ -28,6 +28,15 @@ class Settings(BaseSettings):
     access_ttl_seconds: int = 15 * 60
     refresh_ttl_seconds: int = 7 * 24 * 3600
 
+    # Calls (Phase 4). Unset URL = no SFU configured: call commands answer
+    # `sfu_unavailable`, everything else works.
+    janus_url: str | None = None
+    janus_api_secret: str = ""
+
+    # Serves the dev-only call harness at /dev/call (app/static/call_harness.html).
+    # Off by default: it is a test tool, not a product client.
+    dev_harness: bool = False
+
     # Must be explicitly enabled to run with a weak/default JWT key (local dev only).
     allow_insecure_auth: bool = False
 

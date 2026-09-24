@@ -1,0 +1,187 @@
+<!doctype html>
+<!--
+  Brook call harness: a DEV/TEST tool, not a product client.
+  Speaks the real protocol (REST login, /ws, PROTOCOL.md §3) with the browser's
+  own WebRTC, so the server can be tested end to end before any native client
+  exists, and native clients have a second participant to call.
+  Served only when BROOK_DEV_HARNESS=true. Query params (for automation):
+    ?handle=&password=&channel=<channel uuid>&autojoin=1
+  Note: browsers only allow camera/mic on https or localhost.
+-->
+<html lang="en">
+<meta charset="utf-8">
+<title>Brook call harness (dev)</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 16px; }
+  #videos { display: flex; flex-wrap: wrap; gap: 8px; }
+  video { width: 320px; background: #111; border-radius: 6px; }
+  figure { margin: 0; } figcaption { font-size: 12px; color: #555; }
+  #log { white-space: pre-wrap; font: 12px ui-monospace, monospace; max-height: 40vh; overflow: auto; }
+</style>
+<form id="f">
+  <input name="handle" placeholder="handle" required>
+  <input name="password" type="password" placeholder="password" required>
+  <input name="channel" placeholder="channel id" required size="38">
+  <button>Join call</button>
+  <button type="button" id="leave" disabled>Leave</button>
+</form>
+<div id="videos"></div>
+<div id="log"></div>
+<script>
+"use strict";
+// ---- state exposed for automated tests ------------------------------------
+window.brook = { state: "idle", errors: [], remote: {}, participants: {} };
+const log = (...a) => { document.getElementById("log").textContent += a.join(" ") + "\n"; };
+const fail = (e) => { window.brook.errors.push(String(e && (e.message || JSON.stringify(e)) || e)); log("ERROR", window.brook.errors.at(-1)); };
+// Not crypto.randomUUID: that needs a secure context, and ids need no secrecy.
+const rid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+let ws, callId, pubPc, subPc, local;
+const pending = new Map();
+let subChain = Promise.resolve();          // subscribe offers are handled strictly in order
+let subVersion = 0, subStreams = [];
+const iceBuffer = { publish: [], subscribe: [] };  // contract §3.3: client buffers early ICE
+
+function send(type, data) {
+  const id = rid();
+  ws.send(JSON.stringify({ type, id, ts: new Date().toISOString(), data }));
+  return id;
+}
+function request(type, data) {             // contract §3.2: exactly one reply
+  return new Promise((resolve, reject) => {
+    const id = send(type, data);
+    pending.set(id, { resolve, reject });
+    setTimeout(() => { if (pending.delete(id)) reject(new Error("timeout " + type)); }, 10000);
+  });
+}
+
+async function applyIce(pc, which, cand) {
+  if (!pc || !pc.remoteDescription) { iceBuffer[which].push(cand); return; }
+  try { await pc.addIceCandidate(cand || null); } catch (e) { fail(e); }
+}
+async function flushIce(pc, which) {
+  for (const c of iceBuffer[which].splice(0)) await applyIce(pc, which, c);
+}
+
+function onFrame(frame) {
+  if (frame.re && pending.has(frame.re)) {
+    const p = pending.get(frame.re); pending.delete(frame.re);
+    return frame.type === "error" ? p.reject(frame.data) : p.resolve(frame);
+  }
+  const d = frame.data;
+  switch (frame.type) {
+    case "call.subscribe.offer": subChain = subChain.then(() => onSubOffer(d)).catch(fail); break;
+    case "call.ice": applyIce(d.pc === "publish" ? pubPc : subPc, d.pc, d.candidate); break;
+    case "call.participant":
+      if (d.event === "left") delete window.brook.participants[d.participant.participant_id];
+      else window.brook.participants[d.participant.participant_id] = d.participant;
+      log("participant", d.event, d.participant.display_name); break;
+    case "call.ended": window.brook.state = "ended"; log("call ended:", d.reason); break;
+    case "error": fail(d); break;
+  }
+}
+
+async function onSubOffer(d) {
+  log("sub offer v" + d.version, "streams", JSON.stringify(d.streams));
+  subVersion = d.version; subStreams = d.streams;
+  if (!subPc) {
+    subPc = new RTCPeerConnection();
+    subPc.onicecandidate = (e) => send("call.ice", { call_id: callId, pc: "subscribe",
+      candidate: e.candidate ? e.candidate.toJSON() : null });
+    subPc.ontrack = (e) => attach(e.transceiver.mid, e.track);
+  }
+  await subPc.setRemoteDescription({ type: "offer", sdp: d.sdp });
+  await flushIce(subPc, "subscribe");
+  const answer = await subPc.createAnswer();
+  await subPc.setLocalDescription(answer);
+  if (d.version !== subVersion) return;    // a newer offer is queued behind us
+  try {
+    await request("call.subscribe.answer", { call_id: callId, version: d.version, sdp: answer.sdp });
+    log("sub answer v" + d.version, "accepted");
+  } catch (e) {
+    log("sub answer v" + d.version, "refused:", JSON.stringify(e));
+    if (e.code !== "stale") throw e;
+  }
+  const active = new Set(subStreams.map((s) => s.mid));
+  for (const mid of Object.keys(window.brook.remote)) {
+    if (!active.has(mid)) { document.getElementById("v-" + mid)?.remove(); delete window.brook.remote[mid]; }
+  }
+}
+
+function attach(mid, track) {
+  const s = subStreams.find((x) => x.mid === mid);
+  window.brook.remote[mid] = { kind: track.kind, participant_id: s && s.participant_id };
+  if (track.kind !== "video") { const a = new Audio(); a.srcObject = new MediaStream([track]); a.play().catch(() => {}); return; }
+  const fig = document.createElement("figure"); fig.id = "v-" + mid;
+  const v = document.createElement("video"); v.autoplay = true; v.muted = true; v.playsInline = true;
+  v.srcObject = new MediaStream([track]);
+  const who = s && window.brook.participants[s.participant_id];
+  fig.append(v, Object.assign(document.createElement("figcaption"), { textContent: who ? who.display_name : mid }));
+  document.getElementById("videos").append(fig);
+}
+
+// Connection states for diagnosing a failed test run.
+window.brook.pcState = () => Object.fromEntries([["pub", pubPc], ["sub", subPc]].map(([k, pc]) =>
+  [k, pc ? { ice: pc.iceConnectionState, conn: pc.connectionState, sig: pc.signalingState,
+             gather: pc.iceGatheringState } : null]));
+// Totals for tests: proves media actually flowed, not just that signaling finished.
+window.brook.stats = async () => {
+  const out = { inboundVideoBytes: 0, framesDecoded: 0, outboundVideoBytes: 0 };
+  for (const [pc, dir] of [[subPc, "in"], [pubPc, "out"]]) {
+    if (!pc) continue;
+    (await pc.getStats()).forEach((r) => {
+      if (dir === "in" && r.type === "inbound-rtp" && r.kind === "video") { out.inboundVideoBytes += r.bytesReceived || 0; out.framesDecoded += r.framesDecoded || 0; }
+      if (dir === "out" && r.type === "outbound-rtp" && r.kind === "video") out.outboundVideoBytes += r.bytesSent || 0;
+    });
+  }
+  return out;
+};
+
+async function join({ handle, password, channel }) {
+  window.brook.state = "logging-in";
+  const r = await fetch("/api/v1/auth/login", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ handle, password }) });
+  if (!r.ok) throw new Error("login failed " + r.status);
+  const { access_token } = await r.json();
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.onmessage = (m) => onFrame(JSON.parse(m.data));
+  ws.onclose = (e) => log("ws closed", e.code, e.reason);
+  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error("ws error")); });
+  await request("auth", { access_token });   // answered by `ready` carrying re (PROTOCOL.md §2)
+
+  const joined = await request("call.join", { channel_id: channel });
+  callId = joined.data.call_id;
+  for (const p of joined.data.participants) window.brook.participants[p.participant_id] = p;
+  window.brook.state = "joined"; log("joined call", callId, "with", joined.data.participants.length, "others");
+
+  local = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: 640, height: 360 } });
+  pubPc = new RTCPeerConnection();
+  pubPc.onicecandidate = (e) => send("call.ice", { call_id: callId, pc: "publish",
+    candidate: e.candidate ? e.candidate.toJSON() : null });
+  for (const t of local.getTracks()) pubPc.addTransceiver(t, { direction: "sendonly" });
+  const offer = await pubPc.createOffer();
+  await pubPc.setLocalDescription(offer);
+  const ans = await request("call.publish", { call_id: callId, sdp: offer.sdp });
+  await pubPc.setRemoteDescription({ type: "answer", sdp: ans.data.sdp });
+  await flushIce(pubPc, "publish");
+  window.brook.state = "published"; log("publishing");
+  document.getElementById("leave").disabled = false;
+}
+
+async function leave() {
+  try { await request("call.leave", { call_id: callId }); } catch (e) { fail(e); }
+  for (const pc of [pubPc, subPc]) pc && pc.close();
+  local && local.getTracks().forEach((t) => t.stop());
+  window.brook.state = "left";
+}
+
+document.getElementById("f").onsubmit = (ev) => {
+  ev.preventDefault(); join(Object.fromEntries(new FormData(ev.target))).catch(fail);
+};
+document.getElementById("leave").onclick = () => leave();
+window.brook.leave = leave;
+const q = new URLSearchParams(location.search);
+for (const k of ["handle", "password", "channel"]) if (q.get(k)) document.querySelector(`[name=${k}]`).value = q.get(k);
+if (q.get("autojoin") === "1") join(Object.fromEntries(new FormData(document.getElementById("f")))).catch(fail);
+</script>
+</html>
