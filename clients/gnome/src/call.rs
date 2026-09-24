@@ -263,6 +263,17 @@ impl CallView {
         self.status.set_revealed(!text.is_empty());
     }
 
+    /// Grey out (and show as off) the mic / camera when there is none to
+    /// publish, so toggles never ask the engine to enable a missing track.
+    pub fn set_available(&self, mic: bool, camera: bool) {
+        for (button, available) in [(&self.mic_button, mic), (&self.camera_button, camera)] {
+            if !available {
+                button.set_active(true);
+                button.set_sensitive(false);
+            }
+        }
+    }
+
     /// Called with `(audio_on, video_on)` whenever the user toggles mic/camera.
     pub fn connect_media_toggled(&self, f: impl Fn(bool, bool) + 'static) {
         let f = Rc::new(f);
@@ -520,6 +531,11 @@ pub fn open_call(
             return window;
         }
     };
+    // Before the toggle handlers are wired: this is initial state, not a toggle.
+    view.set_available(
+        config.mic != MicSource::None,
+        config.camera != CameraSource::None,
+    );
     let (engine, mut engine_events) = match GstEngine::new(config) {
         Ok(e) => e,
         Err(err) => {

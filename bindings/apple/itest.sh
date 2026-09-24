@@ -4,7 +4,7 @@
 #
 # Reads bindings/apple/.itest.env (gitignored, mode 600, filled in by a human):
 #   BROOK_TEST_SERVER=http://host:port           (base URL, no /api/v1)
-#   BROOK_TEST_HANDLE=itest-mac
+#   BROOK_TEST_HANDLE=mac                        (the shared dev account on the LAN test server)
 #   BROOK_TEST_PASSWORD=...
 #   BROOK_TEST_ALLOW_INSECURE_HTTP=1             (only if the server is plain http)
 set -euo pipefail
@@ -14,6 +14,7 @@ ENV_FILE="$HERE/.itest.env"
 EXPECTED_TESTS=2
 
 [[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE (see header of $0)" >&2; exit 1; }
+# `stat -f '%Lp'` is the BSD/macOS form (GNU stat uses `-c '%a'`); this script runs on the Mac.
 if [[ "$(stat -f '%Lp' "$ENV_FILE")" != "600" ]]; then
   echo "$ENV_FILE must be mode 600 (it holds a password): chmod 600 $ENV_FILE" >&2; exit 1
 fi
