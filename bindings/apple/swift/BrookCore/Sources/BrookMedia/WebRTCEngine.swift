@@ -49,6 +49,11 @@ public struct MediaOptions: @unchecked Sendable {
     }
 }
 
+struct CaptureTimeout: Error, CustomStringConvertible {
+    let timeout: Duration
+    var description: String { "camera did not start within \(timeout)" }
+}
+
 struct EngineFailure: Error, CustomStringConvertible {
     let description: String
     init(_ description: String) { self.description = description }
@@ -83,8 +88,16 @@ public final class WebRTCEngine: FfiMediaEngine, @unchecked Sendable {
     }
 
     /// Latest remote tracks with their owners, on every subscribe offer (engine queue).
+    /// Replays the current tracks at once if there are any (the UI registers after join_call
+    /// returns, which can be after the first subscribe offer).
     public func onRemoteTracks(_ callback: @escaping @Sendable ([RemoteTrack]) -> Void) {
-        core.enqueue { $0.remoteTracksCallback = callback }
+        core.enqueue { $0.setRemoteTracksCallback(callback) }
+    }
+
+    /// The camera track for the self-view, as soon as it exists (replayed if it already does):
+    /// the publish offer that creates it runs independently of join_call returning.
+    public func onLocalVideoTrack(_ callback: @escaping @Sendable (RTCVideoTrack) -> Void) {
+        core.enqueue { $0.setLocalVideoCallback(callback) }
     }
 
     /// The camera track for the self-view (nil without a camera, or before the first offer).
@@ -197,7 +210,12 @@ actor EngineCore {
     /// returns a fresh wrapper each time, and a wrapper's dealloc detaches every renderer that
     /// was added through it, so a transient wrapper would leave a tile blank.
     private var remoteTracks: [String: RemoteTrack] = [:]
-    var remoteTracksCallback: (@Sendable ([RemoteTrack]) -> Void)?
+    private var remoteTracksCallback: (@Sendable ([RemoteTrack]) -> Void)?
+    private var localVideoCallback: (@Sendable (RTCVideoTrack) -> Void)?
+    /// A capture start timed out: that start may still complete later, so the capture object
+    /// is never started again (a second start could be stopped by the first one's clean-up).
+    private var captureBroken = false
+    private var captureIdleWaiters: [CheckedContinuation<Void, Never>] = []
 
     private var closing = false
     private var isClosed = false
@@ -258,6 +276,7 @@ actor EngineCore {
             try addSendOnly(pc, track)
             videoSource = source
             localVideoTrack = track
+            localVideoCallback?(track)
         }
         publish = pc
         return pc
@@ -307,6 +326,16 @@ actor EngineCore {
         return pc
     }
 
+    func setRemoteTracksCallback(_ callback: @escaping @Sendable ([RemoteTrack]) -> Void) {
+        remoteTracksCallback = callback
+        if !remoteTracks.isEmpty { callback(remoteTracks.values.sorted { $0.mid < $1.mid }) }
+    }
+
+    func setLocalVideoCallback(_ callback: @escaping @Sendable (RTCVideoTrack) -> Void) {
+        localVideoCallback = callback
+        if let localVideoTrack { callback(localVideoTrack) }
+    }
+
     private func publishRemoteTracks(_ pc: RTCPeerConnection) {
         var next: [String: RemoteTrack] = [:]
         for t in pc.transceivers where !t.isStopped {
@@ -341,21 +370,26 @@ actor EngineCore {
     }
 
     func onLocalCandidate(_ kind: FfiPcKind, _ candidate: FfiIceCandidate?) {
-        guard !closing else { return }
+        guard !closing, !fence.isSet else { return }
         emit { $0.localCandidate(pc: kind, candidate: candidate) }
     }
 
     func fail(_ message: String) {
-        guard !closing else { return }
+        guard !closing, !fence.isSet else { return }
         emit { $0.engineFailed(message: message) }
     }
 
     func attach(_ events: EngineEvents) {
         self.events = events
         attached = true
+        if closing || fence.isSet {
+            pending = []  // nothing is delivered once close has begun
+            return
+        }
         let backlog = pending
         pending = []
-        for event in backlog { event(events) }
+        // close() may raise the fence (from another thread) mid-replay: check per event.
+        for event in backlog where !fence.isSet { event(events) }
     }
 
     /// Before attachment: buffered. After: delivered, unless the handle is gone (then nothing).
@@ -388,11 +422,22 @@ actor EngineCore {
     /// await, so toggles made meanwhile are honoured.
     private func syncCapture() async throws {
         guard let capture, let source = videoSource, !captureSyncing else { return }
+        if captureBroken { throw EngineFailure("the camera did not start earlier") }
         captureSyncing = true
-        defer { captureSyncing = false }
+        defer {
+            captureSyncing = false
+            let waiters = captureIdleWaiters
+            captureIdleWaiters = []
+            for w in waiters { w.resume() }
+        }
         while !closing && media.video != captureRunning {
             if media.video {
-                try await startBounded(capture, source)
+                do {
+                    try await startBounded(capture, source)
+                } catch let error as CaptureTimeout {
+                    captureBroken = true
+                    throw EngineFailure(error.description)
+                }
                 captureRunning = true
                 if fence.isSet || closing {
                     await capture.stop()
@@ -426,9 +471,7 @@ actor EngineCore {
             }
             Task {
                 try? await Task.sleep(for: timeout)
-                if once.claim() {
-                    cont.resume(throwing: EngineFailure("camera did not start within \(timeout)"))
-                }
+                if once.claim() { cont.resume(throwing: CaptureTimeout(timeout: timeout)) }
             }
         }
     }
@@ -452,6 +495,12 @@ actor EngineCore {
             return
         }
         closing = true
+        pending = []
+        // A capture sync in flight (bounded by the capture timeout) finishes first: it sees the
+        // fence and stops what it started, so `closed` never precedes a start.
+        if captureSyncing {
+            await withCheckedContinuation { captureIdleWaiters.append($0) }
+        }
         if let capture, captureRunning || capture.isCapturing {
             await capture.stop()
             captureRunning = false

@@ -177,4 +177,25 @@ final class LoopbackTests: XCTestCase {
         await a.close()
         await b.close()
     }
+
+    /// A callback registered after the first subscribe offer still gets the current tracks
+    /// (the UI registers after join_call returns, which can be after that offer).
+    func testLateRemoteTrackCallbackGetsTheCurrentTracks() async throws {
+        let a = WebRTCEngine(options: MediaOptions(
+            audio: true, video: SyntheticVideoCapture(), audioDevice: SyntheticAudioDevice(toneHz: nil)))
+        let b = WebRTCEngine(options: MediaOptions(
+            audio: false, video: nil, audioDevice: SyntheticAudioDevice(toneHz: nil)))
+        let offer = try await a.createPublishOffer()
+        let streams = mediaSections(offer).map {
+            FfiSubStream(mid: $0.mid, participantId: "p-a", kind: $0.kind, source: $0.kind == .audio ? .mic : .camera)
+        }
+        _ = try await b.applySubscribeOffer(sdp: offer, streams: streams)
+        let seen = Locked([String]())
+        b.onRemoteTracks { tracks in seen.withLock { $0 = tracks.map(\.mid) } }
+        await eventually("current tracks replayed to a late callback", timeout: 2) {
+            seen.withLock { $0.count } == 2
+        }
+        await a.close()
+        await b.close()
+    }
 }

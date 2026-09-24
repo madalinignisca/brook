@@ -16,7 +16,11 @@ final class ScriptedCapture: VideoCapture, @unchecked Sendable {
         var starts = 0
         var stops = 0
         var held: CheckedContinuation<Void, Never>?
+        var holdStop = false
+        var heldStop: CheckedContinuation<Void, Never>?
     }
+    /// Ordered record of "started" / "stopped" (tests append their own marks).
+    let events = Locked([String]())
 
     init(_ mode: Mode) { state = Locked(State(mode: mode)) }
 
@@ -32,6 +36,7 @@ final class ScriptedCapture: VideoCapture, @unchecked Sendable {
         case .never: await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
         }
         state.withLock { $0.running = true }
+        events.withLock { $0.append("started") }
     }
 
     /// Let a held start finish now.
@@ -42,8 +47,20 @@ final class ScriptedCapture: VideoCapture, @unchecked Sendable {
 
     var isHeld: Bool { state.withLock { $0.held != nil } }
 
+    /// Make the next stop wait for `releaseStop()`.
+    func holdNextStop() { state.withLock { $0.holdStop = true } }
+    var isStopHeld: Bool { state.withLock { $0.heldStop != nil } }
+    func releaseStop() {
+        let c = state.withLock { s -> CheckedContinuation<Void, Never>? in defer { s.heldStop = nil }; return s.heldStop }
+        c?.resume()
+    }
+
     func stop() async {
+        if state.withLock({ s -> Bool in defer { s.holdStop = false }; return s.holdStop }) {
+            await withCheckedContinuation { c in state.withLock { $0.heldStop = c } }
+        }
         state.withLock { $0.running = false; $0.stops += 1 }
+        events.withLock { $0.append("stopped") }
     }
 }
 
@@ -105,7 +122,56 @@ final class EngineContractTests: XCTestCase {
         XCTAssertEqual(capture.stops, 1, "capture stopped more than once")
     }
 
+    /// A capture start in flight when close() begins: `closed` completes only after that
+    /// start finished and was stopped, never before (capture must not run after `closed`).
+    func testClosedWaitsForAnInFlightCaptureStart() async throws {
+        let capture = ScriptedCapture(.held)
+        let e = engine(capture: capture)
+        let offer = Task { try await e.createPublishOffer() }
+        await eventually("capture start reached") { capture.isHeld }
+        let closing = Task {
+            await e.close()
+            capture.events.withLock { $0.append("closed") }
+        }
+        try? await Task.sleep(for: .milliseconds(100))
+        capture.release()
+        await closing.value
+        _ = try? await offer.value
+        XCTAssertEqual(capture.events.withLock { $0 }, ["started", "stopped", "closed"])
+    }
+
+    /// Nothing is delivered once close has begun: not a buffered backlog flushed by a late
+    /// attach while close awaits the capture stop.
+    func testNoEventsDeliveredWhileClosing() async throws {
+        let capture = ScriptedCapture(.immediate)
+        let e = engine(capture: capture)
+        _ = try await e.createPublishOffer()
+        try? await Task.sleep(for: .milliseconds(300))  // candidates buffered, unattached
+        capture.holdNextStop()
+        let closing = Task { await e.close() }
+        await eventually("close is stopping capture") { capture.isStopHeld }
+        let events = RecordingEvents()
+        e.attach(events)
+        try? await Task.sleep(for: .milliseconds(200))
+        capture.releaseStop()
+        await closing.value
+        XCTAssertEqual(events.entries, [], "delivered while closing")
+    }
+
     // MARK: capture bound
+
+    /// After a start timed out, the capture object is not trusted again: a later toggle must
+    /// not start it a second time (the first start may still complete and stop the second).
+    func testNoSecondStartAfterATimedOutStart() async throws {
+        let capture = ScriptedCapture(.never)
+        let e = engine(capture: capture, timeout: .milliseconds(200))
+        await XCTAssertThrowsAsync { _ = try await e.createPublishOffer() }
+        try e.setLocalMedia(audio: true, video: false)
+        try e.setLocalMedia(audio: true, video: true)
+        try? await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(capture.starts, 1, "started again after a timed-out start")
+        await e.close()
+    }
 
     func testCaptureThatNeverStartsFailsWithinTheBound() async throws {
         let capture = ScriptedCapture(.never)

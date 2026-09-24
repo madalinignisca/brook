@@ -8,11 +8,16 @@ import Synchronization
 /// The engine side the call UI needs (WebRTCEngine; a fake in tests).
 protocol CallMedia: AnyObject, Sendable {
     func closed() async
-    func localVideoTrack() async -> RTCVideoTrack?
+    func onLocalVideoTrack(_ callback: @escaping @Sendable (RTCVideoTrack) -> Void)
     func onRemoteTracks(_ callback: @escaping @Sendable ([RemoteTrack]) -> Void)
 }
 
-extension WebRTCEngine: CallMedia {}
+/// What joining needs from an engine: core's side, the UI's side, and the attachment.
+protocol CallEngine: FfiMediaEngine, CallMedia {
+    func attach(_ events: EngineEvents)
+}
+
+extension WebRTCEngine: CallEngine {}
 
 /// One live call: roster tiles, local controls, banners, and a bounded leave.
 @MainActor
@@ -34,6 +39,11 @@ final class CallModel {
     private(set) var cameraOn: Bool
     private(set) var localVideo: RTCVideoTrack?
     private(set) var leaving = false
+    private var leaveTask: Task<Void, Never>?
+    private var mediaGeneration = 0
+    /// The last state core accepted, and the chain that sends requests one at a time.
+    private var confirmed: (audio: Bool, video: Bool)
+    private var mediaChain: Task<Void, Never>?
     private var remote: [String: RTCVideoTrack] = [:]  // participant id → camera track
 
     private let handle: any FfiCallHandleProtocol
@@ -52,6 +62,7 @@ final class CallModel {
         self.closeBound = closeBound
         micOn = plan.microphone
         cameraOn = plan.camera
+        confirmed = (plan.microphone, plan.camera)
     }
 
     func start() async {
@@ -66,7 +77,13 @@ final class CallModel {
                 MainActor.assumeIsolated { self?.remote = owned }
             }
         }
-        localVideo = await media.localVideoTrack()
+        // The camera track appears when the publish offer is built, which can be after this.
+        media.onLocalVideoTrack { [weak self] track in
+            nonisolated(unsafe) let track = track
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.localVideo = track }
+            }
+        }
     }
 
     func apply(_ state: FfiCallState) { self.state = state }
@@ -121,23 +138,43 @@ final class CallModel {
         await setMedia(audio: micOn, video: !cameraOn)
     }
 
+    /// The control answers at once with the newest request. Requests reach core one at a time,
+    /// so their outcomes arrive in order: an accepted one becomes `confirmed`, and when the
+    /// newest is refused the UI shows `confirmed`, which is what core rolls back to.
     private func setMedia(audio: Bool, video: Bool) async {
-        let before = (micOn, cameraOn)
-        (micOn, cameraOn) = (audio, video)  // the control answers at once
-        do {
-            try await handle.setMedia(audio: audio, video: video)
-        } catch {
-            (micOn, cameraOn) = before  // refused: show what is really sent
+        (micOn, cameraOn) = (audio, video)
+        mediaGeneration += 1
+        let generation = mediaGeneration
+        let previous = mediaChain
+        let task = Task { [handle] in
+            await previous?.value
+            let accepted = (try? await handle.setMedia(audio: audio, video: video)) != nil
+            if accepted { self.confirmed = (audio, video) }
+            if generation == self.mediaGeneration, !accepted {
+                (self.micOn, self.cameraOn) = self.confirmed
+            }
         }
+        mediaChain = task
+        await task.value
     }
 
-    /// Leave, then wait for the engine to close (capture provably stopped), bounded.
+    /// Leave, then wait for the engine to close (capture provably stopped); the whole of it
+    /// bounded. Every caller (Leave, quit) awaits the same leave.
     func leave() async {
-        guard !leaving else { return }
+        if let leaveTask {
+            await leaveTask.value
+            return
+        }
         leaving = true
         stateSubscription?.cancel()
-        try? await handle.leave()
-        await firstOf({ [media] in await media.closed() }, orAfter: closeBound)
+        let task = Task { [handle, media, closeBound] in
+            await firstOf({
+                try? await handle.leave()
+                await media.closed()
+            }, orAfter: closeBound)
+        }
+        leaveTask = task
+        await task.value
     }
 }
 

@@ -19,14 +19,33 @@ final class RecordingEngine: FfiMediaEngine, @unchecked Sendable {
         return offer
     }
     func applyPublishAnswer(sdp: String) async throws { record("applyPublishAnswer") }
+    /// Other participants in the shared channel cause subscribe offers. A fake can't answer
+    /// them, and failing would end the call, so they are held unanswered until close()
+    /// (the contract lets an operation stay pending until the fence).
     func applySubscribeOffer(sdp: String, streams: [FfiSubStream]) async throws -> String {
         record("applySubscribeOffer")
-        throw FfiEngineError.Failed(message: "not a real engine")
+        await withCheckedContinuation { c in
+            let closed = held.withLock { h -> Bool in
+                if !h.closed { h.waiters.append(c) }
+                return h.closed
+            }
+            if closed { c.resume() }
+        }
+        throw FfiEngineError.Failed(message: "closed")
     }
     func addRemoteCandidate(pc: FfiPcKind, candidate: FfiIceCandidate?) throws { record("addRemoteCandidate") }
     func setLocalMedia(audio: Bool, video: Bool) throws { record("setLocalMedia") }
     func setIceServers(servers: [FfiIceServer]) { record("setIceServers") }
-    func close() async { record("close") }
+    func close() async {
+        record("close")
+        let waiters = held.withLock { h -> [CheckedContinuation<Void, Never>] in
+            h.closed = true
+            defer { h.waiters = [] }
+            return h.waiters
+        }
+        waiters.forEach { $0.resume() }
+    }
+    private let held = Mutex<(closed: Bool, waiters: [CheckedContinuation<Void, Never>])>((false, []))
 }
 
 final class EventLog: ServerEventListener, CallStateListener, @unchecked Sendable {
