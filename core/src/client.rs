@@ -7,16 +7,14 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::{broadcast, watch, RwLock};
+use tokio::sync::{broadcast, watch};
 use url::Url;
 
+use crate::session_store::{RefreshApplied, SessionStore};
 use crate::ws::{self, ServerEvent};
 use crate::{
     AuthState, Channel, CoreConfig, Error, Message, ReactionSummary, Result, Session, User,
 };
-
-/// Shared, mutable session — read by chat calls, the WS, and the refresh loop.
-type SharedSession = Arc<RwLock<Option<Session>>>;
 
 /// Refresh the access token this long before its ~15 min server TTL elapses.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(600);
@@ -31,10 +29,10 @@ const REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 pub struct BrookClient {
     base: Url,
     http: reqwest::Client,
-    state_tx: watch::Sender<AuthState>,
+    state_tx: Arc<watch::Sender<AuthState>>,
     state_rx: watch::Receiver<AuthState>,
     /// The active session (set on login), used to authorize chat calls + the WS.
-    session: SharedSession,
+    session: SessionStore,
     /// Realtime events fan-out to UI subscribers.
     events_tx: broadcast::Sender<ServerEvent>,
     /// Guards against starting the realtime task more than once.
@@ -46,13 +44,14 @@ impl BrookClient {
     pub fn new(config: CoreConfig) -> Result<Self> {
         let http = reqwest::Client::builder().build()?;
         let (state_tx, state_rx) = watch::channel(AuthState::LoggedOut);
+        let state_tx = Arc::new(state_tx);
         let (events_tx, _) = broadcast::channel(256);
         Ok(Self {
             base: config.base_url,
             http,
+            session: SessionStore::new(state_tx.clone()),
             state_tx,
             state_rx,
-            session: Arc::new(RwLock::new(None)),
             events_tx,
             realtime_started: AtomicBool::new(false),
         })
@@ -70,7 +69,7 @@ impl BrookClient {
         let _ = self.state_tx.send(AuthState::Authenticating);
         // Drop any prior session up front so a failed attempt can never leave the
         // previous user's token usable by chat calls.
-        *self.session.write().await = None;
+        self.session.replace(None).await;
         let result = self.do_login(handle, password).await;
         let next = match &result {
             Ok(session) => AuthState::LoggedIn(session.user.clone()),
@@ -99,7 +98,7 @@ impl BrookClient {
             user,
         };
         // Retain the session so chat calls and the WS can authorize.
-        *self.session.write().await = Some(session.clone());
+        self.session.replace(Some(session.clone())).await;
         Ok(session)
     }
 
@@ -115,29 +114,22 @@ impl BrookClient {
     /// The current access token, or [`Error::NotAuthenticated`] if logged out.
     async fn access_token(&self) -> Result<String> {
         self.session
-            .read()
+            .access_token()
             .await
-            .as_ref()
-            .map(|s| s.access_token.clone())
             .ok_or(Error::NotAuthenticated)
     }
 
     /// The logged-in user's id (for rendering DM titles), or `None` if logged out.
     pub async fn current_user_id(&self) -> Option<String> {
-        self.session
-            .read()
-            .await
-            .as_ref()
-            .map(|s| s.user.id.clone())
+        self.session.with_session(|s| s.user.id.clone()).await
     }
 
     /// Whether the logged-in user is a global admin.
     pub async fn is_admin(&self) -> bool {
         self.session
-            .read()
+            .with_session(|s| s.user.global_role == "admin")
             .await
-            .as_ref()
-            .is_some_and(|s| s.user.global_role == "admin")
+            .unwrap_or(false)
     }
 
     /// Channels and DMs the user belongs to.
@@ -410,6 +402,12 @@ impl BrookClient {
         Ok(())
     }
 
+    /// Run one refresh now (tests drive the refresh path without waiting for the loop).
+    #[cfg(test)]
+    pub(crate) async fn refresh_now(&self) -> Result<RefreshOutcome> {
+        refresh_once(&self.http, &self.base, &self.session).await
+    }
+
     async fn parse<T: DeserializeOwned>(&self, resp: reqwest::Response) -> Result<T> {
         if !resp.status().is_success() {
             return Err(api_error(resp).await);
@@ -467,14 +465,17 @@ async fn api_error(resp: reqwest::Response) -> Error {
 /// Periodically rotate the access token so a long-lived session keeps REST calls
 /// and the WebSocket authorized. Runs for the client's life: when there's no
 /// session (logged out, or the refresh token was rejected) it idles and polls, so
-/// a later login is picked up automatically without restarting the task.
-async fn refresh_loop(http: reqwest::Client, base: Url, session: SharedSession) {
+/// Periodically rotate the access token so a long-lived session keeps REST calls
+/// and the socket authorized. While there is no session it idles and polls.
+async fn refresh_loop(http: reqwest::Client, base: Url, session: SessionStore) {
     let mut delay = REFRESH_INTERVAL;
     loop {
         tokio::time::sleep(delay).await;
         delay = match refresh_once(&http, &base, &session).await {
-            Ok(true) => REFRESH_INTERVAL,        // refreshed → next near expiry
-            Ok(false) => REFRESH_RETRY_INTERVAL, // no session / token rejected → poll for login
+            Ok(RefreshOutcome::Committed) => REFRESH_INTERVAL,
+            // Nothing to do, a newer login won, or the token was rejected (session cleared):
+            // poll for the next login.
+            Ok(_) => REFRESH_RETRY_INTERVAL,
             Err(err) => {
                 tracing::warn!(%err, "token refresh failed; retrying soon");
                 REFRESH_RETRY_INTERVAL // transient (network/5xx) → retry before expiry
@@ -483,15 +484,29 @@ async fn refresh_loop(http: reqwest::Client, base: Url, session: SharedSession) 
     }
 }
 
-/// Rotate access+refresh tokens once via `/auth/refresh`.
-///
-/// `Ok(false)` means "no work / give up for now": either there's no session, or
-/// the refresh token was rejected (4xx) — in which case the session is cleared so
-/// callers see [`Error::NotAuthenticated`]. `Err` is transient (retry).
-async fn refresh_once(http: &reqwest::Client, base: &Url, session: &SharedSession) -> Result<bool> {
-    let refresh_token = match session.read().await.as_ref() {
-        Some(s) => s.refresh_token.clone(),
-        None => return Ok(false),
+/// What one refresh attempt did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RefreshOutcome {
+    /// New credentials are live.
+    Committed,
+    /// A login/logout replaced the session while we were refreshing; our result was dropped.
+    Discarded,
+    /// There was no session to refresh.
+    NoSession,
+    /// The server rejected the refresh token; the session was cleared if it still held it.
+    Rejected,
+}
+
+/// Rotate access+refresh tokens once via `/auth/refresh`. Both the success and the
+/// rejection path are compare-and-set against the token we sent, so a slow refresh can
+/// never overwrite or erase a session from a newer login.
+pub(crate) async fn refresh_once(
+    http: &reqwest::Client,
+    base: &Url,
+    session: &SessionStore,
+) -> Result<RefreshOutcome> {
+    let Some(refresh_token) = session.with_session(|s| s.refresh_token.clone()).await else {
+        return Ok(RefreshOutcome::NoSession);
     };
     let url = base.join("api/v1/auth/refresh")?;
     let resp = http
@@ -500,24 +515,22 @@ async fn refresh_once(http: &reqwest::Client, base: &Url, session: &SharedSessio
         .send()
         .await?;
     if resp.status().is_client_error() {
-        // The refresh token is invalid/expired — drop the session, stop retrying.
-        *session.write().await = None;
-        return Ok(false);
+        session.clear_if_holds(&refresh_token).await;
+        return Ok(RefreshOutcome::Rejected);
     }
     if !resp.status().is_success() {
         return Err(api_error(resp).await); // 5xx → transient
     }
     let tokens: TokenPair = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
-    if let Some(session) = session.write().await.as_mut() {
-        // Compare-and-set: only apply if the session still holds the token we
-        // rotated — otherwise a concurrent (re)login replaced it and our result
-        // is stale (would mix an old token with a new user).
-        if session.refresh_token == refresh_token {
-            session.access_token = tokens.access_token;
-            session.refresh_token = tokens.refresh_token;
-        }
-    }
-    Ok(true)
+    Ok(
+        match session
+            .commit_refresh(&refresh_token, tokens.access_token, tokens.refresh_token)
+            .await
+        {
+            RefreshApplied::Committed => RefreshOutcome::Committed,
+            RefreshApplied::Discarded => RefreshOutcome::Discarded,
+        },
+    )
 }
 
 #[cfg(test)]

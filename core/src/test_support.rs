@@ -2,9 +2,6 @@
 //! upgrade (the client derives both from a single base URL), with each accepted socket
 //! handed to the test to drive imperatively — so tests choose frame order exactly.
 
-// Refresh control is used by the session tests (P1); drop this allow once they land.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -186,6 +183,20 @@ impl WsPeer {
         auth
     }
 
+    /// Wait until the client closes this socket (bounded); panics if it sends a text frame.
+    pub(crate) async fn expect_closed(&mut self) {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), self.socket.recv())
+                .await
+                .expect("client kept the socket open")
+            {
+                None | Some(Err(_)) | Some(Ok(AxMessage::Close(_))) => return,
+                Some(Ok(AxMessage::Text(t))) => panic!("expected close, got frame {t}"),
+                Some(Ok(_)) => continue,
+            }
+        }
+    }
+
     pub(crate) async fn close(mut self, code: u16, reason: &str) {
         let _ = self
             .socket
@@ -200,7 +211,7 @@ impl WsPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ServerEvent;
+    use crate::{AuthState, ServerEvent};
 
     /// P0 smoke: through the public client — login, realtime start, auth frame carries
     /// the issued token, `ready` becomes `ServerEvent::Ready`, server close is survived.
@@ -225,5 +236,39 @@ mod tests {
         // The client reconnects after a backoff: a second socket arrives and authenticates again.
         let mut again = server.accept().await;
         again.accept_auth().await;
+    }
+
+    /// Signing in as someone else must not leave the socket authenticated as the previous
+    /// user: it closes, and the next socket authenticates with the new user's token.
+    #[tokio::test]
+    async fn login_as_another_user_replaces_the_socket_identity() {
+        let mut server = TestServer::start().await;
+        let client = server.client();
+        client.login("alice", "pw").await.unwrap();
+        client.start_realtime().await.unwrap();
+        let mut alice = server.accept().await;
+        assert_eq!(
+            alice.accept_auth().await["data"]["access_token"],
+            "access-1"
+        );
+
+        client.login("bob", "pw").await.unwrap();
+        alice.expect_closed().await;
+        let mut bob = server.accept().await;
+        assert_eq!(bob.accept_auth().await["data"]["access_token"], "access-2");
+    }
+
+    /// A refresh the server rejects clears the session and tells the UI (LoggedOut).
+    #[tokio::test]
+    async fn rejected_refresh_publishes_logged_out() {
+        let server = TestServer::start().await;
+        let client = server.client();
+        client.login("alice", "pw").await.unwrap();
+        server.set_refresh_mode(RefreshMode::Fail(401));
+        let outcome = client.refresh_now().await.unwrap();
+        assert_eq!(outcome, crate::client::RefreshOutcome::Rejected);
+        assert_eq!(*client.state().borrow(), AuthState::LoggedOut);
+        assert!(client.current_user_id().await.is_none());
+        assert_eq!(server.refresh_calls(), 1);
     }
 }
