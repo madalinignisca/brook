@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-brook-core = { path = "../../core" }
+brook-core = { path = "../../core", version = "0.0.0" }
 gtk = { package = "gtk4", version = "0.9", features = ["v4_10"] }
 adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }

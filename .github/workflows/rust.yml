@@ -18,10 +18,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install GTK4 / libadwaita dev libraries
+      - name: Install GTK4 / libadwaita / GStreamer libraries
+        # GStreamer: dev libs to build clients/gst-media, plus the runtime
+        # plugins its loopback call test exercises (webrtcbin + libnice, x264,
+        # vp8, opus, H.264 decode).
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable

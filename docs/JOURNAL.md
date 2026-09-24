@@ -14,6 +14,25 @@ Conventions:
 
 ---
 
+## 2026-09-24
+
+### P4 calls: Linux media engine (`clients/gst-media`), reviewed by Vibe
+
+Coordinated P4 with the server (brook) and Apple (brook-ios) agents: wire
+contract = PROTOCOL.md §3 (PR #10), signaling lives in `core` (brook-ios, C1b),
+media is per client. New toolkit-free crate `brook-media-gst` on GStreamer
+`webrtcbin`: publish PC (sendonly, client offers, H.264 advertised
+`profile-level-id=42e01f` pmode=1 + Opus; VP8 fallback) and subscribe PC
+(recvonly, SFU offers, renegotiable), trickle ICE both ways, mute/camera
+toggles with keyframe on resume, app-injected sinks. In-process loopback test
+(publish PC -> subscribe PC) passes for H.264+Opus and VP8+Opus.
+
+Friends review: only Vibe CLI 2.14 ran (Codex login expired, Gemini had no
+`GEMINI_API_KEY`). Applied: quote the V4L2 device path in the launch
+description (regression test), propagate missing-element errors in the remote
+decode chain instead of linking a shortened chain, warn when webrtcbin rejects
+a TURN server, document the GStreamer build requirement. Declined: none.
+
 ## 2026-06-20
 
 ### PN typing indicators (slice B) — both clients, reviewed by Codex/Gemini/Vibe
