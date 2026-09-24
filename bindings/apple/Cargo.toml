@@ -27,9 +27,11 @@ cli = ["uniffi/cli"]
 brook-core = { path = "../../core", version = "0.0.0" }
 # Exact pin: generated Swift and the scaffolding must come from the same UniFFI release.
 uniffi = "=0.32.2"
+thiserror = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync"] }
 
 [dev-dependencies]
 futures = "0.3"
+serde_json = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
 wiremock = "0.6"

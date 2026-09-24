@@ -365,6 +365,8 @@ version = "0.0.0"
 dependencies = [
  "brook-core",
  "futures",
+ "serde_json",
+ "thiserror",
  "tokio",
  "uniffi",
  "wiremock",
