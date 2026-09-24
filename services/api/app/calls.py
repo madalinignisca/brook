@@ -774,9 +774,14 @@ async def _ice(conn: Connection, frame: dict[str, Any], re: str | None) -> None:
 async def _media(conn: Connection, frame: dict[str, Any], re: str | None) -> None:
     data = _require(frame, "call_id", "audio", "video")
     p = manager._participant_of(conn, data["call_id"])
+    before = (p.audio, p.video)
     p.audio_intent, p.video_intent = bool(data["audio"]), bool(data["video"])
     p.refresh_media()  # announced = intent AND published (see Participant)
     await conn.send(envelope("call.ok", {}, re=re))
+    if (p.audio, p.video) == before:
+        # Nothing peers can see changed (e.g. a client re-announcing its intent
+        # after a publish landed): no redundant call.participant event.
+        return
     updated = envelope(
         "call.participant",
         {"call_id": p.call.call_id, "event": "updated", "participant": p.view()},
