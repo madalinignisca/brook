@@ -7,7 +7,7 @@
 use core::pin::Pin;
 use std::sync::Arc;
 
-use brook_core::{BrookClient, CoreConfig};
+use brook_core::{AuthState, BrookClient, CoreConfig};
 use cxx_qt::Threading;
 use cxx_qt_lib::QString;
 
@@ -79,8 +79,8 @@ impl qobject::LoginController {
                 let client = Arc::new(BrookClient::new(config)?);
                 let session = client.login(&handle, &password).await?;
                 // Share the authenticated client with the chat controller.
-                app::set_client(client).await;
-                Ok::<_, brook_core::Error>(session)
+                app::set_client(client.clone()).await;
+                Ok::<_, brook_core::Error>((session, client))
             }
             .await;
 
@@ -88,11 +88,12 @@ impl qobject::LoginController {
                 .queue(move |mut this| {
                     this.as_mut().set_busy(false);
                     match outcome {
-                        Ok(session) => {
+                        Ok((session, client)) => {
                             this.as_mut().set_display_name(QString::from(
                                 session.user.display_name.as_str(),
                             ));
                             this.as_mut().set_logged_in(true);
+                            watch_sign_out(this.qt_thread(), client);
                         }
                         Err(err) => {
                             this.as_mut()
@@ -103,4 +104,34 @@ impl qobject::LoginController {
                 .ok(); // the window may have closed; dropping the update is fine
         });
     }
+}
+
+/// Return to the login page when the session ends mid-use (core publishes
+/// `LoggedOut` when a refresh is rejected). QML swaps the page on `logged_in`,
+/// which destroys the chat page and its models; the chat listener exits on its
+/// next event once a new page starts a newer one.
+fn watch_sign_out(
+    qt_thread: cxx_qt::CxxQtThread<qobject::LoginController>,
+    client: Arc<BrookClient>,
+) {
+    let mut state = client.state();
+    drop(client);
+    app::runtime().spawn(async move {
+        loop {
+            if matches!(*state.borrow_and_update(), AuthState::LoggedOut) {
+                break;
+            }
+            if state.changed().await.is_err() {
+                return; // client gone (replaced by a newer login)
+            }
+        }
+        app::clear_client().await;
+        qt_thread
+            .queue(|mut this| {
+                this.as_mut().set_logged_in(false);
+                this.as_mut()
+                    .set_error_text(QString::from("You were signed out. Please log in again."));
+            })
+            .ok();
+    });
 }

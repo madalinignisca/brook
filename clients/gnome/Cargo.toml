@@ -13,4 +13,8 @@ adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 pulldown-cmark = { version = "0.12", default-features = false }
 tracing = { workspace = true }
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Calls: the Linux media engine + the GStreamer types its events carry.
+brook-media-gst = { path = "../gst-media", version = "0.0.0" }
+gst = { package = "gstreamer", version = "0.23" }
+gst-webrtc = { package = "gstreamer-webrtc", version = "0.23" }

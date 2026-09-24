@@ -14,6 +14,131 @@ Conventions:
 
 ---
 
+## 2026-09-24
+
+### P4 calls: GNOME joins real calls through core, reviewed by Vibe
+
+Chat header gets a call button ("Start a call" / "Join call (N)" from
+`channel.call`; insensitive on archived channels). It opens a call window
+driven by `BrookClient::join_call` + `GstEngine`: engine candidates ->
+`local_candidate`, engine errors -> `engine_failed`, `SubscribeStreams` +
+`CallState` roster -> tile names / tile removal, status banner for
+Joining/Reconnecting/Ended(reason), mic/camera -> `set_media`, hang up / close
+window -> `leave`. Core's awaited `leave()` fix verified: the back-to-back
+live test now passes 3/3 (it failed every time before). **Not run on screen yet** (libadwaita
+missing); the same engine + core path is proven headless by `core_call.rs`.
+
+Friends review: only Vibe ran. Declined all three (engine.close() on window
+close / close-during-join / engine error): core's MediaEngine contract calls
+close() exactly once on every end path (leave, engine_failed, handle drop);
+the UI closes it itself only when join fails, before a handle exists.
+
+### P4 calls: live call through core's signaling (C1b acceptance on Linux)
+
+`clients/gst-media/tests/core_call.rs` (ignored, live): two `BrookClient`s +
+`GstEngine`s via `join_call`/`CallHandle` against local Janus. Passes: joined
+-> Connected, rosters, video both ways, `set_media` reflected in the other
+roster, leave -> Ended(Left) + empty re-offer applied. Found by running it
+twice back-to-back: a ghost participant in the next call. Two causes, reported
+to their owners: server `_leave` replies before removing the participant (a
+failed send skips removal; ghost until the 30 s grace), and core's `leave()`
+is fire-and-forget (spec said reply awaited), so an app exiting right after
+leave races it.
+
+### P4 calls: GstEngine implements core's MediaEngine, reviewed by Vibe
+
+Branch `feat/gtk-calls` = `feat/gtk-media-engine` + the core side's
+`feat/core-call-signaling` (P4 public types). `brook-media-gst` now uses core's
+`PcKind`/`IceCandidate`/`IceServer`/`SubStream` (one definition) and implements
+`brook_core::MediaEngine`. Contract obligations met and tested
+(`tests/engine_contract.rs`): usable as `Arc<dyn MediaEngine>`; `close()`
+fences the engine (later or in-flight operations fail and build nothing; the
+fence tests fail with the fence disabled); `set_ice_servers` applies to PCs
+built afterwards; new `EngineEvent::SubscribeStreams` hands the UI each applied
+offer's mid -> participant map. Live Janus interop still passes. Vibe: nothing
+material.
+
+### P4 calls: webrtcbin <-> Janus interop proven (local stack)
+
+Ran the server side's `feat/calls` (api + Janus 1.4.2 VideoRoom) in local docker
+(`docker compose -p brookcalls --profile media`, separate project so the dev
+stack's volumes are untouched) and a new ignored test,
+`clients/gst-media/tests/janus_interop.rs`, with a minimal in-test signaling
+client (not the product's: that is core's C1b). Result, two GStreamer engines
+(alice, bob; synthetic H.264 + Opus): both decode each other's video through
+Janus; bob leaving -> alice gets re-offer v2 with no streams, answer `call.ok`;
+bob rejoining -> re-offer v3 on alice's SAME subscribe PC (Janus reuses mids
+0/1), webrtcbin emits new remote pads and decoding resumes. Follow-up fix:
+decode chains of superseded pads are now retired (per-mid chains, torn down
+via `call_async` off the streaming thread); the interop test asserts one
+decoder per active mid and fails without the fix. Vibe: nothing material.
+
+### KDE: return to login on mid-session sign-out, reviewed by Vibe
+
+Same requirement as GNOME (from the core side, before core's session-epoch fix merges):
+a watcher on the core `AuthState` flips `logged_in` back on `LoggedOut`, so
+Kirigami swaps the chat page for the login page; the shared client is cleared.
+The chat realtime listener now uses a generation counter instead of a
+one-shot `STARTED` flag (which blocked any restart after re-login), and it
+exits on sign-out. Builds and clippy-clean; not exercised at runtime yet.
+
+Friends review: only Vibe CLI 2.14 ran. Applied: the listener no longer idles
+forever (holding the client) after a sign-out with no re-login. Declined:
+"tasks outlive the Qt controllers" (both controllers live at the root of
+Main.qml for the window's lifetime; `qt.queue` fails harmlessly after).
+
+### GNOME login: remembered Server field + mid-session sign-out, reviewed by Vibe
+
+Parity with macOS (user asked for a server field kept across restarts): login
+form gets a Server row; the server of the last *successful* login is saved to
+`$XDG_CONFIG_HOME/brook/gnome.ini` (GKeyFile, not GSettings: an uninstalled
+`cargo run` has no compiled schema); `BROOK_SERVER` still overrides. A client
+is created per server; its auth watcher stops once replaced. Requested by
+the core side before core's session-epoch fix (C1b P1) merges: a mid-session
+`LoggedOut` now tears the chat view down and returns to login; the chat
+realtime loop stops once its view is gone (else a rebuilt view on the same
+client double-handles events, e.g. duplicate notifications). **Not run on
+screen yet** (libadwaita missing on the bench).
+
+Friends review: only Vibe CLI 2.14 ran. Applied: rebuild chat after a
+server switch (via the sign-out teardown), stop superseded auth watchers.
+Declined: "curly quotes may render incorrectly" (UTF-8 in GTK is fine; the
+codebase already uses them).
+
+### P4 calls: GNOME call view + dev loopback, reviewed by Vibe
+
+`clients/gnome/src/call.rs`: video tile grid (`gtk4paintablesink` ->
+`gtk::Picture`), self-view overlay, mic/camera/hang-up controls, status banner;
+`BROOK_CALL_LOOPBACK=1` runs a call with yourself through two engines (no
+server). Logging now caps `tungstenite`/`tokio_tungstenite` at `info` even under
+`RUST_LOG=trace` (they dump whole frames incl. tokens; verified in a scratch
+program). **Not yet run on screen**: libadwaita is currently uninstalled on the
+bench, so this is type-checked + clippy-clean only.
+
+Friends review: only Vibe CLI 2.14 ran (Codex login expired, Gemini no API key).
+Applied: preflight `gtk4paintablesink`/`autoaudiosink` instead of panicking on a
+GStreamer thread; log failed loopback ICE adds. Declined: "publisher leaks when
+the second engine fails" (engines build pipelines lazily, dropping the `Arc`
+frees everything); "`RUST_LOG=error` gets raised to info for tungstenite"
+(harmless: info carries no frames; the directive exists to cap trace).
+
+### P4 calls: Linux media engine (`clients/gst-media`), reviewed by Vibe
+
+Coordinated P4 with the server and core/Apple sides: wire
+contract = PROTOCOL.md §3 (PR #10), signaling lives in `core` (C1b),
+media is per client. New toolkit-free crate `brook-media-gst` on GStreamer
+`webrtcbin`: publish PC (sendonly, client offers, H.264 advertised
+`profile-level-id=42e01f` pmode=1 + Opus; VP8 fallback) and subscribe PC
+(recvonly, SFU offers, renegotiable), trickle ICE both ways, mute/camera
+toggles with keyframe on resume, app-injected sinks. In-process loopback test
+(publish PC -> subscribe PC) passes for H.264+Opus and VP8+Opus.
+
+Friends review: only Vibe CLI 2.14 ran (Codex login expired, Gemini had no
+`GEMINI_API_KEY`). Applied: quote the V4L2 device path in the launch
+description (regression test), propagate missing-element errors in the remote
+decode chain instead of linking a shortened chain, warn when webrtcbin rejects
+a TURN server, document the GStreamer build requirement. Declined: none.
+
 ## 2026-06-20
 
 ### PN typing indicators (slice B) — both clients, reviewed by Codex/Gemini/Vibe

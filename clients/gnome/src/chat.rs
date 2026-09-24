@@ -59,6 +59,12 @@ struct Chat {
     title: adw::WindowTitle,
     composer: gtk::Entry,
     send_button: gtk::Button,
+    /// Start/join the open channel's call; its label follows `channel.call`.
+    call_button: gtk::Button,
+    /// channel id -> participants in its ongoing call (from `channel.call`).
+    active_calls: Rc<RefCell<HashMap<String, u32>>>,
+    /// The open call window, if any (one call at a time).
+    call_window: Rc<RefCell<Option<glib::WeakRef<adw::Window>>>>,
 }
 
 /// The widgets of a rendered message we may mutate after an edit/delete/reaction.
@@ -146,6 +152,12 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
         .css_classes(["caption", "dim-label"])
         .build();
 
+    let call_button = gtk::Button::builder()
+        .icon_name("call-start-symbolic")
+        .tooltip_text("Start a call")
+        .sensitive(false)
+        .build();
+
     let chat = Rc::new(Chat {
         client,
         runtime,
@@ -168,6 +180,9 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
         title: title.clone(),
         composer: composer.clone(),
         send_button: send_button.clone(),
+        call_button: call_button.clone(),
+        active_calls: Rc::default(),
+        call_window: Rc::default(),
     });
 
     // --- sidebar ---
@@ -211,6 +226,11 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
     content_header.pack_end(&add_member_button);
     channel_settings.set_popover(Some(&channel_settings_popover(&chat)));
     content_header.pack_end(&channel_settings);
+    content_header.pack_start(&call_button);
+    call_button.connect_clicked({
+        let chat = chat.clone();
+        move |button| open_call(&chat, button)
+    });
 
     let composer_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -324,7 +344,14 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
     let mut events = chat.client.events();
     glib::spawn_future_local(async move {
         loop {
-            match events.recv().await {
+            let event = events.recv().await;
+            // The view was torn down (signed out mid-session): stop, or a
+            // rebuilt view on the same client would double-handle every event
+            // (duplicate notifications).
+            if chat.message_list.root().is_none() {
+                break;
+            }
+            match event {
                 Ok(ServerEvent::MessageNew(message)) => {
                     let is_current = chat
                         .current
@@ -414,6 +441,7 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         chat.composer.set_sensitive(false);
                         chat.send_button.set_sensitive(false);
                         chat.channel_settings.set_visible(false);
+                        chat.call_button.set_sensitive(false);
                     }
                     refresh_channels(&chat, None);
                 }
@@ -432,6 +460,25 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     // Added to / removed from a channel, or metadata changed:
                     // reload the sidebar so it reflects the change live.
                     refresh_channels(&chat, None);
+                }
+                Ok(ServerEvent::ChannelCall {
+                    channel_id,
+                    call_id,
+                    participant_count,
+                    ..
+                }) => {
+                    {
+                        let mut calls = chat.active_calls.borrow_mut();
+                        match call_id {
+                            Some(_) if participant_count > 0 => {
+                                calls.insert(channel_id, participant_count);
+                            }
+                            _ => {
+                                calls.remove(&channel_id);
+                            }
+                        }
+                    }
+                    refresh_call_button(&chat);
                 }
                 Ok(ServerEvent::Ready) => {}
                 Ok(_) => {} // future event kinds — ignored
@@ -510,6 +557,51 @@ fn apply_channel_chrome(chat: &Rc<Chat>, channel_id: &str) {
         .set_visible(!is_dm && *chat.is_admin.borrow());
     chat.composer.set_sensitive(!archived);
     chat.send_button.set_sensitive(!archived);
+    // Archived channels refuse call.join.
+    chat.call_button.set_sensitive(!archived);
+    refresh_call_button(chat);
+}
+
+/// "Start a call" vs "Join call (N)" for the open channel.
+fn refresh_call_button(chat: &Rc<Chat>) {
+    let current = chat.current.borrow().clone();
+    let count = current
+        .as_ref()
+        .and_then(|c| chat.active_calls.borrow().get(c).copied());
+    match count {
+        Some(n) => {
+            chat.call_button.set_tooltip_text(Some(&format!(
+                "Join call ({n} {})",
+                if n == 1 { "person" } else { "people" }
+            )));
+            chat.call_button.add_css_class("success");
+        }
+        None => {
+            chat.call_button.set_tooltip_text(Some("Start a call"));
+            chat.call_button.remove_css_class("success");
+        }
+    }
+}
+
+/// Start or join the open channel's call in its own window (one at a time).
+fn open_call(chat: &Rc<Chat>, button: &gtk::Button) {
+    if let Some(window) = chat.call_window.borrow().as_ref().and_then(|w| w.upgrade()) {
+        window.present();
+        return;
+    }
+    let Some(channel_id) = chat.current.borrow().clone() else {
+        return;
+    };
+    let title = chat.title.title().to_string();
+    let parent = button.root().and_downcast::<gtk::Window>();
+    let window = crate::call::open_call(
+        parent.as_ref(),
+        chat.client.clone(),
+        chat.runtime.clone(),
+        channel_id,
+        &title,
+    );
+    *chat.call_window.borrow_mut() = Some(window.downgrade());
 }
 
 fn select_channel(chat: &Rc<Chat>, channel_id: &str) {

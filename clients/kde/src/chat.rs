@@ -5,18 +5,19 @@
 //! runs on the shared Tokio runtime; signals are emitted back on the Qt thread.
 
 use core::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use brook_core::ServerEvent;
+use brook_core::{AuthState, ServerEvent};
 use cxx_qt::Threading;
 use cxx_qt_lib::QString;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::app;
 
-/// Guards the single realtime listener so `start()` can't spawn overlapping loops
-/// if the chat page is recreated.
-static STARTED: AtomicBool = AtomicBool::new(false);
+/// Generation of the realtime listener. Each `start()` (a new chat page, e.g.
+/// after signing in again) bumps it; an older loop sees the change at its next
+/// event and exits, so exactly one loop handles each event.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -142,9 +143,7 @@ type Controller = qobject::ChatController;
 
 impl qobject::ChatController {
     fn start(self: Pin<&mut Self>) {
-        if STARTED.swap(true, Ordering::SeqCst) {
-            return; // already listening; don't spawn a second loop
-        }
+        let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         let qt = self.qt_thread();
         app::runtime().spawn(async move {
             let Some(client) = app::client().await else {
@@ -168,8 +167,23 @@ impl qobject::ChatController {
             }
             emit_channels(&client, &qt).await;
 
+            let mut auth = client.state();
             loop {
-                match events.recv().await {
+                // Also wake on sign-out, so this loop (and its client) doesn't
+                // linger when nobody logs in again.
+                let event = tokio::select! {
+                    event = events.recv() => event,
+                    changed = auth.changed() => {
+                        if changed.is_err() || matches!(*auth.borrow(), AuthState::LoggedOut) {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                if GENERATION.load(Ordering::SeqCst) != generation {
+                    break; // superseded by a newer chat page's listener
+                }
+                match event {
                     Ok(ServerEvent::MessageNew(message)) => {
                         let json = serde_json::to_string(&message).unwrap_or_default();
                         let _ = qt.queue(move |mut this: Pin<&mut Controller>| {

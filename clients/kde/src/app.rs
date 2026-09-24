@@ -29,3 +29,8 @@ pub async fn set_client(client: Arc<BrookClient>) {
 pub async fn client() -> Option<Arc<BrookClient>> {
     client_cell().read().await.clone()
 }
+
+/// Forget the client after the session ended (signed out mid-use).
+pub async fn clear_client() {
+    *client_cell().write().await = None;
+}

@@ -1,0 +1,27 @@
+[package]
+name = "brook-media-gst"
+version = "0.0.0"
+description = "Brook call media engine on GStreamer webrtcbin (Linux clients: GNOME, KDE, Pi)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The MediaEngine trait + call types (PcKind, IceCandidate, IceServer, SubStream).
+brook-core = { path = "../../core", version = "0.0.0" }
+async-trait = "0.1"
+gst = { package = "gstreamer", version = "0.23" }
+gst-webrtc = { package = "gstreamer-webrtc", version = "0.23" }
+gst-sdp = { package = "gstreamer-sdp", version = "0.23" }
+gst-video = { package = "gstreamer-video", version = "0.23" }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+# tests/janus_interop.rs: a minimal signaling client against a live server.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = { workspace = true }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
