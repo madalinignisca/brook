@@ -105,7 +105,7 @@ Messages are tagged envelopes:
   [SECURITY.md](SECURITY.md) §7 fires). **Authorization = channel membership**,
   checked by `api` on every call command; a member removed from the channel is
   removed from its call (`call.ended {reason: "removed"}`). One user may join the
-  same call from several devices; each device is its own participant.
+  same call from several devices; each device is its own participant, and one socket holds at most one participant per call. An archived channel is read-only: `call.join` gets `bad_state`.
 - **Two PeerConnections per participant**, both terminated by the SFU:
   - **publish** — `sendonly`: the participant's mic, camera, and later screen.
     The **client offers**, the server answers. The client may **renegotiate** the
@@ -140,7 +140,7 @@ Every frame in both directions is the §2 envelope `{type, id, ts, data}`.
 | `not_member` | caller is not a member of the channel |
 | `not_in_call` | command refers to a call the caller hasn't joined |
 | `call_full` | participant limit reached (§3.6) |
-| `bad_state` | command out of order (e.g. `call.publish` before `call.joined`) |
+| `bad_state` | command out of order (e.g. `call.publish` before `call.joined`), this socket is already in that call, or the channel is archived |
 | `stale` | `call.subscribe.answer` for a `version` that is no longer the latest; discard it and answer the newer offer |
 | `sfu_unavailable` | Janus unreachable or refused; retry later |
 
@@ -179,7 +179,7 @@ its candidates in the SDP, so server → client trickle is rare but allowed.)
 | `call.ice` | `{call_id, pc, candidate}` | SFU's trickled candidates |
 | `call.participant` | `{call_id, event: "joined"\|"updated"\|"left", participant: Participant}` | roster change (excluding self) |
 | `call.ok` | `{}` | generic success reply |
-| `call.ended` | `{call_id, reason: "sfu_restart"\|"removed"}` | your participation ended without `call.leave`: the SFU restarted, or you were removed from the channel. Later commands for that call get `not_in_call` |
+| `call.ended` | `{call_id, reason: "sfu_restart"\|"removed"\|"replaced"}` | your participation ended without `call.leave`: the SFU restarted, you were removed from the channel, or another socket of yours took this participant over with `call.resume`. Later commands for that call get `not_in_call` |
 | `channel.call` | `{channel_id, call_id\|null, participant_count}` | sent to **all** channel members (in the call or not) so UIs can show "call in progress · join" |
 
 ```text
