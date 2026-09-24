@@ -45,6 +45,10 @@ curl http://<BROOK_HTTP_BIND>:8080/health      # {"status":"ok","version":"..."}
 > every interface **including IPv6**. On a host with a public IPv6 address, that puts
 > the server on the internet even when the LAN is behind NAT. Bind one LAN address.
 
+> The MinIO admin console (`make storage`, Phase 2) follows the same rule with
+> `BROOK_MINIO_CONSOLE_BIND` (default `127.0.0.1`). It is an admin-credentialed UI,
+> so keep it on loopback and use an SSH tunnel rather than binding it to the LAN.
+
 > **Upgrading from an older release:** a `.env` created before `BROOK_HTTP_BIND`
 > existed doesn't have it, so the server falls back to loopback and **LAN clients can
 > no longer connect**. Add `BROOK_HTTP_BIND=<LAN IP>` to `.env` and `make up`.
