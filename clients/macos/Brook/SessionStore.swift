@@ -34,7 +34,7 @@ final class SessionStore {
     let settings: Settings
     private let makeClient: ClientFactory
     /// Kept while signed in: later phases talk to the server through it.
-    private var client: FfiBrookClient?
+    private(set) var client: FfiBrookClient?
 
     init(settings: Settings = Settings(), makeClient: @escaping ClientFactory = SessionStore.liveClient) {
         self.settings = settings

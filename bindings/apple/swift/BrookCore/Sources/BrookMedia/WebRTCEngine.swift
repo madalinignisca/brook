@@ -87,6 +87,12 @@ public final class WebRTCEngine: FfiMediaEngine, @unchecked Sendable {
         core.enqueue { $0.remoteTracksCallback = callback }
     }
 
+    /// The camera track for the self-view (nil without a camera, or before the first offer).
+    /// The engine keeps this wrapper alive, so renderers added to it stay attached.
+    public func localVideoTrack() async -> RTCVideoTrack? {
+        await core.localVideoTrack
+    }
+
     /// Completes once `close()` has stopped capture and closed both connections.
     public func closed() async {
         await core.waitClosed()
@@ -176,6 +182,7 @@ actor EngineCore {
     private var delegates: [FfiPcKind: PeerDelegate] = [:]
     private var audioTrack: RTCAudioTrack?
     private var videoSource: RTCVideoSource?
+    private(set) var localVideoTrack: RTCVideoTrack?
     /// The user's intent; applied to tracks and capture as they come to exist.
     private var media = (audio: true, video: true)
     private var captureRunning = false
@@ -247,8 +254,10 @@ actor EngineCore {
         }
         if capture != nil {
             let source = factory.videoSource()
-            try addSendOnly(pc, factory.videoTrack(with: source, trackId: "camera"))
+            let track = factory.videoTrack(with: source, trackId: "camera")
+            try addSendOnly(pc, track)
             videoSource = source
+            localVideoTrack = track
         }
         publish = pc
         return pc
@@ -454,6 +463,7 @@ actor EngineCore {
         delegates = [:]
         audioTrack = nil
         videoSource = nil
+        localVideoTrack = nil
         remoteTracks = [:]
         pending = []
         isClosed = true

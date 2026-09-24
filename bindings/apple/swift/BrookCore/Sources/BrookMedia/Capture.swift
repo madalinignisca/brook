@@ -90,6 +90,12 @@ public struct JoinPlan: Equatable, Sendable {
     /// Shown to the user when the call is degraded; nil when everything was granted.
     public let explanation: String?
 
+    public init(microphone: Bool, camera: Bool, explanation: String?) {
+        self.microphone = microphone
+        self.camera = camera
+        self.explanation = explanation
+    }
+
     public static let micDenied =
         "Brook can't use your microphone, so you joined listen-only. Allow it in System Settings › Privacy & Security › Microphone, then rejoin to speak."
     public static let cameraDenied =

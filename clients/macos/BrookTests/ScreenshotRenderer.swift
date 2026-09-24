@@ -1,5 +1,6 @@
 import AppKit
 import BrookCore
+import BrookMedia
 @testable import Brook
 import SwiftUI
 import XCTest
@@ -9,11 +10,13 @@ import XCTest
 /// sandboxed app, so files land in its container's temporary directory (printed below).
 @MainActor
 final class ScreenshotRenderer: XCTestCase {
-    private func render(_ view: some View, _ name: String, dark: Bool, to dir: URL) throws {
+    private func render(
+        _ view: some View, _ name: String, dark: Bool, to dir: URL, size: CGSize = CGSize(width: 420, height: 560)
+    ) throws {
         // Off-screen there is no window to paint the background; supply the system one.
-        let framed = view.frame(width: 420, height: 560).background(Color(nsColor: .windowBackgroundColor))
+        let framed = view.frame(width: size.width, height: size.height).background(Color(nsColor: .windowBackgroundColor))
         let host = NSHostingView(rootView: framed)
-        host.frame = NSRect(x: 0, y: 0, width: 420, height: 560)
+        host.frame = NSRect(origin: .zero, size: size)
         host.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         host.layoutSubtreeIfNeeded()
         let rep = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
@@ -55,7 +58,24 @@ final class ScreenshotRenderer: XCTestCase {
             await wrong.submit()
             try render(LoginView(form: wrong), "3-login-wrong-password-insecure", dark: dark, to: dir)
 
-            try render(SignedInView(user: alice), "4-signed-in", dark: dark, to: dir)
+            let realtime = FakeRealtime(channels: [channel("c1", "general"), channel("c2", "calltest")])
+            try render(
+                SignedInView(user: alice, client: realtime, calls: CallCenter()), "4-signed-in", dark: dark,
+                to: dir, size: CGSize(width: 720, height: 560))
+
+            let wide = CGSize(width: 800, height: 560)
+            let peer = FfiParticipant(participantId: "p2", userId: "u2", displayName: "Linux", audio: false, video: true)
+            func call(_ plan: JoinPlan, _ status: FfiCallStatus, _ people: [FfiParticipant]) -> CallModel {
+                let model = CallModel(channelName: "calltest", plan: plan, handle: FakeHandle(), media: FakeMedia())
+                model.apply(FfiCallState(status: status, callId: "k1", selfParticipant: "p1", participants: people))
+                return model
+            }
+            let full = JoinPlan(microphone: true, camera: true, explanation: nil)
+            let audioOnly = JoinPlan(microphone: true, camera: false, explanation: JoinPlan.cameraDenied)
+            try render(CallView(call: call(full, .connected, [peer])) {}, "5-call-connected", dark: dark, to: dir, size: wide)
+            try render(CallView(call: call(audioOnly, .connected, [peer])) {}, "6-call-audio-only", dark: dark, to: dir, size: wide)
+            try render(CallView(call: call(full, .reconnecting, [peer])) {}, "7-call-reconnecting", dark: dark, to: dir, size: wide)
+            try render(CallView(call: call(full, .ended(reason: .left), [])) {}, "8-call-ended", dark: dark, to: dir, size: wide)
         }
     }
 }

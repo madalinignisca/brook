@@ -1,0 +1,153 @@
+import AppKit
+import BrookCore
+import BrookMedia
+import SwiftUI
+@preconcurrency import WebRTC
+
+/// A remote or local video track in a Metal view. Renderers are attached to the track object the
+/// engine keeps alive (its wrapper's dealloc would detach them).
+struct VideoTile: NSViewRepresentable {
+    let track: RTCVideoTrack?
+
+    final class Coordinator {
+        var attached: RTCVideoTrack?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> RTCMTLNSVideoView {
+        RTCMTLNSVideoView(frame: .zero)
+    }
+
+    func updateNSView(_ view: RTCMTLNSVideoView, context: Context) {
+        guard context.coordinator.attached !== track else { return }
+        context.coordinator.attached?.remove(view)
+        track?.add(view)
+        context.coordinator.attached = track
+    }
+
+    static func dismantleNSView(_ view: RTCMTLNSVideoView, coordinator: Coordinator) {
+        coordinator.attached?.remove(view)
+        coordinator.attached = nil
+    }
+}
+
+struct TileView: View {
+    let tile: CallModel.Tile
+
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            Rectangle().fill(.black)
+            if tile.video, tile.track != nil {
+                VideoTile(track: tile.track)
+            } else {
+                Image(systemName: "person.crop.circle.fill")
+                    .font(.system(size: 48))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            HStack(spacing: 4) {
+                if !tile.audio { Image(systemName: "mic.slash.fill") }
+                Text(tile.name)
+            }
+            .font(.callout)
+            .padding(6)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6))
+            .padding(8)
+        }
+        .aspectRatio(16 / 9, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(tile.name)
+    }
+}
+
+struct CallView: View {
+    let call: CallModel
+    let leave: () async -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            if let banner = call.banner {
+                Text(banner)
+                    .padding(8)
+                    .frame(maxWidth: .infinity)
+                    .background(.yellow.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+            }
+            if let explanation = call.plan.explanation {
+                Text(explanation).font(.callout).foregroundStyle(.secondary)
+            }
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 10)], spacing: 10) {
+                    ForEach(call.tiles) { TileView(tile: $0) }
+                }
+            }
+            HStack(spacing: 16) {
+                Button {
+                    Task { await call.toggleMic() }
+                } label: {
+                    Label(call.micOn ? "Mute" : "Unmute",
+                          systemImage: call.micOn ? "mic.fill" : "mic.slash.fill")
+                }
+                .disabled(!call.plan.microphone || call.isEnded)
+                .help(JoinPlan.muteTooltip)
+                .keyboardShortcut("m", modifiers: [.command, .shift])
+
+                Button {
+                    Task { await call.toggleCamera() }
+                } label: {
+                    Label(call.cameraOn ? "Stop camera" : "Start camera",
+                          systemImage: call.cameraOn ? "video.fill" : "video.slash.fill")
+                }
+                .disabled(!call.plan.camera || call.isEnded)
+                .keyboardShortcut("v", modifiers: [.command, .shift])
+
+                Button(role: .destructive) {
+                    Task { await leave() }
+                } label: {
+                    Label(call.isEnded ? "Close" : "Leave", systemImage: "phone.down.fill")
+                }
+                .disabled(call.leaving)
+                .keyboardShortcut("w", modifiers: .command)
+            }
+            .labelStyle(.titleAndIcon)
+        }
+        .padding()
+        .navigationTitle(call.channelName)
+    }
+}
+
+/// The call window. Its close button is disabled: leaving (⌘W or Leave) is the only way out,
+/// so closing always awaits `leave()` and the engine's `closed` before the window goes.
+struct CallWindow: View {
+    let center: CallCenter
+    @Environment(\.dismissWindow) private var dismissWindow
+
+    var body: some View {
+        Group {
+            if let call = center.call {
+                CallView(call: call) {
+                    await center.leave()
+                    dismissWindow(id: "call")
+                }
+            } else if center.joining {
+                ProgressView("Joining…")
+            } else {
+                ContentUnavailableView("No call", systemImage: "phone")
+            }
+        }
+        .frame(minWidth: 560, minHeight: 420)
+        .background(WindowCloseDisabler())
+    }
+}
+
+struct WindowCloseDisabler: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            view.window?.standardWindowButton(.closeButton)?.isEnabled = false
+        }
+        return view
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
