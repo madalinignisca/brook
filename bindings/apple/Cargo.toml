@@ -1,0 +1,35 @@
+[package]
+name = "brook-ffi"
+version = "0.0.0"
+description = "UniFFI bindings of brook-core for the macOS and iOS clients."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# staticlib: linked into the xcframework (iOS cannot ship a loose dylib).
+# cdylib: what library-mode bindgen reads the UniFFI metadata from.
+# lib: so the crate's own Rust tests can use it.
+crate-type = ["staticlib", "cdylib", "lib"]
+name = "brook_ffi"
+
+[[bin]]
+name = "uniffi-bindgen-swift"
+path = "src/bin/uniffi-bindgen-swift.rs"
+# Keeps clap & friends out of the default (Linux CI) build.
+required-features = ["cli"]
+
+[features]
+cli = ["uniffi/cli"]
+
+[dependencies]
+# `version` alongside `path`: cargo-deny treats a version-less path dep as a wildcard.
+brook-core = { path = "../../core", version = "0.0.0" }
+# Exact pin: generated Swift and the scaffolding must come from the same UniFFI release.
+uniffi = "=0.32.2"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync"] }
+
+[dev-dependencies]
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
+wiremock = "0.6"
