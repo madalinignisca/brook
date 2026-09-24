@@ -96,6 +96,21 @@ pub enum LoginError {
     /// The call needs a signed-in session and there is none.
     #[error("not signed in")]
     NotAuthenticated,
+    /// The realtime connection is down (or dropped before the server answered).
+    #[error("not connected to the server")]
+    Disconnected,
+    /// The server did not answer a realtime command in time.
+    #[error("the server did not answer in time")]
+    Timeout,
+    /// The call has ended; its handle can no longer be used.
+    #[error("the call has ended")]
+    CallEnded,
+    /// Too many realtime commands are waiting to be sent.
+    #[error("too many pending commands")]
+    Busy,
+    /// A realtime message exceeded the server's size limit.
+    #[error("message too large")]
+    TooLarge,
 }
 
 impl From<Error> for LoginError {
@@ -114,6 +129,11 @@ impl From<Error> for LoginError {
             Error::Api { code, message } => Self::Api { code, message },
             Error::UnexpectedResponse => Self::UnexpectedResponse,
             Error::NotAuthenticated => Self::NotAuthenticated,
+            Error::Disconnected => Self::Disconnected,
+            Error::Timeout => Self::Timeout,
+            Error::CallEnded => Self::CallEnded,
+            Error::Busy => Self::Busy,
+            Error::TooLarge => Self::TooLarge,
             // The realtime socket is transport, like HTTP: surface it as a network error.
             Error::WebSocket(err) => Self::Network {
                 message: err.to_string(),
