@@ -197,7 +197,7 @@ impl WsPeer {
         }
     }
 
-    pub(crate) async fn close(mut self, code: u16, reason: &str) {
+    pub(crate) async fn close(&mut self, code: u16, reason: &str) {
         let _ = self
             .socket
             .send(AxMessage::Close(Some(CloseFrame {
@@ -365,7 +365,7 @@ mod tests {
     #[tokio::test]
     async fn stale_generation_is_not_sent_and_nothing_leaks_to_the_next_socket() {
         let mut server = TestServer::start().await;
-        let (client, peer, generation) = connected(&mut server, |_| {}).await;
+        let (client, mut peer, generation) = connected(&mut server, |_| {}).await;
         peer.close(1000, "drop").await;
         let mut conn = client.commands.conn();
         conn.wait_for(|c| !c.ready).await.unwrap();
@@ -462,7 +462,7 @@ mod tests {
         let mut server = TestServer::start().await;
         let hold = Arc::new(tokio::sync::Semaphore::new(0));
         let h = hold.clone();
-        let (client, peer, generation) =
+        let (client, mut peer, generation) =
             connected(&mut server, move |t| t.hold_writes = Some(h)).await;
         let c = client.clone();
         let req = tokio::spawn(async move {
@@ -694,7 +694,7 @@ mod tests {
     #[tokio::test]
     async fn auth_close_refreshes_before_reconnecting() {
         let mut server = TestServer::start().await;
-        let (_client, peer, _generation) = connected(&mut server, |_| {}).await;
+        let (_client, mut peer, _generation) = connected(&mut server, |_| {}).await;
         assert_eq!(server.refresh_calls(), 0);
         peer.close(1008, "token_expired").await;
         let mut next = server.accept().await;
@@ -719,7 +719,7 @@ mod tests {
     #[tokio::test]
     async fn auth_close_with_rejected_refresh_signs_out() {
         let mut server = TestServer::start().await;
-        let (client, peer, _generation) = connected(&mut server, |_| {}).await;
+        let (client, mut peer, _generation) = connected(&mut server, |_| {}).await;
         server.set_refresh_mode(RefreshMode::Fail(401));
         peer.close(1008, "token_expired").await;
         let mut state = client.state();

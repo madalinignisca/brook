@@ -41,6 +41,40 @@ pub enum Error {
     /// A WebSocket transport error (boxed — tungstenite's error is large).
     #[error("websocket error: {0}")]
     WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
+
+    /// The realtime socket is not connected (or dropped before the server answered).
+    #[error("not connected to the server")]
+    Disconnected,
+
+    /// The server did not answer a realtime command in time.
+    #[error("the server did not answer in time")]
+    Timeout,
+
+    /// The call has ended; its handle can no longer be used.
+    #[error("the call has ended")]
+    CallEnded,
+
+    /// Too many realtime commands are waiting to be sent.
+    #[error("too many pending commands")]
+    Busy,
+
+    /// A realtime command exceeded the server's frame size limit.
+    #[error("message too large")]
+    TooLarge,
+}
+
+impl From<crate::ws::CommandError> for Error {
+    fn from(err: crate::ws::CommandError) -> Self {
+        use crate::ws::CommandError as C;
+        match err {
+            C::NotSent | C::Unknown => Error::Disconnected,
+            C::Timeout => Error::Timeout,
+            C::Rejected { code, message } => Error::Api { code, message },
+            C::UnexpectedReply => Error::UnexpectedResponse,
+            C::TooLarge => Error::TooLarge,
+            C::Busy => Error::Busy,
+        }
+    }
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for Error {
