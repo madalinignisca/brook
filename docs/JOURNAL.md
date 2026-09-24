@@ -16,6 +16,19 @@ Conventions:
 
 ## 2026-09-24
 
+### P4 calls: webrtcbin <-> Janus interop proven (local stack)
+
+Ran brook's `feat/calls` (api + Janus 1.4.2 VideoRoom) in local docker
+(`docker compose -p brookcalls --profile media`, separate project so the dev
+stack's volumes are untouched) and a new ignored test,
+`clients/gst-media/tests/janus_interop.rs`, with a minimal in-test signaling
+client (not the product's: that is core's C1b). Result, two GStreamer engines
+(alice, bob; synthetic H.264 + Opus): both decode each other's video through
+Janus; bob leaving -> alice gets re-offer v2 with no streams, answer `call.ok`;
+bob rejoining -> re-offer v3 on alice's SAME subscribe PC (Janus reuses mids
+0/1), webrtcbin emits new remote pads and decoding resumes. Open: decode
+chains of superseded pads are not torn down yet (small leak per re-offer).
+
 ### KDE: return to login on mid-session sign-out, reviewed by Vibe
 
 Same requirement as GNOME (brook-ios, before core's session-epoch fix merges):

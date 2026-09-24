@@ -278,12 +278,16 @@ dependencies = [
 name = "brook-media-gst"
 version = "0.0.0"
 dependencies = [
+ "futures-util",
  "gstreamer",
  "gstreamer-sdp",
  "gstreamer-video",
  "gstreamer-webrtc",
+ "reqwest",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
 ]
 
