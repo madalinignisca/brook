@@ -44,7 +44,13 @@ pub struct BrookClient {
 impl BrookClient {
     /// Create a client for the given configuration.
     pub fn new(config: CoreConfig) -> Result<Self> {
-        let http = reqwest::Client::builder().build()?;
+        // Never follow redirects. `CoreConfig` enforces https (or loopback http) on the
+        // configured URL only; a followed 307/308 would re-send the request body — the
+        // password — to wherever `Location` points, plain http included. The API has no
+        // reason to redirect, so a 3xx surfaces as an error instead.
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
         let (state_tx, state_rx) = watch::channel(AuthState::LoggedOut);
         let (events_tx, _) = broadcast::channel(256);
         Ok(Self {
@@ -557,6 +563,40 @@ mod tests {
         assert_eq!(
             *state.borrow_and_update(),
             AuthState::LoggedIn(session.user.clone())
+        );
+    }
+
+    /// A redirect must never be followed: the https/loopback rule in `CoreConfig` only
+    /// checks the configured URL, and reqwest re-sends a 307/308 request *with its body* —
+    /// the password — to wherever `Location` points, including plain http elsewhere.
+    #[tokio::test]
+    async fn login_does_not_follow_redirects_or_resend_credentials() {
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/login"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/steal", elsewhere.uri()).as_str()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server).await;
+        let err = client.login("alice", "supersecret").await.unwrap_err();
+
+        assert!(
+            matches!(&err, Error::Api { code, .. } if code == "http_307"),
+            "expected the 307 to surface as an error, got {err:?}"
+        );
+        assert!(
+            elsewhere.received_requests().await.unwrap().is_empty(),
+            "credentials were re-sent to the redirect target"
         );
     }
 
