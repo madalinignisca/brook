@@ -271,8 +271,12 @@ impl GstEngine {
         self.ensure_open()?;
         // Capture ran long enough to negotiate real codec parameters; now
         // honour any mute / camera-off chosen before the pipeline existed.
-        let (audio, video) = *self.media.lock().unwrap();
-        self.set_local_media(audio, video)?;
+        {
+            // Held while applying, so a concurrent toggle can't be overwritten
+            // by this (then stale) state.
+            let media = self.media.lock().unwrap();
+            self.apply_media(media.0, media.1)?;
+        }
         // The publish PC only sends (PROTOCOL.md §3.1).
         for t in transceivers(&webrtc) {
             t.set_property(
@@ -354,7 +358,14 @@ impl GstEngine {
         if video && self.config.camera == CameraSource::None {
             return Err(Error::State("no camera is published"));
         }
-        *self.media.lock().unwrap() = (audio, video);
+        let mut media = self.media.lock().unwrap();
+        *media = (audio, video);
+        self.apply_media(audio, video)
+    }
+
+    /// Apply a mic/camera state to the publish pipeline, if it exists. Callers
+    /// hold `self.media` (lock order: `media`, then `publish`).
+    fn apply_media(&self, audio: bool, video: bool) -> Result<()> {
         let pipeline = self
             .publish
             .lock()
