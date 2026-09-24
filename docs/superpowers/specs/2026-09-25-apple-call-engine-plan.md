@@ -98,6 +98,16 @@ Each task ends in a check; tests are written first and seen failing under a name
   the recording is checked for that clip. CPU noted.
 - **Check:** all of the above recorded in the PR; the merge is gated on the echo check.
 
+### Deviations found while implementing
+- **E2, audio device header.** The macOS slice of WebRTC M153 compiles `RTCAudioDevice` and
+  `ObjCAudioDeviceModule` (checked in the binary) but ships the header only in its iOS slices. A
+  declarations-only C target, `WebRTCAudioDevice`, re-exports the upstream header unchanged for
+  macOS (BSD licence kept alongside). With it the synthetic audio device of E2 works as planned, and
+  the E6 fallback (a custom device with Apple voice processing) is possible on macOS.
+- **E2, remote track wrappers.** `receiver.track` returns a new ObjC wrapper on each call, and a
+  wrapper's dealloc removes every renderer added through it. The engine keeps one wrapper per owned
+  mid; the loopback test's frame counter failed until it did (0 frames rendered while 241 decoded).
+
 ## Where this fails
 
 | Point | Failure | Response |
