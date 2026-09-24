@@ -10,7 +10,6 @@ Media is covered for real by e2e/call_e2e.py.
 
 from __future__ import annotations
 
-import itertools
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -20,46 +19,9 @@ from fastapi.testclient import TestClient
 
 from app import calls
 
+from .fake_janus import FakeJanus
+
 AUTH = "/api/v1/auth"
-
-
-class FakeJanus:
-    """The JanusClient surface calls.py uses, answering like Janus would."""
-
-    def __init__(self) -> None:
-        self._ids = itertools.count(1000)
-
-    async def create_session(self) -> int:
-        return next(self._ids)
-
-    async def attach(self, sid: int, listener: Any = None) -> int:
-        return next(self._ids)
-
-    async def message(
-        self, sid: int, hid: int, body: dict[str, Any], jsep: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        req = body["request"]
-        if req == "join" and body.get("ptype") == "publisher":
-            data = {"videoroom": "joined", "id": next(self._ids), "private_id": next(self._ids)}
-            return {"plugindata": {"data": data}}
-        if req == "configure":
-            return {
-                "jsep": {"type": "answer", "sdp": "v=0 fake-answer"},
-                "plugindata": {"data": {}},
-            }
-        return {"plugindata": {"data": {}}}
-
-    async def trickle(self, sid: int, hid: int, candidate: Any) -> None:
-        return None
-
-    async def destroy_session(self, sid: int) -> None:
-        return None
-
-    async def detach(self, sid: int, hid: int) -> None:
-        return None
-
-    def detach_listener(self, hid: int) -> None:
-        return None
 
 
 @pytest.fixture
