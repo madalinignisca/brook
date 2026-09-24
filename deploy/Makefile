@@ -68,7 +68,7 @@ media: ## Start, also bringing up Janus (Phase 4)
 	@# has no Janus secret. Add one (random, never printed) rather than fail.
 	@grep -qE '^JANUS_API_SECRET=.+' $(ENV) || { \
 	  jsec=$$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40); \
-	  sed -i '/^JANUS_API_SECRET=/d' $(ENV); \
+	  tmp=$$(mktemp); grep -v '^JANUS_API_SECRET=' $(ENV) > $$tmp && mv $$tmp $(ENV); \
 	  printf '\n# Added by `make media`: shared secret between api and Janus.\nJANUS_API_SECRET=%s\n' "$$jsec" >> $(ENV); \
 	  echo "Added JANUS_API_SECRET to $(ENV)."; }
 	$(COMPOSE) --profile media up -d --build
