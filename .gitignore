@@ -48,3 +48,4 @@ clients/macos/Brook.xcodeproj/
 clients/macos/build/
 clients/macos/Brook/Info.plist
 clients/macos/Brook/Brook.entitlements
+clients/macos/Local.xcconfig
