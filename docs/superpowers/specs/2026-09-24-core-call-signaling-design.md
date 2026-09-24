@@ -1,6 +1,6 @@
 # core: WS commands + call signaling (C1b)
 
-> Status: **revised after review round 1** (Codex + Vibe, Heavy) · 2026-09-24
+> Status: **approved** (Heavy review rounds 1–2 closed; round-2 findings applied, see §8) · 2026-09-24
 > Review dial: **Heavy** (tokens on the socket; shared by every client). Both external models, given evidence.
 > Wire contract: [PROTOCOL.md](../../PROTOCOL.md) §2–§3 as in PR #10 @ 8a26965 (owned by the server side).
 > Consumers: GTK/KDE (`clients/gst-media` adapter, Rust), macOS/iOS (UniFFI, a later step).
@@ -31,13 +31,18 @@ drives a platform `MediaEngine` (GStreamer on Linux, libwebrtc on Apple) without
 
 The review found three defects in the inherited session code; C1b builds on a session with these fixed:
 
-- **Session revision.** The shared session becomes `{ revision: u64, session: Option<Session> }`. Login,
-  logout and every committed refresh bump `revision`. Everything bound to an identity (socket
-  authentication, pending commands, calls) records the revision it started under.
+- **Session epoch vs credential revision.** The shared session becomes
+  `{ epoch: u64, credential_rev: u64, session: Option<Session> }`. `epoch` changes on every login, logout
+  or session clear (identity changes — even logout→login as the same user, which a coalescing watch
+  could otherwise hide: the epoch is compared, not the user id). `credential_rev` changes on every
+  committed refresh within an epoch. Sockets, pending commands and calls are bound to the **epoch**; a
+  credential change only triggers re-auth (§3.2).
 - **Refresh compare-and-set on both paths.** `refresh_once` already compares the refresh token before
   committing a success; its 4xx path must do the same (today a stale failure after a new login erases
-  the new session). It returns `Committed | Discarded | Failed`, and only `Committed` notifies.
-- **Login/logout invalidate the socket.** A revision change to a different user (or to none) closes the
+  the new session). It returns `Committed | Discarded | Failed`. Watchers are notified on every
+  *committed* change: a committed refresh (credential_rev) and a committed clear after a matching 4xx
+  (epoch). A discarded result notifies nothing.
+- **Login/logout invalidate the socket.** An epoch change closes the
   current socket, fails its pending commands with `Disconnected`, and ends active calls
   (`Ended(Server("session_changed"))`); the reconnect loop then authenticates as the new user. A refresh
   of the *same* user keeps the socket and re-auths it (§3.2).
@@ -59,11 +64,15 @@ The review found three defects in the inherited session code; C1b builds on a se
   `Timeout`; a late reply is an unknown `re` and is dropped.
 - **Reply validation.** A reply whose `type` is not the expected success type for that command (or
   `error`) is a protocol violation → `Err(UnexpectedResponse)`; the frame is not otherwise applied.
-- **Call event routing without a gap.** For `call.join` and `call.resume`, the command carries the call
-  task's mailbox. When the transport receives the correlated `call.joined`, it installs
-  `call_id → mailbox` **before reading the next frame**, then completes the reply. So a
-  `call.subscribe.offer` sent back-to-back with `call.joined` is never dropped. Call events for an
-  unknown `call_id` are logged (type only) and dropped.
+- **Call event routing without a gap, in order.** For `call.join` and `call.resume`, the command carries
+  the call task's mailbox. When the transport receives the correlated `call.joined`, it installs
+  `call_id → mailbox` **and delivers the `call.joined` itself into that mailbox**, both before reading
+  the next frame. The call task therefore always processes `call.joined` (and installs joined/resumed
+  state) before any event that followed it. Call events for an unknown `call_id` are logged (type only)
+  and dropped.
+- **Abandoned join.** If the `join_call` future is dropped: a not-yet-written `call.join` is skipped; if it
+  was written, the transport, on receiving its `call.joined` with no live receiver, immediately sends
+  `call.leave{call_id}` so no orphaned participant remains.
 - **Outbound size.** Frames larger than 64 KiB are refused locally (`Error::TooLarge`) rather than
   triggering the server's 1009 close. A 1009 close is not treated as an auth problem.
 
@@ -106,7 +115,9 @@ pub trait MediaEngine: Send + Sync {
     fn set_local_media(&self, audio: bool, video: bool) -> Result<(), EngineError>;
     /// MUST NOT block. Applies to PeerConnections created after the call; default: ignore.
     fn set_ice_servers(&self, _servers: Vec<IceServer>) {}
-    /// Stops capture and tears down both PCs. Called exactly once.
+    /// Stops capture and tears down both PCs. Called exactly once. **Fences** the engine: every operation
+    /// still running must, when it completes, leave capture stopped and the PCs closed (a capture start
+    /// that finishes after close is torn down immediately), and its result is an error.
     async fn close(&self);
 }
 ```
@@ -118,8 +129,11 @@ the GStreamer engine; required of the libwebrtc engine.
 ### 3.4 Call task
 
 One task per `CallHandle` owns all call state. It **never awaits an engine operation inline**: engine
-futures are spawned; their completions come back to the task's mailbox tagged with the operation and
-the call's incarnation. At most one description operation per PC is in flight. So the task always keeps
+futures are spawned; their completions come back to the task's mailbox tagged with the call's
+incarnation and a per-PC **operation sequence number**. A completion whose sequence number is not the
+PC's current one is ignored. At most one description operation per PC is in flight; a new one is only
+started after the previous completed. Completions never write to the socket directly: they update state,
+and writes happen only through the state rules below, on the current generation. So the task always keeps
 servicing: server events, handle commands, local candidates, connection changes, and completions.
 
 **Join.** `join_call` requires a ready socket (else `Err(Disconnected)`), sends `call.join{channel_id}`
@@ -127,10 +141,11 @@ with the task's mailbox (routing per §3.1), and returns the handle once `call.j
 (`call_full`/`not_member`/… → `Err`). On `call.joined`: store `participant_id`, `resume_token`, roster;
 `engine.set_ice_servers(...)` if present; status `Connected`. If `publish`: spawn `create_publish_offer`.
 
-**Publish negotiation state** `Idle | Offering | AwaitingAnswer{sent_generation} | Stable`. Offer done →
-`call.publish{call_id, sdp}` → answer → spawn `apply_publish_answer` → `Stable`. `republish()` from
-`Stable` repeats it. A publish error reply or engine error while negotiating → the call ends
-(`Ended(EngineFailed|Server)`): v1 does not try to recover a half-negotiated publish PC.
+**Publish negotiation state** `Idle | Offering(seq) | AwaitingAnswer(seq) | ApplyingAnswer(seq) | Stable`.
+Offer done → `call.publish{call_id, sdp}` → answer → spawn `apply_publish_answer` (`ApplyingAnswer`) →
+completion → `Stable`. `republish()` only from `Stable` (else `Err(Busy)`). Any failure of the publish
+negotiation — error reply, `Timeout`, `UnexpectedResponse`, engine error — ends the call
+(`Ended(Server(code))` / `Ended(EngineFailed)`): v1 does not recover a half-negotiated publish PC.
 
 **Subscribe versions.** State: `latest_received` (version, sdp, streams), `applying` (version),
 `answer_pending_ack` (version, answer), `acked` (version). Rules:
@@ -141,8 +156,12 @@ with the task's mailbox (routing per §3.1), and returns the handle once `call.j
   becomes current; if a newer offer arrived meanwhile, the answer for *v* is kept only locally and the
   newer offer is applied next (each offer is a complete description of the server's current state, so
   skipping superseded ones loses nothing); otherwise `call.subscribe.answer{call_id, version: v, sdp}`
-  → `answer_pending_ack`; `call.ok` → `acked`. `error: stale` → drop the pending answer (a newer offer
-  is already queued or arriving).
+  → `answer_pending_ack` (exactly one retained answer: the latest sent; older ones are discarded, so
+  memory is bounded). Every reply is matched to the **version it was sent for**: `call.ok` for *v*
+  sets `acked = max(acked, v)` (monotonic) and clears `answer_pending_ack` only if it still holds *v*;
+  `error: stale` for *v* clears only a pending answer that is still *v*. A subscribe-answer `Timeout` /
+  `Unknown` keeps the answer retained (the server replays the offer after resume or re-offers); any
+  other error code, or an engine error applying an offer, ends the call.
 
 **ICE.**
 - Outgoing: local candidates → `call.ice{call_id, pc, candidate}` only while `Connected` on the current
@@ -151,21 +170,28 @@ with the task's mailbox (routing per §3.1), and returns the handle once `call.j
 - Incoming, per PC: a candidate whose `sdp_mid` is not in the PC's **currently applied** description
   (publish: mids parsed from the applied answer's `a=mid:` lines; subscribe: the applied version's
   `streams`) is buffered, in order, until a description containing that mid is applied. `null`
-  (end-of-candidates) is queued behind them. v1 relies on the contract stating **no ICE restarts**
+  (end-of-candidates) is queued behind them. A candidate with `sdp_mid: null` is resolved by
+  `sdp_mline_index` against the applied description's m-lines; with neither resolvable it is buffered
+  the same way. v1 relies on the contract stating **no ICE restarts**
   (raised with the server side); under that rule a candidate for an already-applied mid is always valid.
 
 **Resume.** Generation change while in a call → `Reconnecting`. Once the new socket is ready: send
 `call.resume{call_id, participant_id, resume_token}` (routing per §3.1). On `call.joined`: store the
 **rotated** token, replace roster, `Connected`; then redo work the drop interrupted: a publish in
-`Offering/AwaitingAnswer` → restart the publish negotiation (new offer); a pending subscribe answer →
-resend it (the server re-sends the latest unanswered offer, handled by the version rules). No call
+`AwaitingAnswer` (offer sent, answer lost with the socket) → restart the publish negotiation with a new
+offer; `Offering`/`ApplyingAnswer` (an engine op in flight) → let it complete first, then continue from
+the resulting state (an offer completed in `Offering` is sent on the new generation); a pending
+subscribe answer → resend it (the server re-sends the latest unanswered offer, handled by the version rules). No call
 command other than `call.resume` is written on the new generation before this `call.joined`.
 `not_in_call` → `Ended(Expired)`. A lost `call.joined` after the server rotated the token leaves core
 with a spent token; the next resume then ends the call as `Expired` unless the server adopts the
 one-step lookback proposed to it — a documented limit, not silent recovery.
 
-**Mute.** `set_media`: `engine.set_local_media` first; on success `call.media{call_id, audio, video}`; if
-that command fails, the engine state is rolled back to the previous values and the error returned.
+**Mute.** `set_media` calls are serialized (one `call.media` in flight; a newer intent replaces a queued
+one). `engine.set_local_media` first; on success `call.media{call_id, audio, video}`. An **error reply**
+(server rejected) rolls the engine back — only if no newer intent has been applied since — and returns the
+error. A `Timeout`/`Unknown` outcome does **not** roll back (the server may have applied it): the intent
+is kept and re-sent after resume, so engine and server converge on the latest local intent.
 
 **End.** Every terminal cause — `leave()`, `call.ended`, `engine_failed`, `not_in_call`, session change,
 handle dropped — goes through one `finish(reason)`: set `Ended(reason)` (idempotent: first reason wins),
@@ -258,3 +284,14 @@ description); "ICE during renegotiation" folded into the per-mid rule. From the 
 (default no-op) and `Unknown` enum variants added; engine async ops confirmed to complete on local work.
 Contract questions sent to the server side: resume-token lookback, "no ICE restart in v1", `call.ice`
 exemption wording, wire key names, replay keeps the same version.
+
+**Round 2 — Codex + Vibe (Heavy), final.** Vibe: all resolved; new: unbounded retained answers → exactly one
+retained. Codex: still open 3/4/5/9/12 and five new P1s — none disputed, all applied without a round 3
+(the convergence rule stops review rounds; it does not block accepting agreed fixes): index-only
+candidates resolved by m-line; completions tagged with per-PC sequence numbers and never writing
+directly; abandoned joins skipped or left; `call.joined` delivered through the mailbox for ordered
+initialization; full publish/subscribe failure policy; `close()` fences outstanding engine operations;
+publish `ApplyingAnswer` state and in-flight-aware resume; session **epoch** (identity) split from
+**credential revision** (rotation); serialized mute with rollback only on rejection; version-guarded,
+monotonic subscribe acknowledgements. "No ICE restart in v1" stays dependent on the server side
+confirming it in the contract.
