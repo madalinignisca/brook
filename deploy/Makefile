@@ -18,17 +18,19 @@ init: ## Create .env with random secrets — only if it doesn't exist yet
 	  key=$$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 48); \
 	  pw=$$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24); \
 	  mpw=$$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24); \
+	  jsec=$$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40); \
 	  tmp=$$(mktemp); \
 	  sed "s|^BROOK_JWT_SIGNING_KEY=.*|BROOK_JWT_SIGNING_KEY=$$key|;\
 	       s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$$pw|;\
-	       s|^MINIO_ROOT_PASSWORD=.*|MINIO_ROOT_PASSWORD=$$mpw|" $(ENV) > $$tmp && mv $$tmp $(ENV); \
+	       s|^MINIO_ROOT_PASSWORD=.*|MINIO_ROOT_PASSWORD=$$mpw|;\
+	       s|^JANUS_API_SECRET=.*|JANUS_API_SECRET=$$jsec|" $(ENV) > $$tmp && mv $$tmp $(ENV); \
 	  echo "Generated $(ENV) with random secrets — review it."; \
 	fi
 
 up: ## Start the core stack (postgres + api + caddy)
 	@[ -f $(ENV) ] || $(MAKE) init
 	$(COMPOSE) up -d --build
-	@echo "Brook API is up on host port $$(grep -E '^BROOK_HTTP_PORT=' $(ENV) | cut -d= -f2)."
+	@echo "Brook API is up on $$(grep -E '^BROOK_HTTP_BIND=' $(ENV) | cut -d= -f2 | grep . || echo 127.0.0.1):$$(grep -E '^BROOK_HTTP_PORT=' $(ENV) | cut -d= -f2) (BROOK_HTTP_BIND / BROOK_HTTP_PORT in .env)."
 
 down: ## Stop the stack (data is kept)
 	$(COMPOSE) down

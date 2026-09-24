@@ -16,8 +16,9 @@ make ps        # check it's healthy
 make logs      # follow logs
 ```
 
-The API is then reachable at **`http://<vm-ip>:8080`** (port set by
-`BROOK_HTTP_PORT`). Smoke-test it:
+The API listens on **loopback** by default (`http://127.0.0.1:8080`). To reach it from
+other machines, set `BROOK_HTTP_BIND=<vm-ip>` in `.env` (one LAN address, never
+`0.0.0.0`, which also binds public IPv6) and `make up`. Smoke-test it:
 
 ```bash
 curl http://<vm-ip>:8080/health

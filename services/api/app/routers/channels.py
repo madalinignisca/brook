@@ -392,6 +392,12 @@ async def delete_channel(
     await session.delete(channel)  # cascades to memberships, messages, reactions
     await session.commit()
     await hub.send_to_users(member_ids, _envelope("channel.delete", {"id": str(channel_id)}))
+    # A deleted channel has no members, so nobody is authorized to stay in its call.
+    from ..calls import manager  # local import: calls pulls in the ws router
+
+    # Spawned, not awaited: with a wedged SFU each teardown waits out the Janus
+    # request timeout, and the DELETE must not hang for it.
+    manager._spawn(manager.end_channel(channel_id, reason="removed"))
 
 
 @router.post("/{channel_id}/join", response_model=ChannelOut)
