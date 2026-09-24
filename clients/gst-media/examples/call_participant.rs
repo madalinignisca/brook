@@ -71,10 +71,15 @@ async fn main() {
                 .property("signal-handoffs", true)
                 .build()
                 .unwrap();
+            // Video counts decoded frames; audio counts decoded bytes.
             let n = Arc::new(AtomicUsize::new(0));
             let c = n.clone();
-            sink.connect("handoff", false, move |_| {
-                c.fetch_add(1, Ordering::Relaxed);
+            sink.connect("handoff", false, move |args| {
+                let step = match kind {
+                    TrackKind::Video => 1,
+                    TrackKind::Audio => args[1].get::<gst::Buffer>().map_or(0, |b| b.size()),
+                };
+                c.fetch_add(step, Ordering::Relaxed);
                 None
             });
             frames.lock().unwrap().insert(sink.name().to_string(), n);
@@ -149,13 +154,17 @@ async fn main() {
                 let names: Vec<String> = s.participants.iter().map(|p| {
                     format!("{}(a={},v={})", p.display_name, p.audio, p.video)
                 }).collect();
-                let video: Vec<String> = tracks.lock().unwrap().iter()
-                    .filter(|(_, (k, _))| *k == TrackKind::Video)
-                    .map(|(mid, (_, sink))| {
-                        let n = frames.lock().unwrap().get(sink).map(|n| n.load(Ordering::Relaxed)).unwrap_or(0);
-                        format!("mid {mid}: {n} frames")
-                    }).collect();
-                println!("[{:?}] roster {names:?}; video {video:?}", s.status);
+                let count = |sink: &str| frames.lock().unwrap().get(sink).map(|n| n.load(Ordering::Relaxed));
+                let (mut video, mut audio) = (Vec::new(), Vec::new());
+                for (mid, (kind, sink)) in tracks.lock().unwrap().iter() {
+                    match (kind, count(sink)) {
+                        (TrackKind::Video, Some(n)) => video.push(format!("mid {mid}: {n} frames")),
+                        (TrackKind::Audio, Some(n)) => audio.push(format!("mid {mid}: {n} bytes")),
+                        (TrackKind::Audio, None) => audio.push(format!("mid {mid}: playing")),
+                        _ => {}
+                    }
+                }
+                println!("[{:?}] roster {names:?}; video {video:?}; audio {audio:?}", s.status);
                 if matches!(s.status, CallStatus::Ended(_)) {
                     return;
                 }
