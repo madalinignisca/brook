@@ -102,6 +102,11 @@ public final class WebRTCEngine: FfiMediaEngine, @unchecked Sendable {
         await core.statistics(pc, type: type)
     }
 
+    /// Tests: run `work` on the engine queue, in order with everything else (e.g. to stall it).
+    func onEngineQueue(_ work: @escaping @Sendable () -> Void) {
+        core.enqueue { _ in work() }
+    }
+
     // MARK: FfiMediaEngine
 
     public func createPublishOffer() async throws -> String {

@@ -134,4 +134,47 @@ final class LoopbackTests: XCTestCase {
         await b.close()
         XCTAssertFalse(camera.isCapturing, "capture still running after close")
     }
+
+    /// Re-offers update ownership from the latest `streams` even though no new track callback
+    /// fires: a reused mid keeps its track (and renderers) and takes the new owner; a mid no
+    /// longer listed disappears.
+    func testReofferMovesOwnershipAndKeepsTheTrack() async throws {
+        let a = WebRTCEngine(options: MediaOptions(
+            audio: true, video: SyntheticVideoCapture(), audioDevice: SyntheticAudioDevice(toneHz: 440)))
+        let b = WebRTCEngine(options: MediaOptions(
+            audio: false, video: nil, audioDevice: SyntheticAudioDevice(toneHz: nil)))
+        let wire = LoopbackWire(publisher: a, subscriber: b)
+        a.attach(wire.fromA)
+        b.attach(wire.fromB)
+        let seen = Locked([[RemoteTrack]]())
+        b.onRemoteTracks { tracks in seen.withLock { $0.append(tracks) } }
+
+        func negotiate(_ owners: [String: String]) async throws {
+            let offer = try await a.createPublishOffer()
+            let streams = mediaSections(offer).compactMap { s -> FfiSubStream? in
+                owners[s.mid].map {
+                    FfiSubStream(mid: s.mid, participantId: $0, kind: s.kind,
+                                 source: s.kind == .audio ? .mic : .camera)
+                }
+            }
+            let answer = try await b.applySubscribeOffer(sdp: offer, streams: streams)
+            wire.subscriberHasOffer()
+            try await a.applyPublishAnswer(sdp: answer)
+            wire.publisherHasAnswer()
+        }
+
+        try await negotiate(["0": "p-a", "1": "p-a"])
+        try await negotiate(["1": "p-b"])  // mid 1 reused by another participant; mid 0 unlisted
+
+        let rounds = seen.withLock { $0 }
+        XCTAssertEqual(rounds.count, 2)
+        let first = Dictionary(uniqueKeysWithValues: rounds[0].map { ($0.mid, $0) })
+        let second = Dictionary(uniqueKeysWithValues: rounds[1].map { ($0.mid, $0) })
+        XCTAssertEqual(Set(first.keys), ["0", "1"])
+        XCTAssertEqual(Set(second.keys), ["1"], "an unlisted mid still has an owner")
+        XCTAssertEqual(second["1"]?.participantId, "p-b")
+        XCTAssertTrue(first["1"]!.track === second["1"]!.track, "the reused mid got a new track wrapper")
+        await a.close()
+        await b.close()
+    }
 }
