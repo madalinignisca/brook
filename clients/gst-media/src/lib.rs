@@ -194,6 +194,9 @@ pub struct GstEngine {
     ice_servers: Mutex<Vec<IceServer>>,
     /// Set by [`GstEngine::close`]: nothing builds a PC or succeeds afterwards.
     closed: AtomicBool,
+    /// The user's mic/camera state, applied to the publish pipeline when it
+    /// exists (a toggle before the first offer must not be lost).
+    media: Mutex<(bool, bool)>,
 }
 
 /// One PeerConnection: a pipeline with a `webrtcbin` named `webrtc`.
@@ -223,6 +226,11 @@ impl GstEngine {
             ));
         }
         let (tx, rx) = mpsc::unbounded_channel();
+        // Everything configured starts on.
+        let media = (
+            config.mic != MicSource::None,
+            config.camera != CameraSource::None,
+        );
         Ok((
             Arc::new(Self {
                 ice_servers: Mutex::new(config.ice_servers.clone()),
@@ -231,6 +239,7 @@ impl GstEngine {
                 publish: Mutex::new(None),
                 subscribe: Mutex::new(None),
                 closed: AtomicBool::new(false),
+                media: Mutex::new(media),
             }),
             rx,
         ))
@@ -260,6 +269,10 @@ impl GstEngine {
         };
         wait_for_sink_caps(&webrtc, &self.closed).await;
         self.ensure_open()?;
+        // Capture ran long enough to negotiate real codec parameters; now
+        // honour any mute / camera-off chosen before the pipeline existed.
+        let (audio, video) = *self.media.lock().unwrap();
+        self.set_local_media(audio, video)?;
         // The publish PC only sends (PROTOCOL.md §3.1).
         for t in transceivers(&webrtc) {
             t.set_property(
@@ -333,30 +346,34 @@ impl GstEngine {
     /// once. Enabling a track that isn't published is an error, so core
     /// doesn't announce media that isn't there.
     pub fn set_local_media(&self, audio: bool, video: bool) -> Result<()> {
+        // What exists is decided by the configuration, so "not built yet" is
+        // not mistaken for "no such device".
+        if audio && self.config.mic == MicSource::None {
+            return Err(Error::State("no microphone is published"));
+        }
+        if video && self.config.camera == CameraSource::None {
+            return Err(Error::State("no camera is published"));
+        }
+        *self.media.lock().unwrap() = (audio, video);
         let pipeline = self
             .publish
             .lock()
             .unwrap()
             .as_ref()
             .map(|pc| pc.pipeline.clone());
-        let (mic, valve, camera) = match &pipeline {
-            Some(p) => (
-                p.by_name("mic_volume"),
-                p.by_name("cam_valve"),
-                p.by_name("cam_src"),
-            ),
-            None => (None, None, None),
+        // No publish pipeline yet: the state is applied when it is built.
+        let Some(pipeline) = pipeline else {
+            return Ok(());
         };
-        if audio && mic.is_none() {
-            return Err(Error::State("no microphone is published"));
-        }
-        if video && valve.is_none() {
-            return Err(Error::State("no camera is published"));
-        }
+        let (mic, valve, camera) = (
+            pipeline.by_name("mic_volume"),
+            pipeline.by_name("cam_valve"),
+            pipeline.by_name("cam_src"),
+        );
         if let Some(vol) = mic {
             vol.set_property("mute", !audio);
         }
-        if let (Some(pipeline), Some(valve), Some(camera)) = (pipeline, valve, camera) {
+        if let (Some(valve), Some(camera)) = (valve, camera) {
             let off = valve.property::<bool>("drop");
             if video && off {
                 camera.set_locked_state(false);

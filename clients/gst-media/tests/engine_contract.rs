@@ -190,3 +190,29 @@ async fn enabling_an_unpublished_track_fails() {
         "audio on without a mic"
     );
 }
+
+/// Toggles before the first offer are remembered and applied once the
+/// publish pipeline exists; errors come from the configuration ("no such
+/// device"), not from the pipeline not being built yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn media_state_set_before_the_offer_is_kept() {
+    let engine = engine_with(CameraSource::Test, MicSource::Test);
+    assert!(
+        engine.set_local_media(true, true).is_ok(),
+        "devices are configured"
+    );
+    engine.set_local_media(false, false).unwrap();
+    let offer = engine.create_publish_offer().await.unwrap();
+    assert!(offer.contains("VP8/90000"), "the offer still carries video");
+    assert!(
+        !engine.camera_capturing(),
+        "camera off before the offer was lost"
+    );
+
+    let engine = engine_with(CameraSource::None, MicSource::Test);
+    assert!(
+        engine.set_local_media(true, true).is_err(),
+        "no camera configured"
+    );
+    assert!(engine.set_local_media(true, false).is_ok());
+}
