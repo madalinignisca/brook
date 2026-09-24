@@ -44,7 +44,13 @@ pub struct BrookClient {
 impl BrookClient {
     /// Create a client for the given configuration.
     pub fn new(config: CoreConfig) -> Result<Self> {
-        let http = reqwest::Client::builder().build()?;
+        // Never follow redirects. `CoreConfig` enforces https (or loopback http) on the
+        // configured URL only; a followed 307/308 would re-send the request body — the
+        // password — to wherever `Location` points, plain http included. The API has no
+        // reason to redirect, so a 3xx surfaces as an error instead.
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
         let (state_tx, state_rx) = watch::channel(AuthState::LoggedOut);
         let (events_tx, _) = broadcast::channel(256);
         Ok(Self {
@@ -438,6 +444,15 @@ struct ApiErrorContent {
 /// Map a non-2xx response into a structured [`Error`].
 async fn api_error(resp: reqwest::Response) -> Error {
     let status = resp.status();
+    // Redirects are never followed (see `BrookClient::new`), and a redirect's body is not
+    // an API error envelope: report the status only, never content the redirecting party
+    // chose — it reaches the UI verbatim.
+    if status.is_redirection() {
+        return Error::Api {
+            code: format!("http_{}", status.as_u16()),
+            message: format!("unexpected redirect (status {})", status.as_u16()),
+        };
+    }
     let body = resp.text().await.unwrap_or_else(|err| {
         tracing::warn!(%err, "failed to read error response body");
         String::new()
@@ -557,6 +572,67 @@ mod tests {
         assert_eq!(
             *state.borrow_and_update(),
             AuthState::LoggedIn(session.user.clone())
+        );
+    }
+
+    /// A redirect must never be followed: the https/loopback rule in `CoreConfig` only
+    /// checks the configured URL, and reqwest re-sends a 307/308 request *with its body* —
+    /// the password — to wherever `Location` points, including plain http elsewhere.
+    #[tokio::test]
+    async fn login_does_not_follow_redirects_or_resend_credentials() {
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/login"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/steal", elsewhere.uri()).as_str()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server).await;
+        let err = client.login("alice", "supersecret").await.unwrap_err();
+
+        assert!(
+            matches!(&err, Error::Api { code, .. } if code == "http_307"),
+            "expected the 307 to surface as an error, got {err:?}"
+        );
+        assert!(
+            elsewhere.received_requests().await.unwrap().is_empty(),
+            "credentials were re-sent to the redirect target"
+        );
+    }
+
+    /// A redirect's body is not an API error and must not be echoed to the UI: it could
+    /// carry anything the redirecting party chose, including reflected secrets.
+    #[tokio::test]
+    async fn redirect_error_does_not_echo_the_response_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/login"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", "http://elsewhere.invalid/")
+                    .set_body_json(json!({
+                        "error": { "code": "echo", "message": "supersecret" }
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server).await;
+        let err = client.login("alice", "supersecret").await.unwrap_err();
+
+        assert!(!err.to_string().contains("supersecret"), "echoed: {err}");
+        assert!(
+            matches!(&err, Error::Api { code, .. } if code == "http_307"),
+            "{err:?}"
         );
     }
 
