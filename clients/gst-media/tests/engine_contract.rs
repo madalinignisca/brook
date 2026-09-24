@@ -109,5 +109,110 @@ async fn auto_camera_produces_frames() {
         frames.load(Ordering::Relaxed) > 20,
         "self-view got too few frames"
     );
+
+    // Camera off releases the device (this process no longer holds any
+    // /dev/video*); camera on brings frames back.
+    let holds_camera = || {
+        let me = std::process::id().to_string();
+        let out = std::process::Command::new("fuser")
+            .args(["/dev/video0", "/dev/video1", "/dev/video2", "/dev/video3"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        out.split_whitespace()
+            .any(|p| p.trim_end_matches(|c: char| !c.is_ascii_digit()) == me)
+    };
+    assert!(holds_camera(), "fuser check can't see the open camera");
+    engine.set_local_media(false, false).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!holds_camera(), "camera device still open while off");
+    let before = frames.load(Ordering::Relaxed);
+    engine.set_local_media(false, true).unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(
+        frames.load(Ordering::Relaxed) > before + 20,
+        "no frames after camera back on"
+    );
     engine.close();
+}
+
+fn engine_with(camera: CameraSource, mic: MicSource) -> Arc<GstEngine> {
+    let sink = Arc::new(|_| gst::ElementFactory::make("fakesink").build().unwrap());
+    GstEngine::new(EngineConfig {
+        camera,
+        mic,
+        codec: VideoCodec::Vp8,
+        hardware_encode: false,
+        video_kbps: 500,
+        ice_servers: vec![],
+        video_sink: sink.clone(),
+        audio_sink: Some(sink),
+    })
+    .unwrap()
+    .0
+}
+
+/// Privacy: camera off must release the capture device (its LED goes off),
+/// not just stop sending frames; camera on captures again.
+#[tokio::test(flavor = "multi_thread")]
+async fn camera_off_releases_the_source() {
+    let engine = engine_with(CameraSource::Test, MicSource::Test);
+    engine.create_publish_offer().await.unwrap();
+    assert!(engine.camera_capturing(), "camera should capture while on");
+    engine.set_local_media(true, false).unwrap();
+    assert!(
+        !engine.camera_capturing(),
+        "camera still capturing while off"
+    );
+    engine.set_local_media(true, true).unwrap();
+    assert!(engine.camera_capturing(), "camera did not restart");
+    engine.close();
+}
+
+/// Enabling a track that isn't published is an error, so core doesn't
+/// announce media that isn't there. Disabling it is fine.
+#[tokio::test(flavor = "multi_thread")]
+async fn enabling_an_unpublished_track_fails() {
+    let engine = engine_with(CameraSource::None, MicSource::Test);
+    engine.create_publish_offer().await.unwrap();
+    assert!(engine.set_local_media(true, false).is_ok());
+    assert!(engine.set_local_media(false, false).is_ok());
+    assert!(
+        engine.set_local_media(true, true).is_err(),
+        "video on without a camera"
+    );
+
+    let engine = engine_with(CameraSource::Test, MicSource::None);
+    engine.create_publish_offer().await.unwrap();
+    assert!(engine.set_local_media(false, true).is_ok());
+    assert!(
+        engine.set_local_media(true, true).is_err(),
+        "audio on without a mic"
+    );
+}
+
+/// Toggles before the first offer are remembered and applied once the
+/// publish pipeline exists; errors come from the configuration ("no such
+/// device"), not from the pipeline not being built yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn media_state_set_before_the_offer_is_kept() {
+    let engine = engine_with(CameraSource::Test, MicSource::Test);
+    assert!(
+        engine.set_local_media(true, true).is_ok(),
+        "devices are configured"
+    );
+    engine.set_local_media(false, false).unwrap();
+    let offer = engine.create_publish_offer().await.unwrap();
+    assert!(offer.contains("VP8/90000"), "the offer still carries video");
+    assert!(
+        !engine.camera_capturing(),
+        "camera off before the offer was lost"
+    );
+
+    let engine = engine_with(CameraSource::None, MicSource::Test);
+    assert!(
+        engine.set_local_media(true, true).is_err(),
+        "no camera configured"
+    );
+    assert!(engine.set_local_media(true, false).is_ok());
 }

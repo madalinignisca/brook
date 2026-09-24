@@ -194,6 +194,9 @@ pub struct GstEngine {
     ice_servers: Mutex<Vec<IceServer>>,
     /// Set by [`GstEngine::close`]: nothing builds a PC or succeeds afterwards.
     closed: AtomicBool,
+    /// The user's mic/camera state, applied to the publish pipeline when it
+    /// exists (a toggle before the first offer must not be lost).
+    media: Mutex<(bool, bool)>,
 }
 
 /// One PeerConnection: a pipeline with a `webrtcbin` named `webrtc`.
@@ -223,6 +226,11 @@ impl GstEngine {
             ));
         }
         let (tx, rx) = mpsc::unbounded_channel();
+        // Everything configured starts on.
+        let media = (
+            config.mic != MicSource::None,
+            config.camera != CameraSource::None,
+        );
         Ok((
             Arc::new(Self {
                 ice_servers: Mutex::new(config.ice_servers.clone()),
@@ -231,6 +239,7 @@ impl GstEngine {
                 publish: Mutex::new(None),
                 subscribe: Mutex::new(None),
                 closed: AtomicBool::new(false),
+                media: Mutex::new(media),
             }),
             rx,
         ))
@@ -239,16 +248,31 @@ impl GstEngine {
     /// Create (or, on an existing publish PC, re-create for renegotiation) the
     /// publish offer. Builds the capture pipeline on first use.
     pub async fn create_publish_offer(&self) -> Result<String> {
-        let webrtc = {
-            let mut guard = self.publish.lock().unwrap();
-            self.ensure_open()?;
-            if guard.is_none() {
-                *guard = Some(self.build_publish()?);
+        let existing = self
+            .publish
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|pc| pc.webrtc.clone());
+        let webrtc = match existing {
+            Some(webrtc) => webrtc,
+            None => {
+                // Build (opening devices can take a while) without holding the
+                // lock, so set_local_media never waits behind it.
+                self.ensure_open()?;
+                let pc = self.build_publish()?;
+                let mut guard = self.publish.lock().unwrap();
+                // Closed meanwhile: `pc` drops here, stopping its pipeline.
+                self.ensure_open()?;
+                guard.get_or_insert(pc).webrtc.clone()
             }
-            guard.as_ref().unwrap().webrtc.clone()
         };
         wait_for_sink_caps(&webrtc, &self.closed).await;
         self.ensure_open()?;
+        // Capture ran long enough to negotiate real codec parameters; now
+        // honour any mute / camera-off chosen before the pipeline existed.
+        let (audio, video) = *self.media.lock().unwrap();
+        self.set_local_media(audio, video)?;
         // The publish PC only sends (PROTOCOL.md §3.1).
         for t in transceivers(&webrtc) {
             t.set_property(
@@ -316,24 +340,73 @@ impl GstEngine {
     }
 
     /// Local mute / camera toggle as the user sees it. Muted audio sends
-    /// silence; a disabled camera stops sending frames. Turning the camera
-    /// back on asks the encoder for a keyframe so receivers recover at once.
+    /// silence (the mic stays open). Camera off stops sending AND stops the
+    /// capture source, releasing the device (its LED goes off); camera on
+    /// restarts it and asks the encoder for a keyframe so receivers recover at
+    /// once. Enabling a track that isn't published is an error, so core
+    /// doesn't announce media that isn't there.
     pub fn set_local_media(&self, audio: bool, video: bool) -> Result<()> {
-        let guard = self.publish.lock().unwrap();
-        let Some(pc) = guard.as_ref() else {
+        // What exists is decided by the configuration, so "not built yet" is
+        // not mistaken for "no such device".
+        if audio && self.config.mic == MicSource::None {
+            return Err(Error::State("no microphone is published"));
+        }
+        if video && self.config.camera == CameraSource::None {
+            return Err(Error::State("no camera is published"));
+        }
+        *self.media.lock().unwrap() = (audio, video);
+        let pipeline = self
+            .publish
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|pc| pc.pipeline.clone());
+        // No publish pipeline yet: the state is applied when it is built.
+        let Some(pipeline) = pipeline else {
             return Ok(());
         };
-        if let Some(vol) = pc.pipeline.by_name("mic_volume") {
+        let (mic, valve, camera) = (
+            pipeline.by_name("mic_volume"),
+            pipeline.by_name("cam_valve"),
+            pipeline.by_name("cam_src"),
+        );
+        if let Some(vol) = mic {
             vol.set_property("mute", !audio);
         }
-        if let Some(valve) = pc.pipeline.by_name("cam_valve") {
-            let was_dropping = valve.property::<bool>("drop");
-            valve.set_property("drop", !video);
-            if video && was_dropping {
-                request_keyframe(&pc.pipeline);
+        if let (Some(valve), Some(camera)) = (valve, camera) {
+            let off = valve.property::<bool>("drop");
+            if video && off {
+                camera.set_locked_state(false);
+                camera
+                    .sync_state_with_parent()
+                    .map_err(|e| Error::Setup(format!("restart camera: {e}")))?;
+                valve.set_property("drop", false);
+                request_keyframe(&pipeline);
+            } else if !video && !off {
+                valve.set_property("drop", true);
+                // Out of the pipeline's state changes, then stopped: the device
+                // is closed until the camera is turned back on.
+                camera.set_locked_state(true);
+                camera
+                    .set_state(gst::State::Null)
+                    .map_err(|e| Error::Setup(format!("stop camera: {e}")))?;
             }
         }
         Ok(())
+    }
+
+    /// Whether the camera source is running (holding the device). For tests:
+    /// camera off must release it.
+    #[doc(hidden)]
+    pub fn camera_capturing(&self) -> bool {
+        let guard = self.publish.lock().unwrap();
+        guard
+            .as_ref()
+            .and_then(|pc| pc.pipeline.by_name("cam_src"))
+            .is_some_and(|src| {
+                let (_, current, pending) = src.state(gst::ClockTime::from_seconds(2));
+                current == gst::State::Playing || pending == gst::State::Playing
+            })
     }
 
     /// Number of remote decode chains (decodebins) in the subscribe pipeline.
@@ -578,13 +651,19 @@ fn publish_description(config: &EngineConfig) -> Result<String> {
 
     let video_src = match &config.camera {
         CameraSource::Auto => Some(match find_v4l2_camera() {
-            Some(path) => format!("v4l2src device={} ! decodebin", launch_quote(&path)),
-            None => "autovideosrc ! decodebin".to_string(),
+            Some(path) => format!(
+                "v4l2src name=cam_src device={} ! decodebin",
+                launch_quote(&path)
+            ),
+            None => "autovideosrc name=cam_src ! decodebin".to_string(),
         }),
-        CameraSource::Device(path) => {
-            Some(format!("v4l2src device={} ! decodebin", launch_quote(path)))
+        CameraSource::Device(path) => Some(format!(
+            "v4l2src name=cam_src device={} ! decodebin",
+            launch_quote(path)
+        )),
+        CameraSource::Test => {
+            Some("videotestsrc name=cam_src is-live=true pattern=ball".to_string())
         }
-        CameraSource::Test => Some("videotestsrc is-live=true pattern=ball".to_string()),
         CameraSource::None => None,
     };
     if let Some(src) = video_src {
