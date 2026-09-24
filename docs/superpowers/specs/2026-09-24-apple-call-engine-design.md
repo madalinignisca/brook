@@ -1,6 +1,6 @@
 # Apple call engine + macOS call UI (C2/C3)
 
-> Status: **revised after Heavy review round 1** (Codex + Vibe) · 2026-09-25
+> Status: **approved** (Heavy review rounds 1–2 closed) · 2026-09-25
 > Review dial: **Heavy** — camera/microphone access, a wider sandbox (incoming network), a third-party
 > binary in the app. Both external models, given evidence.
 > Builds on: core call signaling (PR #13, live-proven on GStreamer), Apple FFI bridge (#7), macOS app (#11).
@@ -77,16 +77,19 @@ shared test server; can mute, turn the camera off, and leave. iOS reuses the eng
   keeps the track/transceiver, so turning it back on restarts capture without renegotiation.
   **Mute** sets the audio track's `isEnabled = false`: silence is sent, the microphone stays open
   (its indicator stays on) — the same as other call apps, stated in the UI tooltip. If a track does not
-  exist (permission denied), `set_local_media` returns `Err` **immediately** — whether a track exists
-  is plain engine state, read without calling WebRTC — and the UI keeps that control disabled.
+  exist (permission denied), `set_local_media` returns `Err` **immediately only when asked to enable
+  it** — whether a track exists is plain engine state, read without calling WebRTC. Disabling an absent
+  track succeeds (so a camera-denied user can still mute the microphone), and the UI keeps that
+  control disabled.
 - **`close()` and the fence:** the fence flag is set **first**, then capture is stopped (awaited), both
   PCs are closed, and late UI updates are discarded. Every operation checks the fence at entry, after
   each await, and before installing any resource; a capture that finishes starting after the fence is
   stopped immediately and the op errors. The engine publishes an observable **`closed`** completion.
 - **Every end path closes the engine:** core's single `finish()` calls `close()` for local leave,
   handle drop, engine failure, remote `call.ended`, `Expired`, session change. The app adds the one
-  path core cannot see: **app quit** (`applicationShouldTerminate` → `leave()` and await `closed`,
-  bounded).
+  path core cannot see: **app quit** — `applicationShouldTerminate` returns `.terminateLater` while a
+  call is live, runs `leave()` + await `closed` in a task bounded at 5 s, and calls
+  `NSApp.reply(toApplicationShouldTerminate: true)` **exactly once**, on completion or timeout.
 - Threading: WebRTC delegate callbacks hop onto the engine queue; UI state is published to the main
   actor; the Rust worker threads that call the sync methods never wait on either.
 
@@ -174,3 +177,8 @@ path, app quit, added. `network.server` exposure documented. Thinned framework r
 embedded copy, verified on the Release bundle. Echo acceptance gates the merge. "Tear down the
 subscribe PC when no streams remain" — rejected: the proven model keeps the PC across an empty re-offer
 (it is reused when someone joins again).
+
+**Round 2 — Codex + Vibe (Heavy), final.** Vibe: all resolved / rebuttal accepted, no new defects.
+Codex: all five resolved; two new P2s, both applied: a missing track only rejects *enabling* it
+(disabling succeeds, so microphone mute works when the camera was denied); app quit uses AppKit's
+`.terminateLater` + single `reply(toApplicationShouldTerminate:)` handshake, including on timeout.
