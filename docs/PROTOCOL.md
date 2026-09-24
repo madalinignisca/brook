@@ -96,6 +96,9 @@ Every frame in both directions is the §2 envelope `{type, id, ts, data}`.
 - A client **command** carries a fresh `id`. The server's **direct reply** to it
   carries `re: <that id>` (sibling of `data`), so the client can match reply to
   request. Unsolicited server events have no `re`.
+- Every command with a reply in §3.3 gets **exactly one** reply: its success frame
+  **or** an `error`, never both, never none. Clients may await it with a timeout
+  (10 s is ample). `call.ice` has no reply.
 - A failed command gets `{"type":"error","re":"<id>","data":{"code":"…","message":"…"}}`.
   `message` is for logs, not UI. Codes:
 
@@ -106,6 +109,7 @@ Every frame in both directions is the §2 envelope `{type, id, ts, data}`.
 | `not_in_call` | command refers to a call the caller hasn't joined |
 | `call_full` | participant limit reached (§3.6) |
 | `bad_state` | command out of order (e.g. `call.publish` before `call.joined`) |
+| `stale` | `call.subscribe.answer` for a `version` that is no longer the latest; discard it and answer the newer offer |
 | `sfu_unavailable` | Janus unreachable or refused; retry later |
 
 ### 3.3 Client → server commands
@@ -114,7 +118,7 @@ Every frame in both directions is the §2 envelope `{type, id, ts, data}`.
 |---|---|---|
 | `call.join` | `{channel_id}` | `call.joined` |
 | `call.publish` | `{call_id, sdp}` (publish-PC **offer**) | `call.publish.answer` |
-| `call.subscribe.answer` | `{call_id, sdp}` (subscribe-PC **answer** to the server's latest offer) | `call.ok` |
+| `call.subscribe.answer` | `{call_id, version, sdp}` (subscribe-PC **answer** to the offer with that `version`) | `call.ok` or `error: stale` |
 | `call.ice` | `{call_id, pc: "publish"\|"subscribe", candidate}` | none (fire-and-forget) |
 | `call.media` | `{call_id, audio: bool, video: bool}` (mute state as the user sees it) | `call.ok` |
 | `call.leave` | `{call_id}` | `call.ok` |
@@ -122,6 +126,12 @@ Every frame in both directions is the §2 envelope `{type, id, ts, data}`.
 
 `candidate` is `{candidate, sdpMid, sdpMLineIndex}` as produced by WebRTC, or `null`
 for end-of-candidates.
+
+**Who buffers ICE.** The server relays client candidates to the SFU immediately;
+the SFU accepts them before or after the SDP. The **client** buffers any
+server → client `call.ice` that arrives before it has applied the matching remote
+description, and applies them after. (The SFU runs ICE-lite and normally puts
+its candidates in the SDP, so server → client trickle is rare but allowed.)
 
 ### 3.4 Server → client events
 
@@ -147,8 +157,11 @@ SubStream   = { mid, participant_id, kind: "audio"|"video", source }
 per receiver, which is why the mapping travels with each `call.subscribe.offer`
 rather than inside `Participant`: it lets the client map an incoming track
 (`transceiver.mid`) to its participant without parsing SDP. A mid absent from the
-latest `streams` is inactive. `version` increases monotonically; answer only the
-latest.
+latest `streams` is inactive. `version` increases monotonically. The client answers
+only the latest offer and echoes its `version`; the server rejects an answer whose
+`version` is not the latest with `error: stale` (the client then answers the newer
+offer it has, or will shortly receive). Each PC has one fixed offerer, so there
+is no glare.
 
 ### 3.5 Sequences
 
@@ -172,7 +185,9 @@ C ⇄ S  call.ice {pc: "subscribe"} …
 **WS drops mid-call.** Media keeps flowing (it doesn't use the WS). The server keeps
 the participant for a **30 s grace**. The client reconnects, sends `auth`, then
 `call.resume {call_id}`; the server replies `call.joined` (fresh roster) and re-sends
-the latest `call.subscribe.offer` if the client may have missed it. After the grace
+the latest `call.subscribe.offer` if it is still unanswered. The **publish PC is
+untouched** by a WS reconnect (its media never used the WS), so there is no
+publish renegotiation and no re-sent `call.publish.answer`. After the grace
 the participant is removed as if it had sent `call.leave`; a later `call.resume`
 gets `error: not_in_call` and the client must `call.join` again.
 
