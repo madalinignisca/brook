@@ -703,3 +703,22 @@ def test_recycled_mline_is_refused_cleanly(sync_client: TestClient, fake: FakeJa
         assert _pub(wa, call_id, appended, [*AV_TRACKS, {"mid": "4", **SCREEN}])["type"] == (
             "call.publish.answer"
         )
+
+
+def test_unlabelled_republish_keeps_a_live_screen_a_screen(
+    sync_client: TestClient, fake: FakeJanus
+) -> None:
+    """Review follow-up to #23: with `tracks` absent the defaults used to be applied
+    before the pinned-source rule, so a live screen republished without labels
+    silently became a "camera". A live mid keeps its source either way."""
+    a, b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa, _ws(sync_client, b) as wb:
+        call_id = cmd(wa, "call.join", {"channel_id": ch})["data"]["call_id"]
+        cmd(wb, "call.join", {"channel_id": ch})
+        share = (*AV, ("video", "2", True))
+        assert _pub(wa, call_id, share, [*AV_TRACKS, {"mid": "2", **SCREEN}])["type"] == (
+            "call.publish.answer"
+        )
+        assert _pub(wa, call_id, share, None)["type"] == "call.publish.answer"
+        who = of(collect(wb), "call.participant")[-1]["participant"]
+        assert sorted(x["source"] for x in who["publishing"]) == ["camera", "mic", "screen"]
