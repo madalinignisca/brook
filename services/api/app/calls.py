@@ -763,7 +763,13 @@ async def _ice(conn: Connection, frame: dict[str, Any], re: str | None) -> None:
 async def _media(conn: Connection, frame: dict[str, Any], re: str | None) -> None:
     data = _require(frame, "call_id", "audio", "video")
     p = manager._participant_of(conn, data["call_id"])
-    p.audio, p.video = bool(data["audio"]), bool(data["video"])
+    # Clamped to what is actually published: call.media is the mute state of
+    # published media, so a kind the participant does not send can never be
+    # announced as on (a listen-only client claiming video would show a tile that
+    # never gets frames). Clients guard this too; the server must not trust it.
+    kinds = {x["kind"] for x in p.publishing}
+    p.audio = bool(data["audio"]) and "audio" in kinds
+    p.video = bool(data["video"]) and "video" in kinds
     await conn.send(envelope("call.ok", {}, re=re))
     updated = envelope(
         "call.participant",

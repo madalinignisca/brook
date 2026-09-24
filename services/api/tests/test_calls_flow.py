@@ -351,3 +351,29 @@ def test_leave_from_a_client_already_gone_leaves_no_ghost(
             assert jb["self"]["participant_id"] not in calls.manager.by_id[call_id].participants
         left = [p for p in of(collect(wa), "call.participant") if p["event"] == "left"]
         assert left and left[-1]["participant"]["participant_id"] == jb["self"]["participant_id"]
+
+
+def test_call_media_cannot_announce_unpublished_media(
+    sync_client: TestClient, fake: FakeJanus
+) -> None:
+    """call.media is the user-visible mute state of what a participant PUBLISHES.
+    A listen-only participant (or one sending audio only) must not be able to
+    announce video: the flags are clamped to what is actually published."""
+    a, b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa, _ws(sync_client, b) as wb:
+        call_id = cmd(wa, "call.join", {"channel_id": ch})["data"]["call_id"]
+        cmd(wb, "call.join", {"channel_id": ch})
+        collect(wa)
+        # bob never published: claiming audio+video changes nothing visible
+        r = cmd(wb, "call.media", {"call_id": call_id, "audio": True, "video": True})
+        assert r["type"] == "call.ok"
+        seen = of(collect(wa), "call.participant")[-1]["participant"]
+        assert (seen["audio"], seen["video"]) == (False, False), seen
+        # bob publishes audio only: he may unmute audio, still not claim video
+        audio_only = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+        assert cmd(wb, "call.publish", {"call_id": call_id, "sdp": audio_only})["type"] == (
+            "call.publish.answer"
+        )
+        cmd(wb, "call.media", {"call_id": call_id, "audio": True, "video": True})
+        seen = of(collect(wa), "call.participant")[-1]["participant"]
+        assert (seen["audio"], seen["video"]) == (True, False), seen

@@ -152,7 +152,7 @@ Every frame in both directions is the §2 envelope `{type, id, ts, data}`.
 | `call.publish` | `{call_id, sdp}` (publish-PC **offer**) | `call.publish.answer` |
 | `call.subscribe.answer` | `{call_id, version, sdp}` (subscribe-PC **answer** to the offer with that `version`) | `call.ok` or `error: stale` |
 | `call.ice` | `{call_id, pc: "publish"\|"subscribe", candidate}` | none (fire-and-forget) |
-| `call.media` | `{call_id, audio: bool, video: bool}` (mute state as the user sees it) | `call.ok` |
+| `call.media` | `{call_id, audio: bool, video: bool}` (mute state as the user sees it; the server clamps each to what the participant publishes, so an unpublished kind stays `false`) | `call.ok` |
 | `call.leave` | `{call_id}` | `call.ok` |
 | `call.resume` | `{call_id, participant_id, resume_token}` (after a WS reconnect, §3.5) | `call.joined` |
 
