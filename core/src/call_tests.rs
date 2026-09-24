@@ -1,0 +1,631 @@
+//! Call task tests: the real client and transport against the scripted test origin, with
+//! a fake engine whose operations can be held at gates.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde_json::{json, Value};
+use tokio::sync::Semaphore;
+
+use crate::test_support::{TestServer, WsPeer};
+use crate::{
+    BrookClient, CallHandle, CallStatus, EndReason, EngineError, IceCandidate, MediaEngine, PcKind,
+    SubStream,
+};
+
+const WAIT: Duration = Duration::from_secs(5);
+const QUIET: Duration = Duration::from_millis(300);
+
+#[derive(Default)]
+struct FakeEngine {
+    log: Mutex<Vec<String>>,
+    gates: Mutex<HashMap<&'static str, Arc<Semaphore>>>,
+    closes: AtomicUsize,
+    closed: AtomicBool,
+    capture: AtomicBool,
+    offers: AtomicUsize,
+    subscribe_applies: AtomicUsize,
+    fail_media: AtomicBool,
+}
+
+impl FakeEngine {
+    fn gate(&self, op: &'static str) -> Arc<Semaphore> {
+        let sem = Arc::new(Semaphore::new(0));
+        self.gates.lock().unwrap().insert(op, sem.clone());
+        sem
+    }
+    async fn pass(&self, op: &'static str) {
+        let gate = self.gates.lock().unwrap().get(op).cloned();
+        if let Some(gate) = gate {
+            gate.acquire().await.unwrap().forget();
+        }
+    }
+    fn record(&self, entry: impl Into<String>) {
+        self.log.lock().unwrap().push(entry.into());
+    }
+    fn log(&self) -> Vec<String> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl MediaEngine for FakeEngine {
+    async fn create_publish_offer(&self) -> Result<String, EngineError> {
+        self.record("create_publish_offer");
+        self.capture.store(true, Ordering::SeqCst); // capture starts…
+        self.pass("create_publish_offer").await;
+        if self.closed.load(Ordering::SeqCst) {
+            self.capture.store(false, Ordering::SeqCst); // …fenced by close
+            return Err(EngineError("closed".into()));
+        }
+        let n = self.offers.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(format!("offer-{n}"))
+    }
+    async fn apply_publish_answer(&self, sdp: String) -> Result<(), EngineError> {
+        self.record(format!(
+            "apply_publish_answer:{}",
+            sdp.lines().next().unwrap_or("")
+        ));
+        self.pass("apply_publish_answer").await;
+        Ok(())
+    }
+    async fn apply_subscribe_offer(
+        &self,
+        sdp: String,
+        _streams: Vec<SubStream>,
+    ) -> Result<String, EngineError> {
+        self.subscribe_applies.fetch_add(1, Ordering::SeqCst);
+        self.record(format!("apply_subscribe_offer:{sdp}"));
+        self.pass("apply_subscribe_offer").await;
+        Ok(format!("answer-to-{sdp}"))
+    }
+    fn add_remote_candidate(&self, pc: PcKind, c: Option<IceCandidate>) -> Result<(), EngineError> {
+        let what = c.map(|c| c.candidate).unwrap_or_else(|| "end".into());
+        self.record(format!("remote:{pc:?}:{what}"));
+        Ok(())
+    }
+    fn set_local_media(&self, audio: bool, video: bool) -> Result<(), EngineError> {
+        if self.fail_media.load(Ordering::SeqCst) {
+            return Err(EngineError("no device".into()));
+        }
+        self.record(format!("media:{audio}:{video}"));
+        Ok(())
+    }
+    async fn close(&self) {
+        let n = self.closes.fetch_add(1, Ordering::SeqCst) + 1;
+        assert_eq!(n, 1, "engine closed twice");
+        self.closed.store(true, Ordering::SeqCst);
+        self.capture.store(false, Ordering::SeqCst);
+        self.record("close");
+    }
+}
+
+fn stream(mid: &str) -> Value {
+    json!({ "mid": mid, "participant_id": "p2", "kind": "video", "source": "camera" })
+}
+
+fn cand(text: &str, mid: &str) -> Value {
+    json!({ "candidate": text, "sdpMid": mid, "sdpMLineIndex": 0 })
+}
+
+struct Call {
+    client: Arc<BrookClient>,
+    peer: WsPeer,
+    handle: Arc<CallHandle>,
+    engine: Arc<FakeEngine>,
+    server: TestServer,
+}
+
+async fn connected(server: &mut TestServer) -> (Arc<BrookClient>, WsPeer) {
+    let client = Arc::new(server.client());
+    client.login("alice", "pw").await.unwrap();
+    client.start_realtime().await.unwrap();
+    let mut peer = server.accept().await;
+    peer.accept_auth().await;
+    client.commands.conn().wait_for(|c| c.ready).await.unwrap();
+    (client, peer)
+}
+
+fn joined(re: &Value, token: &str) -> Value {
+    json!({ "type": "call.joined", "re": re, "data": {
+        "call_id": "k1", "channel_id": "ch",
+        "self": { "participant_id": "me", "resume_token": token },
+        "participants": [{ "participant_id": "p2", "user_id": "u2", "display_name": "Bob",
+                           "audio": true, "video": true, "publishing": [] }]
+    }})
+}
+
+/// A joined call. `publish`: whether we publish. `setup` configures the engine first.
+async fn join(publish: bool, setup: impl FnOnce(&FakeEngine)) -> Call {
+    let mut server = TestServer::start().await;
+    let (client, mut peer) = connected(&mut server).await;
+    let engine = Arc::new(FakeEngine::default());
+    setup(&engine);
+    let (c, e) = (client.clone(), engine.clone());
+    let joining = tokio::spawn(async move { c.join_call("ch", e, publish).await });
+    let f = peer.recv().await;
+    assert_eq!(f["type"], "call.join");
+    peer.send(joined(&f["id"], "t1")).await;
+    let handle = tokio::time::timeout(WAIT, joining)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    Call {
+        client,
+        peer,
+        handle,
+        engine,
+        server,
+    }
+}
+
+impl Call {
+    async fn recv_type(&mut self, ty: &str) -> Value {
+        loop {
+            let f = self.peer.recv().await;
+            if f["type"] == ty {
+                return f;
+            }
+        }
+    }
+    async fn ok(&mut self, f: &Value) {
+        self.peer
+            .send(json!({ "type": "call.ok", "re": f["id"], "data": {} }))
+            .await;
+    }
+    async fn offer(&mut self, version: u64, streams: Vec<Value>) {
+        self.peer
+            .send(json!({ "type": "call.subscribe.offer", "data": {
+                "call_id": "k1", "version": version, "sdp": format!("sub-v{version}"), "streams": streams }}))
+            .await;
+    }
+    /// Drop the socket and let the client come back; returns the `call.resume` frame.
+    async fn reconnect(&mut self) -> Value {
+        self.peer.close(1000, "drop").await;
+        self.peer = self.server.accept().await;
+        self.peer.accept_auth().await;
+        let resume = self.peer.recv().await;
+        assert_eq!(
+            resume["type"], "call.resume",
+            "first call frame on a new socket must be call.resume"
+        );
+        resume
+    }
+    async fn wait_status(&self, want: impl Fn(&CallStatus) -> bool) {
+        let mut st = self.handle.state();
+        tokio::time::timeout(WAIT, st.wait_for(|s| want(&s.status)))
+            .await
+            .expect("status never reached")
+            .unwrap();
+    }
+    async fn eventually(&self, what: &str, f: impl Fn(&[String]) -> bool) {
+        for _ in 0..500 {
+            if f(&self.engine.log()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("never: {what}; log = {:?}", self.engine.log());
+    }
+}
+
+// ---- join and publish ----
+
+#[tokio::test]
+async fn join_then_publish_offer_answer() {
+    let mut call = join(true, |_| {}).await;
+    call.wait_status(|s| *s == CallStatus::Connected).await;
+    assert_eq!(
+        call.handle.state().borrow().participants[0].display_name,
+        "Bob"
+    );
+    let publish = call.recv_type("call.publish").await;
+    assert_eq!(
+        publish["data"],
+        json!({ "call_id": "k1", "sdp": "offer-1" })
+    );
+    call.peer
+        .send(json!({ "type": "call.publish.answer", "re": publish["id"],
+            "data": { "call_id": "k1", "sdp": "pub-answer\na=mid:0\na=mid:1" } }))
+        .await;
+    call.eventually("answer applied", |l| {
+        l.iter().any(|e| e == "apply_publish_answer:pub-answer")
+    })
+    .await;
+}
+
+/// Publish candidates the engine emits before `call.publish` is written go out after it.
+#[tokio::test]
+async fn publish_candidates_wait_for_call_publish() {
+    let mut call = join(true, |e| {
+        e.gate("create_publish_offer");
+    })
+    .await;
+    call.eventually("offer started", |l| {
+        l.iter().any(|e| e == "create_publish_offer")
+    })
+    .await;
+    let c = IceCandidate {
+        candidate: "c-early".into(),
+        sdp_mid: Some("0".into()),
+        sdp_mline_index: Some(0),
+    };
+    call.handle.local_candidate(PcKind::Publish, Some(c));
+    tokio::time::sleep(QUIET).await;
+    call.engine.gates.lock().unwrap()["create_publish_offer"].add_permits(1);
+    assert_eq!(call.peer.recv().await["type"], "call.publish");
+    let ice = call.peer.recv().await;
+    assert_eq!(ice["type"], "call.ice");
+    assert_eq!(ice["data"]["candidate"]["candidate"], "c-early");
+}
+
+// ---- subscribe ----
+
+/// `call.joined` then the first offer back-to-back: the offer is applied and answered.
+#[tokio::test]
+async fn first_offer_right_behind_joined_is_answered() {
+    let mut server = TestServer::start().await;
+    let (client, mut peer) = connected(&mut server).await;
+    let engine = Arc::new(FakeEngine::default());
+    let (c, e) = (client.clone(), engine.clone());
+    let joining = tokio::spawn(async move { c.join_call("ch", e, false).await });
+    let f = peer.recv().await;
+    peer.send(joined(&f["id"], "t1")).await;
+    peer.send(json!({ "type": "call.subscribe.offer", "data": {
+        "call_id": "k1", "version": 1, "sdp": "sub-v1", "streams": [stream("0")] }}))
+        .await;
+    let _handle = joining.await.unwrap().unwrap();
+    let answer = peer.recv().await;
+    assert_eq!(answer["type"], "call.subscribe.answer");
+    assert_eq!(answer["data"]["version"], 1);
+    assert_eq!(answer["data"]["sdp"], "answer-to-sub-v1");
+}
+
+/// v2 and v3 arrive while v1 is being applied, and a local candidate is emitted meanwhile:
+/// the candidate still goes out, only v3 is answered (v2 is never applied).
+#[tokio::test]
+async fn superseded_offers_are_skipped_and_signaling_keeps_flowing() {
+    let mut call = join(false, |e| {
+        e.gate("apply_subscribe_offer");
+    })
+    .await;
+    call.offer(1, vec![stream("0")]).await;
+    call.eventually("v1 applying", |l| {
+        l.iter().any(|e| e == "apply_subscribe_offer:sub-v1")
+    })
+    .await;
+    call.offer(2, vec![stream("0")]).await;
+    call.offer(3, vec![stream("0"), stream("1")]).await;
+    // Ordering signal: the call mailbox is FIFO, so once this roster event is visible in the
+    // state, v2 and v3 have been processed by the call task too.
+    call.peer
+        .send(
+            json!({ "type": "call.participant", "data": { "call_id": "k1", "event": "joined",
+            "participant": { "participant_id": "p3", "user_id": "u3", "display_name": "Cy",
+                             "audio": true, "video": true, "publishing": [] } } }),
+        )
+        .await;
+    let mut st = call.handle.state();
+    tokio::time::timeout(
+        WAIT,
+        st.wait_for(|s| s.participants.iter().any(|p| p.participant_id == "p3")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let c = IceCandidate {
+        candidate: "c-sub".into(),
+        sdp_mid: Some("0".into()),
+        sdp_mline_index: Some(0),
+    };
+    call.handle.local_candidate(PcKind::Subscribe, Some(c));
+    let ice = call.peer.recv().await;
+    assert_eq!(
+        ice["type"], "call.ice",
+        "signaling stalled behind the engine"
+    );
+    call.engine.gates.lock().unwrap()["apply_subscribe_offer"].add_permits(10);
+    let answer = call.recv_type("call.subscribe.answer").await;
+    assert_eq!(answer["data"]["version"], 3);
+    assert!(!call
+        .engine
+        .log()
+        .iter()
+        .any(|e| e == "apply_subscribe_offer:sub-v2"));
+}
+
+/// After resume the server replays the unanswered offer (same version): the retained
+/// answer is resent, the engine is not asked again.
+#[tokio::test]
+async fn replayed_offer_gets_the_retained_answer() {
+    let mut call = join(false, |_| {}).await;
+    call.offer(1, vec![stream("0")]).await;
+    call.recv_type("call.subscribe.answer").await; // never acknowledged
+    let resume = call.reconnect().await;
+    call.peer.send(joined(&resume["id"], "t2")).await;
+    call.wait_status(|s| *s == CallStatus::Connected).await;
+    // The client resends the retained answer on its own after resume, and again for the
+    // server's replay; neither re-applies.
+    call.offer(1, vec![stream("0")]).await;
+    let again = call.recv_type("call.subscribe.answer").await;
+    assert_eq!(again["data"]["version"], 1);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(call.engine.subscribe_applies.load(Ordering::SeqCst), 1);
+}
+
+/// A late `stale` for v1 must not clear the retained v2 answer.
+#[tokio::test]
+async fn late_stale_for_an_old_version_keeps_the_newer_answer() {
+    let mut call = join(false, |_| {}).await;
+    call.offer(1, vec![stream("0")]).await;
+    let a1 = call.recv_type("call.subscribe.answer").await;
+    call.offer(2, vec![stream("0")]).await;
+    let a2 = call.recv_type("call.subscribe.answer").await;
+    assert_eq!(a2["data"]["version"], 2);
+    call.peer
+        .send(
+            json!({ "type": "error", "re": a1["id"], "data": { "code": "stale", "message": "" } }),
+        )
+        .await;
+    tokio::time::sleep(QUIET).await;
+    let resume = call.reconnect().await; // v2 never acknowledged
+    call.peer.send(joined(&resume["id"], "t2")).await;
+    call.offer(2, vec![stream("0")]).await;
+    let again = call.recv_type("call.subscribe.answer").await;
+    assert_eq!(again["data"]["version"], 2);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(
+        call.engine.subscribe_applies.load(Ordering::SeqCst),
+        2,
+        "v2 was re-applied"
+    );
+}
+
+/// A late `call.ok` for v1 after v2 was acknowledged must not lower `acked`: a replay of
+/// v2 is then ignored, not re-applied.
+#[tokio::test]
+async fn acknowledgements_never_move_backwards() {
+    let mut call = join(false, |_| {}).await;
+    call.offer(1, vec![stream("0")]).await;
+    let a1 = call.recv_type("call.subscribe.answer").await;
+    call.offer(2, vec![stream("0")]).await;
+    let a2 = call.recv_type("call.subscribe.answer").await;
+    call.ok(&a2).await;
+    call.ok(&a1).await; // late
+    tokio::time::sleep(QUIET).await;
+    call.offer(2, vec![stream("0")]).await;
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(call.engine.subscribe_applies.load(Ordering::SeqCst), 2);
+}
+
+// ---- ICE ----
+
+/// A remote candidate for a mid that is not yet in the applied description waits for the
+/// re-offer that adds it, and stays in order with end-of-candidates.
+#[tokio::test]
+async fn remote_candidate_for_a_new_mid_waits_for_its_description() {
+    let mut call = join(false, |_| {}).await;
+    call.offer(1, vec![stream("0")]).await;
+    let a1 = call.recv_type("call.subscribe.answer").await;
+    call.ok(&a1).await;
+    call.peer.send(json!({ "type": "call.ice", "data": { "call_id": "k1", "pc": "subscribe", "candidate": cand("c-mid1", "1") } })).await;
+    call.peer.send(json!({ "type": "call.ice", "data": { "call_id": "k1", "pc": "subscribe", "candidate": null } })).await;
+    tokio::time::sleep(QUIET).await;
+    assert!(
+        !call.engine.log().iter().any(|e| e.starts_with("remote:")),
+        "applied before its mid existed"
+    );
+    call.offer(2, vec![stream("0"), stream("1")]).await;
+    call.eventually("flushed in order", |l| {
+        let remote: Vec<&String> = l.iter().filter(|e| e.starts_with("remote:")).collect();
+        remote.len() == 2
+            && remote[0] == "remote:Subscribe:c-mid1"
+            && remote[1] == "remote:Subscribe:end"
+    })
+    .await;
+}
+
+// ---- resume ----
+
+/// The answer to `call.publish` is lost with the socket: after resume a new offer is sent.
+#[tokio::test]
+async fn publish_interrupted_by_a_drop_is_renegotiated_after_resume() {
+    let mut call = join(true, |_| {}).await;
+    call.recv_type("call.publish").await; // answer never comes
+    let resume = call.reconnect().await;
+    call.peer.send(joined(&resume["id"], "t2")).await;
+    let publish = call.recv_type("call.publish").await;
+    assert_eq!(publish["data"]["sdp"], "offer-2");
+}
+
+/// On a new socket, nothing but `call.resume` is written before its `call.joined`.
+#[tokio::test]
+async fn only_resume_before_resumed() {
+    let mut call = join(false, |_| {}).await;
+    call.peer.close(1000, "drop").await;
+    call.wait_status(|s| *s == CallStatus::Reconnecting).await;
+    let h = call.handle.clone();
+    tokio::spawn(async move { h.set_media(false, true).await });
+    call.handle.local_candidate(PcKind::Subscribe, None);
+    call.peer = call.server.accept().await;
+    call.peer.accept_auth().await;
+    let resume = call.peer.recv().await;
+    assert_eq!(resume["type"], "call.resume");
+    assert!(
+        tokio::time::timeout(QUIET, call.peer.recv()).await.is_err(),
+        "wrote a call command before being resumed"
+    );
+    call.peer.send(joined(&resume["id"], "t2")).await;
+    let media = call.recv_type("call.media").await; // the intent made while down
+    assert_eq!(media["data"]["audio"], false);
+}
+
+/// Each resume uses the newest token received.
+#[tokio::test]
+async fn resume_uses_the_rotated_token() {
+    let mut call = join(false, |_| {}).await;
+    let r1 = call.reconnect().await;
+    assert_eq!(r1["data"]["resume_token"], "t1");
+    assert_eq!(r1["data"]["participant_id"], "me");
+    call.peer.send(joined(&r1["id"], "t2")).await;
+    call.wait_status(|s| *s == CallStatus::Connected).await;
+    let r2 = call.reconnect().await;
+    assert_eq!(r2["data"]["resume_token"], "t2");
+}
+
+#[tokio::test]
+async fn resume_refused_ends_the_call_expired() {
+    let mut call = join(false, |_| {}).await;
+    let r = call.reconnect().await;
+    call.peer.send(json!({ "type": "error", "re": r["id"], "data": { "code": "not_in_call", "message": "" } })).await;
+    call.wait_status(|s| *s == CallStatus::Ended(EndReason::Expired))
+        .await;
+    call.eventually("engine closed", |l| l.iter().any(|e| e == "close"))
+        .await;
+}
+
+// ---- mute ----
+
+#[tokio::test]
+async fn rejected_mute_rolls_the_engine_back() {
+    let mut call = join(false, |_| {}).await;
+    let h = call.handle.clone();
+    let res = tokio::spawn(async move { h.set_media(false, true).await });
+    let m = call.recv_type("call.media").await;
+    call.peer
+        .send(
+            json!({ "type": "error", "re": m["id"], "data": { "code": "invalid", "message": "" } }),
+        )
+        .await;
+    assert!(res.await.unwrap().is_err());
+    let log = call.engine.log();
+    let media: Vec<&String> = log.iter().filter(|e| e.starts_with("media:")).collect();
+    assert_eq!(
+        media,
+        ["media:false:true", "media:true:true"],
+        "not rolled back"
+    );
+}
+
+#[tokio::test]
+async fn unanswered_mute_is_not_rolled_back() {
+    let mut call = join(false, |_| {}).await;
+    let h = call.handle.clone();
+    let res = tokio::spawn(async move { h.set_media(false, true).await });
+    call.recv_type("call.media").await;
+    call.peer.close(1000, "drop").await; // outcome unknown
+    let _ = res.await;
+    let log = call.engine.log();
+    let media: Vec<&String> = log.iter().filter(|e| e.starts_with("media:")).collect();
+    assert_eq!(
+        media,
+        ["media:false:true"],
+        "rolled back although the server may have it"
+    );
+}
+
+// ---- ending ----
+
+/// Several end causes racing while an engine operation is held: `close()` exactly once, and
+/// promptly (before the held operation is released); the held operation cannot restart capture.
+#[tokio::test]
+async fn racing_ends_close_once_and_fence_the_engine() {
+    let mut call = join(true, |e| {
+        e.gate("create_publish_offer");
+    })
+    .await;
+    call.eventually("offer held", |l| {
+        l.iter().any(|e| e == "create_publish_offer")
+    })
+    .await;
+    call.peer
+        .send(json!({ "type": "call.ended", "data": { "call_id": "k1", "reason": "sfu_restart" } }))
+        .await;
+    call.handle.engine_failed("boom".into());
+    let _ = call.handle.leave().await;
+    call.eventually("closed before release", |l| l.iter().any(|e| e == "close"))
+        .await;
+    call.engine.gates.lock().unwrap()["create_publish_offer"].add_permits(1);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(call.engine.closes.load(Ordering::SeqCst), 1);
+    assert!(
+        !call.engine.capture.load(Ordering::SeqCst),
+        "capture restarted after close"
+    );
+    // The causes arrive on different channels, so any of them may win — but exactly one does.
+    assert!(matches!(
+        call.handle.state().borrow().status,
+        CallStatus::Ended(_)
+    ));
+}
+
+#[tokio::test]
+async fn replaced_by_another_socket_ends_the_call() {
+    let mut call = join(false, |_| {}).await;
+    call.peer
+        .send(json!({ "type": "call.ended", "data": { "call_id": "k1", "reason": "replaced" } }))
+        .await;
+    call.wait_status(|s| *s == CallStatus::Ended(EndReason::Replaced))
+        .await;
+}
+
+#[tokio::test]
+async fn signing_in_as_someone_else_ends_the_call() {
+    let call = join(false, |_| {}).await;
+    call.client.login("bob", "pw").await.unwrap();
+    call.wait_status(|s| *s == CallStatus::Ended(EndReason::SessionChanged))
+        .await;
+    call.eventually("engine closed", |l| l.iter().any(|e| e == "close"))
+        .await;
+}
+
+#[tokio::test]
+async fn leave_tells_the_server_and_later_calls_fail() {
+    let mut call = join(false, |_| {}).await;
+    call.handle.leave().await.unwrap();
+    assert_eq!(call.recv_type("call.leave").await["data"]["call_id"], "k1");
+    assert!(call.handle.set_media(true, true).await.is_err());
+}
+
+/// `leave()` resolves only once the server confirmed, so an app can await it and quit
+/// without racing its own leave; media stops and the status ends immediately.
+#[tokio::test]
+async fn leave_waits_for_the_server_before_resolving() {
+    let mut call = join(false, |_| {}).await;
+    let h = call.handle.clone();
+    let leaving = tokio::spawn(async move { h.leave().await });
+    let leave = call.recv_type("call.leave").await;
+    call.wait_status(|s| *s == CallStatus::Ended(EndReason::Left))
+        .await;
+    call.eventually("engine closed at once", |l| l.iter().any(|e| e == "close"))
+        .await;
+    tokio::time::sleep(QUIET).await;
+    assert!(
+        !leaving.is_finished(),
+        "leave() resolved before the server confirmed"
+    );
+    call.ok(&leave).await;
+    tokio::time::timeout(WAIT, leaving)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+/// No confirmation: `leave()` still resolves, after the bounded wait.
+#[tokio::test]
+async fn leave_without_confirmation_resolves_after_the_bounded_wait() {
+    let mut call = join(false, |_| {}).await;
+    let h = call.handle.clone();
+    let leaving = tokio::spawn(async move { h.leave().await });
+    call.recv_type("call.leave").await; // never confirmed
+    tokio::time::timeout(Duration::from_secs(5), leaving)
+        .await
+        .expect("leave() hung")
+        .unwrap()
+        .unwrap();
+}

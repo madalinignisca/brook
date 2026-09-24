@@ -22,3 +22,37 @@ UI, widgets, navigation, the file *picker* dialog, notifications, and the media 
 
 ## Why Rust
 Fast, memory-lean, no GC pauses (matters on the Raspberry Pi), excellent FFI, compiles to all five targets.
+
+## Calls (PROTOCOL.md §3)
+
+```rust
+client.start_realtime().await?;                       // the socket carries call signaling
+let call = client.join_call(channel_id, engine, true).await?;   // engine: Arc<dyn MediaEngine>
+let mut state = call.state();                          // watch::Receiver<CallState>
+call.local_candidate(PcKind::Publish, Some(c));       // from the engine's own threads
+call.set_media(false, true).await?;                    // mute (engine first, then server)
+call.leave().await?;                                   // dropping the handle also leaves
+```
+
+Core owns signaling: the offer/answer state for both PeerConnections, subscribe versions,
+ICE buffering per media section, resume after a socket drop, and exactly-once teardown.
+The platform implements [`MediaEngine`](src/call_types.rs) — GStreamer on Linux
+(`clients/gst-media`), libwebrtc on Apple — and must honour its contract: async
+operations finish on local WebRTC work alone (never waiting for ICE or for core), the sync
+methods never block, and `close()` fences every operation still running.
+
+Design and tests: [docs/superpowers/specs/2026-09-24-core-call-signaling-design.md](../docs/superpowers/specs/2026-09-24-core-call-signaling-design.md).
+
+## Logging: required cap for every client
+
+Core never logs frame contents, tokens or resume tokens. **tungstenite does**: at `trace`
+it logs whole WebSocket messages, including the `auth` frame's access token and
+`call.joined`'s resume token. Every client that installs a tracing subscriber MUST cap
+it, even when the user asks for `trace`:
+
+```text
+trace,tungstenite=info,tokio_tungstenite=info
+```
+
+`log_secrecy_tests` proves both halves: with this filter no token appears in any
+encoding across auth, re-auth, join and resume; without the cap, tokens do leak.
