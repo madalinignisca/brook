@@ -29,6 +29,13 @@ services:
       # Schema is owned by Alembic: the api entrypoint runs `alembic upgrade head`
       # on start, so create_all must stay off (avoids drift between the two paths).
       BROOK_AUTO_CREATE_SCHEMA: "false"
+      # Calls (Phase 4). api runs without Janus; call commands then answer
+      # `sfu_unavailable` until `make media` brings the SFU up.
+      BROOK_JANUS_URL: ws://janus:8188
+      BROOK_JANUS_API_SECRET: ${JANUS_API_SECRET:-}
+      # Dev/test only: serves the browser call harness at /dev/call. Keep false in
+      # anything user-facing; it is a test tool, not a client.
+      BROOK_DEV_HARNESS: ${BROOK_DEV_HARNESS:-false}
     depends_on:
       postgres:
         condition: service_healthy
@@ -67,11 +74,26 @@ services:
       # Admin console: loopback unless explicitly opened (see the caddy note above).
       - "${BROOK_MINIO_CONSOLE_BIND:-127.0.0.1}:${BROOK_MINIO_CONSOLE_PORT:-9001}:9001"
 
-  # --- Phase 4: media SFU (Janus). Enable with `make media`. Config lands in Phase 4. ---
+  # --- Phase 4: media SFU (Janus, built from services/sfu). Enable with `make media`. ---
   janus:
-    image: canyan/janus-gateway:latest
+    build:
+      context: ../services/sfu
     profiles: ["media"]
     restart: unless-stopped
+    environment:
+      # Shared with api only; every Janus API request must carry it.
+      JANUS_API_SECRET: ${JANUS_API_SECRET:?set JANUS_API_SECRET in .env (make init generates it)}
+      # The address clients send media to. Defaults to the media bind address.
+      JANUS_PUBLIC_IP: ${BROOK_MEDIA_PUBLIC_IP:-${BROOK_MEDIA_BIND:-127.0.0.1}}
+      JANUS_RTP_PORTS: ${BROOK_MEDIA_RTP_PORTS:-20000-20099}
+    # 8188 = Janus WebSocket API: internal network only, NEVER published.
+    expose:
+      - "8188"
+    ports:
+      # Media (SRTP/DTLS over UDP), same rule as the gateway: always IP-qualified,
+      # loopback by default, one named address for a LAN. Never the short form
+      # (it binds 0.0.0.0 and [::]). Keep the range small: one port per stream.
+      - "${BROOK_MEDIA_BIND:-127.0.0.1}:${BROOK_MEDIA_RTP_PORTS:-20000-20099}:${BROOK_MEDIA_RTP_PORTS:-20000-20099}/udp"
 
 volumes:
   pgdata:

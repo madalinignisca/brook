@@ -14,6 +14,7 @@ dependencies = [
     "argon2-cffi>=23.1",
     "pyjwt>=2.8",
     "alembic>=1.18.4",
+    "websockets>=13",
 ]
 
 [project.optional-dependencies]
@@ -52,6 +53,7 @@ known-third-party = ["alembic"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S105", "S106"]  # asserts + test-only secret literals
+"e2e/**" = ["S101"]  # the e2e scripts assert, like tests
 
 [tool.mypy]
 python_version = "3.11"

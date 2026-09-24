@@ -21,13 +21,25 @@ class Hub:
     def __init__(self) -> None:
         self._conns: dict[uuid.UUID, set[WebSocket]] = defaultdict(set)
         self._lock = asyncio.Lock()
+        # One writer per socket. Fan-out (chat events) and direct replies (call
+        # signaling) can target the same socket from different tasks; unserialized
+        # concurrent sends on one ASGI WebSocket are not safe.
+        self._send_locks: dict[WebSocket, asyncio.Lock] = {}
 
     async def register(self, user_id: uuid.UUID, ws: WebSocket) -> None:
         async with self._lock:
             self._conns[user_id].add(ws)
+            self._send_locks.setdefault(ws, asyncio.Lock())
+
+    async def send(self, ws: WebSocket, event: dict[str, Any]) -> None:
+        """Send to one socket, serialized with every other send to it."""
+        lock = self._send_locks.setdefault(ws, asyncio.Lock())
+        async with lock:
+            await ws.send_json(event)
 
     async def unregister(self, user_id: uuid.UUID, ws: WebSocket) -> None:
         async with self._lock:
+            self._send_locks.pop(ws, None)
             conns = self._conns.get(user_id)
             if conns is not None:
                 conns.discard(ws)
@@ -42,7 +54,7 @@ class Hub:
             targets = [(uid, ws) for uid in set(user_ids) for ws in self._conns.get(uid, set())]
         for uid, ws in targets:
             try:
-                await ws.send_json(event)
+                await self.send(ws, event)
             except Exception:  # noqa: BLE001 - a dead socket shouldn't break fan-out
                 await self.unregister(uid, ws)
 

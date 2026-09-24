@@ -18,10 +18,12 @@ init: ## Create .env with random secrets — only if it doesn't exist yet
 	  key=$$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 48); \
 	  pw=$$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24); \
 	  mpw=$$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24); \
+	  jsec=$$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40); \
 	  tmp=$$(mktemp); \
 	  sed "s|^BROOK_JWT_SIGNING_KEY=.*|BROOK_JWT_SIGNING_KEY=$$key|;\
 	       s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$$pw|;\
-	       s|^MINIO_ROOT_PASSWORD=.*|MINIO_ROOT_PASSWORD=$$mpw|" $(ENV) > $$tmp && mv $$tmp $(ENV); \
+	       s|^MINIO_ROOT_PASSWORD=.*|MINIO_ROOT_PASSWORD=$$mpw|;\
+	       s|^JANUS_API_SECRET=.*|JANUS_API_SECRET=$$jsec|" $(ENV) > $$tmp && mv $$tmp $(ENV); \
 	  echo "Generated $(ENV) with random secrets — review it."; \
 	fi
 
