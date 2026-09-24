@@ -16,6 +16,18 @@ Conventions:
 
 ## 2026-09-24
 
+### P4 calls: live call through core's signaling (C1b acceptance on Linux)
+
+`clients/gst-media/tests/core_call.rs` (ignored, live): two `BrookClient`s +
+`GstEngine`s via `join_call`/`CallHandle` against local Janus. Passes: joined
+-> Connected, rosters, video both ways, `set_media` reflected in the other
+roster, leave -> Ended(Left) + empty re-offer applied. Found by running it
+twice back-to-back: a ghost participant in the next call. Two causes, reported
+to their owners: server `_leave` replies before removing the participant (a
+failed send skips removal; ghost until the 30 s grace), and core's `leave()`
+is fire-and-forget (spec said reply awaited), so an app exiting right after
+leave races it.
+
 ### P4 calls: GstEngine implements core's MediaEngine, reviewed by Vibe
 
 Branch `feat/gtk-calls` = `feat/gtk-media-engine` + brook-ios's
