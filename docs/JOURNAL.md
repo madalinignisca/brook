@@ -16,6 +16,20 @@ Conventions:
 
 ## 2026-09-24
 
+### KDE: return to login on mid-session sign-out, reviewed by Vibe
+
+Same requirement as GNOME (brook-ios, before core's session-epoch fix merges):
+a watcher on the core `AuthState` flips `logged_in` back on `LoggedOut`, so
+Kirigami swaps the chat page for the login page; the shared client is cleared.
+The chat realtime listener now uses a generation counter instead of a
+one-shot `STARTED` flag (which blocked any restart after re-login), and it
+exits on sign-out. Builds and clippy-clean; not exercised at runtime yet.
+
+Friends review: only Vibe CLI 2.14 ran. Applied: the listener no longer idles
+forever (holding the client) after a sign-out with no re-login. Declined:
+"tasks outlive the Qt controllers" (both controllers live at the root of
+Main.qml for the window's lifetime; `qt.queue` fails harmlessly after).
+
 ### GNOME login: remembered Server field + mid-session sign-out, reviewed by Vibe
 
 Parity with macOS (user asked for a server field kept across restarts): login
