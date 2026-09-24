@@ -73,10 +73,16 @@ class Participant:
     # subscribe anyone to a feed before that ("No such feed"), so a participant only
     # counts as a subscribable publisher from then on; "hangup" clears it.
     media_up: bool = False
-    # Contract §3.4: false until published; then set from what the publish offer
-    # sends, and changed only by call.media afterwards.
+    # Announced mute state (contract §3.4), derived by refresh_media(): never set directly.
     audio: bool = False
     video: bool = False
+    # What the user last asked for with call.media (on until they say otherwise).
+    # The announced audio/video are always intent AND "that kind is published",
+    # recomputed on call.media and on every publish, so a mute sent before the
+    # publish lands survives it, and an unpublished kind can never show as on.
+    audio_intent: bool = True
+    video_intent: bool = True
+
     # Proves "this device is that participant" on call.resume (contract §3.5). A
     # user may be in one call from several devices, so user_id alone would let one
     # device take over another's participant. Rotated on every resume.
@@ -92,6 +98,12 @@ class Participant:
     sub_dirty: bool = False
     grace: asyncio.Task[None] | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def refresh_media(self) -> None:
+        """audio/video = what the user wants AND what is actually published."""
+        kinds = {x["kind"] for x in self.publishing}
+        self.audio = self.audio_intent and "audio" in kinds
+        self.video = self.video_intent and "video" in kinds
 
     def view(self) -> dict[str, Any]:
         return {
@@ -346,8 +358,7 @@ class CallManager:
             log.warning("SFU rejected a publish offer from %s: %s", p.participant_id, exc)
             raise CallError("invalid", "the SFU rejected the offer") from exc
         p.publishing = _publishing_from_sdp(sdp)
-        p.audio = any(x["kind"] == "audio" for x in p.publishing)
-        p.video = any(x["kind"] == "video" for x in p.publishing)
+        p.refresh_media()  # keeps a mute sent before this publish landed
         await self._broadcast(
             p.call,
             envelope(
@@ -763,7 +774,8 @@ async def _ice(conn: Connection, frame: dict[str, Any], re: str | None) -> None:
 async def _media(conn: Connection, frame: dict[str, Any], re: str | None) -> None:
     data = _require(frame, "call_id", "audio", "video")
     p = manager._participant_of(conn, data["call_id"])
-    p.audio, p.video = bool(data["audio"]), bool(data["video"])
+    p.audio_intent, p.video_intent = bool(data["audio"]), bool(data["video"])
+    p.refresh_media()  # announced = intent AND published (see Participant)
     await conn.send(envelope("call.ok", {}, re=re))
     updated = envelope(
         "call.participant",
