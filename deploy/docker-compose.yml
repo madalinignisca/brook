@@ -40,6 +40,15 @@ services:
       # Dev/test only: serves the browser call harness at /dev/call. Keep false in
       # anything user-facing; it is a test tool, not a client.
       BROOK_DEV_HARNESS: ${BROOK_DEV_HARNESS:-false}
+      # Trust X-Forwarded-For from any peer. Without it uvicorn trusts only
+      # 127.0.0.1, which in compose is never Caddy: every client then shares the
+      # Caddy container's IP, and one person's mistyped passwords rate-limit
+      # everyone on the server (app/ratelimit.py). Safe here and only here: api is
+      # `expose`d on the compose network, never published, so Caddy is its only
+      # HTTP peer, and Caddy (2.5+, no trusted_proxies) replaces any client-sent
+      # X-Forwarded-For with the real client address. The native deploy keeps
+      # uvicorn's default (Caddy is on 127.0.0.1 there).
+      FORWARDED_ALLOW_IPS: "*"
     depends_on:
       postgres:
         condition: service_healthy
