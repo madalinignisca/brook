@@ -118,6 +118,13 @@ pub struct BrookClient {
     pub(crate) offline: Arc<tokio::sync::Mutex<Option<crate::offline::Offline>>>,
     /// The app's cache notices, stable across sign-ins.
     pub(crate) cache_events: broadcast::Sender<crate::cache::CacheEvent>,
+    /// The signed-in user's sync state, stable across sign-ins (default while nobody's
+    /// stores are feeding it).
+    pub(crate) cache_state: watch::Sender<crate::cache::CacheState>,
+    /// Lost unsent messages, numbered, until the app acknowledges them. Owned here, not by
+    /// the per-user data: a loss can be found before that exists, and its numbers must
+    /// never restart.
+    pub(crate) losses: Arc<std::sync::Mutex<crate::offline::Losses>>,
 }
 
 impl Drop for BrookClient {
@@ -163,6 +170,8 @@ impl BrookClient {
             tasks: std::sync::Mutex::default(),
             offline: Arc::default(),
             cache_events: broadcast::channel(512).0,
+            cache_state: watch::channel(crate::cache::CacheState::default()).0,
+            losses: Arc::default(),
         })
     }
 

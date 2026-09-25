@@ -66,7 +66,9 @@ impl LocalData {
             // The index's key is gone: nobody knows which directory is whose any more, so
             // every store is an orphan. Guessing an owner could show one user's data to
             // another, so `reconcile` erases them, and says so if an outbox was among them.
-            local.reconcile().await?;
+            // A failure here is left to the caller's own reconcile, which retries it: returning
+            // the error would drop `local`, and with it a loss already found.
+            let _ = local.reconcile().await;
         }
         Ok(Some(local))
     }

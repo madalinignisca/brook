@@ -68,6 +68,8 @@ impl Server {
         v
     }
     fn store(&self, channel: &str, body: &str, client_id: &str) -> Value {
+        // Like the server: the id is parsed as a UUID and echoed canonical (lowercase).
+        let client_id = &client_id.to_ascii_lowercase();
         let mut stored = self.stored.lock().unwrap();
         let n = stored.len() + 1;
         stored
@@ -845,4 +847,80 @@ async fn a_dropped_session_source_stops_the_sender() {
         1,
         "sent after its session source was gone"
     );
+}
+
+const UPPER: &str = "0190A000-0000-7000-8000-00000000ABCD";
+const LOWER: &str = "0190a000-0000-7000-8000-00000000abcd";
+
+/// Swift's `UUID().uuidString` is uppercase and the server echoes lowercase: the id is
+/// stored canonical, so the echo matches and the message goes out and clears.
+#[tokio::test]
+async fn an_uppercase_client_id_is_sent_and_cleared() {
+    let s = setup().await;
+    let id = s
+        .outbox
+        .enqueue("c1", "shout", Some(UPPER.into()))
+        .await
+        .unwrap();
+    assert_eq!(id, LOWER, "the id wasn't made canonical");
+    drained(&s).await;
+    assert_eq!(cached_bodies(&s, "c1").await, vec!["shout"]);
+}
+
+/// Retry and delete find the row by the form the caller kept.
+#[tokio::test]
+async fn retry_and_delete_accept_the_callers_form_of_the_id() {
+    let s = setup().await;
+    s.server
+        .script([Answer::Fail(SendFailure::Refused { code: "x".into() })]);
+    s.outbox
+        .enqueue("c1", "again", Some(UPPER.into()))
+        .await
+        .unwrap();
+    let outbox = s.outbox.clone();
+    for _ in 0..500 {
+        let p = outbox.pending("c1").await.unwrap();
+        if matches!(
+            p.first().map(|m| &m.state),
+            Some(crate::outbox::PendingState::Failed { .. })
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    s.outbox.retry(UPPER).await.unwrap();
+    drained(&s).await;
+    s.session.send_replace(None);
+    s.outbox
+        .enqueue("c1", "never", Some(UPPER.replace("ABCD", "ABCE")))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.outbox
+            .delete_pending(&UPPER.replace("ABCD", "ABCE"))
+            .await
+            .unwrap(),
+        crate::outbox::Deleted::Removed
+    );
+}
+
+#[tokio::test]
+async fn a_client_id_that_isnt_a_uuid_is_refused() {
+    let s = setup().await;
+    for bad in [
+        "hello",
+        "0190a000-0000-7000-8000-00000000abcz",
+        "0190a0000000-7000-8000-00000000abcd-",
+    ] {
+        assert_eq!(
+            s.outbox.enqueue("c1", "x", Some(bad.into())).await,
+            Err(OutboxError::BadId),
+            "{bad} was accepted"
+        );
+    }
+    assert!(s
+        .outbox
+        .enqueue("c1", "x", Some("0190A00000007000800000000000ABCD".into()))
+        .await
+        .is_ok_and(|id| id == LOWER));
 }

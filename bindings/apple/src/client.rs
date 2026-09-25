@@ -22,7 +22,7 @@ use crate::types::{
 /// Swift-facing wrapper around [`BrookClient`].
 #[derive(uniffi::Object)]
 pub struct FfiBrookClient {
-    inner: Arc<BrookClient>,
+    pub(crate) inner: Arc<BrookClient>,
 }
 
 #[uniffi::export]
