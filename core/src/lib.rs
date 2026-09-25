@@ -36,6 +36,10 @@ mod error;
 mod keyslot;
 #[cfg(test)]
 mod log_secrecy_tests;
+#[allow(dead_code)] // wired into the client once stores turn on (C5)
+mod outbox;
+#[cfg(test)]
+mod outbox_tests;
 mod persist;
 #[cfg(test)]
 mod restore_tests;

@@ -773,3 +773,117 @@ async fn only_an_unreachable_server_is_offline() {
         "a refused token read as offline"
     );
 }
+
+mod post_http {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tokio::sync::watch;
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::cache_http::Http;
+    use crate::outbox::{Post, SendFailure};
+    use crate::session_store::SessionStore;
+    use crate::{AuthState, Session, User};
+
+    async fn http(server: &MockServer) -> (Http, u64) {
+        let (tx, _) = watch::channel(AuthState::LoggedOut);
+        let session = SessionStore::new(Arc::new(tx));
+        session
+            .replace(Some(Session {
+                access_token: "tok".into(),
+                refresh_token: "ref".into(),
+                user: User {
+                    id: "me".into(),
+                    handle: "me".into(),
+                    display_name: "Me".into(),
+                    global_role: "member".into(),
+                },
+            }))
+            .await;
+        let epoch = session.snapshot().await.0.epoch;
+        let h = Http {
+            http: reqwest::Client::new(),
+            base: format!("{}/", server.uri()).parse().unwrap(),
+            session,
+        };
+        (h, epoch)
+    }
+
+    async fn answer(
+        status: u16,
+        body: serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> Result<serde_json::Value, SendFailure> {
+        let server = MockServer::start().await;
+        let mut t = ResponseTemplate::new(status).set_body_json(body);
+        for (k, v) in headers {
+            t = t.insert_header(*k, *v);
+        }
+        Mock::given(method("POST"))
+            .and(path("/api/v1/channels/c1/messages"))
+            .and(body_partial_json(
+                json!({ "body": "hi", "client_id": "cid" }),
+            ))
+            .respond_with(t)
+            .mount(&server)
+            .await;
+        let (h, epoch) = http(&server).await;
+        h.send("c1", "hi", "cid", epoch).await
+    }
+
+    #[tokio::test]
+    async fn the_status_table() {
+        assert!(answer(201, json!({ "id": "m1", "client_id": "cid" }), &[])
+            .await
+            .is_ok());
+        assert!(answer(200, json!({ "id": "m1", "client_id": "cid" }), &[])
+            .await
+            .is_ok());
+        assert_eq!(
+            answer(429, json!({}), &[("retry-after", "7")]).await,
+            Err(SendFailure::Transient {
+                retry_after: Some(7)
+            })
+        );
+        for s in [401, 408, 500, 503] {
+            assert!(
+                matches!(
+                    answer(s, json!({}), &[]).await,
+                    Err(SendFailure::Transient { .. })
+                ),
+                "{s}"
+            );
+        }
+        let refused = json!({ "error": { "code": "authz.forbidden", "message": "no" } });
+        assert_eq!(
+            answer(403, refused, &[]).await,
+            Err(SendFailure::Refused {
+                code: "authz.forbidden".into()
+            })
+        );
+        assert_eq!(
+            answer(409, json!({}), &[]).await,
+            Err(SendFailure::Refused {
+                code: "http_409".into()
+            })
+        );
+    }
+
+    /// Asked under a session that isn't the current one: nothing is sent.
+    #[tokio::test]
+    async fn a_stale_session_sends_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (h, epoch) = http(&server).await;
+        assert!(matches!(
+            h.send("c1", "hi", "cid", epoch + 1).await,
+            Err(SendFailure::Transient { .. })
+        ));
+    }
+}

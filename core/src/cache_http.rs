@@ -87,3 +87,67 @@ impl History for Http {
             .map_err(|_| Error::UnexpectedResponse)
     }
 }
+
+#[async_trait::async_trait]
+impl crate::outbox::Post for Http {
+    /// `POST /channels/{id}/messages` with the outbox's `client_id`, under session `epoch`
+    /// only: if the signed-in session isn't that one any more, nothing is sent.
+    async fn send(
+        &self,
+        channel_id: &str,
+        body: &str,
+        client_id: &str,
+        epoch: u64,
+    ) -> Result<Value, crate::outbox::SendFailure> {
+        use crate::outbox::SendFailure;
+        let (rev, session) = self.session.snapshot().await;
+        let Some(session) = session.filter(|_| rev.epoch == epoch) else {
+            return Err(SendFailure::Transient { retry_after: None });
+        };
+        let url = self
+            .base
+            .join(&format!("api/v1/channels/{channel_id}/messages"))
+            .map_err(|_| SendFailure::Refused {
+                code: "client.bad_channel".into(),
+            })?;
+        let sent = self
+            .http
+            .post(url)
+            .bearer_auth(&session.access_token)
+            .json(&serde_json::json!({ "body": body, "client_id": client_id }))
+            .send()
+            .await;
+        let resp = match sent {
+            Ok(r) => r,
+            Err(_) => return Err(SendFailure::Transient { retry_after: None }),
+        };
+        let status = resp.status();
+        if status.is_success() {
+            return resp
+                .json::<Value>()
+                .await
+                .map_err(|_| SendFailure::Transient { retry_after: None });
+        }
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|s| s.min(300));
+        if status.is_server_error() || matches!(status.as_u16(), 401 | 408 | 429) {
+            return Err(SendFailure::Transient { retry_after });
+        }
+        // Refused: the server's code only (never its message, which could echo input).
+        let code = resp
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| {
+                v.pointer("/error/code")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| format!("http_{}", status.as_u16()));
+        Err(SendFailure::Refused { code })
+    }
+}
