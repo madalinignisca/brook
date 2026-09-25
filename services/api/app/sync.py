@@ -14,6 +14,8 @@ deleted channel's, which the database cascade removes unseen) leave tombstones.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
 from sqlalchemy import event, insert, inspect, select, update
@@ -21,9 +23,12 @@ from sqlalchemy.orm import Session
 
 from .models import Channel, File, Membership, Message, Reaction, SyncCounter, SyncTombstone, User
 
+log = logging.getLogger(__name__)
+
 _STAMPED = (Message, Channel, Membership, User)
 _KEY = "brook_sync_seq"
 _TX = "brook_sync_seq_tx"  # the (sub)transaction that took it
+_HINT = "brook_sync_hint"  # (channel ids, user ids) whose visible rows changed
 
 
 def _take_seq(session: Session) -> int:
@@ -71,6 +76,24 @@ def _stamp(session: Session, _ctx: Any, _instances: Any) -> None:
     if not (changed or reactions or dead_files or ended or dead_channels):
         return
     seq = _take_seq(session)
+    # sync.hint only for changes with no live event of their own. Messages, reactions
+    # and channel edits already have one; hinting those too would just make every
+    # client run /sync after every message.
+    #   channels: membership changed (joined, left): hint every member;
+    #   users:    that user only (their read marker, moved on another device);
+    #   sharers:  a profile change: everyone who shares a channel with them.
+    channels, users, sharers = session.info.setdefault(_HINT, (set(), set(), set()))
+    for obj in changed:
+        if isinstance(obj, Membership):
+            if obj in session.new:
+                channels.add(obj.channel_id)
+                users.add(obj.user_id)
+            else:
+                users.add(obj.user_id)  # last_read moved: only their other devices care
+        elif isinstance(obj, User) and obj not in session.new:
+            sharers.add(obj.id)
+    channels.update(m.channel_id for m in ended)
+    users.update(m.user_id for m in ended)  # the removed member hears it too
     for obj in changed:
         obj.seq = seq
         if isinstance(obj, Membership) and obj in session.new:
@@ -93,6 +116,7 @@ def _stamp(session: Session, _ctx: Any, _instances: Any) -> None:
         )
         for user_id in members:
             session.add(SyncTombstone(channel_id=ch.id, user_id=user_id, seq=seq))
+            # channel.delete already tells them live; no hint needed
 
 
 def transaction_seq(session: Session) -> int:
@@ -101,11 +125,70 @@ def transaction_seq(session: Session) -> int:
     return int(session.info.get(_KEY) or 0)
 
 
+@event.listens_for(Session, "after_commit")
+def _hint_after_commit(session: Session) -> None:
+    """After a commit that stamped changes, tell each affected user "run /sync now" (WS
+    ``sync.hint``). Most changes also have their own live event, but some don't (added
+    to a channel, a member left, a profile change), and a connected client would only
+    learn of those on its next reconnect. Fire-and-forget: a commit never waits on it."""
+    seq = session.info.get(_KEY)
+    hint = session.info.pop(_HINT, None)
+    if seq is None or hint is None or not any(hint) or not HINTS_ENABLED:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # no event loop (the host CLI): nobody is connected to this process
+    task = loop.create_task(_send_hints(int(seq), set(hint[0]), set(hint[1]), set(hint[2])))
+    _pending.add(task)  # keep a reference until it finishes
+    task.add_done_callback(_pending.discard)
+
+
+_pending: set[asyncio.Task[None]] = set()
+# Tests turn hints off by default (tests/conftest.py): a hint from setup can land ahead of
+# the frame a test is waiting for. The hint tests turn it back on.
+HINTS_ENABLED = True
+
+
+async def _send_hints(seq: int, channels: set[Any], users: set[Any], sharers: set[Any]) -> None:
+    from .db import get_sessionmaker  # local: db imports this module
+    from .hub import get_hub
+
+    try:
+        async with get_sessionmaker()() as session:
+            recipients = set(users)
+            if channels:
+                recipients |= set(
+                    (
+                        await session.scalars(
+                            select(Membership.user_id).where(Membership.channel_id.in_(channels))
+                        )
+                    ).all()
+                )
+            if sharers:
+                # A profile change reaches everyone who shares a channel with its owner.
+                shared = select(Membership.channel_id).where(Membership.user_id.in_(sharers))
+                recipients |= set(
+                    (
+                        await session.scalars(
+                            select(Membership.user_id).where(Membership.channel_id.in_(shared))
+                        )
+                    ).all()
+                )
+        if recipients:
+            await get_hub().send_to_users(
+                list(recipients), {"type": "sync.hint", "data": {"seq": seq}}
+            )
+    except Exception:  # an optimisation: /sync on reconnect still catches everything up
+        log.exception("sync hint failed")
+
+
 @event.listens_for(Session, "after_transaction_end")
 def _forget(session: Session, transaction: Any) -> None:
     if transaction.parent is None:  # the outermost transaction ended: next one bumps again
         session.info.pop(_KEY, None)
         session.info.pop(_TX, None)
+        session.info.pop(_HINT, None)
 
 
 @event.listens_for(Session, "after_soft_rollback")
@@ -119,5 +202,6 @@ def _forget_on_rollback(session: Session, previous_transaction: Any) -> None:
         if tx is previous_transaction:
             session.info.pop(_KEY, None)
             session.info.pop(_TX, None)
+            session.info.pop(_HINT, None)
             return
         tx = tx.parent

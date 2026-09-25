@@ -49,6 +49,16 @@ def _files_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None
 
 
 @pytest.fixture(autouse=True)
+def _no_sync_hints(monkeypatch: pytest.MonkeyPatch) -> None:
+    """sync.hint frames arrive asynchronously after commits (on Postgres, often after a
+    socket from the test's setup has connected) and would interleave with the frames a
+    test reads. Off by default; tests/test_sync.py turns them on where it tests them."""
+    from app import sync as sync_module
+
+    monkeypatch.setattr(sync_module, "HINTS_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
 def _fresh_limiter() -> Iterator[None]:
     """Each test starts with an empty auth limiter (all test clients share one IP)."""
     ratelimit.get_limiter.cache_clear()
