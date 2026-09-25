@@ -253,6 +253,11 @@ async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) ->
     if result.rowcount != 1:
         # Already rotated/revoked, or token reuse.
         # TODO(Phase 0b): treat reuse of a revoked token as theft → revoke the family.
+        # Scope that to THIS token's own login lineage (one device's chain of
+        # rotations), never the user's other sessions: a client that dies between our
+        # rotation and its keychain write replays a stale token on next launch, and a
+        # user-wide revoke would then sign the user out everywhere on every such crash.
+        # (Needs a family id on refresh_tokens; brook-ios stay-signed-in plan, #58.)
         raise bad
     return await _issue_tokens(session, settings, user)
 

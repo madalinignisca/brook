@@ -5,6 +5,28 @@
 
 Incremental: each phase is independently usable and proves a piece of the architecture. The **GNOME/Linux client + `core`** lead every phase (Rust-only, fastest loop, and the Raspberry Pi target).
 
+## Next milestone: MVP+ (offline-capable)
+
+Tracked as the GitHub milestone [**MVP+**](https://github.com/madalinignisca/brook/milestone/1), one issue per
+item (#53–#68). What it adds to today's MVP
+(sign-in, chat, calls on macOS and GTK):
+
+- **Sign out, and following a remote sign-out** in both apps (in progress).
+- **TOTP two-factor sign-in**: server, core and both apps (in progress).
+- **Stay signed in across restarts**: the session kept in the platform's secret store
+  (data-protection Keychain on Apple; Secret portal or Secret Service on Linux).
+- **Local data, encrypted**: a per-device key in that same store (spec #46); local data is
+  disposable, so a lost key means wipe and re-sync.
+- **Offline cache in core** (one SQLite store for every app): channels, members and messages
+  saved as they arrive, so the app opens with the last-known content with or without a
+  connection, and **catches up** on reconnect (`after=` forward sync).
+- **Outbox**: messages written offline are sent when the connection returns.
+- **Attachments** (Phase 2 below, pulled into this milestone): upload/download through the
+  api, cached once opened, and **"Keep available offline"** for files needed without a
+  connection.
+- Pre-1.0 rule: no compatibility fallbacks and no local-data migrations; a changed cache
+  format is wiped and rebuilt.
+
 ## Phase 0 — Foundations
 - Repo + `docker-compose` (Postgres, MinIO, Janus, Caddy, api skeleton).
 - `core` crate skeleton: config, async runtime, error types, state container.
@@ -31,7 +53,9 @@ Incremental: each phase is independently usable and proves a piece of the archit
 ## Phase 2 — File transfer
 - Presigned PUT/GET via `api` + MinIO; **upload states** (`pending`→`committed` via `/files/{id}/commit`) + orphan sweep; attachment metadata.
 - `core` transfer orchestration (progress, resume); native **file picker** per platform.
-- **Exit:** upload in one client, pull from another when online (feature 5).
+- Cached once opened; **"Keep available offline"** pins a file for use without a connection.
+- **Exit:** upload in one client, pull from another when online (feature 5), and open a pinned
+  file with no connection.
 
 ## Phase 3 — Bots & webhooks (quick, motivating win)
 - Bot registry + signing secrets; `channel_bots`.

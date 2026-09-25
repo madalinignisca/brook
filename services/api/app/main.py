@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,12 +11,12 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 
-from . import __version__, calls
+from . import __version__, calls, sweep
 from .config import get_settings
 from .db import get_sessionmaker, init_models
 from .errors import register_error_handlers
 from .models import Totp
-from .routers import auth, channels, health, totp, users, ws
+from .routers import auth, channels, files, health, totp, users, ws
 from .secretbox import DecryptError, Purpose, get_secret_box
 
 
@@ -27,7 +28,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     get_secret_box()
     await init_models()
     await secret_canary()
-    yield
+    sweeper = asyncio.create_task(sweep.run_forever())
+    try:
+        yield
+    finally:
+        sweeper.cancel()
 
 
 async def secret_canary() -> None:
@@ -66,6 +71,7 @@ def create_app() -> FastAPI:
     app.include_router(totp.router, prefix="/api/v1")
     app.include_router(channels.router, prefix="/api/v1")
     app.include_router(users.router, prefix="/api/v1")
+    app.include_router(files.router, prefix="/api/v1")
     app.include_router(ws.router)  # /ws at the root, not under /api/v1
     # Importing app.calls registers the call.* WebSocket commands; holding the
     # manager on app.state makes that dependency explicit, so no tool (or person)
