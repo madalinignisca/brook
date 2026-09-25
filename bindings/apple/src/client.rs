@@ -39,6 +39,24 @@ impl FfiBrookClient {
         subscribe_receiver(self.inner.state(), listener)
     }
 
+    /// Core's authentication state right now. The subscription keeps only the latest value
+    /// (a quick `LoggedIn` then `LoggedOut` can arrive as just `LoggedOut`), so the app reads
+    /// the truth here when its own login completes.
+    pub fn auth_state(&self) -> crate::types::FfiAuthState {
+        self.inner.state().borrow().clone().into()
+    }
+
+    /// Sign out: the session ends at once, `LoggedOut` is published, and the server is asked
+    /// to revoke the refresh token (best-effort). Never fails.
+    pub async fn logout(&self) {
+        let inner = Arc::clone(&self.inner);
+        let _ = run(async move {
+            inner.logout().await;
+            Ok::<(), brook_core::Error>(())
+        })
+        .await;
+    }
+
     /// Open the realtime socket (idempotent). Subscribe to events first so `Ready` and the
     /// `channel.call` snapshot sent right after it are not missed.
     pub async fn start_realtime(&self) -> Result<(), LoginError> {

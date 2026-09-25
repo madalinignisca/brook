@@ -43,6 +43,8 @@ final class FakeRealtime: FfiBrookClientProtocol, @unchecked Sendable {
     func login(handle: String, password: String) async throws -> LoginResult { throw LoginError.Disconnected }
     func subscribe(listener: AuthStateListener) -> Subscription { FakeSubscription() }
     func changePassword(current: String, new: String, signOutOtherDevices: Bool) async throws -> Bool? { nil }
+    func logout() async {}
+    func authState() -> FfiAuthState { .loggedOut }
     func adminResetPassword(userId: String, adminPassword: String, new: String) async throws {}
     func listUsers() async throws -> [FfiUserSummary] { [] }
 
@@ -341,6 +343,36 @@ final class CallReviewFixTests: XCTestCase {
         let started = Date()
         await call.leave()
         XCTAssertLessThan(Date().timeIntervalSince(started), 1.5, "leave not bounded as a whole")
+    }
+
+    /// Signed out between the join being accepted and its work starting: still abandoned.
+    func testSignOutRightAfterAJoinIsAcceptedAbandonsIt() async throws {
+        let client = FakeRealtime(channels: [])
+        client.joinGate = Gate()
+        let center = CallCenter(auth: GrantedNothing(), makeEngine: { _ in FakeMedia() })
+        let joining = Task { await center.join(channel("c1", "general"), name: "general", client: client) }
+        await Task.yield() // join() registers its task; the join's work has not started yet
+        await center.endAll()
+        client.joinGate?.open()
+        await joining.value
+        XCTAssertNil(center.call, "a join accepted before sign-out became the live call")
+    }
+
+    /// Signed out while a join is still waiting: the late join is abandoned (left at once),
+    /// never becomes the live call, and nothing is left joining.
+    func testSignOutDuringAJoinAbandonsIt() async throws {
+        let client = FakeRealtime(channels: [])
+        client.joinGate = Gate()
+        let center = CallCenter(auth: GrantedNothing(), makeEngine: { _ in FakeMedia() })
+        let joining = Task { await center.join(channel("c1", "general"), name: "general", client: client) }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(center.joining)
+        let ended = Task { await center.endAll() }
+        client.joinGate?.open()
+        await joining.value
+        await ended.value
+        XCTAssertNil(center.call, "a join finishing after sign-out became the live call")
+        XCTAssertFalse(center.joining)
     }
 
     /// Quit while joining: core may already publish, so quit waits for the join and leaves.

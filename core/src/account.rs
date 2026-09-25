@@ -140,6 +140,7 @@ impl Ctx {
         }
         let out: PasswordChangeOut = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
         let pair = out.pair;
+        let fresh = pair.refresh_token.clone();
         // Against the token the successful attempt used: after a 401 retry that is the rotated
         // one, not the one held at the start.
         match self
@@ -148,7 +149,10 @@ impl Ctx {
             .await
         {
             RefreshApplied::Committed => Ok(out.other_devices_signed_out),
-            RefreshApplied::Discarded => Err(Error::NotAuthenticated),
+            RefreshApplied::Discarded => {
+                self.session.revoke_detached(fresh); // issued for a session no longer held
+                Err(Error::NotAuthenticated)
+            }
         }
     }
 }
