@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 
 AUTH = "/api/v1/auth"
 USERS = "/api/v1/users"
@@ -223,3 +224,82 @@ async def test_admin_cannot_reset_another_admin(client: httpx.AsyncClient) -> No
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "authz.forbidden"
     assert (await _login(client, "bob")).status_code == 200
+
+
+# ---------------------------------------------------------------- rate limiting
+
+
+async def test_wrong_current_passwords_are_throttled(client: httpx.AsyncClient) -> None:
+    """A stolen access token must not guess the current password at Argon2 speed."""
+    from app import ratelimit
+
+    await _register(client, "alice")
+    pair = await _login(client, "alice")
+    backoff_after = ratelimit.get_limiter().config.backoff_after
+    for _ in range(backoff_after):
+        r = await client.post(
+            f"{AUTH}/password",
+            json={"current_password": "a-wrong-guess", "new_password": "brand-new-pass"},
+            headers=_bearer(pair),
+        )
+        assert r.status_code == 403
+    throttled = await client.post(
+        f"{AUTH}/password",
+        json={"current_password": "a-wrong-guess", "new_password": "brand-new-pass"},
+        headers=_bearer(pair),
+    )
+    assert throttled.status_code == 429
+    assert throttled.json()["error"]["code"] == "auth.rate_limited"
+    assert "retry-after" in throttled.headers
+
+
+async def test_flooded_ip_is_refused_before_argon2(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import ratelimit
+    from app.routers import auth as auth_router
+    from app.routers import users as users_router
+
+    alice, bob = await _admin_and_member(client)
+    bob_id = (await client.get(f"{AUTH}/me", headers=_bearer(bob))).json()["id"]
+    lim = ratelimit.get_limiter()
+    for _ in range(lim.config.go_away_per_hour + 1):
+        lim.failure("127.0.0.1")
+
+    def _no_argon2(*_a: object) -> bool:
+        raise AssertionError("Argon2 ran for a flooded IP")
+
+    monkeypatch.setattr(auth_router, "verify_password", _no_argon2)
+    monkeypatch.setattr(users_router, "verify_password", _no_argon2)
+    change = await client.post(
+        f"{AUTH}/password",
+        json={"current_password": PW, "new_password": "brand-new-pass"},
+        headers=_bearer(alice),
+    )
+    assert change.status_code == 429
+    reset = await client.post(
+        f"{USERS}/{bob_id}/password",
+        json={"admin_password": PW, "new_password": "temporary-pass"},
+        headers=_bearer(alice),
+    )
+    assert reset.status_code == 429
+
+
+async def test_wrong_admin_passwords_are_throttled(client: httpx.AsyncClient) -> None:
+    from app import ratelimit
+
+    alice, bob = await _admin_and_member(client)
+    bob_id = (await client.get(f"{AUTH}/me", headers=_bearer(bob))).json()["id"]
+    for _ in range(ratelimit.get_limiter().config.backoff_after):
+        r = await client.post(
+            f"{USERS}/{bob_id}/password",
+            json={"admin_password": "a-wrong-guess", "new_password": "temporary-pass"},
+            headers=_bearer(alice),
+        )
+        assert r.status_code == 403
+    throttled = await client.post(
+        f"{USERS}/{bob_id}/password",
+        json={"admin_password": "a-wrong-guess", "new_password": "temporary-pass"},
+        headers=_bearer(alice),
+    )
+    assert throttled.status_code == 429

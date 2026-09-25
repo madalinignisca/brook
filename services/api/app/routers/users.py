@@ -9,13 +9,14 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import get_session
 from ..deps import require_admin
 from ..models import User
+from ..ratelimit import AuthLimiter, client_ip, enforce, get_limiter
 from ..schemas import AdminPasswordIn, UserOut
 from ..security import hash_password, verify_password
 from .auth import lock_user, revoke_all_refresh_tokens
@@ -49,8 +50,10 @@ async def list_users(
 async def reset_password(
     user_id: uuid.UUID,
     body: AdminPasswordIn,
+    request: Request,
     admin: Annotated[User, Depends(require_admin)],
     session: Annotated[AsyncSession, Depends(get_session)],
+    limiter: Annotated[AuthLimiter, Depends(get_limiter)],
 ) -> None:
     """Set another user's password and sign them out of every device.
 
@@ -62,11 +65,15 @@ async def reset_password(
     # Re-authentication: a stolen admin access token alone must not be able to
     # reset member passwords (that would give the thief persistent logins that
     # outlive the token). Same rule as the TOTP reset (encryption spec §7.6).
+    ip = client_ip(request.client.host if request.client else None)
+    enforce(limiter, ip, admin.handle)  # the admin_password check is a guessing surface too
     if admin.password_hash is None or not verify_password(admin.password_hash, body.admin_password):
+        limiter.failure(ip, admin.handle)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "auth.invalid_credentials", "message": "Admin password is wrong"},
         )
+    limiter.success(ip, admin.handle)
     if user_id == admin.id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

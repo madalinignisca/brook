@@ -33,16 +33,17 @@ class AdminPasswordIn(BaseModel):
 
 
 class LoginIn(BaseModel):
-    """Login payload."""
+    """Login payload. Bounded like RegisterIn: oversized input is a 422 before the
+    database, the rate limiter (which keys on the handle) or Argon2 sees it."""
 
-    handle: str
-    password: str
+    handle: str = Field(max_length=64)
+    password: str = Field(max_length=256)
 
 
 class RefreshIn(BaseModel):
     """Refresh payload."""
 
-    refresh_token: str
+    refresh_token: str = Field(max_length=512)
 
 
 class TokenPair(BaseModel):

@@ -133,3 +133,36 @@ async def test_admin_reset_takes_the_target_lock(client: httpx.AsyncClient) -> N
         assert not task.done()
         await holder.rollback()
     assert (await task).status_code == 204
+
+
+async def test_lost_refresh_race_is_not_a_failure(client: httpx.AsyncClient) -> None:
+    """Two tabs refresh the same token at once: one wins, the other gets 401, and
+    the loser must not count against the IP (it presented a valid token)."""
+    from app import ratelimit
+
+    user_id, pair = await _alice(client)
+    lim = ratelimit.get_limiter()
+    body = {"refresh_token": pair["refresh_token"]}
+
+    async with db.get_sessionmaker()() as holder:
+        # Park both refreshes on the user lock, after each has read the token as
+        # valid: that is the interleaving where the loser's CAS matches no row.
+        await lock_user(holder, user_id)
+        tab1 = asyncio.create_task(client.post(f"{AUTH}/refresh", json=body))
+        tab2 = asyncio.create_task(client.post(f"{AUTH}/refresh", json=body))
+        await asyncio.sleep(SETTLE)
+        assert not tab1.done() and not tab2.done()
+        await holder.rollback()
+    codes = sorted([(await tab1).status_code, (await tab2).status_code])
+    assert codes == [200, 401]
+
+    # Not counted: the IP can still fail backoff_after - 1 times without a 429.
+    # Had the lost race counted, the last of these would already be throttled.
+    for _ in range(lim.config.backoff_after - 1):
+        r = await client.post(f"{AUTH}/login", json={"handle": "alice", "password": "nope-x"})
+        assert r.status_code == 401
+    # And a genuinely reused (already revoked) token still is a failure.
+    reuse = await client.post(f"{AUTH}/refresh", json=body)
+    assert reuse.status_code == 401
+    throttled = await client.post(f"{AUTH}/login", json={"handle": "alice", "password": "nope-x"})
+    assert throttled.status_code == 429

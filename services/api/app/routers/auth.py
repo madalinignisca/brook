@@ -10,7 +10,7 @@ from datetime import timedelta
 from typing import Annotated, Any, cast
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import func, select, update
 from sqlalchemy.engine import CursorResult
@@ -20,6 +20,7 @@ from ..config import Settings, get_settings
 from ..db import get_session
 from ..deps import get_current_user
 from ..models import RefreshToken, User, ensure_utc, utcnow
+from ..ratelimit import AuthLimiter, client_ip, enforce, get_limiter
 from ..schemas import LoginIn, PasswordChangeIn, RefreshIn, RegisterIn, TokenPair, UserOut
 from ..security import (
     create_access_token,
@@ -92,17 +93,22 @@ async def _issue_tokens(session: AsyncSession, settings: Settings, user: User) -
 @router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
 async def register(
     body: RegisterIn,
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     caller: Annotated[User | None, Depends(_optional_user)],
+    limiter: Annotated[AuthLimiter, Depends(get_limiter)],
 ) -> User:
     """Create a user.
 
     The **first** user bootstraps as global ``admin`` (open). Once any user
     exists, only an authenticated admin may create further accounts.
     """
+    ip = client_ip(request.client.host if request.client else None)
+    enforce(limiter, ip)
     count = await session.scalar(select(func.count()).select_from(User))
     is_first = (count or 0) == 0
     if not is_first and (caller is None or caller.global_role != "admin"):
+        limiter.failure(ip)  # an unauthenticated attempt on a closed endpoint
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "authz.forbidden", "message": "Admin role required to add users"},
@@ -115,6 +121,7 @@ async def register(
             detail={"code": "conflict", "message": "Handle already taken"},
         )
 
+    limiter.success(ip)
     user = User(
         handle=body.handle,
         display_name=body.display_name,
@@ -130,10 +137,17 @@ async def register(
 @router.post("/login", response_model=TokenPair)
 async def login(
     body: LoginIn,
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_settings)],
+    limiter: Annotated[AuthLimiter, Depends(get_limiter)],
 ) -> TokenPair:
-    """Authenticate with handle + password, returning a token pair."""
+    """Authenticate with handle + password, returning a token pair.
+
+    Rate limited before any Argon2 work (app/ratelimit.py). A 429 is answered the
+    same way for known and unknown handles, so it reveals nothing either."""
+    ip = client_ip(request.client.host if request.client else None)
+    enforce(limiter, ip, body.handle)
     # FOR UPDATE: see lock_user. Also means the hash verified here is the one
     # committed last, so a login racing a password change cannot use the old one.
     user = await session.scalar(select(User).where(User.handle == body.handle).with_for_update())
@@ -143,9 +157,12 @@ async def login(
     )
     if user is None or user.password_hash is None or user.status != "active":
         dummy_verify(body.password)  # normalize timing → no user enumeration
+        limiter.failure(ip, body.handle)
         raise bad
     if not verify_password(user.password_hash, body.password):
+        limiter.failure(ip, body.handle)
         raise bad
+    limiter.success(ip, body.handle)
     if needs_rehash(user.password_hash):  # transparently upgrade params on login
         user.password_hash = hash_password(body.password)
     return await _issue_tokens(session, settings, user)
@@ -154,10 +171,31 @@ async def login(
 @router.post("/refresh", response_model=TokenPair)
 async def refresh(
     body: RefreshIn,
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_settings)],
+    limiter: Annotated[AuthLimiter, Depends(get_limiter)],
 ) -> TokenPair:
     """Rotate a refresh token: atomically revoke the old one, issue a fresh pair."""
+    ip = client_ip(request.client.host if request.client else None)
+    enforce(limiter, ip)
+    try:
+        pair = await _rotate(body, session, settings)
+    except _LostRotationRace:
+        raise  # two tabs refreshing at once: benign, not a failure
+    except HTTPException:
+        limiter.failure(ip)
+        raise
+    limiter.success(ip)
+    return pair
+
+
+class _LostRotationRace(HTTPException):
+    """A valid, unrevoked token whose rotation another request won concurrently."""
+
+
+async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) -> TokenPair:
+    """The refresh itself; any HTTPException is a failed credential."""
     token = await session.scalar(
         select(RefreshToken).where(RefreshToken.token_hash == hash_token(body.refresh_token))
     )
@@ -171,6 +209,9 @@ async def refresh(
     user = await lock_user(session, token.user_id)
     if user is None or user.status != "active":
         raise bad
+    # Read before the UPDATE: the ORM UPDATE's synchronize_session sets
+    # token.revoked=True in memory even when it matched no row.
+    was_revoked = bool(token.revoked)
     # Compare-and-set: only the first concurrent rotation flips revoked→true, so
     # two simultaneous /refresh calls can't both mint a new token (TOCTOU-safe).
     result = cast(
@@ -181,6 +222,9 @@ async def refresh(
             .values(revoked=True)
         ),
     )
+    if result.rowcount != 1 and not was_revoked:
+        # It was unrevoked when read: a concurrent rotation won (two tabs).
+        raise _LostRotationRace(status_code=bad.status_code, detail=bad.detail)
     if result.rowcount != 1:
         # Already rotated/revoked, or token reuse.
         # TODO(Phase 0b): treat reuse of a revoked token as theft → revoke the family.
@@ -205,9 +249,11 @@ async def revoke_all_refresh_tokens(session: AsyncSession, user_id: uuid.UUID) -
 @router.post("/password", response_model=TokenPair)
 async def change_password(
     body: PasswordChangeIn,
+    request: Request,
     user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_settings)],
+    limiter: Annotated[AuthLimiter, Depends(get_limiter)],
 ) -> TokenPair:
     """Change the caller's password; sign out every device; return a fresh pair.
 
@@ -219,6 +265,10 @@ async def change_password(
     A wrong current password is 403, deliberately not 401: clients treat 401 as
     "access token expired" and would refresh-and-retry instead of reporting it.
     """
+    # Rate limited like login, before any Argon2 work: otherwise a stolen access
+    # token could guess the current password at full speed through this route.
+    ip = client_ip(request.client.host if request.client else None)
+    enforce(limiter, ip, user.handle)
     # Re-read under the lock (see lock_user): the copy from get_current_user was
     # loaded without it, and a concurrent change may have replaced the hash.
     locked = await lock_user(session, user.id)
@@ -234,10 +284,12 @@ async def change_password(
     else:
         ok = verify_password(user.password_hash, body.current_password)
     if not ok:
+        limiter.failure(ip, user.handle)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "auth.invalid_credentials", "message": "Current password is wrong"},
         )
+    limiter.success(ip, user.handle)
     if body.new_password == body.current_password:
         # Would sign out every device for no change; almost always a UI slip.
         raise HTTPException(
