@@ -7,33 +7,67 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message as AxMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::{BrookClient, CoreConfig};
 
 /// How `/auth/refresh` answers.
 #[derive(Clone, Copy, Debug)]
 pub enum RefreshMode {
-    /// Issue a fresh token pair.
+    /// Issue a fresh token pair, whatever token was sent.
     Rotate,
+    /// Like the real server: only a live refresh token rotates (and is consumed); an unknown or
+    /// revoked one is answered 401 `auth.invalid_token`.
+    Strict,
     /// Answer with this status and an error envelope.
     Fail(u16),
     /// 429 `auth.rate_limited` with `Retry-After: <seconds>`.
     RateLimited(u32),
+    /// Never answer (a stalled request).
+    Stall,
+}
+
+/// How the password endpoints answer (`/auth/password`, `/users/{id}/password`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordMode {
+    /// Commit: revoke the user's refresh tokens (and, for a self change, issue a fresh pair).
+    Ok,
+    /// 403 `auth.invalid_credentials` (wrong current password).
+    WrongCurrent,
+    /// 422 whose body echoes the submitted passwords, as FastAPI's validation errors do.
+    Echo422,
+    /// 403 `authz.forbidden` (not an admin).
+    Forbidden,
+    /// 400 `invalid` (an admin targeting their own id).
+    SelfTarget,
+    /// 404 `not_found`.
+    NotFound,
 }
 
 struct ServerState {
     next: u32,
     /// access token → user handle
     tokens: HashMap<String, String>,
+    /// live refresh token → user handle (`Strict` refresh and the password endpoints use it)
+    refresh_tokens: HashMap<String, String>,
     refresh_mode: RefreshMode,
     refresh_calls: u32,
+    stall_login: bool,
+    password_mode: PasswordMode,
+    /// Answer this many authenticated calls (password, users) with 401 first.
+    expire_next: u32,
+    /// Held after the server-side commit of a password call, before the response is sent.
+    password_gate: Option<Arc<Semaphore>>,
+    /// Held before a scripted 401 on the user list is sent (a response still in flight).
+    expired_gate: Option<Arc<Semaphore>>,
+    /// Every password/users request: (path, bearer token, JSON body).
+    requests: Vec<(String, String, Value)>,
     sockets: mpsc::UnboundedSender<WsPeer>,
 }
 
@@ -52,14 +86,24 @@ impl TestServer {
         let state = Arc::new(Mutex::new(ServerState {
             next: 0,
             tokens: HashMap::new(),
+            refresh_tokens: HashMap::new(),
             refresh_mode: RefreshMode::Rotate,
             refresh_calls: 0,
+            stall_login: false,
+            password_mode: PasswordMode::Ok,
+            expire_next: 0,
+            password_gate: None,
+            expired_gate: None,
+            requests: Vec::new(),
             sockets: tx,
         }));
         let app = Router::new()
             .route("/api/v1/auth/login", post(login))
             .route("/api/v1/auth/me", get(me))
             .route("/api/v1/auth/refresh", post(refresh))
+            .route("/api/v1/auth/password", post(change_password))
+            .route("/api/v1/users", get(list_users))
+            .route("/api/v1/users/{id}/password", post(reset_password))
             .route("/ws", get(ws_upgrade))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -85,6 +129,49 @@ impl TestServer {
         self.state.lock().unwrap().refresh_calls
     }
 
+    pub fn set_stall_login(&self, stall: bool) {
+        self.state.lock().unwrap().stall_login = stall;
+    }
+
+    pub fn set_password_mode(&self, mode: PasswordMode) {
+        self.state.lock().unwrap().password_mode = mode;
+    }
+
+    /// Answer the next `n` authenticated calls (password, users) with 401.
+    pub fn expire_next(&self, n: u32) {
+        self.state.lock().unwrap().expire_next = n;
+    }
+
+    /// Hold password responses after the server-side commit until the returned gate gets a
+    /// permit.
+    pub fn gate_password(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        self.state.lock().unwrap().password_gate = Some(gate.clone());
+        gate
+    }
+
+    /// Hold the user list's scripted 401 (see `expire_next`) until the returned gate gets a
+    /// permit, so a test can change the session while that answer is in flight.
+    pub fn gate_expired(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        self.state.lock().unwrap().expired_gate = Some(gate.clone());
+        gate
+    }
+
+    /// Every password/users request so far: (path, bearer token, JSON body).
+    pub fn requests(&self) -> Vec<(String, String, Value)> {
+        self.state.lock().unwrap().requests.clone()
+    }
+
+    /// Whether this refresh token is still live (not rotated, not revoked).
+    pub fn refresh_token_live(&self, token: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .refresh_tokens
+            .contains_key(token)
+    }
+
     /// The next socket a client opens (bounded wait).
     pub async fn accept(&mut self) -> WsPeer {
         tokio::time::timeout(Duration::from_secs(10), self.sockets.recv())
@@ -97,13 +184,179 @@ impl TestServer {
 fn issue(state: &mut ServerState, handle: &str) -> Value {
     state.next += 1;
     let access = format!("access-{}", state.next);
+    let refresh = format!("refresh-{}", state.next);
     state.tokens.insert(access.clone(), handle.to_string());
-    json!({ "access_token": access, "refresh_token": format!("refresh-{}", state.next), "token_type": "bearer" })
+    state
+        .refresh_tokens
+        .insert(refresh.clone(), handle.to_string());
+    json!({ "access_token": access, "refresh_token": refresh, "token_type": "bearer" })
+}
+
+fn error(status: u16, code: &str, message: &str) -> Response {
+    (
+        StatusCode::from_u16(status).unwrap(),
+        Json(json!({ "error": { "code": code, "message": message } })),
+    )
+        .into_response()
+}
+
+fn bearer(headers: &HeaderMap) -> String {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Record the request, then the common 401 cases: a scripted expiry, or an unknown token.
+/// On success, the caller's handle. (A test fake: the response is returned as is, unboxed.)
+#[allow(clippy::result_large_err)]
+fn authed(
+    state: &mut ServerState,
+    path: &str,
+    token: &str,
+    body: Value,
+) -> Result<String, Response> {
+    state
+        .requests
+        .push((path.to_string(), token.to_string(), body));
+    if state.expire_next > 0 {
+        state.expire_next -= 1;
+        return Err(error(401, "auth.token_expired", "access token expired"));
+    }
+    state
+        .tokens
+        .get(token)
+        .cloned()
+        .ok_or_else(|| error(401, "auth.invalid_token", "unknown access token"))
+}
+
+fn revoke_refresh_tokens(state: &mut ServerState, handle: &str) {
+    state.refresh_tokens.retain(|_, h| h != handle);
+}
+
+/// Held after the commit, when the test asked to hold responses.
+async fn after_commit(gate: Option<Arc<Semaphore>>) {
+    if let Some(gate) = gate {
+        gate.acquire().await.unwrap().forget();
+    }
+}
+
+fn echo_422(body: &Value) -> Response {
+    // FastAPI validation errors echo the submitted value ("input").
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({ "detail": [{ "loc": ["body", "new_password"],
+            "msg": "String should have at least 8 characters",
+            "input": body["new_password"], "ctx": { "current": body["current_password"] } }] })),
+    )
+        .into_response()
 }
 
 async fn login(State(state): State<Shared>, Json(body): Json<Value>) -> Response {
     let handle = body["handle"].as_str().unwrap_or_default().to_string();
+    let stall = state.lock().unwrap().stall_login;
+    if stall {
+        std::future::pending::<()>().await;
+    }
     Json(issue(&mut state.lock().unwrap(), &handle)).into_response()
+}
+
+async fn change_password(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let token = bearer(&headers);
+    let (pair, gate) = {
+        let mut state = state.lock().unwrap();
+        let handle = match authed(&mut state, "/auth/password", &token, body.clone()) {
+            Ok(h) => h,
+            Err(r) => return r,
+        };
+        match state.password_mode {
+            PasswordMode::WrongCurrent => {
+                return error(403, "auth.invalid_credentials", "wrong password")
+            }
+            PasswordMode::Echo422 => return echo_422(&body),
+            _ => {}
+        }
+        revoke_refresh_tokens(&mut state, &handle);
+        (issue(&mut state, &handle), state.password_gate.clone())
+    };
+    after_commit(gate).await;
+    Json(pair).into_response()
+}
+
+async fn reset_password(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let token = bearer(&headers);
+    let gate = {
+        let mut state = state.lock().unwrap();
+        let path = format!("/users/{id}/password");
+        if let Err(r) = authed(&mut state, &path, &token, body.clone()) {
+            return r;
+        }
+        match state.password_mode {
+            PasswordMode::WrongCurrent => {
+                return error(403, "auth.invalid_credentials", "wrong admin password")
+            }
+            PasswordMode::Forbidden => return error(403, "authz.forbidden", "admins only"),
+            PasswordMode::SelfTarget => return error(400, "invalid", "use /auth/password"),
+            PasswordMode::NotFound => return error(404, "not_found", "no such user"),
+            PasswordMode::Echo422 => return echo_422(&body),
+            _ => {}
+        }
+        let handle = id.strip_prefix("id-").unwrap_or(&id).to_string();
+        revoke_refresh_tokens(&mut state, &handle);
+        state.password_gate.clone()
+    };
+    after_commit(gate).await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn list_users(State(state): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
+    let token = bearer(&headers);
+    let held = {
+        let mut state = state.lock().unwrap();
+        match authed(&mut state, "/users", &token, Value::Null) {
+            Ok(_) => None,
+            Err(r) => Some((r, state.expired_gate.clone())),
+        }
+    };
+    if let Some((r, gate)) = held {
+        after_commit(gate).await; // the same hold, used before an answer that commits nothing
+        return r;
+    }
+    let state = state.lock().unwrap();
+    if state.password_mode == PasswordMode::Forbidden {
+        return error(403, "authz.forbidden", "admins only");
+    }
+    let mut handles: Vec<String> = state.tokens.values().cloned().collect();
+    handles.sort();
+    handles.dedup();
+    let wanted = uri
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("handle=")))
+        .map(str::to_string);
+    if let Some(wanted) = wanted {
+        handles.retain(|h| *h == wanted);
+        if handles.is_empty() {
+            return error(404, "not_found", "no such user");
+        }
+    }
+    Json(
+        handles
+            .iter()
+            .map(|h| json!({ "id": format!("id-{h}"), "handle": h, "display_name": h, "global_role": "member" }))
+            .collect::<Vec<_>>(),
+    )
+    .into_response()
 }
 
 async fn me(State(state): State<Shared>, headers: HeaderMap) -> Response {
@@ -122,11 +375,30 @@ async fn me(State(state): State<Shared>, headers: HeaderMap) -> Response {
     }
 }
 
-async fn refresh(State(state): State<Shared>) -> Response {
+async fn refresh(State(state): State<Shared>, Json(body): Json<Value>) -> Response {
+    let mode = {
+        let mut state = state.lock().unwrap();
+        state.refresh_calls += 1;
+        state.refresh_mode
+    };
+    if let RefreshMode::Stall = mode {
+        std::future::pending::<()>().await;
+    }
     let mut state = state.lock().unwrap();
-    state.refresh_calls += 1;
-    match state.refresh_mode {
+    match mode {
+        RefreshMode::Stall => unreachable!(),
         RefreshMode::Rotate => Json(issue(&mut state, "alice")).into_response(),
+        RefreshMode::Strict => {
+            let sent = body["refresh_token"].as_str().unwrap_or_default();
+            match state.refresh_tokens.remove(sent) {
+                Some(handle) => Json(issue(&mut state, &handle)).into_response(),
+                None => error(
+                    401,
+                    "auth.invalid_token",
+                    "refresh token revoked or unknown",
+                ),
+            }
+        }
         RefreshMode::RateLimited(secs) => (
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", secs.to_string())],
