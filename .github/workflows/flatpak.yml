@@ -37,16 +37,18 @@ jobs:
         run: |
           set -u
           m=clients/gnome/packaging/flatpak/dev.brook.Brook.yml
+          # The container has no machine-id; gst-inspect's D-Bus probe wants one.
+          [ -s /etc/machine-id ] || dbus-uuidgen > /etc/machine-id || true
           missing=0
           # Show one full answer, so a broken probe is not mistaken for missing plugins.
-          flatpak-builder --run build "$m" gst-inspect-1.0 videoconvert | head -5
+          flatpak-builder --disable-rofiles-fuse --run build "$m" gst-inspect-1.0 videoconvert | head -5
           # Required: every call uses these.
           for e in webrtcbin nicesrc nicesink dtlssrtpenc dtlssrtpdec srtpenc srtpdec \
                    rtpopuspay opusenc opusdec rtph264pay rtph264depay h264parse \
                    rtpvp8pay vp8enc vp8dec capssetter decodebin videoconvert videoscale \
                    videorate audioconvert audioresample autoaudiosrc autoaudiosink \
                    gtk4paintablesink; do
-            if flatpak-builder --run build "$m" gst-inspect-1.0 --exists "$e" 2>/dev/null; then
+            if flatpak-builder --disable-rofiles-fuse --run build "$m" gst-inspect-1.0 --exists "$e" 2>/dev/null; then
               echo "ok       $e"
             elif [ "$e" = gtk4paintablesink ]; then
               echo "linked   $e (registered by the app at startup)"
@@ -60,7 +62,7 @@ jobs:
                        "v4l2src pipewiresrc" "pipewiresrc ximagesrc"; do
             found=""
             for e in $group; do
-              flatpak-builder --run build "$m" gst-inspect-1.0 --exists "$e" 2>/dev/null \
+              flatpak-builder --disable-rofiles-fuse --run build "$m" gst-inspect-1.0 --exists "$e" 2>/dev/null \
                 && found="$found $e"
             done
             if [ -n "$found" ]; then echo "ok       {$group}:$found"
