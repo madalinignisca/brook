@@ -1,8 +1,8 @@
 # Outbox attachments: plan
 
 Spec: `2026-09-26-outbox-attachments-spec.md` (closed after round 2). Dial: Heavy. One PR, in
-commits that each build and pass on their own. Revised after plan review round 1; that
-section is at the end.
+commits that each build and pass on their own. Closed after plan review round 2; both
+rounds are at the end.
 
 ## Steps
 
@@ -57,6 +57,11 @@ section is at the end.
        `wait_or_cancel` (no plain `sleep`), so a Delete or a pause is never stuck behind a
        60 s `Retry-After`.
      - A pause ends as `transfer.paused`, a transient error, and emits `Retrying`.
+       `wait_or_cancel` takes the `RowFlags` and returns `transfer.paused` for a pause
+       and `transfer.cancelled` for a cancel, never one for the other.
+     - **Map lifecycle:** `forget(id)` touches only unregistered ids (`upload_file`'s).
+       A row's registrations are removed when the row leaves (ack, Delete, rebuild), and
+       all of them at `Outbox::close`, so a user switch leaves nothing behind.
    - **The final event is the caller's.** The upload core returns its result without
      emitting an end state. `upload_file` emits as before; the outbox emits `Retrying` for
      transient outcomes and `Failed` only when it fails the row.
@@ -85,11 +90,16 @@ section is at the end.
      3. snapshots via `spawn_blocking`, with `Preparing` progress;
      4. one transaction for the row and its files;
      5. on a conflict, removes its own snapshots and returns the stored receipt.
-   - **Ack, Delete, and the accepted-refused branch** of `drop_row`: one transaction
-     deletes the row (its file rows cascade) and inserts the snapshot paths into
-     `deletions`. After the commit it unlinks them, then clears the journal.
+   - **Ack, Delete, and the accepted-refused branch** of `drop_row`: one transaction reads
+     the row's `file_client_id`s **first**, inserts their snapshot paths into
+     `deletions`, then deletes the row (its file rows cascade). After the commit it
+     unlinks them, then clears the journal. An insert adds the `outbox` row before its
+     `outbox_files` rows (the foreign key).
    - **`attempt` for a row with files:**
-     1. clear the row's flags (a new attempt, or after Retry);
+     1. clear the row's **pause** flag only. A pause is the session's state, and this
+        attempt runs under a current epoch. The **cancel** flag is the user's intent: an
+        attempt never clears it (a cancel that arrived just before would be lost), and
+        only Retry does;
      2. for each file without a `file_id`, in order:
         - check the epoch;
         - verify once per process; the mark is cleared on a PUT read error;
@@ -102,7 +112,8 @@ section is at the end.
      in-progress, expired and stalled upload codes, `transfer.paused`,
      `NotAuthenticated`/401, and `UnexpectedResponse` (as in `Post::send`).
    - **Cancel:** via the row map (step 2). Checked before each create, between chunks, and
-     before the POST. **Retry clears the row's flags** before waking the sender.
+     before the POST. **Retry clears the row's flags and each file's `error`** before
+     waking the sender. A test cancels during the backoff: the row fails with no upload.
    - **Delete:** sets the row's cancel flag through the map **before** taking
      `sender.lock` (the map is a std mutex that is never held across an await). Then as
      above.
@@ -149,7 +160,9 @@ section is at the end.
   test.
 - **Deadlock:** the flag map is a std mutex, never held across an await. Delete sets
   flags before `sender.lock`.
-- **Stale flags:** each attempt and each Retry clears the row's flags, with a test.
+- **Stale flags:** Retry clears the cancel flag and each attempt clears the pause flag,
+  with a test. A cancel is never cleared by an attempt, so one that arrives just before
+  the attempt still counts.
 - **Runtime starvation:** snapshot I/O runs in `spawn_blocking`.
 - **Test speed:** small chunks, with the same format.
 
@@ -174,3 +187,12 @@ only at open; the chunk size as a parameter.
 From the second reviewer: pause checked in the transfer loop, best-effort reconciliation,
 and ids registered before a transfer starts, all taken. Rejected: "a token swap mid-PUT"
 (one PUT is one request with one token, and each retry re-checks the epoch).
+
+## Plan review round 2
+
+The adversarial review found every round-1 point fixed. New and taken: an attempt clears
+only the pause flag, and only Retry clears a cancel, so a cancel or Delete that arrives
+just before an attempt is never lost (the second reviewer found the same); the map
+lifecycle (`forget` only for unregistered ids, removal with the row and at close);
+`wait_or_cancel` telling a pause from a cancel; Retry clearing per-file errors; paths read
+before the cascade. Checked with no issue: the cascade against the existing delete paths.

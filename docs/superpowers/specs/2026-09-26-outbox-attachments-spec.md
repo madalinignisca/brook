@@ -35,8 +35,8 @@ deletes local data (snapshots), and changes the outbox format.
    at a snapshot a power cut could lose. A crash before the commit leaves orphan snapshots,
    which reconciliation removes (6). The stored `size` is the bytes actually copied, not a
    size read before the copy (a file growing mid-copy can't give the PUT a wrong length).
-   **The same `client_id` again** returns the stored row's receipt (its files, with fresh
-   `transfer_id`s). The `client_id` is looked up **before** anything is copied; only a
+   **The same `client_id` again** returns the stored row's receipt (its files, with the
+   `transfer_id`s this process already issued for them; one per file per process). The `client_id` is looked up **before** anything is copied; only a
    repeat racing an uncommitted first call copies, and it removes its snapshots before
    returning. The stored row wins, files included, as for body and reply target. A
    repeat after the row was acknowledged (it's gone) queues and uploads again. The POST
