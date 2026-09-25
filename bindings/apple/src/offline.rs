@@ -387,6 +387,13 @@ impl FfiBrookClient {
         run(async move { inner.retry_send(&client_id).await }).await
     }
 
+    /// Retry a failed reply without its quote (after `message.reply_target_gone`), keeping
+    /// its place in the queue.
+    pub async fn retry_without_reply(&self, client_id: String) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.retry_without_reply(&client_id).await }).await
+    }
+
     /// Remove a message that hasn't gone out.
     pub async fn delete_pending(&self, client_id: String) -> Result<FfiDeleted, LoginError> {
         let inner = Arc::clone(&self.inner);
