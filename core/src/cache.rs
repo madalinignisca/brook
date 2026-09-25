@@ -200,7 +200,14 @@ impl Cache {
         let mut applied = Announce(self, Applied::default());
         let result = sync::run_into(&self.db, &self.me, self.fetch.as_ref(), &mut applied.1).await;
         self.state.send_modify(|s| {
-            s.offline = matches!(result, Err(SyncError::Net(_)));
+            // Offline means the server couldn't be reached: a refused token or a server error
+            // is a different state (the app signs in again, or waits), not "offline".
+            s.offline = matches!(
+                result,
+                Err(SyncError::Net(
+                    crate::Error::Http(_) | crate::Error::Timeout | crate::Error::Disconnected
+                ))
+            );
             if result.is_ok() {
                 s.last_synced = Some(SystemTime::now());
             }

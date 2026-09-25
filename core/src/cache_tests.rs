@@ -44,7 +44,7 @@ struct Offline;
 #[async_trait::async_trait]
 impl Fetch for Offline {
     async fn page(&self, _since: &str) -> Result<Page, crate::Error> {
-        Err(crate::Error::UnexpectedResponse)
+        Err(crate::Error::Timeout)
     }
 }
 
@@ -747,5 +747,29 @@ async fn a_cancelled_run_still_announces_what_it_committed() {
     assert_eq!(
         events.try_recv().ok(),
         Some(CacheEvent::Channels(vec!["c".into()]))
+    );
+}
+
+/// A refused token is not "offline" (the app signs in again); an unreachable server is.
+#[tokio::test]
+async fn only_an_unreachable_server_is_offline() {
+    struct Refused;
+    #[async_trait::async_trait]
+    impl Fetch for Refused {
+        async fn page(&self, _since: &str) -> Result<Page, crate::Error> {
+            Err(crate::Error::NotAuthenticated)
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let slot: Arc<dyn KeySlot> = Arc::new(InMemoryKeySlot::default());
+    let db = match store::open(dir.path(), Kind::Cache, "s", &KeyStore::new(slot)).unwrap() {
+        Opened::Ready { db, .. } => db,
+        other => panic!("{other:?}"),
+    };
+    let cache = Cache::new(db, ME.into(), Arc::new(Refused), Arc::new(no_history()));
+    assert!(cache.sync_now().await.is_err());
+    assert!(
+        !cache.state().borrow().offline,
+        "a refused token read as offline"
     );
 }
