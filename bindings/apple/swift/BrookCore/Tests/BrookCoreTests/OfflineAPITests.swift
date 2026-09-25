@@ -40,7 +40,7 @@ final class OfflineAPITests: XCTestCase {
             XCTAssertEqual(code, "local.unavailable")
         }
         do {
-            _ = try await client.sendQueued(channelId: "c", body: "hi", clientId: UUID().uuidString)
+            _ = try await client.sendQueued(channelId: "c", body: "hi", replyToId: nil, clientId: UUID().uuidString)
             XCTFail("queued a message with local data off")
         } catch LoginError.Api(let code, _) {
             XCTAssertEqual(code, "local.unavailable")

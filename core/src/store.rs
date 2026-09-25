@@ -59,16 +59,16 @@ impl Kind {
     /// outbox is surfaced first).
     fn format(self) -> i64 {
         match self {
-            Kind::Cache => 2, // 2: `removed.active` (the removal floor)
-            Kind::Index => 2, // 2: `stores.doomed` (a wipe whose keys aren't gone yet)
-            Kind::Outbox => 1,
+            Kind::Cache => 2,  // 2: `removed.active` (the removal floor)
+            Kind::Index => 2,  // 2: `stores.doomed` (a wipe whose keys aren't gone yet)
+            Kind::Outbox => 2, // 2: `outbox.reply_to_id` (queued replies)
         }
     }
 
     fn schema(self) -> &'static str {
         match self {
             Kind::Cache => CACHE_V1,
-            Kind::Outbox => OUTBOX_V1,
+            Kind::Outbox => OUTBOX_V2,
             Kind::Index => INDEX_V1,
         }
     }
@@ -95,11 +95,12 @@ CREATE TABLE files(file_id TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER 
 CREATE TABLE deletions(path TEXT PRIMARY KEY);
 ";
 
-const OUTBOX_V1: &str = "
+const OUTBOX_V2: &str = "
 CREATE TABLE meta(id INTEGER PRIMARY KEY CHECK (id = 1), format INTEGER NOT NULL,
                   generation INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE outbox(ordinal INTEGER PRIMARY KEY AUTOINCREMENT, client_id TEXT NOT NULL UNIQUE,
-                    channel_id TEXT NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL,
+                    channel_id TEXT NOT NULL, body TEXT NOT NULL, reply_to_id TEXT,
+                    state TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL);
 CREATE TABLE outbox_files(client_id TEXT NOT NULL, file_client_id TEXT NOT NULL UNIQUE,
                           snapshot_path TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL,

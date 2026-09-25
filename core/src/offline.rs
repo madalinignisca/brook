@@ -189,6 +189,11 @@ impl Offline {
     }
 
     #[cfg(test)]
+    pub(crate) fn losses(&self) -> Option<u64> {
+        self.losses.lock().unwrap().current()
+    }
+
+    #[cfg(test)]
     pub(crate) fn state_feed(&self) -> watch::Receiver<CacheState> {
         self.state.out.subscribe()
     }
@@ -241,10 +246,13 @@ impl Offline {
             }
         }
         self.close_active().await;
-        let stores = self.local.open_user(origin, user_id).await?;
-        if stores.outbox_lost {
+        let opened = self.local.open_user(origin, user_id).await;
+        // Whether or not the open then succeeded: a loss is flagged before the rebuild
+        // that causes it.
+        if self.local.take_lost_unsent() {
             record_loss(&self.losses, &self.events);
         }
+        let stores = opened?;
         let (cache_db, outbox_db) = match (stores.cache, stores.outbox) {
             (Opened::Ready { db: c, .. }, Opened::Ready { db: o, .. }) => (c, o),
             (c, o) => {

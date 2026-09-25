@@ -23,18 +23,17 @@ pub(crate) struct UserStores {
     pub(crate) store_id: String,
     pub(crate) cache: Opened,
     pub(crate) outbox: Opened,
-    /// The outbox couldn't be kept (its key is gone, or its format changed): unsent messages
-    /// on this device were lost. The app says so; the count can't be known.
-    pub(crate) outbox_lost: bool,
 }
 
 pub(crate) struct LocalData {
     root: PathBuf,
     keys: KeyStore<dyn KeySlot>,
     index: Db,
-    /// Reconciliation erased a store that held an outbox (its owner was unknown): unsent
-    /// messages on this device were lost. Said once.
-    lost_unsent: std::sync::atomic::AtomicBool,
+    /// Unsent messages on this device were lost: reconciliation erased an ownerless outbox
+    /// that held some, or a user's outbox couldn't be kept (its key is gone, or its format
+    /// changed). Set before the rebuild that loses them, so a rebuild failing part-way
+    /// can't drop the report. Said once.
+    lost_unsent: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LocalData {
@@ -60,7 +59,7 @@ impl LocalData {
             root,
             keys,
             index,
-            lost_unsent: std::sync::atomic::AtomicBool::new(false),
+            lost_unsent: Arc::default(),
         };
         if rebuilt == Some(Rebuilt::KeyMissing) {
             // The index's key is gone: nobody knows which directory is whose any more, so
@@ -92,31 +91,34 @@ impl LocalData {
         let dir = self.dir(&store_id);
         let keys = KeyStore::new(self.keys.slots());
         let id = store_id.clone();
+        let lost = self.lost_unsent.clone();
         let (cache, outbox) = tokio::task::spawn_blocking(move || {
+            use std::sync::atomic::Ordering;
             let cache = store::open(&dir, Kind::Cache, &id, &keys)?;
             let mut outbox = store::open(&dir, Kind::Outbox, &id, &keys)?;
-            let mut lost = matches!(
+            if matches!(
                 outbox,
                 Opened::Ready {
                     rebuilt: Some(Rebuilt::KeyMissing),
                     ..
                 }
-            );
+            ) {
+                lost.store(true, Ordering::SeqCst);
+            }
             if matches!(outbox, Opened::NeedsRebuild) {
-                // A format change: surfaced as lost, then remade.
-                lost = true;
+                // A format change: flagged as lost first, then remade (pre-1.0: no
+                // migration). Flagged before, so a rebuild that fails still reports it.
+                lost.store(true, Ordering::SeqCst);
                 outbox = store::rebuild(&dir, Kind::Outbox, &id, &keys)?;
             }
-            Ok::<_, StoreError>((cache, (outbox, lost)))
+            Ok::<_, StoreError>((cache, outbox))
         })
         .await
         .map_err(|_| StoreError::Io)??;
-        let (outbox, outbox_lost) = outbox;
         Ok(UserStores {
             store_id,
             cache,
             outbox,
-            outbox_lost,
         })
     }
 

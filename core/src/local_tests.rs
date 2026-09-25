@@ -146,12 +146,12 @@ async fn a_lost_outbox_is_reported() {
     let local = open(root.path(), &slot).await;
     let s = local.open_user("https://a", "u1").await.unwrap();
     let id = s.store_id.clone();
-    assert!(!s.outbox_lost);
+    assert!(!local.take_lost_unsent());
     ready(s.cache).close().await;
     ready(s.outbox).close().await;
     slot.put(&format!("outbox:{id}"), vec![9; 32]); // not the outbox's key
-    let s = local.open_user("https://a", "u1").await.unwrap();
-    assert!(s.outbox_lost);
+    let _s = local.open_user("https://a", "u1").await.unwrap();
+    assert!(local.take_lost_unsent());
 }
 
 /// Startup: a directory no index row names (a wipe cut short) is erased; the rest, and
@@ -260,11 +260,11 @@ async fn an_outbox_in_another_format_is_reported_lost() {
     ready(s.cache).close().await;
     let outbox = ready(s.outbox);
     outbox
-        .call(|c| c.execute("UPDATE meta SET format = 0", []))
+        .call(|c| c.execute("UPDATE meta SET format = 1", [])) // the format before replies
         .await
         .unwrap();
     outbox.close().await;
     let s = local.open_user("https://a", "u1").await.unwrap();
-    assert!(s.outbox_lost);
+    assert!(local.take_lost_unsent());
     assert!(matches!(s.outbox, Opened::Ready { .. }));
 }

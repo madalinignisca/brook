@@ -836,7 +836,7 @@ mod post_http {
             .mount(&server)
             .await;
         let (h, epoch) = http(&server).await;
-        h.send("c1", "hi", "cid", epoch).await
+        h.send("c1", &super::hi(), "cid", epoch).await
     }
 
     #[tokio::test]
@@ -888,7 +888,7 @@ mod post_http {
             .await;
         let (h, epoch) = http(&server).await;
         assert!(matches!(
-            h.send("c1", "hi", "cid", epoch + 1).await,
+            h.send("c1", &super::hi(), "cid", epoch + 1).await,
             Err(SendFailure::Transient { .. })
         ));
     }
@@ -1002,4 +1002,22 @@ async fn a_reset_at_zero_does_not_loop() {
         .expect("looped on the reset")
         .unwrap();
     assert_eq!(s.server.calls.load(Ordering::SeqCst), 1);
+}
+
+fn hi() -> crate::outbox::Outgoing {
+    crate::outbox::Outgoing {
+        body: "hi".into(),
+        reply_to_id: None,
+    }
+}
+
+/// A reply's POST names its target; a plain message's has no `reply_to_id` at all.
+#[test]
+fn the_send_body_names_the_reply_target_only_for_a_reply() {
+    use crate::cache_http::send_body;
+    let mut m = hi();
+    assert!(send_body(&m, "cid").get("reply_to_id").is_none());
+    m.reply_to_id = Some("q".into());
+    assert_eq!(send_body(&m, "cid")["reply_to_id"], "q");
+    assert_eq!(send_body(&m, "cid")["client_id"], "cid");
 }
