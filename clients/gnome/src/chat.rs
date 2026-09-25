@@ -442,6 +442,9 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     let widgets = chat.message_rows.borrow().get(&message.id).cloned();
                     if let Some(widgets) = widgets {
                         widgets.body.set_markup(&markdown_to_pango(&message.body));
+                        // An edit can add or clear a file message's caption (the server refuses
+                        // a blank edit on a message without files), so follow the new text.
+                        widgets.body.set_visible(!message.body.trim().is_empty());
                         widgets.edited.set_visible(true);
                     }
                 }
@@ -963,6 +966,9 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
             .build();
         row.append(&quote);
     }
+    // A file sent without a caption has no text line (the server allows an empty body
+    // when files are attached).
+    body_label.set_visible(!(message.body.trim().is_empty() && !message.attachments.is_empty()));
     row.append(&body_label);
     let deleted = Rc::new(Cell::new(false));
     if message.is_deleted() {
