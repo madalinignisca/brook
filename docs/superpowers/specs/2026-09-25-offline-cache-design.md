@@ -40,6 +40,9 @@ connection**, and catches up exactly on what it missed. Done means, observably:
   - `PRAGMA temp_store = MEMORY`, so no plaintext spill files;
   - `journal_mode = WAL`. SQLCipher encrypts WAL pages; `-shm` holds only the index. Both are
     verified by test.
+  On Linux it links the **system** `libcrypto.so.3` (not vendored), so distribution security
+  fixes apply: `libssl-dev` in CI and release builds, a line in INSTALL, and Apache-2.0 allowed
+  in `deny`.
   **Decision worth arguing:** SQLCipher, over per-row AES-GCM on plain SQLite. Per-row
   encryption avoids libcrypto on Linux but leaves ids, times and counts readable, and indexes
   work only on cleartext columns.
@@ -50,6 +53,9 @@ connection**, and catches up exactly on what it missed. Done means, observably:
     them undecryptable. Nothing is derived from a device key that could re-derive it;
   - each cached file and outbox snapshot has its own random key (for the nonce scheme, §6.1),
     stored in its row inside the encrypted database.
+  Destroying a slot erases against the **live** secret store. A backup of the keyring taken
+  before (the Linux keyring file, a machine image) still holds the old slot. On Apple the
+  item is ThisDeviceOnly and never backed up.
   **Per-file deletion is best-effort, not crypto-erase:** a deleted file's key can survive in
   SQLite free pages, the WAL, or an older copy of the database, and anyone holding that copy
   *and* the live store key could still decrypt the file. The crypto-erase guarantee is per
@@ -177,8 +183,15 @@ connection**, and catches up exactly on what it missed. Done means, observably:
   per-transfer timeout. The client-wide 30 s doesn't apply.
 - A 401 before the PUT starts refreshes, then re-opens the snapshot.
 ### 6.4 Open and Save
-- **Save** decrypts straight into the user's chosen location.
-- **Open** decrypts into the app's temporary directory, because another app needs a file. That
+- **Save** decrypts **straight into** the user's chosen file. There is no `.part` and rename,
+  because the Flatpak document portal grants only that one file. On failure it truncates and
+  removes the file.
+- **Open** decrypts into a per-store temp directory:
+  - Linux: `$XDG_RUNTIME_DIR/brook/<store>/` (tmpfs, 0700), or
+    `$XDG_RUNTIME_DIR/app/dev.brook.Brook/<store>/` under Flatpak;
+  - Mac: the app's temporary directory.
+  It needs a file because another app will open it. **Open is refused for executables and
+  launchers** (sniffed from the content, not the name); those are Save only. That
   copy is deleted:
   - when the app quits;
   - at the next launch;
@@ -237,13 +250,17 @@ wiped data.
   - `cached_messages(channel, before?, limit)`, which pages from the network and extends
     coverage when needed;
   - `pending_messages(channel)`;
-  - `cache_state()`: online/offline, syncing, last synced, and whether offline storage is
-    available.
+  - `cache_state()`: a watch receiver (online/offline, syncing, last synced, and whether
+    offline storage is available).
 - **Change notices:** a `CacheEvent` stream (which channel changed); the UI re-reads.
 - **Sending:** `send_message(channel, body, attachment_paths)` → `client_id`, durable before it
   returns (§5.1); `retry_send` and `delete_pending`.
-- **Files:** `open_file(file_id)` → temp path; `save_file(file_id, destination)`; `pin_file` and
-  `unpin_file`.
+- **Files:**
+  - `open_file(file_id)` → temp path (refused for executables); `save_file(file_id,
+    destination)` (straight into the destination);
+  - `pin_file` and `unpin_file`;
+  - a `TransferEvent` stream `(file id, bytes done, bytes total, state)` and
+    `cancel_transfer(file id)`, for progress and Cancel in the UI (#66).
 - **Sign-out:** `logout(remove_data: bool)`, and `unsent_count()` for the sign-out warning.
 
 ## 9. Tests (each seen failing under a named mutation)
