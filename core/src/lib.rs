@@ -8,6 +8,9 @@
 //! DMs, send and page message history, and observe realtime [`ServerEvent`]s over
 //! a WebSocket — plus the observable [`AuthState`] the UI watches.
 
+mod account;
+#[cfg(test)]
+mod account_tests;
 mod call;
 #[cfg(test)]
 mod call_tests;
@@ -26,6 +29,7 @@ mod state;
 pub mod test_support;
 mod ws;
 
+pub use account::UserSummary;
 pub use call::CallHandle;
 pub use call_types::{
     default_labels, CallState, CallStatus, EndReason, EngineError, IceCandidate, IceServer,

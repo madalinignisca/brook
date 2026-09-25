@@ -7,6 +7,8 @@ struct SignedInView: View {
     let calls: CallCenter
     @State private var channels: ChannelsModel
     @State private var selection: String?
+    @State private var changingPassword = false
+    @State private var resettingPassword = false
 
     init(user: FfiUser, client: any FfiBrookClientProtocol, calls: CallCenter) {
         self.user = user
@@ -52,5 +54,27 @@ struct SignedInView: View {
             }
         }
         .task { await channels.start() }
+        .toolbar {
+            ToolbarItem {
+                Menu {
+                    Button("Change Password…") { changingPassword = true }
+                    if user.globalRole == "admin" {
+                        Button("Reset a User's Password…") { resettingPassword = true }
+                    }
+                } label: {
+                    Label("Account", systemImage: "person.crop.circle")
+                }
+            }
+        }
+        .sheet(isPresented: $changingPassword) {
+            if let account = client as? any AccountClient {
+                ChangePasswordSheet(client: account)
+            }
+        }
+        .sheet(isPresented: $resettingPassword) {
+            if let account = client as? any AccountClient {
+                AdminResetSheet(client: account, selfId: user.id)
+            }
+        }
     }
 }

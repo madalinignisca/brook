@@ -142,6 +142,27 @@ impl From<Error> for LoginError {
     }
 }
 
+/// A user in the admin user list.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiUserSummary {
+    pub id: String,
+    pub handle: String,
+    pub display_name: String,
+    /// `"member"` or `"admin"`.
+    pub global_role: String,
+}
+
+impl From<brook_core::UserSummary> for FfiUserSummary {
+    fn from(u: brook_core::UserSummary) -> Self {
+        Self {
+            id: u.id,
+            handle: u.handle,
+            display_name: u.display_name,
+            global_role: u.global_role,
+        }
+    }
+}
+
 /// A channel or DM the user belongs to (the fields the Apple UI needs).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiChannel {

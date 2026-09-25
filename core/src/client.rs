@@ -27,8 +27,8 @@ pub(crate) const REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 ///
 /// Cheap to clone-by-`Arc` from the UI; safe to call from any async task.
 pub struct BrookClient {
-    base: Url,
-    http: reqwest::Client,
+    pub(crate) base: Url,
+    pub(crate) http: reqwest::Client,
     state_tx: Arc<watch::Sender<AuthState>>,
     state_rx: watch::Receiver<AuthState>,
     /// The active session (set on login), used to authorize chat calls + the WS.
@@ -41,6 +41,8 @@ pub struct BrookClient {
     pub(crate) commands: Commands,
     /// The socket side of `commands`, handed to the realtime task when it starts.
     transport: std::sync::Mutex<Option<Transport>>,
+    /// Bound on a password change's locked section (tests shorten it).
+    pub(crate) locked_bound: std::time::Duration,
 }
 
 impl BrookClient {
@@ -52,6 +54,7 @@ impl BrookClient {
         // reason to redirect, so a 3xx surfaces as an error instead.
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(config.request_timeout)
             .build()?;
         let (state_tx, state_rx) = watch::channel(AuthState::LoggedOut);
         let state_tx = Arc::new(state_tx);
@@ -67,6 +70,7 @@ impl BrookClient {
             realtime_started: AtomicBool::new(false),
             commands,
             transport: std::sync::Mutex::new(Some(transport)),
+            locked_bound: std::time::Duration::from_secs(30),
         })
     }
 
@@ -80,6 +84,10 @@ impl BrookClient {
         // `send` only fails if all receivers are dropped; `self` holds `state_rx`,
         // so it can never fail here. Ignoring the result is safe.
         let _ = self.state_tx.send(AuthState::Authenticating);
+        // The refresh lock: a password change in flight revokes every refresh token of the user
+        // when its server call commits; a login in between would install a pair it then revokes.
+        // Every holder's requests are bounded by the client's request timeout.
+        let _flight = self.session.refresh_lock.lock().await;
         // Drop any prior session up front so a failed attempt can never leave the
         // previous user's token usable by chat calls.
         self.session.replace(None).await;
@@ -473,9 +481,9 @@ impl BrookClient {
 }
 
 #[derive(Deserialize)]
-struct TokenPair {
-    access_token: String,
-    refresh_token: String,
+pub(crate) struct TokenPair {
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
 }
 
 #[derive(Deserialize)]
