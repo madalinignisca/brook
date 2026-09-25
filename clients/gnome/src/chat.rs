@@ -10,7 +10,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
-use brook_core::{BrookClient, Channel, Message, ReactionSummary, ServerEvent};
+use brook_core::{
+    BrookClient, CacheEvent, Channel, Deleted, Message, PendingMessage, PendingState,
+    ReactionSummary, ServerEvent,
+};
 use gtk::glib;
 use tokio::runtime::Handle;
 
@@ -66,7 +69,14 @@ struct Chat {
     /// The open call window, if any (one call at a time).
     call_window: Rc<RefCell<Option<glib::WeakRef<adw::Window>>>>,
     /// Sign Out in the main menu: set by the app shell (it knows the login view).
-    sign_out: Rc<dyn Fn()>,
+    /// `true` also erases this device's data for the user ("Remove this device's data").
+    sign_out: Rc<dyn Fn(bool)>,
+    /// The open channel's queued (not yet sent) messages, drawn below the history.
+    pending_rows: Rc<RefCell<Vec<gtk::ListBoxRow>>>,
+    /// `client_id`s of messages already on screen: their pending bubble is dropped.
+    shown_client_ids: Rc<RefCell<std::collections::HashSet<String>>>,
+    /// "You're offline" above the messages, from the cache's state.
+    offline_banner: adw::Banner,
 }
 
 /// The widgets of a rendered message we may mutate after an edit/delete/reaction.
@@ -88,7 +98,7 @@ pub fn build(
     client: Arc<BrookClient>,
     runtime: Handle,
     is_admin: bool,
-    sign_out: Rc<dyn Fn()>,
+    sign_out: Rc<dyn Fn(bool)>,
 ) -> gtk::Widget {
     let channel_list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::Single)
@@ -191,6 +201,12 @@ pub fn build(
         active_calls: Rc::default(),
         call_window: Rc::default(),
         sign_out,
+        pending_rows: Rc::default(),
+        shown_client_ids: Rc::default(),
+        offline_banner: adw::Banner::builder()
+            .title("You're offline. Showing saved messages.")
+            .revealed(false)
+            .build(),
     });
 
     // --- sidebar ---
@@ -258,6 +274,7 @@ pub fn build(
     composer_row.append(&send_button);
 
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content_box.append(&chat.offline_banner);
     content_box.append(&message_scroll);
     content_box.append(&typing_label);
     content_box.append(&reply_bar);
@@ -348,6 +365,8 @@ fn bootstrap(chat: &Rc<Chat>) {
             .await;
 
         spawn_event_loop(&chat);
+        spawn_cache_loop(&chat);
+        watch_offline(&chat);
         refresh_channels(&chat, None);
     });
 }
@@ -507,9 +526,16 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
 fn refresh_channels(chat: &Rc<Chat>, select: Option<String>) {
     let chat = chat.clone();
     glib::spawn_future_local(async move {
+        // The network is freshest (server-side unread counts); offline, the cache
+        // answers with the last-synced list and locally computed unread counts.
         let handle = chat.runtime.spawn({
             let client = chat.client.clone();
-            async move { client.list_channels().await }
+            async move {
+                match client.list_channels().await {
+                    Ok(channels) => Ok(channels),
+                    Err(err) => client.cached_channels().await.map_err(|_| err),
+                }
+            }
         });
         let Ok(Ok(channels)) = handle.await else {
             return;
@@ -642,6 +668,8 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
     // Clear now, before the await, so live messages that arrive while history is
     // loading are appended to a fresh list rather than wiped by a late clear.
     chat.message_rows.borrow_mut().clear();
+    chat.pending_rows.borrow_mut().clear();
+    chat.shown_client_ids.borrow_mut().clear();
     while let Some(row) = chat.message_list.row_at_index(0) {
         chat.message_list.remove(&row);
     }
@@ -649,20 +677,49 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
     let chat = chat.clone();
     let channel_id = channel_id.to_string();
     glib::spawn_future_local(async move {
+        let is_current =
+            |chat: &Rc<Chat>| chat.current.borrow().as_deref() == Some(channel_id.as_str());
+        // Saved messages first (instant, and all there is offline), newest first
+        // from the cache, drawn oldest first. A page the cache can't prove complete
+        // fetches the newest into the cache; the cache event then fills it in.
+        let cached = chat.runtime.spawn({
+            let client = chat.client.clone();
+            let channel_id = channel_id.clone();
+            async move {
+                let page = client.cached_messages(&channel_id, None, 50).await?;
+                if page.needs_network {
+                    let _ = client.load_head(&channel_id, 50).await;
+                }
+                Ok::<_, brook_core::Error>(page.messages)
+            }
+        });
+        if let Ok(Ok(mut messages)) = cached.await {
+            if !is_current(&chat) {
+                return;
+            }
+            messages.reverse();
+            for message in &messages {
+                append_message(&chat, message);
+            }
+        }
+        // Then the network, as before (duplicates replace their cached row).
         let handle = chat.runtime.spawn({
             let client = chat.client.clone();
             let channel_id = channel_id.clone();
             async move { client.channel_history(&channel_id, None).await }
         });
-        let Ok(Ok(messages)) = handle.await else {
-            return;
-        };
-        // Only render if the user hasn't switched channels meanwhile.
-        if chat.current.borrow().as_deref() != Some(channel_id.as_str()) {
-            return;
+        if let Ok(Ok(messages)) = handle.await {
+            if !is_current(&chat) {
+                return;
+            }
+            for message in &messages {
+                if !chat.message_rows.borrow().contains_key(&message.id) {
+                    append_message(&chat, message);
+                }
+            }
         }
-        for message in &messages {
-            append_message(&chat, message);
+        if is_current(&chat) {
+            render_pending(&chat);
         }
     });
 }
@@ -682,16 +739,32 @@ fn send_current(chat: &Rc<Chat>) {
 
     let chat = chat.clone();
     glib::spawn_future_local(async move {
+        // Through the outbox when offline storage is on: saved before this returns,
+        // sent in order, shown as a "sending" bubble until it arrives. A reply (the
+        // outbox has no quote field yet) or no local storage sends directly, online.
+        let queued = reply_to.is_none();
         let handle = chat.runtime.spawn({
             let client = chat.client.clone();
             async move {
+                if queued {
+                    match client.send_queued(&channel_id, &body, None).await {
+                        Ok(_) => return Ok(true),
+                        Err(brook_core::Error::Api { code, .. }) if code == "local.unavailable" => {
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
                 client
                     .send_message(&channel_id, &body, reply_to.as_deref())
                     .await
+                    .map(|_| false)
             }
         });
-        if let Ok(Err(err)) = handle.await {
-            tracing::warn!(%err, "failed to send message");
+        match handle.await {
+            Ok(Ok(true)) => render_pending(&chat),
+            Ok(Ok(false)) => {}
+            Ok(Err(err)) => tracing::warn!(%err, "failed to send message"),
+            Err(_) => {}
         }
     });
 }
@@ -896,6 +969,11 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
         chat.message_list.remove(&old.row);
     }
     chat.message_list.append(&list_row);
+    if let Some(cid) = &message.client_id {
+        chat.shown_client_ids.borrow_mut().insert(cid.clone());
+        drop_pending_bubble(chat, cid);
+    }
+    keep_pending_last(chat);
     chat.message_rows.borrow_mut().insert(
         message.id.clone(),
         MessageWidgets {
@@ -1244,7 +1322,7 @@ fn main_menu_popover(chat: &Rc<Chat>) -> gtk::Popover {
         let popover = popover.clone();
         move |_| {
             popover.popdown();
-            (chat.sign_out)();
+            sign_out_dialog(&chat);
         }
     });
     change_password.connect_clicked({
@@ -1943,4 +2021,382 @@ fn add_member_popover(chat: &Rc<Chat>) -> gtk::Popover {
         }
     });
     popover
+}
+
+// ------------------------------------------------------------------ offline (#62)
+
+/// The words under a queued message.
+fn pending_text(state: &PendingState) -> String {
+    match state {
+        PendingState::Pending | PendingState::Sending | PendingState::Accepted => "Sending…".into(),
+        PendingState::Failed { code } => match code.as_str() {
+            "not_found" | "authz.forbidden" | "http_403" | "http_404" => {
+                "Not sent: you can't post here any more".into()
+            }
+            _ => "Not sent".into(),
+        },
+    }
+}
+
+/// Re-read the open channel's queue and draw it below the history.
+fn render_pending(chat: &Rc<Chat>) {
+    let Some(channel_id) = chat.current.borrow().clone() else {
+        return;
+    };
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let handle = chat.runtime.spawn({
+            let client = chat.client.clone();
+            let channel_id = channel_id.clone();
+            async move { client.pending_messages(&channel_id).await }
+        });
+        let pending = match handle.await {
+            Ok(Ok(pending)) => pending,
+            _ => Vec::new(), // no local storage: nothing is ever queued
+        };
+        if chat.current.borrow().as_deref() != Some(channel_id.as_str()) {
+            return;
+        }
+        for row in chat.pending_rows.borrow_mut().drain(..) {
+            chat.message_list.remove(&row);
+        }
+        for item in pending {
+            if chat.shown_client_ids.borrow().contains(&item.client_id) {
+                continue; // already in the history (between the ack's two steps)
+            }
+            let row = pending_row(&chat, &item);
+            chat.message_list.append(&row);
+            chat.pending_rows.borrow_mut().push(row);
+        }
+    });
+}
+
+fn pending_row(chat: &Rc<Chat>, item: &PendingMessage) -> gtk::ListBoxRow {
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(4)
+        .margin_bottom(4)
+        .margin_start(12)
+        .margin_end(12)
+        .opacity(0.6)
+        .build();
+    column.append(
+        &gtk::Label::builder()
+            .label(&item.body)
+            .xalign(0.0)
+            .wrap(true)
+            .build(),
+    );
+    let footer = gtk::Box::builder().spacing(6).build();
+    let failed = matches!(item.state, PendingState::Failed { .. });
+    footer.append(
+        &gtk::Label::builder()
+            .label(pending_text(&item.state))
+            .css_classes(if failed {
+                vec!["caption", "error"]
+            } else {
+                vec!["caption", "dim-label"]
+            })
+            .build(),
+    );
+    if failed {
+        column.set_opacity(1.0);
+        let retry = gtk::Button::builder()
+            .label("Retry")
+            .css_classes(["flat"])
+            .build();
+        let delete = gtk::Button::builder()
+            .label("Delete")
+            .css_classes(["flat"])
+            .build();
+        footer.append(&retry);
+        footer.append(&delete);
+        let cid = item.client_id.clone();
+        retry.connect_clicked({
+            let (chat, cid) = (chat.clone(), cid.clone());
+            move |_| {
+                let (client, cid) = (chat.client.clone(), cid.clone());
+                chat.runtime
+                    .spawn(async move { client.retry_send(&cid).await });
+            }
+        });
+        delete.connect_clicked({
+            let chat = chat.clone();
+            move |_| {
+                let (client, cid) = (chat.client.clone(), cid.clone());
+                let handle = chat
+                    .runtime
+                    .spawn(async move { client.delete_pending(&cid).await });
+                let chat = chat.clone();
+                glib::spawn_future_local(async move {
+                    // AlreadySent: it did go out; the history shows it.
+                    if let Ok(Ok(Deleted::Removed | Deleted::AlreadySent | Deleted::NotFound)) =
+                        handle.await
+                    {
+                        render_pending(&chat);
+                    }
+                });
+            }
+        });
+    }
+    column.append(&footer);
+    gtk::ListBoxRow::builder()
+        .activatable(false)
+        .child(&column)
+        .build()
+}
+
+/// A message with this `client_id` arrived: its bubble goes (the next re-read agrees).
+fn drop_pending_bubble(chat: &Rc<Chat>, _client_id: &str) {
+    // Bubbles don't carry their id; a re-read redraws the queue without it.
+    if !chat.pending_rows.borrow().is_empty() {
+        render_pending(chat);
+    }
+}
+
+/// Keep queued bubbles below the history when a new message lands.
+fn keep_pending_last(chat: &Rc<Chat>) {
+    let rows = chat.pending_rows.borrow().clone();
+    for row in &rows {
+        chat.message_list.remove(row);
+        chat.message_list.append(row);
+    }
+}
+
+/// Change notices from the cache and outbox, on the GTK loop.
+fn spawn_cache_loop(chat: &Rc<Chat>) {
+    let chat = chat.clone();
+    let mut events = chat.client.cache_events();
+    glib::spawn_future_local(async move {
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            let event = events.recv().await;
+            let current = chat.current.borrow().clone();
+            match event {
+                Ok(CacheEvent::Outbox(channel)) => {
+                    if current.as_deref() == Some(channel.as_str()) {
+                        render_pending(&chat);
+                    }
+                }
+                Ok(CacheEvent::Channels(ids)) => {
+                    // A catch-up (/sync) delivered rows no live event showed: fill the
+                    // open channel in, and refresh unread badges from the cache.
+                    if let Some(open) = current.filter(|c| ids.contains(c)) {
+                        fill_from_cache(&chat, open);
+                    }
+                    badges_from_cache(&chat);
+                }
+                Ok(CacheEvent::Removed(_) | CacheEvent::Reset) | Err(RecvError::Lagged(_)) => {
+                    refresh_channels(&chat, None);
+                }
+                Ok(_) => {}
+                Err(RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+/// Append cached messages of the open channel that aren't on screen yet.
+fn fill_from_cache(chat: &Rc<Chat>, channel_id: String) {
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let handle = chat.runtime.spawn({
+            let client = chat.client.clone();
+            let channel_id = channel_id.clone();
+            async move { client.cached_messages(&channel_id, None, 50).await }
+        });
+        let Ok(Ok(page)) = handle.await else { return };
+        if chat.current.borrow().as_deref() != Some(channel_id.as_str()) {
+            return;
+        }
+        for message in page.messages.iter().rev() {
+            if !chat.message_rows.borrow().contains_key(&message.id) {
+                append_message(&chat, message);
+            }
+        }
+    });
+}
+
+/// Unread badges from the cache (after a catch-up that no live event announced).
+fn badges_from_cache(chat: &Rc<Chat>) {
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let handle = chat.runtime.spawn({
+            let client = chat.client.clone();
+            async move { client.cached_channels().await }
+        });
+        let Ok(Ok(cached)) = handle.await else { return };
+        let current = chat.current.borrow().clone();
+        let updates: Vec<(usize, i64)> = chat
+            .channels
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let fresh = cached.iter().find(|f| f.id == c.id)?;
+                // The open channel is being read: its badge stays clear.
+                let unread = if current.as_deref() == Some(c.id.as_str()) {
+                    0
+                } else {
+                    fresh.unread_count
+                };
+                (unread != c.unread_count).then_some((i, unread))
+            })
+            .collect();
+        for (i, unread) in updates {
+            chat.channels.borrow_mut()[i].unread_count = unread;
+            update_badge(&chat, i);
+        }
+    });
+}
+
+/// The offline banner, from the cache's state (every few seconds), and the one-time
+/// clean-up of other accounts' saved data once this user's storage is open.
+fn watch_offline(chat: &Rc<Chat>) {
+    let chat_weak = Rc::downgrade(chat);
+    let checked_others = Rc::new(std::cell::Cell::new(false));
+    glib::timeout_add_seconds_local(3, move || {
+        let Some(chat) = chat_weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if chat.offline_banner.root().is_none() {
+            return glib::ControlFlow::Break; // signed out: the view is gone
+        }
+        let handle = chat.runtime.spawn({
+            let client = chat.client.clone();
+            async move { client.cache_state().await }
+        });
+        let checked_others = checked_others.clone();
+        glib::spawn_future_local(async move {
+            let Ok(Ok(state)) = handle.await else { return };
+            chat.offline_banner.set_revealed(state.offline);
+            if !checked_others.replace(true) {
+                wipe_other_accounts(&chat);
+            }
+        });
+        glib::ControlFlow::Continue
+    });
+}
+
+/// A different account used this device before: its saved data goes (#46 §8).
+fn wipe_other_accounts(chat: &Rc<Chat>) {
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let handle = chat.runtime.spawn({
+            let client = chat.client.clone();
+            async move {
+                let others = client.other_local_users().await?;
+                if !others.is_empty() {
+                    client.wipe_other_local_users().await?;
+                }
+                Ok::<_, brook_core::Error>(others.len())
+            }
+        });
+        if let Ok(Ok(n)) = handle.await {
+            if n > 0 {
+                let alert = adw::AlertDialog::new(
+                    Some("Saved Data Removed"),
+                    Some("Another account's saved messages were removed from this device."),
+                );
+                alert.add_response("ok", "OK");
+                alert.present(Some(&chat.message_list));
+            }
+        }
+    });
+}
+
+/// Sign Out, with "Remove this device's data" (ticked by default, #46 §8) and a warning
+/// when queued messages would be lost with it.
+fn sign_out_dialog(chat: &Rc<Chat>) {
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let unsent = chat
+            .runtime
+            .spawn({
+                let client = chat.client.clone();
+                async move { client.unsent_count().await }
+            })
+            .await
+            .unwrap_or(0);
+        let remove = gtk::CheckButton::builder()
+            .label("Remove this device's data")
+            .active(true)
+            .build();
+        let body = sign_out_body(unsent, true);
+        let dialog = adw::AlertDialog::new(Some("Sign Out?"), Some(&body));
+        dialog.set_extra_child(Some(&remove));
+        remove.connect_toggled({
+            let dialog = dialog.clone();
+            move |check| dialog.set_body(&sign_out_body(unsent, check.is_active()))
+        });
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("sign-out", "Sign Out");
+        dialog.set_response_appearance("sign-out", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.connect_response(None, {
+            let chat = chat.clone();
+            move |_, response| {
+                if response == "sign-out" {
+                    (chat.sign_out)(remove.is_active());
+                }
+            }
+        });
+        dialog.present(Some(&chat.message_list));
+    });
+}
+
+/// What signing out does to this device's data, in words.
+fn sign_out_body(unsent: u64, remove: bool) -> String {
+    let mut text = if remove {
+        String::from("Saved messages and files are removed from this device.")
+    } else {
+        String::from("Saved messages stay on this device for your next sign-in.")
+    };
+    if remove && unsent > 0 {
+        let what = if unsent == 1 {
+            "1 message hasn't"
+        } else {
+            "messages haven't"
+        };
+        let count = if unsent == 1 {
+            String::new()
+        } else {
+            format!("{unsent} ")
+        };
+        text.push_str(&format!(" {count}{what} been sent and will be deleted."));
+    }
+    text
+}
+
+#[cfg(test)]
+mod offline_tests {
+    use super::*;
+
+    #[test]
+    fn sign_out_warns_only_when_unsent_messages_would_go() {
+        assert!(sign_out_body(0, true).contains("removed from this device"));
+        assert!(!sign_out_body(0, true).contains("deleted"));
+        assert!(sign_out_body(1, true).contains("1 message hasn't been sent"));
+        assert!(sign_out_body(3, true).contains("3 messages haven't been sent"));
+        assert!(
+            !sign_out_body(3, false).contains("deleted"),
+            "kept messages aren't lost"
+        );
+    }
+
+    #[test]
+    fn pending_states_read_plainly() {
+        assert_eq!(pending_text(&PendingState::Sending), "Sending…");
+        assert!(pending_text(&PendingState::Failed {
+            code: "not_found".into()
+        })
+        .contains("can't post here"));
+        assert_eq!(
+            pending_text(&PendingState::Failed {
+                code: "http_500".into()
+            }),
+            "Not sent"
+        );
+    }
 }
