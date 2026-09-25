@@ -272,3 +272,113 @@ def test_go_away_works_for_any_configured_threshold() -> None:
     for _ in range(601):
         lim.failure("ip")
     assert lim.check("ip") is not None
+
+
+# ---- review findings: IPv6 keying, wiring, bounds, hardening ------------------------
+
+
+def test_ipv6_is_keyed_per_64() -> None:
+    a = ratelimit.client_ip("2001:db8:1:2:aaaa::1")
+    b = ratelimit.client_ip("2001:db8:1:2:ffff:ffff:ffff:ffff")
+    c = ratelimit.client_ip("2001:db8:1:3::1")
+    assert a == b == "2001:db8:1:2::/64"
+    assert c != a
+    assert ratelimit.client_ip("::ffff:192.0.2.7") == "192.0.2.7"  # mapped v4
+    assert ratelimit.client_ip("192.0.2.7") == "192.0.2.7"
+
+
+def test_rotating_ipv6_addresses_share_one_budget() -> None:
+    lim, _ = limiter(backoff_after=2, bucket_capacity=1000)
+    lim.failure(ratelimit.client_ip("2001:db8::1"))
+    lim.failure(ratelimit.client_ip("2001:db8::2"))
+    assert lim.check(ratelimit.client_ip("2001:db8::3")) is not None
+
+
+def test_backoff_exponent_is_clamped_no_overflow() -> None:
+    lim, _ = limiter(backoff_after=1, go_away_per_hour=10**6, bucket_capacity=10**6)
+    for _ in range(2000):
+        lim.failure("ip")
+    assert lim.check("ip") == 3600
+
+
+def test_trust_expires() -> None:
+    lim, clock = limiter(handle_slow_after=1, bucket_capacity=1000, trust_ttl_s=100)
+    lim.success("home", "gabriel")
+    clock.advance(101)
+    for i in range(5):
+        lim.failure(f"a{i}", "gabriel")
+    assert lim.check("home", "gabriel") is not None  # no longer exempt
+
+
+async def test_success_resets_the_streak_through_login(client: httpx.AsyncClient) -> None:
+    """Wiring (A): the owner's typos must not pile up for the life of the process."""
+    await _register(client)
+    for _ in range(4):
+        assert (await _login(client, "alice", "wrong-password-x")).status_code == 401
+    assert (await _login(client, "alice", "correct-horse-battery")).status_code == 200
+    for _ in range(4):
+        assert (await _login(client, "alice", "wrong-password-x")).status_code == 401
+
+
+async def test_register_from_a_flooded_ip_is_429(client: httpx.AsyncClient) -> None:
+    """Wiring (B): register is paced like login."""
+    lim = ratelimit.get_limiter()
+    for _ in range(lim.config.go_away_per_hour + 1):
+        lim.failure("127.0.0.1")
+    r = await client.post(
+        "/api/v1/auth/register",
+        json={"handle": "alice", "display_name": "Alice", "password": "correct-horse-battery"},
+    )
+    assert r.status_code == 429
+
+
+async def test_oversized_login_payload_is_422(client: httpx.AsyncClient) -> None:
+    r = await _login(client, "x" * 65, "pw")
+    assert r.status_code == 422
+    r = await _login(client, "alice", "p" * 257)
+    assert r.status_code == 422
+
+
+def _ws_token(sync_client: TestClient) -> str:
+    sync_client.post(
+        "/api/v1/auth/register",
+        json={"handle": "alice", "display_name": "Alice", "password": "correct-horse-battery"},
+    )
+    r = sync_client.post(
+        "/api/v1/auth/login", json={"handle": "alice", "password": "correct-horse-battery"}
+    )
+    return str(r.json()["access_token"])
+
+
+def test_ws_reauth_from_an_ip_in_backoff_is_rate_limited(sync_client: TestClient) -> None:
+    """Wiring (D): re-auth on an open socket is checked too."""
+    token = _ws_token(sync_client)
+    with sync_client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "auth", "data": {"access_token": token}})
+        assert ws.receive_json()["type"] == "ready"
+        lim = ratelimit.get_limiter()
+        for _ in range(lim.config.backoff_after):
+            lim.failure("testclient")
+        ws.send_json({"type": "auth", "data": {"access_token": token}})
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+    assert (closed.value.code, closed.value.reason) == (1008, "rate_limited")
+
+
+def test_an_expired_ws_token_is_not_a_failure(
+    sync_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Devices waking with stale tokens get token_expired and no backoff."""
+    from app import config
+
+    monkeypatch.setattr(config.get_settings(), "access_ttl_seconds", -10)
+    token = _ws_token(sync_client)  # issued already expired, correctly signed
+    for _ in range(8):
+        with (
+            pytest.raises(WebSocketDisconnect) as closed,
+            sync_client.websocket_connect("/ws") as ws,
+        ):
+            ws.send_json({"type": "auth", "data": {"access_token": token}})
+            ws.receive_json()
+        assert closed.value.reason == "token_expired"
+    assert ratelimit.get_limiter().check("testclient", consume=False) is None

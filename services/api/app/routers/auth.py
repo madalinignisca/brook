@@ -158,11 +158,17 @@ async def refresh(
     enforce(limiter, ip)
     try:
         pair = await _rotate(body, session, settings)
+    except _LostRotationRace:
+        raise  # two tabs refreshing at once: benign, not a failure
     except HTTPException:
         limiter.failure(ip)
         raise
     limiter.success(ip)
     return pair
+
+
+class _LostRotationRace(HTTPException):
+    """A valid, unrevoked token whose rotation another request won concurrently."""
 
 
 async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) -> TokenPair:
@@ -189,6 +195,9 @@ async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) ->
             .values(revoked=True)
         ),
     )
+    if result.rowcount != 1 and not token.revoked:
+        # It was unrevoked when read: a concurrent rotation won (two tabs).
+        raise _LostRotationRace(status_code=bad.status_code, detail=bad.detail)
     if result.rowcount != 1:
         # Already rotated/revoked, or token reuse.
         # TODO(Phase 0b): treat reuse of a revoked token as theft → revoke the family.

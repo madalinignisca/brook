@@ -131,8 +131,12 @@ async def _ping(conn: Connection, frame: dict[str, Any]) -> None:
     await conn.send(envelope("pong", {}, re=_frame_id(frame)))
 
 
-async def _user_from_token(settings: Settings, token: object) -> tuple[User, int] | None:
-    """``(active user, exp)`` for a valid access token, else ``None``."""
+EXPIRED = "expired"  # a genuine token past its exp: stale, not an attack
+
+
+async def _user_from_token(settings: Settings, token: object) -> tuple[User, int] | str | None:
+    """``(active user, exp)`` for a valid access token, :data:`EXPIRED` for a
+    correctly signed but expired one, else ``None``."""
     if not isinstance(token, str) or not token:
         return None
     try:
@@ -141,6 +145,8 @@ async def _user_from_token(settings: Settings, token: object) -> tuple[User, int
             return None
         user_id = uuid.UUID(str(payload["sub"]))
         exp = int(payload["exp"])
+    except jwt.ExpiredSignatureError:
+        return EXPIRED
     except (jwt.PyJWTError, KeyError, ValueError, TypeError):
         return None
     async with get_sessionmaker()() as session:
@@ -170,7 +176,10 @@ async def _reauth(conn: Connection, frame: dict[str, Any], settings: Settings) -
         await conn.close(CLOSE_POLICY, "rate_limited")
         return
     authed = await _user_from_token(settings, _auth_token(frame))
-    if authed is None or authed[0].id != conn.user_id:
+    if authed == EXPIRED:
+        await conn.close(CLOSE_POLICY, "token_expired")  # stale, not a failure
+        return
+    if not isinstance(authed, tuple) or authed[0].id != conn.user_id:
         limiter.failure(ip)
         await conn.close(CLOSE_POLICY, "auth_failed")
         return
@@ -207,7 +216,11 @@ async def ws_endpoint(ws: WebSocket) -> None:
         await ws.close(code=CLOSE_POLICY, reason="rate_limited")
         return
     authed = await _user_from_token(settings, _auth_token(first))
-    if authed is None:
+    if authed == EXPIRED:
+        # A device waking with a stale token: tell it to refresh, don't back it off.
+        await ws.close(code=CLOSE_POLICY, reason="token_expired")
+        return
+    if not isinstance(authed, tuple):
         limiter.failure(ip)
         await ws.close(code=CLOSE_POLICY, reason="auth_failed")
         return

@@ -16,9 +16,15 @@ container every request appears to come from that container's IP instead):
   answers 429 immediately, *before* any Argon2 work (the CPU is the point).
 
 Per handle (failures from many IPs): the handle is slowed down, capped at
-``handle_max_delay_s``, and **never locked**: an IP that recently logged in to that
-handle successfully is exempt, so the owner's usual devices keep working while an
-attacker's IPs are slowed, and anyone else waits at most the cap.
+``handle_max_delay_s``, and **never locked**: an IP that logged in to that handle
+successfully within ``trust_ttl_s`` is exempt, so the owner's usual devices keep
+working while an attacker's IPs are slowed, and anyone else waits at most the cap.
+Note: a polling attacker can keep the handle's slot occupied for non-trusted IPs
+(each waits up to the cap). That is the price of never locking; keep the cap short,
+because raising it turns the slowdown into a lock-out for new devices.
+
+IPv6 clients are keyed per /64 (one subscriber's prefix), so rotating addresses
+within it can't reset the budget; IPv4 per address.
 
 No tarpitting: callers are told to come back (``Retry-After``), never held open.
 Escalations are logged once per tier change with the IP (a fail2ban hook).
@@ -30,6 +36,7 @@ Reusable: other credential endpoints (password change, TOTP) call
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import math
 import time
@@ -110,6 +117,7 @@ class LimitConfig:
     handle_slow_after: int = 10  # failures on one handle (any IPs) within the window
     handle_max_delay_s: float = 60.0
     trusted_ips_per_handle: int = 8
+    trust_ttl_s: float = 30 * 24 * HOUR
 
 
 class AuthLimiter:
@@ -153,7 +161,9 @@ class AuthLimiter:
 
         # Exponential backoff after consecutive failures.
         if st.consecutive >= cfg.backoff_after:
-            wait = min(2.0 ** (st.consecutive - cfg.backoff_after), cfg.max_backoff_s)
+            # Clamped exponent: 2.0**1100 would overflow into a 500.
+            exponent = min(st.consecutive - cfg.backoff_after, 40)
+            wait = min(2.0**exponent, cfg.max_backoff_s)
             until = st.last_failure + wait
             if now < until:
                 self._escalate(ip, st, 1)
@@ -166,7 +176,7 @@ class AuthLimiter:
                 self._prune(hs.failures, now - cfg.handle_window_s)
                 over = len(hs.failures) - cfg.handle_slow_after
                 if over >= 0:
-                    delay = min(2.0**over, cfg.handle_max_delay_s)
+                    delay = min(2.0 ** min(over, 40), cfg.handle_max_delay_s)
                     until = hs.last_failure + delay
                     if now < until:
                         return _ceil(until - now)
@@ -211,7 +221,8 @@ class AuthLimiter:
 
     def _is_trusted(self, handle: str, ip: str) -> bool:
         trusted = self._trusted.peek(handle)
-        return trusted is not None and ip in trusted
+        since = trusted.get(ip) if trusted is not None else None
+        return since is not None and self._clock() - since <= self.config.trust_ttl_s
 
     @staticmethod
     def _prune(q: deque[float], cutoff: float) -> None:
@@ -259,5 +270,16 @@ def enforce(limiter: AuthLimiter, ip: str, handle: str | None = None) -> None:
 
 
 def client_ip(host: str | None) -> str:
-    """The limiter key for a request's peer (``request.client.host``)."""
-    return host or "unknown"
+    """The limiter key for a request's peer (``request.client.host``): the address
+    for IPv4, the /64 for IPv6 (a subscriber can rotate within its prefix)."""
+    if not host:
+        return "unknown"
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return host  # e.g. "testclient"
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:  # ::ffff:a.b.c.d is really IPv4
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return str(addr)
