@@ -177,7 +177,7 @@ fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
 
             let reuse = matches!(&*current.borrow(), Some((s, _)) if *s == server);
             if !reuse {
-                match new_client(&server, &ui.keyring) {
+                match new_client(&server, &ui.keyring, &ui.runtime) {
                     Ok(client) => {
                         *current.borrow_mut() = Some((server.clone(), client.clone()));
                         watch_auth_state(&ui, &current, server.clone(), Arc::downgrade(&client));
@@ -253,7 +253,7 @@ fn restore_at_launch(ui: &LoginUi, current: &CurrentClient, server: String) {
             settle(""); // nothing to restore: the login form is ready
             return;
         }
-        let Ok(client) = new_client(&server, &ui.keyring) else {
+        let Ok(client) = new_client(&server, &ui.keyring, &ui.runtime) else {
             settle("");
             return;
         };
@@ -318,17 +318,30 @@ fn back_to_password(ui: &LoginUi, message: &str) {
 
 /// Build a core client for `server`. Plain http is only allowed for loopback,
 /// or anywhere with the hidden dev opt-in `BROOK_ALLOW_INSECURE_HTTP=1`.
-fn new_client(server: &str, keyring: &Keyring) -> brook_core::Result<Arc<BrookClient>> {
+fn new_client(
+    server: &str,
+    keyring: &Keyring,
+    runtime: &tokio::runtime::Handle,
+) -> brook_core::Result<Arc<BrookClient>> {
     let allow_insecure_http = std::env::var("BROOK_ALLOW_INSECURE_HTTP").as_deref() == Ok("1");
     let config = CoreConfig::with_options(server, allow_insecure_http)?;
-    let client = BrookClient::new(config)?;
+    let client = Arc::new(BrookClient::new(config)?);
     // Only with a keyring that answered at launch: otherwise every sign-in would try
     // (and fence) a store that isn't there. Sign-out fences live in the data dir.
     if keyring.usable.get() {
         let data_dir = glib::user_data_dir().join("brook");
-        client.enable_persistence(keyring.slot.clone(), data_dir);
+        client.enable_persistence(keyring.slot.clone(), data_dir.clone());
+        // The offline cache and outbox (#62), keyed in the same keyring. The signed-in
+        // user's stores open on sign-in; until then (or if the key store is locked)
+        // every cached call answers `local.unavailable` and the app works online.
+        let (c, slot) = (client.clone(), keyring.slot.clone());
+        runtime.spawn(async move {
+            if !c.enable_local_data(slot, data_dir).await {
+                tracing::info!("offline storage unavailable: online only");
+            }
+        });
     }
-    Ok(Arc::new(client))
+    Ok(client)
 }
 
 /// The desktop keyring, shared by every client this window creates.
@@ -432,20 +445,28 @@ fn watch_auth_state(
                     // grows to a comfortable chat size on first sign-in.
                     if stack.child_by_name("chat").is_none() {
                         let is_admin = user.global_role == "admin";
-                        let sign_out: Rc<dyn Fn()> = Rc::new({
+                        let sign_out: Rc<dyn Fn(bool)> = Rc::new({
                             let (client, runtime) = (client.clone(), ui.runtime.clone());
                             let asked = ui.signed_out_by_user.clone();
                             let error_label = ui.error_label.clone();
                             let signins = ui.signins.clone();
-                            move || {
+                            move |remove_data: bool| {
                                 asked.set(true);
                                 let at_sign_out = signins.get();
                                 let signins = signins.clone();
                                 let client = client.clone();
                                 // Core ends the session at once and publishes
                                 // LoggedOut; the watcher above goes back to login.
+                                // "Remove this device's data" erases this user's
+                                // cache and outbox first, even with no network.
                                 let done = runtime.spawn(async move {
-                                    client.logout().await;
+                                    if remove_data {
+                                        if let Err(err) = client.sign_out_and_forget().await {
+                                            tracing::warn!(%err, "erasing local data failed");
+                                        }
+                                    } else {
+                                        client.logout().await;
+                                    }
                                     client.sign_out_complete()
                                 });
                                 let error_label = error_label.clone();
