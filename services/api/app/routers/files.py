@@ -7,10 +7,12 @@ supported) and delete. Attaching happens in ``POST /channels/{id}/messages``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
 import uuid
+from collections.abc import AsyncIterator
 from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -58,6 +60,11 @@ _in_flight: set[uuid.UUID] = set()
 _in_flight_per_user: dict[uuid.UUID, int] = {}
 MAX_UPLOADS_PER_USER = 3
 FREE_CHECK_EVERY = 8 * 1024 * 1024  # re-check the disk floor while streaming
+# An upload that sends nothing for this long is dropped, freeing its in-flight slot.
+# Idle, not total: 100 MB over a slow link legitimately takes many minutes, but a
+# half-open connection would otherwise hold its slot until the proxy gives up
+# (Caddy has no body-read timeout by default).
+IDLE_TIMEOUT_S = 60.0
 
 
 def _error(
@@ -213,6 +220,22 @@ async def upload_content(
             _in_flight_per_user.pop(user_id, None)
 
 
+async def _with_idle_timeout(stream: AsyncIterator[bytes], idle_s: float) -> AsyncIterator[bytes]:
+    """Yield from ``stream``, failing if no chunk arrives within ``idle_s`` seconds (per
+    chunk, not in total: a whole-call asyncio.timeout would cut off slow real uploads)."""
+    iterator = stream.__aiter__()
+    while True:
+        try:
+            chunk = await asyncio.wait_for(iterator.__anext__(), idle_s)
+        except StopAsyncIteration:
+            return
+        except TimeoutError:
+            raise _error(
+                408, "file.upload_stalled", "No data received; retry", retry_after=1
+            ) from None
+        yield chunk
+
+
 async def _stream_and_commit(
     file_id: uuid.UUID, declared: int, request: Request, session: AsyncSession
 ) -> FileOut:
@@ -222,7 +245,7 @@ async def _stream_and_commit(
     part = await run_in_threadpool(storage.PartWriter, file_id)
     next_check = FREE_CHECK_EVERY
     try:
-        async for chunk in request.stream():
+        async for chunk in _with_idle_timeout(request.stream(), IDLE_TIMEOUT_S):
             if part.size + len(chunk) > declared:
                 raise _error(
                     status.HTTP_413_CONTENT_TOO_LARGE, "file.too_large", "More bytes than declared"
