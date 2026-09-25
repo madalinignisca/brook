@@ -165,6 +165,8 @@ final class SessionStore {
 
     /// Set when a sign-out couldn't make the stored session unusable; shown until a sign-in.
     private(set) var signOutWarning: String?
+    /// Completed sign-ins, counted: a sign-out's late result applies only if none came after.
+    @ObservationIgnored private var signIns = 0
 
     /// After a sign-in with a recovery code: how many are left (the app warns when few).
     private(set) var recoveryCodesLeft: UInt32?
@@ -190,6 +192,7 @@ final class SessionStore {
             return
         }
         self.client = client
+        signIns += 1
         signOutWarning = nil // the new sign-in replaced the stored copy
         settings.saveLastGoodServer(address)
         phase = .signedIn(user)
@@ -264,12 +267,13 @@ final class SessionStore {
         guard case .signedIn = phase, let client else { return }
         end()
         phase = .signedOut(error: nil)
+        let before = signIns
         Task {
             await client.logout() // core forgets the stored copy, then revokes (best effort)
             // Both the keychain delete and the fence failed: the next launch could sign in
             // again. Its own value, not the form's error: typing into the form meanwhile must
-            // not hide it. Only a later sign-in (which replaces the stored copy) clears it.
-            if !client.signOutComplete() { signOutWarning = Message.signOutIncomplete }
+            // not hide it. A sign-in completed since replaced the stored copy: then it's moot.
+            if !client.signOutComplete(), before == signIns { signOutWarning = Message.signOutIncomplete }
         }
     }
 

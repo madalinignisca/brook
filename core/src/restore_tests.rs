@@ -532,3 +532,92 @@ async fn a_refresh_error_never_carries_the_response_body() {
     assert!(!err.to_string().contains(&token), "{err}");
     assert!(!format!("{err:?}").contains(&token), "{err:?}");
 }
+
+// ---- Round 2: only the newest client touches the slot ----
+
+/// An older client's failed new login neither deletes the newer sign-in nor stops it from
+/// following its rotations.
+#[tokio::test]
+async fn an_older_clients_failed_login_leaves_the_newer_sign_in_alone() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let alice = signed_in(&server, &slot, dir.path(), "alice").await;
+    let bob = signed_in(&server, &slot, dir.path(), "bob").await;
+    server.set_login_fails(true);
+    assert!(alice.login("alice", "pw").await.is_err());
+    assert_eq!(stored_token(&slot, &server), Some(held_token(&bob).await));
+    refresh_now(&bob).await;
+    assert_eq!(
+        stored_token(&slot, &server),
+        Some(held_token(&bob).await),
+        "bob's rotations stopped being stored"
+    );
+}
+
+/// An older client's restore never reads (or refreshes, consuming it) a newer client's token.
+#[tokio::test]
+async fn an_older_clients_restore_never_touches_a_newer_sign_in() {
+    let server = strict().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    drop(signed_in(&server, &slot, dir.path(), "alice").await);
+    let old = client(&server, &slot, dir.path());
+    let bob = signed_in(&server, &slot, dir.path(), "bob").await;
+    let bobs = held_token(&bob).await;
+    let outcome = old.restore().await;
+    assert!(matches!(outcome, RestoreOutcome::Superseded), "{outcome:?}");
+    assert_eq!(stored_token(&slot, &server), Some(bobs.clone()));
+    assert!(
+        server.live_refresh_tokens("bob").contains(&bobs),
+        "the old restore consumed bob's token"
+    );
+}
+
+/// An older client that saw a fence never deletes what a newer sign-in stored meanwhile.
+#[tokio::test]
+async fn an_older_clients_fence_cleanup_never_deletes_a_newer_sign_in() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let alice = signed_in(&server, &slot, dir.path(), "alice").await;
+    slot.fail_next("delete", KeySlotError::Unavailable);
+    alice.logout().await; // fenced
+    let old = client(&server, &slot, dir.path());
+    let bob = signed_in(&server, &slot, dir.path(), "bob").await; // lifts the fence
+    let _ = old.restore().await;
+    assert_eq!(stored_token(&slot, &server), Some(held_token(&bob).await));
+}
+
+/// A sign-out, then a quit while a refresh is in flight: the rotated token is revoked and
+/// never stored (the stored-copy follow is for a quit while signed in only).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quit_after_a_sign_out_never_keeps_the_rotated_token() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let c = signed_in(&server, &slot, dir.path(), "alice").await;
+    let old = held_token(&c).await;
+    let gate = server.gate_refresh();
+    let r = refresher(&c);
+    let seen = c.session.snapshot().await.0;
+    let inflight = tokio::spawn(async move { r.refresh(seen).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    slot.fail_next("delete", KeySlotError::Unavailable);
+    c.logout().await; // the delete fails: the old token stays in the slot, fenced
+    drop(c);
+    gate.add_permits(1);
+    let _ = inflight.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        stored_token(&slot, &server),
+        Some(old.clone()),
+        "the rotation was stored after sign-out"
+    );
+    let revoked = server.logouts();
+    assert!(
+        revoked.iter().any(|t| *t != old),
+        "the rotated token was never revoked: {} logouts",
+        revoked.len()
+    );
+}

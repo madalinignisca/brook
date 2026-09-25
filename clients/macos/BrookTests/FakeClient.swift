@@ -24,6 +24,8 @@ final class FakeClient: FfiBrookClient, @unchecked Sendable {
         var restoreOutcome: FfiRestoreOutcome = .notSignedIn
         var restores = 0
         var signOutComplete = true
+        var logoutGated = false
+        var logoutWaiters: [CheckedContinuation<Void, Never>] = []
     }
 
     private let result: Result<LoginResult, LoginError>
@@ -120,7 +122,25 @@ final class FakeClient: FfiBrookClient, @unchecked Sendable {
     }
 
     override func logout() async {
-        state.withLock { $0.logouts += 1 }
+        await withCheckedContinuation { cont in
+            let go = state.withLock { s -> Bool in
+                s.logouts += 1
+                if s.logoutGated { s.logoutWaiters.append(cont); return false }
+                return true
+            }
+            if go { cont.resume() }
+        }
+    }
+
+    /// `logout` suspends until `releaseLogouts()` (a sign-out whose result comes late).
+    func gateLogouts() { state.withLock { $0.logoutGated = true } }
+    func releaseLogouts() {
+        let waiting = state.withLock { s -> [CheckedContinuation<Void, Never>] in
+            s.logoutGated = false
+            defer { s.logoutWaiters = [] }
+            return s.logoutWaiters
+        }
+        waiting.forEach { $0.resume() }
     }
 
     // MARK: Staying signed in

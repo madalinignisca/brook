@@ -139,6 +139,20 @@ final class RestoreTests: XCTestCase {
         XCTAssertEqual(store.phase, .signedOut(error: SessionStore.Message.missingFields))
     }
 
+    /// A sign-out whose result arrives after a newer sign-in: its warning is moot.
+    func testALateSignOutResultNeverWarnsAfterANewSignIn() async {
+        let (store, fake, _) = await restored(.loggedIn(user: alice), login: .success(.loggedIn(session: aliceSession)))
+        fake.setSignOutComplete(false)
+        fake.gateLogouts()
+        store.signOut()
+        for _ in 0 ..< 500 where fake.logouts == 0 { try? await Task.sleep(for: .milliseconds(2)) }
+        await store.signIn(server: "https://h", handle: "alice", password: "pw")
+        XCTAssertEqual(store.phase, .signedIn(alice))
+        fake.releaseLogouts()
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertNil(store.signOutWarning, "a stale sign-out result showed its warning")
+    }
+
     func testASignInClearsTheSignOutWarning() async {
         let (store, fake, _) = await restored(.loggedIn(user: alice), login: .success(.loggedIn(session: aliceSession)))
         fake.setSignOutComplete(false)

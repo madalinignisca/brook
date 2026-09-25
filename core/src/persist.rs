@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -32,19 +31,13 @@ impl std::fmt::Debug for Stored {
     }
 }
 
-/// Who may touch each slot in this process. Every client orders its own writes, but clients
-/// share `session:<origin>`, and nothing orders one client's writes against another's: an old
-/// client's late rotation, rejection or restore could overwrite, delete or resurrect a newer
-/// sign-in. So every login attempt takes a process-wide ticket, the newest attempt that
-/// installed owns the slot, and an older ticket never touches it. The map's lock is held for
-/// the slot operation itself, so operations from different clients are also serialized.
+/// Which client owns each slot in this process: the newest one to enable persistence. Every
+/// client orders its own writes, but clients share `session:<origin>` and nothing orders one
+/// client's writes against another's: an older client's late rotation, rejection, restore or
+/// sign-out could overwrite, delete or resurrect the newer one's session. So only the owner
+/// touches the slot, and the map's lock is held for the slot operation itself. (The app makes
+/// a new client for every attempt, so the owner is always the current attempt's client.)
 static OWNERS: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(Mutex::default);
-static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
-
-/// A new login attempt's ticket (newer than every earlier one, in any client).
-pub(crate) fn ticket() -> u64 {
-    NEXT_TICKET.fetch_add(1, Ordering::Relaxed)
-}
 
 pub(crate) struct Persistence {
     slot: Arc<dyn KeySlot>,
@@ -75,22 +68,24 @@ impl Persistence {
         }
     }
 
-    /// Run `op` on the slot if `ticket` is not older than the slot's owner; with `claim`,
-    /// `ticket` becomes the owner. None: a newer attempt owns the slot; nothing was done.
-    pub(crate) fn guarded<T>(
-        &self,
-        ticket: u64,
-        claim: bool,
-        op: impl FnOnce(&Self) -> T,
-    ) -> Option<T> {
-        let mut owners = OWNERS
+    fn owners() -> std::sync::MutexGuard<'static, HashMap<String, u64>> {
+        OWNERS
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if owners.get(&self.name).is_some_and(|&owner| ticket < owner) {
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Client `owner` (a store id) now owns this slot; every older client's operations on it
+    /// become no-ops.
+    pub(crate) fn claim(&self, owner: u64) {
+        Self::owners().insert(self.name.clone(), owner);
+    }
+
+    /// Run `op` on the slot only if client `owner` owns it. None: a newer client owns it and
+    /// nothing was done.
+    pub(crate) fn guarded<T>(&self, owner: u64, op: impl FnOnce(&Self) -> T) -> Option<T> {
+        let owners = Self::owners();
+        if owners.get(&self.name) != Some(&owner) {
             return None;
-        }
-        if claim {
-            owners.insert(self.name.clone(), ticket);
         }
         Some(op(self))
     }
@@ -178,15 +173,12 @@ impl Persistence {
         }
     }
 
-    /// Atomically: a temp file, fsync, rename, fsync of the directory (and, the first time, of
-    /// the parent that gained the directory: without it the new directory entry, and the fence
-    /// in it, may not survive a power loss).
+    /// Atomically: a temp file, fsync, rename, fsync of the directory and of its parent (a new
+    /// directory's entry must be durable too, or the fence in it may not survive a power loss).
     fn write_fence(&self) -> std::io::Result<()> {
-        if !self.fence_dir.is_dir() {
-            fs::create_dir_all(&self.fence_dir)?;
-            if let Some(parent) = self.fence_dir.parent() {
-                fs::File::open(parent)?.sync_all()?;
-            }
+        fs::create_dir_all(&self.fence_dir)?;
+        if let Some(parent) = self.fence_dir.parent() {
+            fs::File::open(parent)?.sync_all()?; // every time: an earlier attempt may have failed here
         }
         let tmp = self.fence_dir.join(format!(".{}.tmp", std::process::id()));
         {

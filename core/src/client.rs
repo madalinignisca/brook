@@ -284,17 +284,23 @@ impl BrookClient {
         let (session, http, base) = (self.session.clone(), self.http.clone(), self.base.clone());
         let task = tokio::spawn(async move {
             let _flight = session.refresh_lock.clone().lock_owned().await;
-            let Some(p) = session.persistence() else {
-                return RestoreOutcome::NotSignedIn;
-            };
-            if p.fenced() {
-                let _ = p.clear(); // best effort; the fence keeps it unusable either way
+            if session.persistence().is_none() {
                 return RestoreOutcome::NotSignedIn;
             }
-            let stored = match p.load() {
-                Ok(Some(stored)) => stored,
-                Ok(None) => return RestoreOutcome::NotSignedIn,
-                Err(_) => return RestoreOutcome::Unavailable, // locked or failing: delete nothing
+            // Read (and a fence's cleanup) only as the slot's owner: a newer client's stored
+            // session is never read, refreshed or deleted by an older one.
+            let read = session.with_slot(|p| {
+                if p.fenced() {
+                    let _ = p.clear(); // best effort; the fence keeps it unusable either way
+                    return Ok(None);
+                }
+                p.load()
+            });
+            let stored = match read {
+                None => return RestoreOutcome::Superseded, // a newer client owns the slot
+                Some(Ok(Some(stored))) => stored,
+                Some(Ok(None)) => return RestoreOutcome::NotSignedIn,
+                Some(Err(_)) => return RestoreOutcome::Unavailable, // locked or failing: delete nothing
             };
             let Ok(url) = base.join("api/v1/auth/refresh") else {
                 return RestoreOutcome::Offline;

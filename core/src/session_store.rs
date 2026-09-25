@@ -38,12 +38,9 @@ struct Cell {
     /// The current attempt is waiting for its TOTP step (its challenge is open). Closed by a
     /// success, `cancel_totp`, an expired challenge, and anything that moves `login_gen`.
     challenge_open: bool,
-    /// The current attempt's process-wide ticket (see `persist::ticket`): what it may touch in
-    /// the shared slot.
-    ticket: u64,
-    /// The ticket of the attempt that installed the current session: what its rotations and
-    /// its rejection may touch.
-    session_ticket: u64,
+    /// The stored copy mirrors this store's session: set by an install, cleared by a sign-out
+    /// or a rejection (not by a close: quitting keeps it).
+    persisted: bool,
 }
 
 /// Revoking refresh tokens core stops holding, from anywhere, including a `Drop` on a thread
@@ -108,8 +105,18 @@ impl SessionStore {
         }
     }
 
+    /// Enable persistence; this store's client becomes the slot's owner (see `persist`).
     pub(crate) fn set_persistence(&self, p: crate::persist::Persistence) {
+        p.claim(self.id);
         let _ = self.persistence.set(p);
+    }
+
+    /// Run `op` on the stored copy if persistence is on and this client owns the slot.
+    pub(crate) fn with_slot<T>(
+        &self,
+        op: impl FnOnce(&crate::persist::Persistence) -> T,
+    ) -> Option<T> {
+        self.persistence.get()?.guarded(self.id, op)
     }
 
     pub(crate) fn persistence(&self) -> Option<&crate::persist::Persistence> {
@@ -128,7 +135,7 @@ impl SessionStore {
             return; // this restore is stale: whatever replaced it decides
         }
         if let Some(p) = self.persistence.get() {
-            p.guarded(cell.ticket, false, |p| p.clear_if_holds(refresh_token));
+            p.guarded(self.id, |p| p.clear_if_holds(refresh_token));
         }
     }
 
@@ -190,7 +197,6 @@ impl SessionStore {
         let mut cell = self.cell.write().await;
         cell.login_gen += 1;
         cell.challenge_open = false;
-        cell.ticket = crate::persist::ticket();
         cell.login_gen
     }
 
@@ -214,9 +220,8 @@ impl SessionStore {
             let old = cell.session.take();
             if old.is_some() {
                 // The displaced sign-in must not be restorable, whatever this login's outcome.
-                if let Some(p) = self.persistence.get() {
-                    p.guarded(cell.ticket, true, crate::persist::Persistence::clear);
-                }
+                self.with_slot(crate::persist::Persistence::clear);
+                cell.persisted = false;
             }
             cell.rev.epoch += 1;
             cell.rev.credential_rev = 0;
@@ -249,17 +254,15 @@ impl SessionStore {
         let mut installed = false;
         let rev = {
             let mut cell = self.cell.write().await;
-            let owns = |cell: &Cell| match self.persistence.get() {
-                // Claims the slot; refused when a newer attempt (in any client) owns it.
-                Some(p) => p
-                    .guarded(cell.ticket, true, |p| p.write(&session))
-                    .is_some(),
+            // Refused when a newer client owns the slot: it can't bring back a replaced sign-in.
+            let owns = || match self.persistence.get() {
+                Some(_) => self.with_slot(|p| p.write(&session)).is_some(),
                 None => true,
             };
-            if !self.is_closed() && cell.login_gen == gen && cell.challenge_open && owns(&cell) {
+            if !self.is_closed() && cell.login_gen == gen && cell.challenge_open && owns() {
                 let user = session.user.clone();
                 cell.challenge_open = false;
-                cell.session_ticket = cell.ticket;
+                cell.persisted = self.persistence.get().is_some();
                 cell.session = Some(session);
                 cell.rev.epoch += 1;
                 cell.rev.credential_rev = 0;
@@ -295,17 +298,15 @@ impl SessionStore {
             if self.is_closed() || cell.login_gen != gen {
                 return false;
             }
-            if let Some(p) = self.persistence.get() {
-                // Claims the slot; refused when a newer attempt (in any client) owns it, so a
-                // late restore can't bring back a sign-in that was replaced or signed out.
-                if p.guarded(cell.ticket, true, |p| p.write(&session))
-                    .is_none()
-                {
+            if self.persistence.get().is_some() {
+                // Refused when a newer client owns the slot, so a late restore or login can't
+                // bring back a sign-in that was replaced or signed out.
+                if self.with_slot(|p| p.write(&session)).is_none() {
                     return false;
                 }
+                cell.persisted = true;
             }
             let user = session.user.clone();
-            cell.session_ticket = cell.ticket;
             cell.session = Some(session);
             cell.rev.epoch += 1;
             cell.rev.credential_rev = 0;
@@ -330,13 +331,12 @@ impl SessionStore {
             }
             let old = cell.session.take();
             // A sign-out clears the stored copy before it returns; a close (quit) keeps it.
-            if !close {
-                if let Some(p) = self.persistence.get() {
-                    // A newer attempt elsewhere owns the slot: nothing of ours is stored.
-                    let done = p.guarded(cell.ticket, false, crate::persist::Persistence::clear);
-                    self.sign_out_complete
-                        .store(done.unwrap_or(true), Ordering::SeqCst);
-                }
+            if !close && self.persistence.get().is_some() {
+                // A newer client owns the slot: nothing of ours is stored.
+                let done = self.with_slot(crate::persist::Persistence::clear);
+                self.sign_out_complete
+                    .store(done.unwrap_or(true), Ordering::SeqCst);
+                cell.persisted = false;
             }
             cell.rev.epoch += 1;
             cell.rev.credential_rev = 0;
@@ -420,27 +420,27 @@ impl SessionStore {
             if self.is_closed() {
                 // Quitting mid-refresh: the server already rotated, so the stored token is
                 // dead. Store the new one (if ours is still the stored copy) rather than
-                // revoke it, or the next launch finds a dead session.
-                let stored = self.persistence.get().and_then(|p| {
-                    p.guarded(cell.session_ticket, false, |p| {
-                        p.follow_rotation(rotated_from, &refresh_token)
-                    })
-                });
+                // revoke it, or the next launch finds a dead session. Not after a sign-out
+                // or rejection (`persisted` is false then): those tokens must go.
+                let stored = if cell.persisted {
+                    self.with_slot(|p| p.follow_rotation(rotated_from, &refresh_token))
+                } else {
+                    None
+                };
                 return if stored == Some(true) {
                     RefreshApplied::Stored
                 } else {
                     RefreshApplied::Discarded
                 };
             }
-            let ticket = cell.session_ticket;
             match cell.session.as_mut() {
                 Some(s) if s.refresh_token == rotated_from => {
                     s.access_token = access_token;
                     s.refresh_token = refresh_token;
+                    // Rotation made the stored token dead: follow it (unless a newer client
+                    // owns the slot now). Not `with_slot`: `s` borrows the cell.
                     if let Some(p) = self.persistence.get() {
-                        // Rotation made the stored token dead: follow it (unless a newer
-                        // sign-in, in another client, owns the slot now).
-                        p.guarded(ticket, false, |p| p.write(s));
+                        p.guarded(self.id, |p| p.write(s));
                     }
                     cell.rev.credential_rev += 1;
                     cell.rev
@@ -461,14 +461,9 @@ impl SessionStore {
             let mut cell = self.cell.write().await;
             match cell.session.as_ref() {
                 Some(s) if s.refresh_token == rejected => {
-                    if let Some(p) = self.persistence.get() {
-                        // A remote sign-out: not restorable either (only if still ours).
-                        p.guarded(
-                            cell.session_ticket,
-                            false,
-                            crate::persist::Persistence::clear,
-                        );
-                    }
+                    // A remote sign-out: not restorable either (only if still ours).
+                    self.with_slot(crate::persist::Persistence::clear);
+                    cell.persisted = false;
                     cell.session = None;
                     cell.rev.epoch += 1;
                     cell.rev.credential_rev = 0;
