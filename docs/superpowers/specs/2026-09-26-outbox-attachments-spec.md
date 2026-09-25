@@ -1,6 +1,6 @@
 # Outbox: attachments (#65 send side, #63)
 
-Status: spec. Builds on the offline-cache design (2026-09-25-offline-cache-design.md §5.4,
+Status: spec, closed after review round 2. Builds on the offline-cache design (2026-09-25-offline-cache-design.md §5.4,
 §6.1, §6.3, §7.3) and `transfer.rs`. Review dial: **Heavy**. It encrypts user files at rest,
 deletes local data (snapshots), and changes the outbox format.
 
@@ -17,8 +17,9 @@ deletes local data (snapshots), and changes the outbox format.
      encrypted copy the server would refuse): at most `MAX_FILES_PER_MESSAGE` = 10
      (`outbox.too_many_files`), each non-empty (`outbox.empty_file`) and at most
      `MAX_FILE_BYTES` = 100 MiB (`outbox.file_too_large`). Both limits are public consts,
-     so a chooser can grey a file out, and they match the server's (`files_max_bytes`, the
-     message limit). The server's 5 GiB per-user quota (`413 file.quota_exceeded`) can't be
+     so a chooser can grey a file out. They are the server's **defaults** (`files_max_bytes`
+     is operator-configurable): a server set lower refuses at upload (413, handled below);
+     one set higher is capped by the client until a limits endpoint exists. The server's 5 GiB per-user quota (`413 file.quota_exceeded`) can't be
      checked locally; it fails the row like any refusal.
    - **Each path is read only during this call** (a Flatpak portal path may be readable
      once): the snapshot is made from it before returning, and it is never opened again.
@@ -35,8 +36,12 @@ deletes local data (snapshots), and changes the outbox format.
    which reconciliation removes (6). The stored `size` is the bytes actually copied, not a
    size read before the copy (a file growing mid-copy can't give the PUT a wrong length).
    **The same `client_id` again** returns the stored row's receipt (its files, with fresh
-   `transfer_id`s), and anything snapshotted by the repeat call is removed before it
-   returns. The stored row wins, files included, as for body and reply target.
+   `transfer_id`s). The `client_id` is looked up **before** anything is copied; only a
+   repeat racing an uncommitted first call copies, and it removes its snapshots before
+   returning. The stored row wins, files included, as for body and reply target. A
+   repeat after the row was acknowledged (it's gone) queues and uploads again. The POST
+   then returns the stored message, and the new uploads are server-side orphans until the
+   24 h sweep. That's rare and bounded, and stated rather than tracked.
 3. **Snapshot format** (design §6.1): a random 256-bit key per snapshot, kept in its
    `outbox_files` row inside the encrypted outbox. 1 MiB chunks sealed with AES-256-GCM.
    The nonce is the chunk index (96-bit big-endian), and AAD is fixed-width: the 16 bytes of
@@ -45,17 +50,25 @@ deletes local data (snapshots), and changes the outbox format.
    repeat call, a re-snapshot) gets a new key, so a nonce is never reused under one key.
    The plaintext sha256 is computed while copying and stored.
    **A snapshot is verified before its first byte is uploaded** (decrypt every chunk,
-   check the flagged last chunk and the sha256; a read, no plaintext written). A failure
-   fails the row with `outbox.snapshot_damaged`: nothing of it is uploaded, and it isn't
-   retried. A read error during the PUT itself (after a good verification) is a transient
-   local fault, and the next attempt verifies again.
+   check the flagged last chunk and the sha256; a read, no plaintext written), once per
+   file per process: the mark is kept in memory, so a retry doesn't re-read 1 GiB each
+   minute. It is verified again only after a read error during a PUT. A failed
+   verification fails the row with `outbox.snapshot_damaged`: nothing of it is uploaded,
+   and it isn't retried. A read error during the PUT itself (after a good verification) is
+   a transient local fault.
 4. **Sender, per row with files, in order.** Every upload request (create, PUT, and each
    retry of either) runs **under the row's session epoch**, like the message POST. The
-   token is taken from the session only if its epoch is the sender's, otherwise the
-   attempt stops and the row waits (a user switch can't upload one user's snapshot with
-   another's token). The epoch is checked again between files. Signing out cancels the
-   outbox's in-flight transfers (they resume, by `file_client_id`, at the next sign-in of
-   that user).
+   token and the epoch are read **together, from one session snapshot** (as
+   `cache_http`'s `Post::send` does), and the token is used only if the epoch is the
+   sender's; otherwise the attempt stops and the row waits. A user switch can't upload one
+   user's snapshot with another's token. `upload_file`'s internals take that token rather
+   than calling `access_token()` themselves. The epoch is checked again between files.
+   **Signing out pauses** the outbox's in-flight transfers: a stop separate from cancel,
+   which leaves the row `pending` with no cancel flag and reports `Retrying`. They resume,
+   by `file_client_id`, at the next sign-in of that user.
+   A pending upload the server swept mid-transfer (1 h after its creation, e.g. on a very
+   slow link: the PUT answers `file.upload_expired` or 404) is created again by its
+   `file_client_id`, which gives a fresh pending file, and its bytes are PUT again.
    A row with files holds its channel's queue while it uploads (per-channel order is the
    outbox's rule): a later text message in that channel waits for it. That is stated to
    the user by the pending row's progress, and other channels are unaffected.
@@ -99,8 +112,9 @@ deletes local data (snapshots), and changes the outbox format.
    Retry and Delete work as for any failed row. **Retry** re-uses the uploaded `file_id`s
    and re-uploads only what's missing. **Delete** removes the row, its `outbox_files` rows
    and (after the commit) its snapshots. **Delete of an uploading row cancels its
-   transfers first**, then waits for the channel's lock, so a Delete tap never waits
-   for hours of upload.
+   transfers first** (the cancel takes no lock the sender holds), then waits for the
+   channel's lock, so a Delete tap never waits for hours of upload. A row's cancel flags
+   are removed with the row.
    `PendingMessage` gains `files: Vec<PendingFile { file_client_id, transfer_id, filename,
    size, uploaded, error }>`, so the UI can draw per-file progress and state after a
    restart. Transfer ids are re-issued at startup, and `pending_messages` returns the
@@ -147,7 +161,9 @@ deletes local data (snapshots), and changes the outbox format.
     - cancel in each file state, and Retry after it;
     - Delete of an uploading row returns without waiting for the upload;
     - the same `client_id` again returns the stored receipt and leaves no extra snapshot;
-    - reconciliation never removes a snapshot of a row being enqueued.
+    - reconciliation never removes a snapshot of a row being enqueued;
+    - a row uploading at sign-out is `pending` afterwards and resumes at the next sign-in;
+    - a pending upload swept mid-transfer is re-created and completes.
 
 ## Review round 1 (adversarial review of the spec)
 
@@ -156,8 +172,17 @@ verification before upload (3); fsync before commit, size from the copy, a key p
 fixed-width AAD (2, 3); reconciliation before enqueue (6); a repeat call returns the stored
 receipt (2); an empty body refused until the server says otherwise (7a); cancel per file
 state and Delete cancelling first (5); a per-file error (5); `Retrying` rather than
-`Failed` events for retried uploads (5); head-of-line blocking stated (4). Already covered
-before the review: the 24 h sweep (4.3a); request order (server fix under way).
+`Failed` events for retried uploads (5); head-of-line blocking stated (4); the 24 h sweep
+(4.3a, added from the server's facts while the review ran).
+
+## Review round 2
+
+Taken: sign-out pauses rather than cancels (4); verification once per file per process
+(3); the repeat lookup before copying, and a repeat after the ack stated (2); a swept
+pending upload re-created (4); token and epoch from one snapshot (4); limits as server
+defaults (1). Attachment order across later reads depends on the server storing the
+requested position; the server side has taken that fix, and a /sync-order test is added
+here when it lands.
 
 ## Not doing
 
