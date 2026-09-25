@@ -123,8 +123,8 @@ pub(crate) fn record_older(
 /// (older pages below its bottom, a head refetch merged by `record_head`). Partial
 /// tombstones for messages never seen sit at their delete's `seq`, and count only when the
 /// snapshot includes that delete.
-pub(crate) fn settle_tops(tx: &Transaction<'_>, cursor: i64) -> rusqlite::Result<()> {
-    tx.execute(
+pub(crate) fn settle_tops(tx: &Transaction<'_>, cursor: i64) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = tx.prepare(
         "UPDATE coverage SET
              newest_id = (SELECT max(id) FROM messages
                           WHERE channel_id = coverage.channel_id AND seq > 0 AND seq <= ?1),
@@ -133,8 +133,11 @@ pub(crate) fn settle_tops(tx: &Transaction<'_>, cursor: i64) -> rusqlite::Result
                                    WHERE channel_id = coverage.channel_id AND seq > 0 AND seq <= ?1))
          WHERE (SELECT max(id) FROM messages
                 WHERE channel_id = coverage.channel_id AND seq > 0 AND seq <= ?1)
-               > coalesce(newest_id, '')",
-        [cursor],
+               > coalesce(newest_id, '')
+         RETURNING channel_id",
     )?;
-    Ok(())
+    let changed = stmt
+        .query_map([cursor], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(changed)
 }
