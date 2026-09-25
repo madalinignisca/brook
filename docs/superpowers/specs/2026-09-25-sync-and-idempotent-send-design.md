@@ -135,8 +135,9 @@ client).
 - The `sync_counter` table (one row), `sync_tombstones`, and `sync_floor` (a column on
   the counter row).
 - `messages.client_id` plus its partial unique index.
-- **Backfill:** existing rows get `seq = 1` and the counter starts at `1`, so a client's
-  first `since=0` sync returns everything current.
+- **Backfill:** existing rows get `seq = 1` and the counter starts at `1`. A client's
+  first sync (`since=0`) is still state only (§3): it gets current channels, memberships and
+  users, and a cursor at the current `seq`; messages come from `before=` paging.
 
 ## 6. Tests (each seen red under mutation)
 
