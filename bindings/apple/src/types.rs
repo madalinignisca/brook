@@ -267,3 +267,25 @@ impl From<brook_core::Channel> for FfiChannel {
         }
     }
 }
+
+/// What a restore at launch found (core's `RestoreOutcome`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiRestoreOutcome {
+    LoggedIn { user: FfiUser },
+    NotSignedIn,
+    Unavailable,
+    Offline,
+    Superseded,
+}
+
+impl From<brook_core::RestoreOutcome> for FfiRestoreOutcome {
+    fn from(o: brook_core::RestoreOutcome) -> Self {
+        match o {
+            brook_core::RestoreOutcome::LoggedIn(user) => Self::LoggedIn { user: user.into() },
+            brook_core::RestoreOutcome::NotSignedIn => Self::NotSignedIn,
+            brook_core::RestoreOutcome::Unavailable => Self::Unavailable,
+            brook_core::RestoreOutcome::Offline => Self::Offline,
+            brook_core::RestoreOutcome::Superseded => Self::Superseded,
+        }
+    }
+}
