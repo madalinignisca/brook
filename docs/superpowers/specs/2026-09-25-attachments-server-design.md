@@ -140,7 +140,9 @@ preview.
 ## 7. Lifecycle
 
 - **Sweep** (a periodic task in the api):
-  - removes `pending` files older than 1 h, with their `.part`;
+  - removes `pending` files older than 1 h, with their `<id>.*.part` files. A part file is
+    only ever removed when it too is older than the 1 h window (by mtime), so the sweep
+    never deletes one mid-upload;
   - removes committed files never attached after 24 h;
   - removes files on disk that have no row (after a crash between rename and commit, or an
     account delete's cascade).
