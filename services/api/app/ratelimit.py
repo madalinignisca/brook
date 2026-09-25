@@ -256,7 +256,7 @@ class AuthLimiter:
         fails.append(now)
         crossed = len(fails) == self.config.code_budget
         if crossed:
-            log.warning("totp guessing: handle over its code budget")
+            log.warning("totp guessing: %s is over its code budget", handle)
         return crossed
 
     def code_reset(self, handle: str) -> None:

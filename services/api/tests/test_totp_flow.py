@@ -561,3 +561,134 @@ async def test_disable_accepts_a_recovery_code_in_the_code_field(
         headers=_h(activated["access_token"]),
     )
     assert r.status_code == 204
+
+
+# ---------------------------------------------------------------- auth review of #52
+
+
+@pytest.mark.parametrize("route", ["disable", "recovery-codes"])
+async def test_management_refuses_a_wrong_code(
+    client: httpx.AsyncClient, clock: Clock, route: str
+) -> None:
+    """B1: the second factor on disable/regenerate is real, not just the password."""
+    pair = await _setup(client)
+    secret, activated = await _enable(client, pair, clock)
+    access = activated["access_token"]
+    r = await client.post(
+        f"{TOTP}/{route}", json={"password": PW, "code": "000000"}, headers=_h(access)
+    )
+    assert r.status_code == 403 and r.json()["error"]["code"] == "auth.invalid_code"
+    # Nothing changed: TOTP is still on, and the original recovery codes still work.
+    me = (await client.get(f"{AUTH}/me", headers=_h(access))).json()
+    assert me["totp_enabled"] is True and me["recovery_codes_left"] == 10
+    token = await _pending(client)
+    ok = await client.post(
+        TOTP, json={"totp_token": token, "recovery_code": activated["recovery_codes"][0]}
+    )
+    assert ok.status_code == 200
+
+
+async def test_a_code_used_at_login_is_refused_at_disable(
+    client: httpx.AsyncClient, clock: Clock
+) -> None:
+    pair = await _setup(client)
+    secret, _ = await _enable(client, pair, clock)
+    token = await _pending(client)
+    used = code(secret, clock)
+    signed_in = await client.post(TOTP, json={"totp_token": token, "code": used})
+    assert signed_in.status_code == 200
+    r = await client.post(
+        f"{TOTP}/disable",
+        json={"password": PW, "code": used},
+        headers=_h(signed_in.json()["access_token"]),
+    )
+    assert r.status_code == 403 and r.json()["error"]["code"] == "auth.invalid_code"
+
+
+async def test_pending_token_dies_on_sign_out_everywhere_alone(
+    client: httpx.AsyncClient, clock: Clock
+) -> None:
+    """Any future sign-out-everywhere that doesn't change the password must still kill
+    the pending token (only session_revoked covers that)."""
+    from datetime import UTC, datetime, timedelta
+
+    import jwt as pyjwt
+
+    from app.models import User
+
+    pair = await _setup(client)
+    secret, _ = await _enable(client, pair, clock)
+    token = await _pending(client)
+    # One millisecond after the token's own issue time, not "now": a cutoff in the
+    # same millisecond correctly spares the token (strict <), which made this test
+    # flaky when login and the update ran within one ms.
+    iat_ms = pyjwt.decode(token, options={"verify_signature": False})["iat_ms"]
+    cutoff = datetime.fromtimestamp(iat_ms / 1000, tz=UTC) + timedelta(milliseconds=1)
+    async with db.get_sessionmaker()() as s:
+        await s.execute(
+            update(User).where(User.handle == "alice").values(sessions_valid_after=cutoff)
+        )
+        await s.commit()
+    r = await client.post(TOTP, json={"totp_token": token, "code": code(secret, clock)})
+    assert r.status_code == 403 and r.json()["error"]["code"] == "auth.totp_expired"
+
+
+async def test_pending_token_dies_when_the_user_is_disabled(
+    client: httpx.AsyncClient, clock: Clock
+) -> None:
+    from app.models import User
+
+    pair = await _setup(client)
+    secret, _ = await _enable(client, pair, clock)
+    token = await _pending(client)
+    async with db.get_sessionmaker()() as s:
+        await s.execute(update(User).where(User.handle == "alice").values(status="disabled"))
+        await s.commit()
+    r = await client.post(TOTP, json={"totp_token": token, "code": code(secret, clock)})
+    assert r.status_code == 403 and r.json()["error"]["code"] == "auth.totp_expired"
+
+
+async def test_a_recovery_code_only_works_for_its_owner(
+    client: httpx.AsyncClient, clock: Clock
+) -> None:
+    admin = await _setup(client)
+    _s1, alice_on = await _enable(client, admin, clock)
+    body = {"handle": "bob", "display_name": "Bob", "password": PW}
+    await client.post(f"{AUTH}/register", json=body, headers=_h(alice_on["access_token"]))
+    bob = dict((await _login(client, "bob")).json())
+    await _enable(client, bob, clock)
+    bob_token = (await _login(client, "bob")).json()["totp_token"]
+    r = await client.post(
+        TOTP, json={"totp_token": bob_token, "recovery_code": alice_on["recovery_codes"][0]}
+    )
+    assert r.status_code == 403 and r.json()["error"]["code"] == "auth.invalid_code"
+
+
+async def test_a_wrong_recovery_code_counts_toward_the_budget(
+    client: httpx.AsyncClient, clock: Clock
+) -> None:
+    pair = await _setup(client)
+    await _enable(client, pair, clock)
+    ratelimit.get_limiter.cache_clear()
+    lim = ratelimit.get_limiter()
+    for _ in range(lim.config.code_budget - 1):
+        lim.code_failure("alice")
+    token = await _pending(client)
+    r = await client.post(
+        TOTP, json={"totp_token": token, "recovery_code": "0000-0000-0000-0000-0000"}
+    )
+    assert r.status_code == 403
+    assert ("totp_guessing", None, "api") in await _events()
+
+
+async def test_a_password_recheck_earns_no_trust(client: httpx.AsyncClient, clock: Clock) -> None:
+    """Trust = a completed login (spec §6). Re-entering the password for enroll /
+    disable / regenerate must not exempt the IP from the code budget."""
+    pair = await _setup(client)
+    ratelimit.get_limiter.cache_clear()  # forget the trust the setup login earned
+    lim = ratelimit.get_limiter()
+    r = await client.post(f"{TOTP}/enroll", json={"password": PW}, headers=_h(pair["access_token"]))
+    assert r.status_code == 200  # a successful password re-check
+    for _ in range(lim.config.code_budget):
+        lim.code_failure("alice")
+    assert lim.code_check("alice", "127.0.0.1") is not None

@@ -35,17 +35,22 @@ async def secret_canary() -> None:
     serve if it fails. A key dropped too early then stops the deploy, instead of
     locking users out one at a time over days. No enrolments yet: nothing to check.
     (Pending enrolments count too: they hold ciphertext under the same keyring.)"""
+    # One row per key id actually in use, not just the oldest: a busy user's secret
+    # is rewrapped onto the primary on every login, while a dormant user's may still
+    # sit on an old key, and that is the one a premature key removal locks out.
     async with get_sessionmaker()() as session:
-        row = await session.scalar(select(Totp).order_by(Totp.created_at).limit(1))
-    if row is None:
-        return
-    try:
-        get_secret_box().decrypt(row.secret, purpose=Purpose.TOTP_SECRET, row_pk=row.id)
-    except DecryptError as exc:
-        raise RuntimeError(
-            f"secret canary failed: a stored TOTP secret does not decrypt ({exc.reason}). "
-            "Was a key removed from BROOK_SECRET_KEYS before rewrapping?"
-        ) from None
+        rows = list((await session.scalars(select(Totp))).all())
+    seen: dict[str, Totp] = {}
+    for row in rows:
+        seen.setdefault(row.secret.split(".", 2)[1] if row.secret.count(".") >= 2 else "?", row)
+    for key_id, row in seen.items():
+        try:
+            get_secret_box().decrypt(row.secret, purpose=Purpose.TOTP_SECRET, row_pk=row.id)
+        except DecryptError as exc:
+            raise RuntimeError(
+                f"secret canary failed: a TOTP secret on key {key_id} does not decrypt "
+                f"({exc.reason}). Was a key removed from BROOK_SECRET_KEYS before rewrapping?"
+            ) from None
 
 
 def create_app() -> FastAPI:

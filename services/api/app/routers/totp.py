@@ -117,6 +117,13 @@ async def remove_totp(session: AsyncSession, user_id: uuid.UUID) -> None:
     await session.execute(delete(RecoveryCode).where(RecoveryCode.user_id == user_id))
 
 
+def _stored_key_id(stored: str) -> str:
+    """The key id a stored value claims (``v1.<id>.…``), for logs only: it tells the
+    operator which key was dropped. Never the value itself."""
+    parts = stored.split(".", 2)
+    return parts[1] if len(parts) > 2 and parts[1].isdigit() else "?"
+
+
 def _decrypt_secret(row: Totp) -> str:
     return get_secret_box().decrypt(row.secret, purpose=Purpose.TOTP_SECRET, row_pk=row.id)
 
@@ -152,7 +159,12 @@ async def verify_second_factor(
             secret = _decrypt_secret(row)
         except DecryptError as exc:
             limiter.decrypt_failure(user.handle)
-            log.error("totp secret decrypt failed: user=%s reason=%s", user.id, exc.reason)
+            log.error(
+                "totp secret decrypt failed: user=%s key_id=%s reason=%s",
+                user.id,
+                _stored_key_id(row.secret),
+                exc.reason,
+            )
             raise _forbidden(*INVALID_CODE) from None
         step = totp_core.match_step(secret, code, _now(), row.last_used_step)
         if step is None:
@@ -274,7 +286,9 @@ async def _reauth_password(
     if locked.password_hash is None or not verify_password(locked.password_hash, password):
         limiter.failure(ip, locked.handle)
         raise _forbidden("auth.invalid_credentials", "Password is wrong")
-    limiter.success(ip, locked.handle)
+    # No handle: a password re-check resets the IP's streak but is not a completed
+    # login, so it must not make this IP trusted (exempt from the code budget).
+    limiter.success(ip)
     return locked, ip
 
 

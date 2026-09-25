@@ -179,13 +179,15 @@ async def login(
         # Half a login: no limiter.success here. Success marks this IP trusted for the
         # handle, which exempts it from the TOTP code budget; a password-only attacker
         # must never earn that. It is recorded when /auth/totp completes.
+        # Minted while still holding the row lock, so no password change can commit
+        # between this token's iat_ms and the lock's release (password_changed_since).
+        token, _jti = create_totp_pending_token(settings, user.id)
         await session.commit()  # keep a rehash
         if not body.supports_totp:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"code": "auth.totp_client_required", "message": "Update the app"},
             )
-        token, _jti = create_totp_pending_token(settings, user.id)
         return TotpRequiredOut(totp_token=token, expires_in=TOTP_PENDING_TTL_S)
     limiter.success(ip, body.handle)
     return await _issue_tokens(session, settings, user)
