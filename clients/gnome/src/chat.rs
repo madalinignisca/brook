@@ -959,6 +959,9 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
             .build();
         row.append(&quote);
     }
+    // A file sent without a caption has no text line (the server allows an empty body
+    // when files are attached).
+    body_label.set_visible(!(message.body.trim().is_empty() && !message.attachments.is_empty()));
     row.append(&body_label);
     // Attached files (a tombstone has none): shown, and saved only on request.
     for file in &message.attachments {
