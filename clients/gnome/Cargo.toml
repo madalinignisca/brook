@@ -18,3 +18,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 brook-media-gst = { path = "../gst-media", version = "0.0.0" }
 gst = { package = "gstreamer", version = "0.23" }
 gst-webrtc = { package = "gstreamer-webrtc", version = "0.23" }
+# Two-factor enrolment: the otpauth QR code is rendered locally (it carries the secret).
+qrcode = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+# Scans the rendered QR code back in tests.
+rqrr = "0.11"

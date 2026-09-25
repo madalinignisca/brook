@@ -13,6 +13,7 @@ mod account;
 mod call;
 mod chat;
 mod prefs;
+mod totp;
 
 use std::cell::RefCell;
 use std::rc::Rc;
