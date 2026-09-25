@@ -9,8 +9,7 @@ import uuid
 from datetime import timedelta
 from typing import Annotated, Any, cast
 
-import jwt
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import func, select, update
 from sqlalchemy.engine import CursorResult
@@ -18,13 +17,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings, get_settings
 from ..db import get_session
-from ..deps import get_current_user
+from ..deps import get_current_user, user_from_access_token
 from ..models import RefreshToken, User, ensure_utc, utcnow
 from ..ratelimit import AuthLimiter, client_ip, enforce, get_limiter
-from ..schemas import LoginIn, PasswordChangeIn, RefreshIn, RegisterIn, TokenPair, UserOut
+from ..schemas import (
+    LoginIn,
+    PasswordChangeIn,
+    PasswordChangeOut,
+    RefreshIn,
+    RegisterIn,
+    TokenPair,
+    UserOut,
+)
 from ..security import (
     create_access_token,
-    decode_access_token,
     dummy_verify,
     hash_password,
     hash_token,
@@ -32,6 +38,7 @@ from ..security import (
     new_refresh_token,
     verify_password,
 )
+from .ws import revoke_sessions
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -46,12 +53,7 @@ async def _optional_user(
     """Resolve the caller if a valid token is present; else ``None``."""
     if credentials is None:
         return None
-    try:
-        payload = decode_access_token(settings, credentials.credentials)
-        user = await session.get(User, uuid.UUID(str(payload["sub"])))
-    except (jwt.PyJWTError, KeyError, ValueError):
-        return None
-    return user if user and user.status == "active" else None
+    return await user_from_access_token(session, settings, credentials.credentials)
 
 
 async def lock_user(session: AsyncSession, user_id: uuid.UUID) -> User | None:
@@ -232,6 +234,20 @@ async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) ->
     return await _issue_tokens(session, settings, user)
 
 
+async def sign_out_everywhere(session: AsyncSession, user: User) -> int:
+    """Revoke every session of ``user`` (not committed); returns the cutoff in ms.
+
+    Refresh tokens are revoked, and ``sessions_valid_after`` makes every access
+    token issued before now fail at once on REST and WebSocket. After commit the
+    caller closes the live sockets with ``ws.revoke_sessions(user.id, cutoff)``.
+    A pair issued after this call is on the right side of the cutoff.
+    """
+    now = utcnow()
+    user.sessions_valid_after = now
+    await revoke_all_refresh_tokens(session, user.id)
+    return int(now.timestamp() * 1000)
+
+
 async def revoke_all_refresh_tokens(session: AsyncSession, user_id: uuid.UUID) -> None:
     """Revoke every live refresh token of ``user_id`` (signs out all devices).
 
@@ -246,21 +262,24 @@ async def revoke_all_refresh_tokens(session: AsyncSession, user_id: uuid.UUID) -
     )
 
 
-@router.post("/password", response_model=TokenPair)
+@router.post("/password", response_model=PasswordChangeOut)
 async def change_password(
     body: PasswordChangeIn,
     request: Request,
+    background: BackgroundTasks,
     user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_settings)],
     limiter: Annotated[AuthLimiter, Depends(get_limiter)],
-) -> TokenPair:
-    """Change the caller's password; sign out every device; return a fresh pair.
+) -> PasswordChangeOut:
+    """Change the caller's password and return a fresh pair for this client.
 
-    Every refresh token of the user is revoked, including the caller's own, and
-    the response carries a new pair so this client stays signed in. The old
-    refresh token is dead from the moment this commits: a client that loses the
-    response is signed out on its next refresh and signs in with the new password.
+    With ``sign_out_other_devices`` (default): every session of the user is
+    revoked at once, the caller's old one included (sign_out_everywhere), and the
+    new pair keeps this client signed in. The old refresh token is dead from the
+    moment this commits: a client that loses the response is signed out on its
+    next refresh and signs in with the new password. Without it: only the
+    password changes; every existing token, the caller's old one too, stays valid.
 
     A wrong current password is 403, deliberately not 401: clients treat 401 as
     "access token expired" and would refresh-and-retry instead of reporting it.
@@ -297,8 +316,18 @@ async def change_password(
             detail={"code": "invalid", "message": "New password must differ from the current one"},
         )
     user.password_hash = hash_password(body.new_password)
-    await revoke_all_refresh_tokens(session, user.id)
-    return await _issue_tokens(session, settings, user)
+    if not body.sign_out_other_devices:
+        kept = await _issue_tokens(session, settings, user)
+        return PasswordChangeOut(**kept.model_dump(), other_devices_signed_out=False)
+    cutoff_ms = await sign_out_everywhere(session, user)
+    pair = await _issue_tokens(session, settings, user)  # commits; issued after the cutoff
+    # Close the live sockets only AFTER this response is sent. The changing
+    # device's own socket is among them; closed first, its client would refresh
+    # with the old (now revoked) refresh token before it had the new pair, and
+    # sign itself out. Other devices lose at most the time to send this response:
+    # their access tokens are already refused on REST and on re-auth.
+    background.add_task(revoke_sessions, user.id, cutoff_ms)
+    return PasswordChangeOut(**pair.model_dump(), other_devices_signed_out=True)
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)

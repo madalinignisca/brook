@@ -22,7 +22,17 @@ for KDE Plasma, Windows, Android, and iOS are planned, all sharing one core.
 
 ## Getting the GNOME client
 
-Packaged builds (Flatpak) are **planned**. For now, build from source:
+**Release builds** (stable and beta) are on the GitHub Releases page as
+`brook-gnome-<version>-linux-<arch>.tar.gz` (x86_64 and aarch64). Unpack one and
+run `./install.sh`: it installs for your user only (no root), and
+`./install.sh --uninstall` removes it. The tarball's `INSTALL.md` lists the GTK 4,
+libadwaita and GStreamer packages your distribution needs.
+
+A **Flatpak** comes next, from the same release pipeline. It will be the
+recommended Linux install, because it is the only one where the system keeps other
+apps out of Brook's local data (a native install can't promise that).
+
+**From source:**
 
 **Prerequisites:** the Rust toolchain (`rustup`), plus GTK 4 and libadwaita
 development libraries (e.g. on Arch: `gtk4 libadwaita`; on Fedora:

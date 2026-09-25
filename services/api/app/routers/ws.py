@@ -4,8 +4,9 @@ Auth is the **first frame**: ``{"type":"auth","data":{"access_token":...}}`` wit
 ``AUTH_TIMEOUT_S``, never as a query parameter (those leak into logs). The server
 answers ``{"type":"ready"}`` and registers the socket with the in-process hub so
 REST message sends fan out here. Any auth failure closes with 1008; the close
-reason says which (``auth_failed``, ``auth_timeout``, ``token_expired``, or
-``rate_limited`` when the client IP must wait; app/ratelimit.py). A failed WS auth
+reason says which (``auth_failed``, ``auth_timeout``, ``token_expired``,
+``session_revoked`` after a sign-out-everywhere, or ``rate_limited`` when the
+client IP must wait; app/ratelimit.py). A failed WS auth
 counts as a failed login for the limiter.
 
 After ``ready`` the socket also carries **commands** (call signaling, §3): each
@@ -38,7 +39,7 @@ from ..db import get_sessionmaker
 from ..hub import get_hub
 from ..models import User
 from ..ratelimit import client_ip, get_limiter
-from ..security import decode_access_token
+from ..security import decode_access_token, issued_at_ms
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -78,6 +79,9 @@ class Connection:
 
     ws: WebSocket
     user_id: uuid.UUID
+    # When the token that authenticated this socket was issued (ms). Updated on
+    # re-auth; revoke_sessions() closes sockets whose token predates a revocation.
+    issued_ms: int = 0
     conn_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     closed: bool = False
     expiry: asyncio.Task[None] | None = None
@@ -132,11 +136,39 @@ async def _ping(conn: Connection, frame: dict[str, Any]) -> None:
 
 
 EXPIRED = "expired"  # a genuine token past its exp: stale, not an attack
+REVOKED = "revoked"  # a genuine token from before a sign-out-everywhere: not an attack
+
+# Live sockets per user, so a password change can close the other devices' sockets
+# at once instead of leaving them open until their token expires. Per process, like
+# the hub: correct only while the api runs ONE uvicorn worker (deploy/native, the
+# container entrypoint). With --workers N a revocation would only close the sockets
+# held by the worker that served the password change.
+_live: dict[uuid.UUID, set[Connection]] = {}
+# The latest cutoff per user. A socket whose token passed the DB check just before
+# a revocation committed can finish registering after revoke_sessions() swept
+# _live; it re-checks this right after registering (ws_endpoint). Per process,
+# like the hub: this api runs one uvicorn worker (see _live above).
+_cutoffs: dict[uuid.UUID, int] = {}
 
 
-async def _user_from_token(settings: Settings, token: object) -> tuple[User, int] | str | None:
-    """``(active user, exp)`` for a valid access token, :data:`EXPIRED` for a
-    correctly signed but expired one, else ``None``."""
+async def revoke_sessions(user_id: uuid.UUID, cutoff_ms: int) -> int:
+    """Close every live socket of ``user_id`` authenticated by a token issued
+    before ``cutoff_ms``; returns how many. Call after the revocation commits.
+
+    The changing device's own socket is closed too (its token predates the
+    change). Its client already holds the new pair, so it reconnects and resumes
+    any call (PROTOCOL.md §3 call.resume); every other device fails to refresh."""
+    _cutoffs[user_id] = max(cutoff_ms, _cutoffs.get(user_id, 0))
+    stale = [c for c in _live.get(user_id, set()) if c.issued_ms < cutoff_ms]
+    for conn in stale:
+        await conn.close(CLOSE_POLICY, "session_revoked")
+    return len(stale)
+
+
+async def _user_from_token(settings: Settings, token: object) -> tuple[User, int, int] | str | None:
+    """``(active user, exp, issued_ms)`` for a valid access token, :data:`EXPIRED`
+    for a correctly signed but expired one, :data:`REVOKED` for one issued before
+    the user signed out everywhere, else ``None``."""
     if not isinstance(token, str) or not token:
         return None
     try:
@@ -145,6 +177,7 @@ async def _user_from_token(settings: Settings, token: object) -> tuple[User, int
             return None
         user_id = uuid.UUID(str(payload["sub"]))
         exp = int(payload["exp"])
+        issued_ms = issued_at_ms(payload)
     except jwt.ExpiredSignatureError:
         return EXPIRED
     except (jwt.PyJWTError, KeyError, ValueError, TypeError):
@@ -153,7 +186,9 @@ async def _user_from_token(settings: Settings, token: object) -> tuple[User, int
         user = await session.get(User, user_id)
     if user is None or user.status != "active":
         return None
-    return user, exp
+    if user.session_revoked(issued_ms):
+        return REVOKED
+    return user, exp, issued_ms
 
 
 def _auth_token(frame: object) -> object:
@@ -179,6 +214,9 @@ async def _reauth(conn: Connection, frame: dict[str, Any], settings: Settings) -
     if authed == EXPIRED:
         await conn.close(CLOSE_POLICY, "token_expired")  # stale, not a failure
         return
+    if authed == REVOKED:
+        await conn.close(CLOSE_POLICY, "session_revoked")  # not a failure either
+        return
     if not isinstance(authed, tuple) or authed[0].id != conn.user_id:
         limiter.failure(ip)
         await conn.close(CLOSE_POLICY, "auth_failed")
@@ -186,6 +224,11 @@ async def _reauth(conn: Connection, frame: dict[str, Any], settings: Settings) -
     limiter.success(ip)
     if conn.expiry is not None:
         conn.expiry.cancel()
+    conn.issued_ms = authed[2]
+    if conn.issued_ms < _cutoffs.get(conn.user_id, 0):
+        # Same race as at registration: the DB read preceded a revocation's commit.
+        await conn.close(CLOSE_POLICY, "session_revoked")
+        return
     conn.expiry = asyncio.create_task(_expire(conn, authed[1]))
     await conn.send(envelope("ready", {"user_id": str(conn.user_id)}, re=_frame_id(frame)))
 
@@ -220,17 +263,27 @@ async def ws_endpoint(ws: WebSocket) -> None:
         # A device waking with a stale token: tell it to refresh, don't back it off.
         await ws.close(code=CLOSE_POLICY, reason="token_expired")
         return
+    if authed == REVOKED:
+        # A signed-out device reconnecting: it refreshes, fails, and signs out. Not
+        # a failure: it shares its IP with the owner's other, still-valid devices.
+        await ws.close(code=CLOSE_POLICY, reason="session_revoked")
+        return
     if not isinstance(authed, tuple):
         limiter.failure(ip)
         await ws.close(code=CLOSE_POLICY, reason="auth_failed")
         return
     limiter.success(ip)
-    user, exp = authed
+    user, exp, issued_ms = authed
     hub = get_hub()
     await hub.register(user.id, ws)
-    conn = Connection(ws=ws, user_id=user.id)
+    conn = Connection(ws=ws, user_id=user.id, issued_ms=issued_ms)
+    _live.setdefault(user.id, set()).add(conn)
     conn.expiry = asyncio.create_task(_expire(conn, exp))
     try:
+        if issued_ms < _cutoffs.get(user.id, 0):
+            # Revoked between our token check and this registration (see _cutoffs).
+            await conn.close(CLOSE_POLICY, "session_revoked")
+            return
         # Confirm the subscription so the client knows it will now receive fan-out
         # (and so senders racing a just-connected socket aren't silently missed).
         ready_re = _frame_id(first) if isinstance(first, dict) else None
@@ -277,6 +330,11 @@ async def ws_endpoint(ws: WebSocket) -> None:
         if conn.expiry is not None:
             conn.expiry.cancel()
         await hub.unregister(user.id, ws)
+        live = _live.get(user.id)
+        if live is not None:
+            live.discard(conn)
+            if not live:
+                _live.pop(user.id, None)
         for hook in disconnect_hooks:
             try:
                 await hook(conn)

@@ -62,6 +62,20 @@ class User(Base):
     global_role: Mapped[str] = mapped_column(String(16), default="member")
     status: Mapped[str] = mapped_column(String(16), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # "Sign out everywhere": access tokens issued before this instant are refused
+    # on REST and WebSocket, so a password change or admin reset takes effect in
+    # seconds instead of when the stateless 15-minute access token expires.
+    # None = never revoked. Compared in milliseconds (see security.issued_at_ms).
+    sessions_valid_after: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+
+    def session_revoked(self, issued_at_ms: int) -> bool:
+        """True if a token issued at ``issued_at_ms`` predates a sign-out-everywhere."""
+        if self.sessions_valid_after is None:
+            return False
+        cutoff_ms = int(ensure_utc(self.sessions_valid_after).timestamp() * 1000)
+        return issued_at_ms < cutoff_ms
 
 
 class RefreshToken(Base):

@@ -26,6 +26,10 @@ services:
     environment:
       BROOK_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-brook}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-brook}
       BROOK_JWT_SIGNING_KEY: ${BROOK_JWT_SIGNING_KEY:?set BROOK_JWT_SIGNING_KEY in .env (>=32 chars)}
+      # Not `:?`: that would break every compose command for an older .env. The api's
+      # startup guard refuses a missing or invalid ring itself (fails closed).
+      BROOK_SECRET_KEYS: ${BROOK_SECRET_KEYS:-}
+      BROOK_SECRET_PRIMARY_KEY_ID: ${BROOK_SECRET_PRIMARY_KEY_ID:-}
       # Schema is owned by Alembic: the api entrypoint runs `alembic upgrade head`
       # on start, so create_all must stay off (avoids drift between the two paths).
       BROOK_AUTO_CREATE_SCHEMA: "false"
@@ -36,6 +40,18 @@ services:
       # Dev/test only: serves the browser call harness at /dev/call. Keep false in
       # anything user-facing; it is a test tool, not a client.
       BROOK_DEV_HARNESS: ${BROOK_DEV_HARNESS:-false}
+      # Trust X-Forwarded-For from any peer. Without it uvicorn trusts only
+      # 127.0.0.1, which in compose is never Caddy: every client then shares the
+      # Caddy container's IP, and one person's mistyped passwords rate-limit
+      # everyone on the server (app/ratelimit.py). Safe here and only here: api is
+      # `expose`d on the compose network, never published, so Caddy is its only
+      # HTTP peer, and Caddy (2.5+, no trusted_proxies) replaces any client-sent
+      # X-Forwarded-For with the real client address. The native deploy keeps
+      # uvicorn's default (Caddy is on 127.0.0.1 there). If the Caddyfile ever
+      # gets `trusted_proxies` (a CDN in front), Caddy would pass the client's own
+      # X-Forwarded-For through, and "*" would then trust it: narrow this to the
+      # CDN's ranges at the same time.
+      FORWARDED_ALLOW_IPS: "*"
     depends_on:
       postgres:
         condition: service_healthy

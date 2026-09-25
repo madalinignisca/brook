@@ -43,7 +43,13 @@ enum AccountMessage {
     static let refused = "The server refused the new password (8 to 256 characters)."
     static let unexpected = "Something went wrong. Try again."
 
-    static func text(for error: Error, wrongPassword: String, forbidden: String = unexpected) -> String {
+    /// `noAnswer` is for calls that may have committed without a usable answer reaching us (the
+    /// password calls): no answer, or a 200 whose body did not parse. There, "couldn't reach the
+    /// server, try again" would be wrong.
+    static func text(
+        for error: Error, wrongPassword: String, forbidden: String = unexpected,
+        noAnswer: String? = nil
+    ) -> String {
         guard let error = error as? LoginError else { return unexpected }
         switch error {
         case let .Api(code, _):
@@ -55,7 +61,8 @@ enum AccountMessage {
             case "not_found": return "That user no longer exists."
             default: return unexpected
             }
-        case .Network, .Timeout, .Disconnected: return unreachable
+        case .Network, .Timeout, .Disconnected: return noAnswer ?? unreachable
+        case .UnexpectedResponse: return noAnswer ?? unexpected
         case .NotAuthenticated: return signedOut
         default: return unexpected
         }
@@ -81,6 +88,8 @@ final class ChangePasswordModel {
     static let olderServer = "Password changed. Your other devices will be signed out within 15 minutes."
     static let wrongCurrent = "The current password is wrong."
     static let sameAsCurrent = "The new password is the same as the current one."
+    static let noAnswer =
+        "No clear answer came back, so the change may have gone through. If you're signed out, sign in with the new password."
 
     private let client: any AccountClient
 
@@ -113,7 +122,8 @@ final class ChangePasswordModel {
             }
         } catch {
             // Fields stay: a typo can be fixed without retyping everything.
-            self.error = AccountMessage.text(for: error, wrongPassword: Self.wrongCurrent)
+            self.error = AccountMessage.text(
+                for: error, wrongPassword: Self.wrongCurrent, noAnswer: Self.noAnswer)
         }
     }
 
@@ -141,6 +151,7 @@ final class AdminResetModel {
     private(set) var done: String?
 
     static let wrongAdmin = "Your own password is wrong."
+    static let noAnswer = "No clear answer came back, so the reset may have gone through. Trying again is safe."
     static let adminTarget = "Admins change their own passwords."
 
     private let client: any AccountClient
@@ -178,7 +189,8 @@ final class AdminResetModel {
             done = "\(who)'s password is set. They're signed out everywhere."
         } catch {
             self.error = AccountMessage.text(
-                for: error, wrongPassword: Self.wrongAdmin, forbidden: Self.adminTarget)
+                for: error, wrongPassword: Self.wrongAdmin, forbidden: Self.adminTarget,
+                noAnswer: Self.noAnswer)
         }
     }
 

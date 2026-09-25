@@ -61,7 +61,7 @@ Incremental: each phase is independently usable and proves a piece of the archit
 - **Mobile push & background**: device registration, APNs/FCM, push-wake for messages, **call invites via CallKit / ConnectionService** (see [PROTOCOL.md](PROTOCOL.md) §3a).
 - **Scale-out** (if needed): sticky WS + Redis/NATS pub-sub, node-affine call signaling.
 - Hardening, account recovery, admin/operator tooling (user management, deactivation).
-- Packaging: Flatpak (Linux), notarized .app/.dmg (macOS), MSIX (Windows), Play/App Store.
+- Packaging: Flatpak (Linux, next; release tarballs ship meanwhile, decided 2026-09-25), notarized .app/.dmg (macOS), MSIX (Windows), Play/App Store.
 
 > Note: **E2EE is a non-goal** (see [SECURITY.md](SECURITY.md)) — intentionally absent from this roadmap.
 

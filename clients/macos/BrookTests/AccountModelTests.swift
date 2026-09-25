@@ -130,7 +130,11 @@ final class ChangePasswordModelTests: XCTestCase {
             (.Api(code: "auth.invalid_credentials", message: "x"), ChangePasswordModel.wrongCurrent),
             (.Api(code: "validation", message: "x"), AccountMessage.refused),
             (.Api(code: "auth.rate_limited", message: "x"), AccountMessage.tooManyAttempts),
-            (.Network(message: "x"), AccountMessage.unreachable),
+            // No answer: the server may have committed, so never a plain "try again".
+            (.Network(message: "x"), ChangePasswordModel.noAnswer),
+            (.Timeout, ChangePasswordModel.noAnswer),
+            // A 200 whose body did not parse: the server committed.
+            (.UnexpectedResponse, ChangePasswordModel.noAnswer),
             (.NotAuthenticated, AccountMessage.signedOut),
         ]
         for (failure, message) in cases {
@@ -204,5 +208,20 @@ final class AdminResetModelTests: XCTestCase {
             XCTAssertEqual(model.error, message)
             XCTAssertEqual(model.adminPassword, "admin-pw", "fields cleared after a refusal")
         }
+    }
+
+    /// No answer to a reset: it may have gone through, and repeating it is harmless.
+    func testAResetWithoutAnAnswerSaysItMayHaveGoneThrough() async {
+        let account = FakeAccount()
+        account.users = [user("bob")]
+        let model = AdminResetModel(client: account, selfId: "me")
+        await model.load()
+        account.failure = .Timeout
+        model.selectedId = "bob"
+        model.adminPassword = "admin-pw"
+        model.new = "bobs-new-pass"
+        model.confirm = "bobs-new-pass"
+        await model.submit()
+        XCTAssertEqual(model.error, AdminResetModel.noAnswer)
     }
 }
