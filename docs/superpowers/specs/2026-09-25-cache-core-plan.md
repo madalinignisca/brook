@@ -1,6 +1,6 @@
 # Offline cache and outbox in core — implementation plan (#61, #63)
 
-> Status: **draft for review** (Heavy) · 2026-09-25 · Implements §3–§5, §7 and §8 of the
+> Status: **approved** (Heavy, two rounds; server LGTM) · 2026-09-25 · Implements §3–§5, §7 and §8 of the
 > approved spec [2026-09-25-offline-cache-design.md](2026-09-25-offline-cache-design.md) against
 > the server's `/sync` (#91) and idempotent send (#71). Files (#65, #67, spec §6) get their own
 > plan once C1 lands: they build on its store layer. Tests first, each seen failing under a
