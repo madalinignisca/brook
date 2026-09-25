@@ -49,6 +49,9 @@ mod session;
 mod session_store;
 #[cfg(test)]
 mod signout_tests;
+mod snapshot;
+#[cfg(test)]
+mod snapshot_tests;
 mod state;
 mod store;
 #[cfg(test)]
