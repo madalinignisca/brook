@@ -44,7 +44,14 @@ impl History for Fake {
 
 #[async_trait::async_trait]
 impl Post for Fake {
-    async fn send(&self, ch: &str, body: &str, cid: &str, _e: u64) -> Result<Value, SendFailure> {
+    async fn send(
+        &self,
+        ch: &str,
+        msg: &crate::outbox::Outgoing,
+        cid: &str,
+        _e: u64,
+    ) -> Result<Value, SendFailure> {
+        let body = msg.body.as_str();
         self.sent.lock().unwrap().push(body.to_string());
         Ok(
             json!({ "id": format!("m-{cid}"), "channel_id": ch, "author_id": "u1", "body": body,
@@ -166,7 +173,7 @@ async fn signed_out_the_outbox_waits_and_the_next_sign_in_sends() {
     sign_in(&mut s, "u1", 1).await;
     s.offline.signed_out();
     let outbox = s.offline.active().unwrap().outbox.clone();
-    outbox.enqueue("c", "later", None).await.unwrap();
+    outbox.enqueue("c", "later", None, None).await.unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(
         s.fake.sent.lock().unwrap().is_empty(),
@@ -253,7 +260,7 @@ async fn cache_notices_reach_the_app() {
     let mut events = s.offline.events();
     sign_in(&mut s, "u1", 1).await;
     let outbox = s.offline.active().unwrap().outbox.clone();
-    outbox.enqueue("c", "hello", None).await.unwrap();
+    outbox.enqueue("c", "hello", None, None).await.unwrap();
     let got = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let Ok(CacheEvent::Outbox(ch)) = events.recv().await {
@@ -373,6 +380,60 @@ fn acknowledging_a_loss_keeps_a_newer_one() {
     );
     losses.lock().unwrap().acknowledge(newer.unwrap());
     assert_eq!(losses.lock().unwrap().current(), None);
+}
+
+/// An outbox in the format before this one (no reply column) is lost on upgrade: the app
+/// is told through the numbered loss when the user signs in.
+#[tokio::test]
+async fn an_old_outbox_is_reported_lost_when_its_user_signs_in() {
+    let root = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    {
+        let local = LocalData::open(root.path(), slot.clone() as Arc<dyn KeySlot>)
+            .await
+            .unwrap()
+            .unwrap();
+        let u = local.open_user("https://a", "u1").await.unwrap();
+        if let crate::store::Opened::Ready { db, .. } = u.cache {
+            db.close().await;
+        }
+        let crate::store::Opened::Ready { db: outbox, .. } = u.outbox else {
+            panic!("outbox not ready");
+        };
+        outbox
+            .call(|c| {
+                c.execute(
+                    "INSERT INTO outbox(client_id, channel_id, body, state, created_at)
+                     VALUES ('x', 'c', 'hi', 'pending', 'now')",
+                    [],
+                )?;
+                c.execute("UPDATE meta SET format = 1", [])
+            })
+            .await
+            .unwrap();
+        outbox.close().await;
+        local.close().await;
+    }
+    let local = LocalData::open(root.path(), slot.clone() as Arc<dyn KeySlot>)
+        .await
+        .unwrap()
+        .unwrap();
+    let (raw, _) = broadcast::channel(64);
+    let mut s = Setup {
+        offline: Offline::new(local),
+        fake: Arc::new(Fake::default()),
+        raw,
+        root,
+    };
+    assert_eq!(s.offline.losses(), None);
+    assert!(
+        sign_in(&mut s, "u1", 1).await,
+        "the rebuilt outbox didn't open"
+    );
+    assert!(
+        s.offline.losses().is_some(),
+        "the lost outbox went unreported"
+    );
 }
 
 // ---- Through BrookClient (the auth watcher wiring) ----

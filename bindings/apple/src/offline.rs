@@ -119,6 +119,8 @@ pub struct FfiPendingMessage {
     pub client_id: String,
     pub channel_id: String,
     pub body: String,
+    /// The quoted message, for a reply ("Replying to …").
+    pub reply_to_id: Option<String>,
     pub state: FfiPendingState,
 }
 
@@ -128,6 +130,7 @@ impl From<brook_core::PendingMessage> for FfiPendingMessage {
             client_id: p.client_id,
             channel_id: p.channel_id,
             body: p.body,
+            reply_to_id: p.reply_to_id,
             state: match p.state {
                 PendingState::Pending => FfiPendingState::Pending,
                 PendingState::Sending => FfiPendingState::Sending,
@@ -350,14 +353,22 @@ impl FfiBrookClient {
     /// call whose answer was lost can be retried with the same id. Any case is accepted;
     /// the returned id is the canonical lowercase form that `pending_messages` and the sent
     /// message's `client_id` use, so match bubbles on that. Not a UUID: `outbox.bad_id`.
+    /// `reply_to_id`: the quoted message, for a reply. The same `client_id` again returns
+    /// the stored message, reply target included: quoting something else needs a new id.
     pub async fn send_queued(
         &self,
         channel_id: String,
         body: String,
+        reply_to_id: Option<String>,
         client_id: String,
     ) -> Result<String, LoginError> {
         let inner = Arc::clone(&self.inner);
-        run(async move { inner.send_queued(&channel_id, &body, Some(client_id)).await }).await
+        run(async move {
+            inner
+                .send_queued(&channel_id, &body, reply_to_id, Some(client_id))
+                .await
+        })
+        .await
     }
 
     /// A channel's messages that haven't gone out, in the order they will.

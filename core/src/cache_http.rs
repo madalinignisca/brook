@@ -88,6 +88,15 @@ impl History for Http {
     }
 }
 
+/// The JSON a queued send posts: `reply_to_id` only when it's a reply.
+pub(crate) fn send_body(msg: &crate::outbox::Outgoing, client_id: &str) -> Value {
+    let mut v = serde_json::json!({ "body": msg.body, "client_id": client_id });
+    if let Some(r) = &msg.reply_to_id {
+        v["reply_to_id"] = Value::from(r.as_str());
+    }
+    v
+}
+
 #[async_trait::async_trait]
 impl crate::outbox::Post for Http {
     /// `POST /channels/{id}/messages` with the outbox's `client_id`, under session `epoch`
@@ -95,7 +104,7 @@ impl crate::outbox::Post for Http {
     async fn send(
         &self,
         channel_id: &str,
-        body: &str,
+        msg: &crate::outbox::Outgoing,
         client_id: &str,
         epoch: u64,
     ) -> Result<Value, crate::outbox::SendFailure> {
@@ -114,7 +123,7 @@ impl crate::outbox::Post for Http {
             .http
             .post(url)
             .bearer_auth(&session.access_token)
-            .json(&serde_json::json!({ "body": body, "client_id": client_id }))
+            .json(&send_body(msg, client_id))
             .send()
             .await;
         let resp = match sent {
