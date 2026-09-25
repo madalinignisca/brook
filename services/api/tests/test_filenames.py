@@ -18,7 +18,7 @@ from app.filenames import original_name, safe_filename
         # Paths can't climb or smuggle a directory.
         ("../../etc/passwd", "passwd"),
         ("C:\\Windows\\system32\\evil.dll", "evil.dll"),
-        ("/tmp/x/", "file"),  # noqa: S108 - a filename under test, not a temp path
+        ("/srv/x/", "file"),
         # Invisible and direction characters: no disguised extensions.
         ("invoice\u202efdp.exe", "invoicefdp.exe"),
         ("a\u200bb\u2066c.txt", "abc.txt"),
@@ -78,4 +78,4 @@ def test_device_names_with_spaces_before_the_dot(raw: str) -> None:
 
 
 def test_extension_only_names_keep_the_extension() -> None:
-    assert safe_filename("‮.exe") == "file.exe"
+    assert safe_filename("\u202e.exe") == "file.exe"
