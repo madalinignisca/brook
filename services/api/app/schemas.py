@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class RegisterIn(BaseModel):
@@ -42,6 +42,69 @@ class LoginIn(BaseModel):
 
     handle: str = Field(max_length=64)
     password: str = Field(max_length=256)
+    # The client can do the TOTP step. A client that predates TOTP doesn't send it
+    # and gets 403 auth.totp_client_required for a TOTP user, instead of a 200 it
+    # would misread as a login without tokens (spec 2026-09-25-totp §2.1).
+    supports_totp: bool = False
+
+
+class TotpRequiredOut(BaseModel):
+    """Login answer for a TOTP user: the password was right; now the code."""
+
+    totp_required: bool = True
+    totp_token: str
+    expires_in: int
+
+
+class TotpStepIn(BaseModel):
+    """``POST /auth/totp``: exactly one of ``code`` or ``recovery_code``."""
+
+    totp_token: str = Field(max_length=2048)
+    code: str | None = Field(default=None, max_length=16)
+    recovery_code: str | None = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> TotpStepIn:
+        if (self.code is None) == (self.recovery_code is None):
+            raise ValueError("send exactly one of code or recovery_code")
+        return self
+
+
+class SecondFactorIn(BaseModel):
+    """Re-authentication for disabling TOTP or regenerating recovery codes:
+    the password plus exactly one of a code or a recovery code."""
+
+    password: str = Field(max_length=256)
+    # A TOTP code or a recovery code (iiii-xxxx-xxxx-xxxx-xxxx, 24 chars): spec §2.3.
+    code: str | None = Field(default=None, max_length=64)
+    recovery_code: str | None = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> SecondFactorIn:
+        if (self.code is None) == (self.recovery_code is None):
+            raise ValueError("send exactly one of code or recovery_code")
+        return self
+
+
+class PasswordIn(BaseModel):
+    password: str = Field(max_length=256)
+
+
+class CodeIn(BaseModel):
+    code: str = Field(max_length=16)
+
+
+class TotpEnrollOut(BaseModel):
+    otpauth_uri: str
+    expires_in: int
+
+
+class RecoveryCodesOut(BaseModel):
+    recovery_codes: list[str]
+
+
+class AdminReauthIn(BaseModel):
+    admin_password: str = Field(max_length=256)
 
 
 class RefreshIn(BaseModel):
@@ -56,6 +119,18 @@ class TokenPair(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"  # noqa: S105 - field name trips the secret heuristic; not a secret
+
+
+class TotpLoginOut(TokenPair):
+    """``POST /auth/totp``: the pair; with a recovery code, how many are left."""
+
+    recovery_codes_left: int | None = None
+
+
+class TotpActivateOut(TokenPair):
+    """Activation signs out every other session, so it carries this device's new pair."""
+
+    recovery_codes: list[str]
 
 
 class PasswordChangeOut(TokenPair):
@@ -80,6 +155,13 @@ class UserOut(BaseModel):
     global_role: str
     status: str
     created_at: datetime
+
+
+class MeOut(UserOut):
+    """``GET /auth/me``: the user plus their second-factor state."""
+
+    totp_enabled: bool = False
+    recovery_codes_left: int | None = None
 
 
 class UserSummary(BaseModel):

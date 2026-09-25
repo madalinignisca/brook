@@ -18,19 +18,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import Settings, get_settings
 from ..db import get_session
 from ..deps import get_current_user, user_from_access_token
-from ..models import RefreshToken, User, ensure_utc, utcnow
+from ..events import record_event
+from ..models import RecoveryCode, RefreshToken, Totp, User, ensure_utc, utcnow
 from ..ratelimit import AuthLimiter, client_ip, enforce, get_limiter
 from ..schemas import (
     LoginIn,
+    MeOut,
     PasswordChangeIn,
     PasswordChangeOut,
     RefreshIn,
     RegisterIn,
     TokenPair,
+    TotpRequiredOut,
     UserOut,
 )
 from ..security import (
+    TOTP_PENDING_TTL_S,
     create_access_token,
+    create_totp_pending_token,
     dummy_verify,
     hash_password,
     hash_token,
@@ -136,15 +141,16 @@ async def register(
     return user
 
 
-@router.post("/login", response_model=TokenPair)
+@router.post("/login", response_model=TokenPair | TotpRequiredOut)
 async def login(
     body: LoginIn,
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_settings)],
     limiter: Annotated[AuthLimiter, Depends(get_limiter)],
-) -> TokenPair:
-    """Authenticate with handle + password, returning a token pair.
+) -> TokenPair | TotpRequiredOut:
+    """Authenticate with handle + password, returning a token pair, or for a TOTP
+    user a pending token for ``POST /auth/totp`` (spec 2026-09-25-totp §2.1).
 
     Rate limited before any Argon2 work (app/ratelimit.py). A 429 is answered the
     same way for known and unknown handles, so it reveals nothing either."""
@@ -164,9 +170,26 @@ async def login(
     if not verify_password(user.password_hash, body.password):
         limiter.failure(ip, body.handle)
         raise bad
-    limiter.success(ip, body.handle)
     if needs_rehash(user.password_hash):  # transparently upgrade params on login
         user.password_hash = hash_password(body.password)
+    totp_on = await session.scalar(
+        select(Totp.id).where(Totp.user_id == user.id, Totp.activated_at.is_not(None))
+    )
+    if totp_on is not None:
+        # Half a login: no limiter.success here. Success marks this IP trusted for the
+        # handle, which exempts it from the TOTP code budget; a password-only attacker
+        # must never earn that. It is recorded when /auth/totp completes.
+        # Minted while still holding the row lock, so no password change can commit
+        # between this token's iat_ms and the lock's release (password_changed_since).
+        token, _jti = create_totp_pending_token(settings, user.id)
+        await session.commit()  # keep a rehash
+        if not body.supports_totp:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "auth.totp_client_required", "message": "Update the app"},
+            )
+        return TotpRequiredOut(totp_token=token, expires_in=TOTP_PENDING_TTL_S)
+    limiter.success(ip, body.handle)
     return await _issue_tokens(session, settings, user)
 
 
@@ -316,6 +339,11 @@ async def change_password(
             detail={"code": "invalid", "message": "New password must differ from the current one"},
         )
     user.password_hash = hash_password(body.new_password)
+    # A TOTP pending token minted with the old password dies now, whatever the box
+    # says; and the owner's remedy for "someone has my password" ends the code budget.
+    user.password_changed_at = utcnow()
+    limiter.code_reset(user.handle)
+    record_event(session, user.id, "password_changed")
     if not body.sign_out_other_devices:
         kept = await _issue_tokens(session, settings, user)
         return PasswordChangeOut(**kept.model_dump(), other_devices_signed_out=False)
@@ -347,7 +375,29 @@ async def logout(
     await session.commit()
 
 
-@router.get("/me", response_model=UserOut)
-async def me(user: Annotated[User, Depends(get_current_user)]) -> User:
-    """Return the currently authenticated user."""
-    return user
+@router.get("/me", response_model=MeOut)
+async def me(
+    user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> MeOut:
+    """The current user, with their second-factor state (so the app shows Enable or
+    Disable, and warns when recovery codes run low)."""
+    enabled = (
+        await session.scalar(
+            select(Totp.id).where(Totp.user_id == user.id, Totp.activated_at.is_not(None))
+        )
+        is not None
+    )
+    left = None
+    if enabled:
+        left = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(RecoveryCode)
+                .where(RecoveryCode.user_id == user.id, RecoveryCode.used_at.is_(None))
+            )
+            or 0
+        )
+    return MeOut(
+        **UserOut.model_validate(user).model_dump(), totp_enabled=enabled, recovery_codes_left=left
+    )

@@ -7,8 +7,10 @@
 | Method & path | Purpose |
 |---|---|
 | `GET  /auth/methods` | which methods this deployment enabled (local/oidc/ldap) |
-| `POST /auth/login` | local credentials → `{access_token, refresh_token}` or `{totp_required}` |
-| `POST /auth/totp` | login-time TOTP code → tokens; `POST /auth/totp/enroll` to set up |
+| `POST /auth/login` | `{handle, password, supports_totp}` → `{access_token, refresh_token}`, or for a TOTP user `200 {totp_required, totp_token, expires_in}`; see §1.2 |
+| `POST /auth/totp` | `{totp_token, code}` or `{totp_token, recovery_code}` → tokens (`+ recovery_codes_left` with a recovery code) |
+| `POST /auth/totp/enroll` · `/activate` · `/disable` · `/recovery-codes` | set up, confirm, turn off, regenerate codes; see §1.2 |
+| `POST /users/{id}/totp/reset` | **admin**: remove a member's TOTP `{admin_password}` → 204 |
 | `GET  /auth/oidc/start` | begin OIDC (Auth Code + PKCE) in system browser |
 | `GET  /auth/oidc/callback` | provider redirect; api exchanges provider code, issues a short-lived Brook code, redirects to the app |
 | `POST /auth/oidc/exchange` | app exchanges the Brook code + PKCE verifier → `{access_token, refresh_token}` |
@@ -78,6 +80,37 @@
 - Token issue and revocation are serialised per user (the server locks the user
   row in login, refresh, password change and admin reset), so a refresh racing a
   password change cannot mint a token that outlives it.
+
+### 1.2 TOTP (optional 2FA)
+
+Full design: `docs/superpowers/specs/2026-09-25-totp-server-design.md`. The client
+contract:
+
+- **Login** sends `supports_totp: true`. For a TOTP user a correct password answers
+  `200 {totp_required: true, totp_token, expires_in: 300}`. A client that doesn't send
+  the flag gets `403 auth.totp_client_required` for such a user, never a 200 it would
+  misread.
+- **`POST /auth/totp`** completes it. It is never 401:
+  - `403 auth.invalid_code` for a wrong, replayed or used code (a failed code does
+    **not** burn the `totp_token`);
+  - `403 auth.totp_expired` when the token is bad, expired or used, or the password
+    changed or the user signed out everywhere since it was issued: restart at the
+    password;
+  - `429` + `Retry-After` when paced.
+- **A code is accepted once, everywhere.** The code used to activate can't log in; the
+  first login after activation needs the next code (≤ 30 s).
+- **Enrolment** (full access session): `enroll {password}` → `{otpauth_uri,
+  expires_in: 600}`, returned once (the client renders the QR);
+  `activate {code}` → `{recovery_codes, access_token, refresh_token}`. Activation
+  **signs out every other session**; commit its pair like `/auth/password`'s.
+  `409 auth.totp_enrollment_expired` means scan again; `409 conflict` means TOTP is
+  already on, or nothing is pending.
+- **`disable`** and **`recovery-codes`** take `{password, code}`, where `code` may be a
+  TOTP code or a recovery code (`recovery_code` as its own field works too).
+  Regenerating replaces every old code.
+- **`GET /auth/me`** adds `totp_enabled` and `recovery_codes_left` (null when off).
+- **Recovery codes** look like `iiii-xxxx-xxxx-xxxx-xxxx`; case, dashes and spaces
+  are forgiven.
 
 ## 2. WebSocket (realtime plane) — `wss://<host>/ws`
 
