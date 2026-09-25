@@ -191,3 +191,21 @@ successful sign-in removes; deletion conditional on the exact token; three separ
 persistence modes; the single-instance lock held for the life of the process; and one named
 mutation per check. No round 3 by rule. The simplification is new design, so the
 implementation gate reviews it in full.
+
+**Implementation gate (Heavy).** Codex reproduced every finding with a probe. Vibe reviewed the
+Apple half. Its two points were rebutted with evidence: `kSecUseDataProtectionKeychain` in a
+query returns `errSecItemNotFound` for a missing item, and the restore is bounded by core's 30 s
+request timeout. On the core half it produced no output after four attempts, so that half has
+one reviewer.
+- Round 1 accepted:
+  - clients in one process share the slot;
+  - a quit mid-refresh must store the rotated token, not revoke it;
+  - the Mac warning must not depend on form state;
+  - re-assert `ThisDeviceOnly` on update;
+  - fsync the fence's parent;
+  - a pre-existing refresh-error body leak.
+- Round 2 found holes in the first fix (per-attempt tickets). The design changed to: **the
+  newest client to enable persistence owns the slot**. Every slot operation, reads included,
+  checks that under one process-wide lock. The app makes a new client per attempt, so the owner
+  is always the current attempt. A rotation is followed after a quit only while the session is
+  still persisted, never after a sign-out. No round 3 by rule.
