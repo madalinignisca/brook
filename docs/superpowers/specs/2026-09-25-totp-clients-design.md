@@ -1,10 +1,11 @@
 # TOTP two-factor sign-in: core and macOS (PR D, client side)
 
-> Status: **draft**, waiting on the server spec for the wire · 2026-09-25 · Dial: **Heavy** (auth)
+> Status: **draft** · 2026-09-25 · Dial: **Heavy** (auth) · Wire: the server spec
+> [2026-09-25-totp-server-design.md](2026-09-25-totp-server-design.md) (#48, under review)
 > The server side (endpoints, data model, and the requirements in
 > [2026-09-22-app-secret-encryption-design.md](2026-09-22-app-secret-encryption-design.md) §7) is
-> the server's spec. This one covers core and the macOS app, and states what they need from the
-> wire. Points marked **(wire)** are proposals until the server spec confirms them.
+> the server's spec. This one covers core and the macOS app. The wire below is the server spec's §2,
+> which took in every client requirement.
 
 ## 1. Goal
 A local-account user can turn on TOTP two-factor sign-in from the Mac app, and signs in with a
@@ -25,15 +26,16 @@ password plus a code (or a recovery code) from then on. Done means, observably:
   once, at enrolment).
 - The GNOME dialog (the Linux client's; it uses the same core calls).
 
-## 3. Wire (proposed to the server; confirmed by its spec)
+## 3. Wire (server spec §2)
 | Call | Body | Success | Errors the client handles |
 |---|---|---|---|
-| `POST /auth/login` | `{handle, password}` | 200 TokenPair, **or** 200 `{totp_required: true, totp_token, expires_in}` **(wire)** | 401 `auth.invalid_credentials`, 429 |
-| `POST /auth/totp` | `{totp_token, code}` or `{totp_token, recovery_code}` | 200 TokenPair (+ `recovery_codes_left` after a recovery code) **(wire)** | 403 `auth.invalid_code`, 403 `auth.totp_expired`, 429 — **never 401 (wire)** |
+| `POST /auth/login` | `{handle, password}` | 200 TokenPair, **or** 200 `{totp_required: true, totp_token, expires_in: 300}` | 401 `auth.invalid_credentials`, 429 |
+| `POST /auth/totp` | `{totp_token, code}` or `{totp_token, recovery_code}` | 200 TokenPair (+ `recovery_codes_left` after a recovery code) | 403 `auth.invalid_code` (the token stays usable: a typo never sends the user back), 403 `auth.totp_expired`, 429; **never 401** |
 | `POST /auth/totp/enroll` (access) | `{password}` | 200 `{otpauth_uri}`, once | 403 `auth.invalid_credentials`, 409 `conflict` (already on), 429 |
-| `POST /auth/totp/activate` (access) | `{code}` | 200 `{recovery_codes: [..]}`, once | 403 `auth.invalid_code`, 410/404 when the pending enrolment expired |
-| `POST /auth/totp/disable` (access) | `{password, code}` | 204 | 403, 429 |
-| `GET /auth/me` | — | gains `totp_enabled: bool` **(wire)** | — |
+| `POST /auth/totp/activate` (access) | `{code}` | 200 `{recovery_codes: [..]}`, once | 403 `auth.invalid_code`, 409 `conflict` when nothing is pending or it expired (10 min) |
+| `POST /auth/totp/disable` (access) | `{password, code}` (code may be a recovery code) | 204 | 403 `auth.invalid_credentials` / `auth.invalid_code`, 429 |
+| `POST /auth/totp/recovery-codes` (access) | `{password, code}` | 200 `{recovery_codes}`: replaces all | as disable |
+| `GET /auth/me` | — | gains `totp_enabled: bool` | — |
 | `POST /users/{id}/totp/reset` (admin) | `{admin_password}` | 204; the target signed out everywhere | as the password reset |
 
 Why the pending step is a success-shaped 200 and never a 401: core maps errors from the status
@@ -52,8 +54,8 @@ so a wrong code answered 401 would start a refresh instead of asking again.
   server sent one. `auth.totp_expired` ends the challenge (the UI goes back to the password).
 - Account calls on the same `Ctx::send` as the password change (one refresh on 401, body-free
   errors): `totp_enroll(password) -> otpauth_uri`, `totp_activate(code) -> recovery_codes`,
-  `totp_disable(password, code)`, `admin_reset_totp(user_id, admin_password)` (own id refused
-  locally).
+  `totp_disable(password, code)`, `totp_regenerate_recovery_codes(password, code)`,
+  `admin_reset_totp(user_id, admin_password)` (own id refused locally).
 - Secrecy: the otpauth URI and recovery codes are returned to the caller and never logged; the
   log-secrecy test covers every new call and the challenge's `Debug`.
 
@@ -66,7 +68,8 @@ so a wrong code answered 401 would start a refresh instead of asking again.
   fetched) plus the key in groups of 4 for manual entry → code → recovery codes with Copy and
   Save…, and a "I've saved these" confirmation before Done. The URI, key and codes are cleared
   from the model when the sheet closes.
-- Low recovery codes (≤ 2 left after using one): a notice after sign-in.
+- Low recovery codes (≤ 2 left after using one): a notice after sign-in, offering **New
+  Recovery Codes…** (password + code → the new set, shown once, as at enrolment).
 - Admin: "Reset a User's Two-Factor Sign-In…", shaped like the password reset sheet.
 
 ## 6. Tests
@@ -93,5 +96,5 @@ so a wrong code answered 401 would start a refresh instead of asking again.
 | Autofill of codes on macOS | best effort (`oneTimeCode` content type); typing always works |
 
 ## 8. Open for the owner
-None yet; the server spec may raise some (recovery-code count, whether admins may have TOTP
-reset by another admin).
+Those of the server spec §8 (event retention; whether turning TOTP on also signs out other
+devices; if yes, the enrolment sheet gets the same checkbox as the password change).
