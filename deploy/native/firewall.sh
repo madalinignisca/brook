@@ -43,7 +43,9 @@ allow_service https           # TCP 443
 allow_port 443/udp            # HTTP/3
 allow_port 20000-20099/udp    # Janus media
 if firewall-offline-cmd --zone="$zone" --query-service=cockpit >/dev/null; then
-    firewall-offline-cmd --zone="$zone" --remove-service=cockpit >/dev/null
+    # Not --remove-service: with --zone, firewall-offline-cmd parses that as the
+    # legacy lokkit option and refuses ("Can't use lokkit options with other options").
+    firewall-offline-cmd --zone="$zone" --remove-service-from-zone=cockpit >/dev/null
 fi
 
 echo "zone $zone will allow:"
