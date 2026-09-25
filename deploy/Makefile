@@ -4,7 +4,7 @@ ENV := .env
 
 .DEFAULT_GOAL := help
 
-.PHONY: help init keyring up down reset restart logs ps rebuild storage media migrate dbrev
+.PHONY: help init keyring up start stop down reset restart logs ps rebuild storage media migrate dbrev
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -44,7 +44,13 @@ up: ## Start the core stack (postgres + api + caddy)
 	$(COMPOSE) up -d --build
 	@echo "Brook API is up on $$(grep -E '^BROOK_HTTP_BIND=' $(ENV) | cut -d= -f2 | grep . || echo 127.0.0.1):$$(grep -E '^BROOK_HTTP_PORT=' $(ENV) | cut -d= -f2) (BROOK_HTTP_BIND / BROOK_HTTP_PORT in .env)."
 
-down: ## Stop the stack (data is kept)
+stop: ## End the work session — stop containers but keep them (data kept); `make start` resumes
+	$(COMPOSE) stop
+
+start: ## Resume a stopped session without rebuilding
+	$(COMPOSE) start
+
+down: ## Stop and remove containers (data volumes are kept; use `reset` to wipe)
 	$(COMPOSE) down
 
 reset: ## Stop and WIPE all data (postgres + minio volumes), then rebuild the core stack

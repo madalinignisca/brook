@@ -1,12 +1,18 @@
 # Brook server stack. Default = the lean Phase 0 login stack (postgres + api + caddy).
 # Object storage (Phase 2) and the media SFU (Phase 4) are behind compose profiles
 # so they don't run until needed. See ./README.md and the Makefile.
+#
+# Restart policy: services use `restart: on-failure` (not `always`/`unless-stopped`)
+# on purpose. `on-failure` restarts a container that crashes mid-session but is NOT
+# brought back when the Docker daemon starts at boot — so the stack does not come up
+# on laptop restart. Run it per work session with `make up`; end it with `make stop`
+# (or `make down`). Named volumes persist across both; only `down -v` wipes them.
 name: brook
 
 services:
   postgres:
     image: postgres:16-alpine
-    restart: unless-stopped
+    restart: on-failure
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-brook}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
@@ -22,7 +28,7 @@ services:
   api:
     build:
       context: ../services/api
-    restart: unless-stopped
+    restart: on-failure
     environment:
       BROOK_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-brook}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-brook}
       BROOK_JWT_SIGNING_KEY: ${BROOK_JWT_SIGNING_KEY:?set BROOK_JWT_SIGNING_KEY in .env (>=32 chars)}
@@ -60,7 +66,7 @@ services:
 
   caddy:
     image: caddy:2-alpine
-    restart: unless-stopped
+    restart: on-failure
     depends_on:
       - api
     ports:
@@ -79,7 +85,7 @@ services:
   minio:
     image: minio/minio
     profiles: ["storage"]
-    restart: unless-stopped
+    restart: on-failure
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-brook}
@@ -95,7 +101,7 @@ services:
     build:
       context: ../services/sfu
     profiles: ["media"]
-    restart: unless-stopped
+    restart: on-failure
     environment:
       # Shared with api only; every Janus API request must carry it.
       # Not `:?` here: Compose interpolates EVERY service, even ones whose profile is
