@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _DEV_JWT_KEY = "dev-insecure-change-me"  # noqa: S105 - sentinel for the guard, not a secret
@@ -37,17 +38,47 @@ class Settings(BaseSettings):
     # Off by default: it is a test tool, not a product client.
     dev_harness: bool = False
 
+    # Encryption of stored secrets (TOTP, bot secrets): a keyring of AES-256 keys,
+    # `1:<base64url 32 bytes>,2:<...>`, and the explicit primary (encrypting) key id.
+    # Required at startup (spec 2026-09-22 §5.7). SecretStr: never printed.
+    secret_keys: SecretStr | None = None
+    secret_primary_key_id: int | None = None
+
     # Must be explicitly enabled to run with a weak/default JWT key (local dev only).
     allow_insecure_auth: bool = False
 
     def assert_secure(self) -> None:
-        """Refuse to start with a forgeable JWT key unless explicitly allowed."""
+        """Refuse to start with a forgeable JWT key or an unusable secret keyring,
+        unless explicitly allowed (local dev only)."""
+        self._assert_secret_keyring()
         weak = self.jwt_signing_key == _DEV_JWT_KEY or len(self.jwt_signing_key) < 32
         if weak and not self.allow_insecure_auth:
             raise RuntimeError(
                 "BROOK_JWT_SIGNING_KEY must be a strong (>=32 char) non-default value. "
                 "For local dev set BROOK_ALLOW_INSECURE_AUTH=1."
             )
+
+    def _assert_secret_keyring(self) -> None:
+        """The keyring must parse, every key be 32 bytes, ids be unique, and the
+        primary be in the ring. Only the dev escape hatch may omit it, and then a
+        fixed dev key is used: never plaintext, never TOTP disabled."""
+        from .secretbox import KeyringError, SecretBox, parse_keyring
+
+        if self.secret_keys is None:
+            if self.allow_insecure_auth:
+                return
+            raise RuntimeError(
+                "BROOK_SECRET_KEYS and BROOK_SECRET_PRIMARY_KEY_ID are required "
+                "(`make init` generates them). For local dev set BROOK_ALLOW_INSECURE_AUTH=1."
+            )
+        try:
+            keys = parse_keyring(self.secret_keys.get_secret_value())
+            if self.secret_primary_key_id is None:
+                raise KeyringError("BROOK_SECRET_PRIMARY_KEY_ID is not set")
+            SecretBox(keys, self.secret_primary_key_id)
+        except KeyringError as exc:
+            # The message names ids and lengths, never key material.
+            raise RuntimeError(f"secret keyring rejected: {exc}") from None
 
 
 @lru_cache

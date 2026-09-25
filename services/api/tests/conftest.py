@@ -19,6 +19,16 @@ from app import config, db
 from app.main import create_app
 from app.models import Base
 
+# A throwaway test keyring (never used outside tests): key 1, 32 zero-ish bytes.
+TEST_SECRET_KEYS = "1:" + "dGVzdC1zZWNyZXQta2V5LTMyLWJ5dGVzLWxvbmchISE"
+
+
+@pytest.fixture(autouse=True)
+def _test_secret_keyring(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test boots with a valid (throwaway) secret keyring (§5.7 startup guard)."""
+    monkeypatch.setenv("BROOK_SECRET_KEYS", TEST_SECRET_KEYS)
+    monkeypatch.setenv("BROOK_SECRET_PRIMARY_KEY_ID", "1")
+
 
 @pytest.fixture
 async def client(
