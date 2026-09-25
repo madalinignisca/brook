@@ -45,6 +45,10 @@
   **closes with `1008`**; the close *reason* says which: `auth_failed`,
   `auth_timeout`. The client's remedy is the same for all: refresh over REST, then
   reconnect.
+- `1008` / `rate_limited`: the client's IP failed authentication too often (failed
+  WS `auth` frames count like failed logins). The client must **not** retry
+  immediately: back off (the REST auth endpoints answer the same condition with
+  `429` + `Retry-After`, code `auth.rate_limited`) before reconnecting.
 - The socket also closes with `1008` / `token_expired` when its access token
   expires. To avoid that, the client may send the same `auth` frame **again on the
   open socket** with a fresh token for the same user; the server answers another

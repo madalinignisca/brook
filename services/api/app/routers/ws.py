@@ -4,7 +4,9 @@ Auth is the **first frame**: ``{"type":"auth","data":{"access_token":...}}`` wit
 ``AUTH_TIMEOUT_S``, never as a query parameter (those leak into logs). The server
 answers ``{"type":"ready"}`` and registers the socket with the in-process hub so
 REST message sends fan out here. Any auth failure closes with 1008; the close
-reason says which (``auth_failed``, ``auth_timeout``, ``token_expired``).
+reason says which (``auth_failed``, ``auth_timeout``, ``token_expired``, or
+``rate_limited`` when the client IP must wait; app/ratelimit.py). A failed WS auth
+counts as a failed login for the limiter.
 
 After ``ready`` the socket also carries **commands** (call signaling, §3): each
 client frame carries an ``id`` and gets exactly one reply carrying ``re`` (its
@@ -35,6 +37,7 @@ from ..config import Settings, get_settings
 from ..db import get_sessionmaker
 from ..hub import get_hub
 from ..models import User
+from ..ratelimit import client_ip, get_limiter
 from ..security import decode_access_token
 
 log = logging.getLogger(__name__)
@@ -161,10 +164,17 @@ async def _expire(conn: Connection, exp: int) -> None:
 
 async def _reauth(conn: Connection, frame: dict[str, Any], settings: Settings) -> None:
     """``auth`` on the open socket: swap in a fresh token for the same user."""
+    limiter = get_limiter()
+    ip = client_ip(conn.ws.client.host if conn.ws.client else None)
+    if limiter.check(ip, consume=False) is not None:
+        await conn.close(CLOSE_POLICY, "rate_limited")
+        return
     authed = await _user_from_token(settings, _auth_token(frame))
     if authed is None or authed[0].id != conn.user_id:
+        limiter.failure(ip)
         await conn.close(CLOSE_POLICY, "auth_failed")
         return
+    limiter.success(ip)
     if conn.expiry is not None:
         conn.expiry.cancel()
     conn.expiry = asyncio.create_task(_expire(conn, authed[1]))
@@ -190,10 +200,18 @@ async def ws_endpoint(ws: WebSocket) -> None:
         first = json.loads(raw)
     except ValueError:
         first = None
+    # Paced like /auth/login, and checked before any token or DB work.
+    limiter = get_limiter()
+    ip = client_ip(ws.client.host if ws.client else None)
+    if limiter.check(ip, consume=False) is not None:
+        await ws.close(code=CLOSE_POLICY, reason="rate_limited")
+        return
     authed = await _user_from_token(settings, _auth_token(first))
     if authed is None:
+        limiter.failure(ip)
         await ws.close(code=CLOSE_POLICY, reason="auth_failed")
         return
+    limiter.success(ip)
     user, exp = authed
     hub = get_hub()
     await hub.register(user.id, ws)
