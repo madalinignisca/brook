@@ -1,0 +1,45 @@
+# Brook API (FastAPI under uvicorn), native deployment. See deploy/native/README.md.
+#
+# Listens on loopback only: Caddy is the single public entry point and terminates
+# TLS. Anything that reaches 8000 directly would bypass TLS, so never widen --host.
+[Unit]
+Description=Brook API
+Wants=postgresql.service
+After=network-online.target postgresql.service brook-janus.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=brook
+Group=brook
+WorkingDirectory=/opt/brook/api
+EnvironmentFile=/etc/brook/api.env
+Environment=PATH=/opt/brook/api/.venv/bin:/usr/bin
+# Same contract as the container entrypoint: migrate to head, then serve.
+# Idempotent (a no-op when current), single node only.
+ExecStartPre=/opt/brook/api/.venv/bin/alembic upgrade head
+# --ws-max-size mirrors MAX_FRAME_BYTES in app/routers/ws.py (64 KiB): uvicorn
+# buffers a whole frame before the app sees it, so the cap has to live here.
+ExecStart=/opt/brook/api/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --ws-max-size 65536
+Restart=on-failure
+RestartSec=2
+
+# Hardening. The api keeps no files on disk (Postgres over the local socket, no
+# object storage yet), so the whole filesystem can be read-only for it.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# Janus API over WebSocket, for `api` only — native deployment.
+#
+# Differs from services/sfu/janus.transport.websockets.jcfg in one line: ws_ip.
+# In a container the port is private to the Docker network; on a bare host Janus
+# would otherwise listen on every interface, putting the Janus API (guarded only
+# by the api secret) on the public internet.
+general: {
+	json = "compact"
+	ws = true
+	ws_port = 8188
+	ws_ip = "127.0.0.1"
+	wss = false
+}
+
+admin: {
+	# The Janus Admin API is never exposed (ARCHITECTURE.md §Signaling model).
+	admin_ws = false
+	admin_wss = false
+}
