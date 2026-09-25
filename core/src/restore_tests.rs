@@ -621,3 +621,48 @@ async fn a_quit_after_a_sign_out_never_keeps_the_rotated_token() {
         revoked.len()
     );
 }
+
+/// Only 401 and 422 are the api refusing the token. Any other 4xx is something in front of it
+/// (a proxy, a captive portal): the stored copy and the live session are kept.
+#[tokio::test]
+async fn a_4xx_not_from_the_api_never_signs_out() {
+    let server = strict().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let c = signed_in(&server, &slot, dir.path(), "alice").await;
+    let token = held_token(&c).await;
+    for status in [404, 405, 408, 413] {
+        server.set_refresh_mode(RefreshMode::Fail(status));
+        refresh_now(&c).await;
+        assert!(
+            matches!(*c.state().borrow(), AuthState::LoggedIn(_)),
+            "{status} signed out"
+        );
+        assert_eq!(
+            stored_token(&slot, &server),
+            Some(token.clone()),
+            "{status}"
+        );
+    }
+    drop(c);
+    for status in [404, 405, 408, 413] {
+        server.set_refresh_mode(RefreshMode::Fail(status));
+        let (_, outcome) = relaunch(&server, &slot, dir.path()).await;
+        assert!(
+            matches!(outcome, RestoreOutcome::Offline),
+            "{status}: {outcome:?}"
+        );
+        assert_eq!(
+            stored_token(&slot, &server),
+            Some(token.clone()),
+            "{status}"
+        );
+    }
+    server.set_refresh_mode(RefreshMode::Fail(422));
+    let (_, outcome) = relaunch(&server, &slot, dir.path()).await;
+    assert!(
+        matches!(outcome, RestoreOutcome::NotSignedIn),
+        "{outcome:?}"
+    );
+    assert_eq!(stored_token(&slot, &server), None);
+}

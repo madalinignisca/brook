@@ -314,17 +314,15 @@ impl BrookClient {
                 Ok(resp) => resp,
                 Err(_) => return RestoreOutcome::Offline,
             };
-            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-                || resp.status().is_server_error()
-            {
-                return RestoreOutcome::Offline;
-            }
-            if !resp.status().is_success() {
+            if refused(resp.status()) {
                 // Refused: forget it, but only if it's still the stored one.
                 session
                     .clear_persisted_if_holds(gen, &stored.refresh_token)
                     .await;
                 return RestoreOutcome::NotSignedIn;
+            }
+            if !resp.status().is_success() {
+                return RestoreOutcome::Offline; // 429, 5xx, or not the api answering: kept
             }
             let Ok(pair) = resp.json::<TokenPair>().await else {
                 return RestoreOutcome::Offline;
@@ -924,6 +922,15 @@ async fn fetch_me(http: &reqwest::Client, base: &Url, access_token: &str) -> Res
     resp.json().await.map_err(|_| Error::UnexpectedResponse)
 }
 
+/// Whether `/auth/refresh` refused the token itself. The api answers only 200, 401
+/// (`auth.invalid_token`), 422 (a malformed body) or 429; any other 4xx comes from something in
+/// front of it (a misrouted proxy, a captive portal, a maintenance page) and says nothing about
+/// the token, so treating it as a refusal would sign the user out over a proxy hiccup.
+fn refused(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+}
+
 /// Periodically rotate the access token so a long-lived session keeps REST calls
 /// and the socket authorized. While there is no session it idles and polls.
 async fn refresh_loop(refresher: Refresher) {
@@ -1060,12 +1067,12 @@ pub(crate) async fn refresh_once(
         }
         return Ok(RefreshOutcome::RateLimited(wait));
     }
-    if resp.status().is_client_error() {
+    if refused(resp.status()) {
         session.clear_if_holds(&refresh_token).await;
         return Ok(RefreshOutcome::Rejected);
     }
     if !resp.status().is_success() {
-        // 5xx → transient. Body-free: the body of a failed refresh can echo the submitted
+        // 5xx, or a 4xx not from the api: transient. Body-free: the body of a failed refresh can echo the submitted
         // token, and this error is logged by the refresh loop.
         return Err(Error::Api {
             code: format!("http_{}", resp.status().as_u16()),
