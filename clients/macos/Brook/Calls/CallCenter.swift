@@ -16,6 +16,9 @@ final class CallCenter {
     private let auth: AuthorizationSource
     private let makeEngine: EngineFactory
     private var joinTask: Task<Void, Never>?
+    /// Bumped by `endAll` (sign-out): a join that finishes into an older generation is left at
+    /// once instead of becoming the live call.
+    private var generation = 0
 
     init(
         auth: AuthorizationSource = SystemAuthorization(),
@@ -37,7 +40,8 @@ final class CallCenter {
     /// handled from the start: core may already be publishing before join_call returns.
     func join(_ channel: FfiChannel, name: String, client: any FfiBrookClientProtocol) async {
         guard call == nil, joinTask == nil else { return }
-        let task = Task { await self.performJoin(channel, name: name, client: client) }
+        let mine = generation // when the join is accepted, not when its work starts
+        let task = Task { await self.performJoin(channel, name: name, client: client, generation: mine) }
         joinTask = task
         quit.leaveActiveCall = { [weak self] in await self?.shutdown() }
         await task.value
@@ -46,7 +50,7 @@ final class CallCenter {
     }
 
     private func performJoin(
-        _ channel: FfiChannel, name: String, client: any FfiBrookClientProtocol
+        _ channel: FfiChannel, name: String, client: any FfiBrookClientProtocol, generation mine: Int
     ) async {
         joining = true
         joinError = nil
@@ -58,17 +62,32 @@ final class CallCenter {
                 channelId: channel.id, engine: engine, publish: plan.publishes)
             engine.attach(handle)
             let model = CallModel(channelName: name, plan: plan, handle: handle, media: engine)
+            guard mine == generation else {
+                await model.leave() // signed out while joining: this call has no session
+                return
+            }
             await model.start()
+            guard mine == generation else {
+                await model.leave()
+                return
+            }
             call = model
         } catch {
             await engine.close()
-            joinError = "Couldn't join the call."
+            if mine == generation { joinError = "Couldn't join the call." }
         }
     }
 
     /// Quit: let a join in flight finish, then leave.
     private func shutdown() async {
         await joinTask?.value
+        await leave()
+    }
+
+    /// Signed out: a join still in flight is abandoned when it finishes, and a live call is left.
+    func endAll() async {
+        generation += 1
+        joinError = nil
         await leave()
     }
 

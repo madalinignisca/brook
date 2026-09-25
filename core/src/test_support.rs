@@ -62,11 +62,16 @@ struct ServerState {
     refresh_mode: RefreshMode,
     refresh_calls: u32,
     stall_login: bool,
+    /// Answer `/auth/login` with 401 `auth.invalid_credentials`.
+    login_fails: bool,
     password_mode: PasswordMode,
     /// Answer this many authenticated calls (password, users) with 401 first.
     expire_next: u32,
     /// Held after the server-side commit of a password call, before the response is sent.
     password_gate: Option<Arc<Semaphore>>,
+    /// Held after `/auth/refresh` or `/auth/login` issued a pair, before the response is sent.
+    refresh_gate: Option<Arc<Semaphore>>,
+    login_gate: Option<Arc<Semaphore>>,
     /// Held before a scripted 401 on the user list is sent (a response still in flight).
     expired_gate: Option<Arc<Semaphore>>,
     /// Every password/users request: (path, bearer token, JSON body).
@@ -93,10 +98,13 @@ impl TestServer {
             refresh_mode: RefreshMode::Rotate,
             refresh_calls: 0,
             stall_login: false,
+            login_fails: false,
             password_mode: PasswordMode::Ok,
             expire_next: 0,
             password_gate: None,
             expired_gate: None,
+            refresh_gate: None,
+            login_gate: None,
             requests: Vec::new(),
             sockets: tx,
         }));
@@ -105,6 +113,7 @@ impl TestServer {
             .route("/api/v1/auth/me", get(me))
             .route("/api/v1/auth/refresh", post(refresh))
             .route("/api/v1/auth/password", post(change_password))
+            .route("/api/v1/auth/logout", post(logout))
             .route("/api/v1/users", get(list_users))
             .route("/api/v1/users/{id}/password", post(reset_password))
             .route("/ws", get(ws_upgrade))
@@ -130,6 +139,51 @@ impl TestServer {
 
     pub fn refresh_calls(&self) -> u32 {
         self.state.lock().unwrap().refresh_calls
+    }
+
+    /// Hold `/auth/refresh` responses after the rotation until the gate gets a permit.
+    pub fn gate_refresh(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        self.state.lock().unwrap().refresh_gate = Some(gate.clone());
+        gate
+    }
+
+    /// Hold `/auth/login` responses after the pair is issued until the gate gets a permit.
+    pub fn gate_login(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        self.state.lock().unwrap().login_gate = Some(gate.clone());
+        gate
+    }
+
+    /// The live refresh tokens of `handle` (what a thief of the server's view could still use).
+    pub fn live_refresh_tokens(&self, handle: &str) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let mut live: Vec<String> = state
+            .refresh_tokens
+            .iter()
+            .filter(|(_, h)| *h == handle)
+            .map(|(t, _)| t.clone())
+            .collect();
+        live.sort();
+        live
+    }
+
+    /// Every `/auth/logout` request's refresh token, in order.
+    pub fn logouts(&self) -> Vec<String> {
+        self.requests()
+            .into_iter()
+            .filter(|(p, _, _)| p == "/auth/logout")
+            .map(|(_, _, body)| {
+                body["refresh_token"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    pub fn set_login_fails(&self, fails: bool) {
+        self.state.lock().unwrap().login_fails = fails;
     }
 
     pub fn set_stall_login(&self, stall: bool) {
@@ -263,7 +317,27 @@ async fn login(State(state): State<Shared>, Json(body): Json<Value>) -> Response
     if stall {
         std::future::pending::<()>().await;
     }
-    Json(issue(&mut state.lock().unwrap(), &handle)).into_response()
+    let (pair, gate) = {
+        let mut state = state.lock().unwrap();
+        if state.login_fails {
+            return error(401, "auth.invalid_credentials", "wrong password");
+        }
+        (issue(&mut state, &handle), state.login_gate.clone())
+    };
+    after_commit(gate).await;
+    Json(pair).into_response()
+}
+
+/// Revoke one refresh token (idempotent), as the server does.
+async fn logout(State(state): State<Shared>, Json(body): Json<Value>) -> Response {
+    let mut state = state.lock().unwrap();
+    state
+        .requests
+        .push(("/auth/logout".into(), String::new(), body.clone()));
+    if let Some(token) = body["refresh_token"].as_str() {
+        state.refresh_tokens.remove(token);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn change_password(
@@ -399,21 +473,32 @@ async fn refresh(State(state): State<Shared>, Json(body): Json<Value>) -> Respon
     if let RefreshMode::Stall = mode {
         std::future::pending::<()>().await;
     }
-    let mut state = state.lock().unwrap();
-    match mode {
-        RefreshMode::Stall => unreachable!(),
-        RefreshMode::Rotate => Json(issue(&mut state, "alice")).into_response(),
-        RefreshMode::Strict => {
-            let sent = body["refresh_token"].as_str().unwrap_or_default();
-            match state.refresh_tokens.remove(sent) {
-                Some(handle) => Json(issue(&mut state, &handle)).into_response(),
-                None => error(
-                    401,
-                    "auth.invalid_token",
-                    "refresh token revoked or unknown",
-                ),
+    let issued = {
+        let mut state = state.lock().unwrap();
+        let pair = match mode {
+            RefreshMode::Rotate => Some(issue(&mut state, "alice")),
+            RefreshMode::Strict => {
+                let sent = body["refresh_token"].as_str().unwrap_or_default();
+                state
+                    .refresh_tokens
+                    .remove(sent)
+                    .map(|handle| issue(&mut state, &handle))
             }
-        }
+            _ => None,
+        };
+        pair.map(|p| (p, state.refresh_gate.clone()))
+    };
+    if let Some((pair, gate)) = issued {
+        after_commit(gate).await; // rotated server-side; the response is still to come
+        return Json(pair).into_response();
+    }
+    match mode {
+        RefreshMode::Stall | RefreshMode::Rotate => unreachable!(),
+        RefreshMode::Strict => error(
+            401,
+            "auth.invalid_token",
+            "refresh token revoked or unknown",
+        ),
         RefreshMode::RateLimited(secs) => (
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", secs.to_string())],

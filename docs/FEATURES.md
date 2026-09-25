@@ -104,7 +104,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 
 | Feature | Status | Phase | Notes |
 |---|---|---|---|
-| Desktop OS notification | 🟡 | PN | code sends (GNOME gio / KDE notify-rust); GNOME Shell renders only with an installed+cached `.desktop` per app-id → **verify at packaging** (see JOURNAL) |
+| Desktop OS notification | 🟢 | PN | **verified rendering on native Plasma** (KDE notify-rust). GNOME gio path sends but GNOME Shell renders only with an installed+cached `.desktop` per app-id → **verify at packaging** (see JOURNAL) |
 | Tray icon w/ unread count | ⬜ | PN | KDE `KStatusNotifierItem`; GNOME via extension/portal |
 | Notification sound | ⬜ | PN | |
 | Mobile push (messages, mentions, call invites) | ⬜ | P7 | APNs/FCM, per [PROTOCOL.md](PROTOCOL.md) §3a |

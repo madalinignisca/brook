@@ -175,8 +175,10 @@ struct CallWindow: View {
         .background(WindowCloseControl(disabled: center.call != nil))
         // Dismissing goes through the close button, so it must be enabled first (the control
         // above updates in the same pass); dismiss on the next turn of the run loop.
-        .onChange(of: center.call == nil) { _, gone in
-            if gone {
+        // Closes once there is neither a call nor a join in flight: after leaving, after a failed
+        // join, and after a sign-out that abandoned a join (the call never became non-nil).
+        .onChange(of: center.call != nil || center.joining) { _, active in
+            if !active {
                 picker?.cancel()  // a picker left open would keep its observer registered
                 DispatchQueue.main.async { dismissWindow(id: "call") }
             }
