@@ -19,12 +19,13 @@ const ME: &str = "me";
 struct Server {
     pages: Mutex<Vec<Value>>,
     calls: AtomicUsize,
+    since: Mutex<Vec<String>>,
     gate: Option<Arc<Notify>>,
 }
 
 #[async_trait::async_trait]
 impl Fetch for Server {
-    async fn page(&self, _since: &str) -> Result<Page, crate::Error> {
+    async fn page(&self, since: &str) -> Result<Page, crate::Error> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(g) = &self.gate {
             g.notified().await;
@@ -35,6 +36,10 @@ impl Fetch for Server {
         } else {
             pages[0].clone()
         };
+        self.since.lock().unwrap().push(since.to_string());
+        if p == json!("RESET") {
+            return Ok(Page::Reset); // `410 sync.reset`
+        }
         Ok(Page::Rows(p))
     }
 }
@@ -112,6 +117,7 @@ fn setup(pages: Vec<Value>, hist: Hist, gate: Option<Arc<Notify>>) -> Setup {
     let server = Arc::new(Server {
         pages: Mutex::new(pages),
         calls: AtomicUsize::new(0),
+        since: Mutex::new(vec![]),
         gate,
     });
     let cache = Cache::new(db, ME.into(), server.clone(), Arc::new(hist));
@@ -886,4 +892,114 @@ mod post_http {
             Err(SendFailure::Transient { .. })
         ));
     }
+}
+
+/// A closed cache takes no more syncs, and its store can be reset right after.
+#[tokio::test]
+async fn a_closed_cache_releases_its_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let keys = KeyStore::new(slot.clone() as Arc<dyn KeySlot>);
+    let db = match store::open(dir.path(), Kind::Cache, "s", &keys).unwrap() {
+        Opened::Ready { db, .. } => db,
+        other => panic!("{other:?}"),
+    };
+    let server = Arc::new(Server {
+        pages: Mutex::new(vec![page(9, None, vec![], vec![])]),
+        calls: AtomicUsize::new(0),
+        since: Mutex::new(vec![]),
+        gate: None,
+    });
+    let cache = Cache::new(db, ME.into(), server.clone(), Arc::new(no_history()));
+    cache.schedule_sync(); // pending when the close comes
+    cache.close().await;
+    tokio::time::sleep(crate::cache::HINT_DEBOUNCE * 2).await;
+    assert_eq!(server.calls.load(Ordering::SeqCst), 0, "synced after close");
+    assert!(
+        store::reset(dir.path(), Kind::Cache, "s", &keys).is_ok(),
+        "still open"
+    );
+}
+
+/// `410 sync.reset`: the synced rows go, the cursor starts over, and a sync from 0 refills
+/// the cache with what the server has now.
+#[tokio::test]
+async fn a_reset_clears_the_rows_and_syncs_from_zero() {
+    let s = setup(
+        vec![
+            page(5, None, vec![msg("m1", "c", 4, "bob", "before")], vec![]),
+            json!("RESET"),
+            page(7, None, vec![msg("m2", "c", 6, "bob", "after")], vec![]),
+        ],
+        no_history(),
+        None,
+    );
+    s.cache.sync_now().await.unwrap();
+    let mut events = s.cache.events();
+    s.cache.sync_now().await.unwrap();
+    assert_eq!(
+        *s.server.since.lock().unwrap(),
+        vec!["0", "5", "0"],
+        "no sync from 0 after the reset"
+    );
+    let bodies: Vec<Value> = s
+        .cache
+        .cached_messages("c", None, 10)
+        .await
+        .unwrap()
+        .messages
+        .iter()
+        .map(|m| m["body"].clone())
+        .collect();
+    assert_eq!(
+        bodies,
+        vec![json!("after")],
+        "a row from before the reset stayed"
+    );
+    let mut got = vec![];
+    while let Ok(e) = events.try_recv() {
+        got.push(e);
+    }
+    assert!(got.contains(&CacheEvent::Reset), "{got:?}");
+}
+
+/// A history page asked for before a reset doesn't land after it (the channel is back by
+/// then, so only the generation tells).
+#[tokio::test]
+async fn a_history_page_from_before_a_reset_is_dropped() {
+    let gate = Arc::new(Notify::new());
+    let s = setup(
+        vec![
+            page(5, None, vec![], vec![]),
+            json!("RESET"),
+            page(7, None, vec![], vec![]),
+        ],
+        Hist {
+            ids: vec!["m9"],
+            gate: Some(gate.clone()),
+        },
+        None,
+    );
+    s.cache.sync_now().await.unwrap();
+    let load = tokio::spawn({
+        let cache = s.cache.clone();
+        async move { cache.load_head("c", 10).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await; // the load read the generation
+    s.cache.sync_now().await.unwrap();
+    gate.notify_one();
+    load.await.unwrap().unwrap();
+    let page = s.cache.cached_messages("c", None, 10).await.unwrap();
+    assert!(page.messages.is_empty(), "{:?}", page.messages);
+}
+
+/// A server that answers 410 to `since=0` as well gets no second round (no loop).
+#[tokio::test]
+async fn a_reset_at_zero_does_not_loop() {
+    let s = setup(vec![json!("RESET")], no_history(), None);
+    tokio::time::timeout(Duration::from_secs(5), s.cache.sync_now())
+        .await
+        .expect("looped on the reset")
+        .unwrap();
+    assert_eq!(s.server.calls.load(Ordering::SeqCst), 1);
 }

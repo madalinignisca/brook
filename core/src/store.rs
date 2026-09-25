@@ -60,7 +60,8 @@ impl Kind {
     fn format(self) -> i64 {
         match self {
             Kind::Cache => 2, // 2: `removed.active` (the removal floor)
-            Kind::Outbox | Kind::Index => 1,
+            Kind::Index => 2, // 2: `stores.doomed` (a wipe whose keys aren't gone yet)
+            Kind::Outbox => 1,
         }
     }
 
@@ -109,6 +110,7 @@ CREATE TABLE outbox_files(client_id TEXT NOT NULL, file_client_id TEXT NOT NULL 
 const INDEX_V1: &str = "
 CREATE TABLE meta(id INTEGER PRIMARY KEY CHECK (id = 1), format INTEGER NOT NULL);
 CREATE TABLE stores(origin TEXT NOT NULL, user_id TEXT NOT NULL, store_id TEXT NOT NULL UNIQUE,
+                    doomed INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (origin, user_id));
 ";
 
@@ -466,8 +468,10 @@ type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 
 /// An open store: its connection on its own thread.
 pub(crate) struct Db {
-    jobs: Option<mpsc::Sender<Job>>,
-    stopped: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Taken (dropped) by `close`: the thread ends after the jobs already queued.
+    jobs: std::sync::Mutex<Option<mpsc::Sender<Job>>>,
+    /// Held across the wait by whoever closes first; a second `close` waits for the first.
+    stopped: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl Db {
@@ -493,8 +497,8 @@ impl Db {
             })
             .map_err(|_| StoreError::Io)?;
         Ok(Self {
-            jobs: Some(jobs),
-            stopped: Some(stopped),
+            jobs: std::sync::Mutex::new(Some(jobs)),
+            stopped: tokio::sync::Mutex::new(Some(stopped)),
         })
     }
 
@@ -509,6 +513,8 @@ impl Db {
             let _ = tx.send(f(conn).map_err(|_| StoreError::Sql));
         });
         self.jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .ok_or(StoreError::Closed)?
             .send(job)
@@ -517,10 +523,19 @@ impl Db {
     }
 
     /// Stop the thread after the jobs already queued, and wait until the database is closed.
-    pub(crate) async fn close(mut self) {
-        self.jobs = None;
-        if let Some(stopped) = self.stopped.take() {
-            let _ = stopped.await;
+    /// Through any handle: whoever still holds one gets `Closed` from then on, so nothing
+    /// is written after this returns (the guarantee a wipe relies on).
+    pub(crate) async fn close(&self) {
+        self.jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // Awaited in place and cleared only once it fired: a close that is cancelled
+        // mid-wait leaves the receiver for the next close to wait on.
+        let mut stopped = self.stopped.lock().await;
+        if let Some(rx) = stopped.as_mut() {
+            let _ = rx.await;
+            *stopped = None;
         }
     }
 }
@@ -581,8 +596,9 @@ pub(crate) async fn store_id(
         .await
 }
 
-/// Whether persistence may put a store on disk at all (plan: one switch, off until C5
-/// lands). Every store-opening path asks this first.
+/// Whether local data may be put on disk at all (plan: one switch, off until wipes landed;
+/// they did, with C5). Every store-opening path asks this first. It only takes effect where
+/// an app calls `enable_local_data` with a durable key store.
 pub(crate) fn stores_enabled() -> bool {
-    false
+    true
 }

@@ -698,7 +698,7 @@ async fn a_closed_outbox_takes_nothing() {
         extra.enqueue("c1", "after", None).await,
         Err(OutboxError::Closed)
     );
-    assert_eq!(extra.retry("x").await, Ok(()));
+    assert_eq!(extra.retry("x").await, Err(OutboxError::Closed));
 }
 
 /// A 401 is transient: it's retried (the refresh loop renews the token meanwhile).
@@ -825,4 +825,24 @@ async fn retry_after_zero_waits_at_least_a_second() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let n = s.server.sends().len();
     assert!(n <= 2, "re-sent {n} times in 1.5 s");
+}
+
+/// The session's source is gone (the client was dropped): the sender stops, even though the
+/// channel's last value still says "signed in".
+#[tokio::test]
+async fn a_dropped_session_source_stops_the_sender() {
+    let s = setup().await;
+    s.server.script([Answer::Fail(SendFailure::Transient {
+        retry_after: Some(1),
+    })]);
+    s.outbox.enqueue("c1", "orphan", None).await.unwrap();
+    let server = s.server.clone();
+    eventually("the first attempt", move || server.sends().len() == 1).await;
+    drop(s.session); // last value: Some(1)
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        s.server.sends().len(),
+        1,
+        "sent after its session source was gone"
+    );
 }

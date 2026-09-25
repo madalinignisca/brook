@@ -11,13 +11,10 @@
 mod account;
 #[cfg(test)]
 mod account_tests;
-#[allow(dead_code)] // wired up by the sync loop (C2) and the read API (C3)
 mod apply;
 #[cfg(test)]
 mod apply_tests;
-#[allow(dead_code)] // wired into the client once stores turn on (C5)
 mod cache;
-#[allow(dead_code)]
 mod cache_http;
 #[cfg(test)]
 mod cache_tests;
@@ -27,16 +24,21 @@ mod call_tests;
 mod call_types;
 mod chat;
 mod client;
+mod client_offline;
 mod config;
-#[allow(dead_code)] // read by cached_messages (C3)
 mod coverage;
 #[cfg(test)]
 mod coverage_tests;
 mod error;
 mod keyslot;
+mod local;
+#[cfg(test)]
+mod local_tests;
 #[cfg(test)]
 mod log_secrecy_tests;
-#[allow(dead_code)] // wired into the client once stores turn on (C5)
+mod offline;
+#[cfg(test)]
+mod offline_tests;
 mod outbox;
 #[cfg(test)]
 mod outbox_tests;
@@ -48,11 +50,9 @@ mod session_store;
 #[cfg(test)]
 mod signout_tests;
 mod state;
-#[allow(dead_code)] // wired up by C2-C5; C1 lands the layer and its tests
 mod store;
 #[cfg(test)]
 mod store_tests;
-#[allow(dead_code)] // wired into the client with the read API (C3)
 mod sync;
 #[cfg(test)]
 mod sync_tests;
@@ -65,6 +65,7 @@ mod transfer;
 mod ws;
 
 pub use account::{Me, SecondFactor, TotpEnrollment, UserSummary};
+pub use cache::{CacheEvent, CacheState};
 pub use call::CallHandle;
 pub use call_types::{
     default_labels, CallState, CallStatus, EndReason, EngineError, IceCandidate, IceServer,
@@ -73,9 +74,11 @@ pub use call_types::{
 };
 pub use chat::{Channel, ChannelMember, Message, ReactionSummary, ReplyExcerpt};
 pub use client::{BrookClient, LoginOutcome, RestoreOutcome, TotpChallenge};
+pub use client_offline::CachedMessages;
 pub use config::CoreConfig;
 pub use error::{Error, Result};
 pub use keyslot::{InMemoryKeySlot, KeySlot, KeySlotError, KeyStore};
+pub use outbox::{Deleted, PendingMessage, PendingState};
 pub use session::{Session, User};
 pub use state::AuthState;
 pub use transfer::{

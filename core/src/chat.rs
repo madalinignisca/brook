@@ -71,7 +71,8 @@ pub struct Message {
     pub id: String,
     /// The channel this belongs to.
     pub channel_id: String,
-    /// Author user id.
+    /// Author user id (empty on a tombstone core made from a live delete).
+    #[serde(default)]
     pub author_id: String,
     /// Author handle (absent for bots / deleted users).
     pub author_handle: Option<String>,
@@ -79,7 +80,8 @@ pub struct Message {
     pub author_display_name: Option<String>,
     /// Message text.
     pub body: String,
-    /// ISO-8601 creation timestamp.
+    /// ISO-8601 creation timestamp (empty on a tombstone core made from a live delete).
+    #[serde(default)]
     pub created_at: String,
     /// ISO-8601 last-edit timestamp, if the message was edited.
     #[serde(default)]
@@ -102,6 +104,23 @@ pub struct Message {
     /// Attached files (none on a tombstone). Save under `filename`; show `original_name`.
     #[serde(default)]
     pub attachments: Vec<crate::FileInfo>,
+    /// The sender's outbox id, echoed by the server: a UI drops its pending bubble once the
+    /// message with this `client_id` is in the cache.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Set on a tombstone (the body is then empty).
+    #[serde(default)]
+    pub deleted_at: Option<String>,
+    /// A tombstone core made from a live delete, before the server's own arrives.
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+impl Message {
+    /// Deleted: show a tombstone, not the (empty) body.
+    pub fn is_deleted(&self) -> bool {
+        self.deleted || self.deleted_at.is_some()
+    }
 }
 
 /// An emoji's reaction tally on a message, plus whether the caller reacted.

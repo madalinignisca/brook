@@ -36,6 +36,12 @@ pub enum CacheEvent {
     Users(Vec<String>),
     /// The server reset the sync (`410`): the cache is being rebuilt.
     Reset,
+    /// A channel's unsent messages changed (queued, sending, sent, failed, removed): re-read
+    /// `pending_messages`.
+    Outbox(String),
+    /// The outbox couldn't be kept (its key was lost, or its format changed): unsent
+    /// messages on this device were lost. Say so once.
+    OutboxLost,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -90,6 +96,9 @@ pub(crate) struct Cache {
     /// Asked for while a run was going: that run may have fetched past the change, so it
     /// goes round once more.
     again: std::sync::atomic::AtomicBool,
+    /// Closing: no new syncs, and the debounced ones are aborted.
+    closed: std::sync::atomic::AtomicBool,
+    scheduled_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Cache {
@@ -111,6 +120,8 @@ impl Cache {
             running: Mutex::new(()),
             scheduled: std::sync::atomic::AtomicBool::new(false),
             again: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            scheduled_tasks: std::sync::Mutex::default(),
         })
     }
 
@@ -160,6 +171,9 @@ impl Cache {
     /// once more instead (it may already have fetched past the change that asked).
     pub(crate) async fn sync_now(&self) -> Result<(), SyncError> {
         use std::sync::atomic::Ordering;
+        if self.closed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         // The request is recorded before trying the lock: either the owner sees it (it
         // checks after every run and again after letting go), or the lock is free and this
         // caller runs it. No moment exists where neither happens.
@@ -216,26 +230,84 @@ impl Cache {
         match result {
             Ok(Synced::Done(_)) => Ok(()),
             Ok(Synced::Reset) => {
-                // The rebuild itself is C5's (it needs the store wipe); say so meanwhile.
+                // The server's history no longer matches ours: drop every synced row, then
+                // sync from 0. A server that answers 410 to `since=0` too gets no second
+                // round here (the next scheduled sync tries again).
+                let was = self.reset_rows().await.map_err(SyncError::Store)?;
                 let _ = self.events.send(CacheEvent::Reset);
+                if was != "0" {
+                    self.again.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 Ok(())
             }
             Err(e) => Err(e),
         }
     }
 
+    /// Empty the synced tables and start the cursor over, in one transaction; bumps the
+    /// generation so a history page requested before this can't land after it. Returns the
+    /// cursor it replaced. (`files` and `deletions` are left alone: nothing writes them yet.
+    /// The file cache, when it lands, must drop the old server's file rows here too, and
+    /// journal their blobs in `deletions` rather than orphan them.)
+    async fn reset_rows(&self) -> Result<String, StoreError> {
+        self.db
+            .call(|c| {
+                let tx = c.transaction()?;
+                let was: String =
+                    tx.query_row("SELECT cursor FROM meta WHERE id = 1", [], |r| r.get(0))?;
+                tx.execute_batch(
+                    "DELETE FROM channels; DELETE FROM removed; DELETE FROM memberships;
+                     DELETE FROM users; DELETE FROM messages; DELETE FROM coverage;
+                     UPDATE meta SET cursor = '0', generation = generation + 1 WHERE id = 1;",
+                )?;
+                tx.commit()?;
+                Ok(was)
+            })
+            .await
+    }
+
     /// Ask for a sync in `HINT_DEBOUNCE`; asks meanwhile join it.
     pub(crate) fn schedule_sync(self: &Arc<Self>) {
         use std::sync::atomic::Ordering;
-        if self.scheduled.swap(true, Ordering::SeqCst) {
+        if self.closed.load(Ordering::SeqCst) || self.scheduled.swap(true, Ordering::SeqCst) {
             return;
         }
         let me = Arc::clone(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             tokio::time::sleep(HINT_DEBOUNCE).await;
             me.scheduled.store(false, Ordering::SeqCst);
             let _ = me.sync_now().await;
         });
+        let mut tasks = self
+            .scheduled_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task);
+    }
+
+    /// Stop syncing and close the store, for a wipe or shutdown: debounced syncs are aborted,
+    /// a run in progress is waited for (its page commits whole or not at all), then the
+    /// database closes. Afterwards the store may be reset.
+    pub(crate) async fn close(self: Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        self.closed.store(true, Ordering::SeqCst);
+        let tasks: Vec<_> = std::mem::take(
+            &mut *self
+                .scheduled_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for t in &tasks {
+            t.abort();
+        }
+        for t in tasks {
+            let _ = t.await;
+        }
+        drop(self.running.lock().await); // a run in progress finishes first
+                                         // Closed through this handle, whoever else holds one: a history load or read still
+                                         // in flight gets `Closed`, and nothing reaches the file after this returns.
+        self.db.close().await;
     }
 
     /// `sync.hint {seq}`: nothing to do if the cache is already there.
@@ -439,11 +511,11 @@ impl Cache {
         // The channel's removal floor as of now: a removal while this request is out makes
         // its answer stale, and `apply` drops it (`Batch::history_floors`).
         let id = channel_id.to_string();
-        let floor = self
+        let (floor, asked_at) = self
             .db
             .call(move |c| {
                 let tx = c.transaction()?;
-                floor_at(&tx, &id)
+                Ok((floor_at(&tx, &id)?, generation(&tx)?))
             })
             .await
             .map_err(|_| crate::Error::UnexpectedResponse)?;
@@ -461,6 +533,9 @@ impl Cache {
             .db
             .call(move |c| {
                 let tx = c.transaction()?;
+                if generation(&tx)? != asked_at {
+                    return Ok(Applied::default()); // the cache was reset meanwhile: stale
+                }
                 // Coverage only from a page that could land: no removal since the request
                 // started, and the channel is here (history for a channel not yet synced
                 // is dropped by `apply`, so it proves nothing).
@@ -504,4 +579,8 @@ impl Cache {
         self.notify(applied);
         Ok(())
     }
+}
+
+fn generation(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<i64> {
+    tx.query_row("SELECT generation FROM meta WHERE id = 1", [], |r| r.get(0))
 }
