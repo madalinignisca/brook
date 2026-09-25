@@ -209,3 +209,22 @@ async def test_one_pending_token_completes_one_login(
         await holder.rollback()
     codes = sorted([(await with_code).status_code, (await with_recovery).status_code])
     assert codes == [200, 403]
+
+
+async def test_concurrent_resends_store_one_message(client: httpx.AsyncClient) -> None:
+    """Two concurrent sends with one client_id (an outbox retry racing the original):
+    one row; both answers carry its id (sync spec §4)."""
+    user_id, pair = await _alice(client)
+    h = {"Authorization": f"Bearer {pair['access_token']}"}
+    ch = (
+        await client.post("/api/v1/channels", json={"kind": "channel", "name": "g"}, headers=h)
+    ).json()
+    body = {"body": "once", "client_id": str(uuid.uuid4())}
+    url = f"/api/v1/channels/{ch['id']}/messages"
+    first, second = await asyncio.gather(
+        client.post(url, json=body, headers=h), client.post(url, json=body, headers=h)
+    )
+    assert sorted([first.status_code, second.status_code]) == [200, 201]
+    assert first.json()["id"] == second.json()["id"]
+    history = (await client.get(url, headers=h)).json()
+    assert [m["body"] for m in history] == ["once"]
