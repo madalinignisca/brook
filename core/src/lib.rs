@@ -11,6 +11,10 @@
 mod account;
 #[cfg(test)]
 mod account_tests;
+#[allow(dead_code)] // wired up by the sync loop (C2) and the read API (C3)
+mod apply;
+#[cfg(test)]
+mod apply_tests;
 mod call;
 #[cfg(test)]
 mod call_tests;
