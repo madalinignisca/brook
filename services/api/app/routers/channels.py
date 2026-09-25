@@ -517,7 +517,8 @@ async def send_message(
     if channel.archived_at is not None:
         raise _forbidden("This channel is archived")
     # After the membership and archive checks: a resend gets exactly the answer a
-    # fresh send would, so a removed member's replay is a 403, not their stored copy.
+    # fresh send would, so a removed member's replay is a 404 (non-members never learn
+    # the channel exists) and one into an archived channel a 403, not the stored copy.
     if body.client_id is not None:
         stored = await _stored_send(session, user, body.client_id)
         if stored is not None:
