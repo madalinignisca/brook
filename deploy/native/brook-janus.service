@@ -1,0 +1,48 @@
+# Brook SFU (Janus, VideoRoom only), native deployment. See deploy/native/README.md.
+#
+# Flags mirror services/sfu/entrypoint.sh. Deployment values come from
+# /etc/brook/janus.env because Janus .jcfg files cannot read the environment.
+#
+# Network exposure: the Janus API (WebSocket 8188) is bound to 127.0.0.1 by
+# /opt/janus/etc/janus/janus.transport.websockets.jcfg — only the api talks to it.
+# Media (UDP JANUS_RTP_PORTS) is public on purpose: phones send SRTP straight here.
+[Unit]
+Description=Brook SFU (Janus)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=janus
+Group=janus
+EnvironmentFile=/etc/brook/janus.env
+# --nat-1-1: OCI gives the VM a private address and 1:1-NATs the reserved public
+#   one, so Janus must advertise the public address in its candidates.
+# --ice-lite: a directly reachable SFU never needs to probe (see entrypoint.sh).
+ExecStart=/opt/janus/bin/janus \
+    --configs-folder=/opt/janus/etc/janus \
+    --apisecret=${JANUS_API_SECRET} \
+    --nat-1-1=${JANUS_PUBLIC_IP} \
+    --ice-lite \
+    --rtp-port-range=${JANUS_RTP_PORTS}
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+# AF_NETLINK: libnice enumerates local interfaces over netlink to gather candidates.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

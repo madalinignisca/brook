@@ -1,0 +1,17 @@
+# Brook gateway, native deployment. install.sh substitutes BROOK_DOMAIN.
+#
+# Caddy gets the certificate via Let's Encrypt HTTP-01 (TCP 80 must be reachable)
+# and serves HTTP/1.1, HTTP/2 and HTTP/3 (UDP 443). It proxies REST and the /ws
+# WebSocket to the api on loopback.
+{
+	# ACME account contact: expiry and incident notices from Let's Encrypt.
+	email hi@madalin.me
+}
+
+BROOK_DOMAIN {
+	encode gzip
+	# The dev call harness is off in production (BROOK_DEV_HARNESS unset); refuse
+	# the path at the edge too so a config slip cannot expose it.
+	respond /dev/* 404
+	reverse_proxy 127.0.0.1:8000
+}
