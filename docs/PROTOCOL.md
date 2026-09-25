@@ -40,6 +40,24 @@
 | `POST /channels/{id}/bots` · `DELETE /channels/{id}/bots/{bot}` | add / remove bot from channel |
 | `POST /bots/{id}/webhook` | **inbound** webhook: external posts as bot (HMAC-signed) |
 
+### 1.0 Refresh tokens
+
+- `POST /auth/refresh` **rotates**: the presented token is retired and a new pair
+  comes back. Save the new refresh token before using it; the old one is done.
+- Each login starts a **family** (that device's chain of rotations). Presenting an
+  already-rotated token again is treated as **theft** and revokes that family only:
+  that device must sign in again, the user's other devices are untouched. Access
+  tokens already issued in the family live out their 15 minutes.
+- **Crash grace:** within **30 s** of a rotation, the rotated token is accepted once
+  more *if its successor was never used*. This covers a client that died after the
+  server rotated but before it saved the new token: on relaunch it replays the old
+  one and gets a fresh pair (the lost successor is retired). A second replay, a
+  replay after the successor was used, or one after 30 s is theft as above.
+- A token revoked by logout, sign-out or a password change is simply refused
+  (401 `auth.invalid_token`); only rotation reuse ends a family.
+- Two refreshes racing with the same token (two tabs): one wins, the other gets
+  401 without counting as a failed attempt; a client should share one refresh.
+
 ### 1.1 Password changes and sessions
 
 - `POST /auth/password {current_password, new_password, sign_out_other_devices?}`

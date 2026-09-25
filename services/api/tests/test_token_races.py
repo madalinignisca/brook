@@ -153,15 +153,18 @@ async def test_lost_refresh_race_is_not_a_failure(client: httpx.AsyncClient) -> 
         await asyncio.sleep(SETTLE)
         assert not tab1.done() and not tab2.done()
         await holder.rollback()
-    codes = sorted([(await tab1).status_code, (await tab2).status_code])
-    assert codes == [200, 401]
+    r1, r2 = await tab1, await tab2
+    assert sorted([r1.status_code, r2.status_code]) == [200, 401]
+    winner = (r1 if r1.status_code == 200 else r2).json()["refresh_token"]
 
     # Not counted: the IP can still fail backoff_after - 1 times without a 429.
     # Had the lost race counted, the last of these would already be throttled.
     for _ in range(lim.config.backoff_after - 1):
         r = await client.post(f"{AUTH}/login", json={"handle": "alice", "password": "nope-x"})
         assert r.status_code == 401
-    # And a genuinely reused (already revoked) token still is a failure.
+    # And a genuinely reused token still is a failure. Its successor is used first:
+    # an unused one within the grace window is a crash replay (test_refresh_reuse.py).
+    assert (await client.post(f"{AUTH}/refresh", json={"refresh_token": winner})).status_code == 200
     reuse = await client.post(f"{AUTH}/refresh", json=body)
     assert reuse.status_code == 401
     throttled = await client.post(f"{AUTH}/login", json={"handle": "alice", "password": "nope-x"})

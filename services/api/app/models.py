@@ -116,6 +116,14 @@ class RefreshToken(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # One login's chain of rotations (one device). Reuse of a rotated token revokes
+    # this family only, never the user's other devices (routers/auth.py `_rotate`).
+    family_id: Mapped[uuid.UUID] = mapped_column(default=uuid.uuid4, index=True)
+    # Set when rotated (as opposed to revoked by logout or sign-out): only a rotated
+    # token presented again is evidence of theft, or of a client that crashed before
+    # saving its successor.
+    rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    replaced_by_id: Mapped[uuid.UUID | None] = mapped_column(default=None)
 
 
 class Channel(Base):

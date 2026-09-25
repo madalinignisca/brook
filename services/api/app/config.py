@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     # production host, with the git server), and attachments must never fill it.
     files_min_free_bytes: int = 5 * 1024 * 1024 * 1024
     refresh_ttl_seconds: int = 7 * 24 * 3600
+    # A rotated refresh token presented again within this window is accepted once, if
+    # its successor was never used: the client crashed after our rotation but before
+    # saving the new token. Later, or with the successor used, it's theft (_rotate).
+    refresh_reuse_grace_seconds: int = 30
 
     # Calls (Phase 4). Unset URL = no SFU configured: call commands answer
     # `sfu_unavailable`, everything else works.

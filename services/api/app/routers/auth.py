@@ -6,7 +6,7 @@ OIDC and LDAP (docs/AUTH.md) arrive in Phase 0b; this is the local-account path.
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
@@ -82,12 +82,24 @@ async def lock_user(session: AsyncSession, user_id: uuid.UUID) -> User | None:
     return user
 
 
-async def _issue_tokens(session: AsyncSession, settings: Settings, user: User) -> TokenPair:
-    """Create an access token and a persisted refresh token for ``user``."""
+async def _issue_tokens(
+    session: AsyncSession,
+    settings: Settings,
+    user: User,
+    *,
+    token_id: uuid.UUID | None = None,
+    family_id: uuid.UUID | None = None,
+) -> TokenPair:
+    """Create an access token and a persisted refresh token for ``user``.
+
+    A new login starts a new family; a rotation passes its family (and the id it
+    already recorded as the old token's ``replaced_by_id``)."""
     access = create_access_token(settings, user.id, user.global_role)
     raw, token_hash = new_refresh_token()
     session.add(
         RefreshToken(
+            id=token_id or uuid.uuid4(),
+            family_id=family_id or uuid.uuid4(),
             user_id=user.id,
             token_hash=token_hash,
             expires_at=utcnow() + timedelta(seconds=settings.refresh_ttl_seconds),
@@ -235,31 +247,67 @@ async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) ->
     if user is None or user.status != "active":
         raise bad
     # Read before the UPDATE: the ORM UPDATE's synchronize_session sets
-    # token.revoked=True in memory even when it matched no row.
+    # token.revoked=True (and rotated_at, replaced_by_id) in memory even when it
+    # matched no row.
     was_revoked = bool(token.revoked)
+    rotated_at = token.rotated_at
+    replaced_by = token.replaced_by_id
+    now = utcnow()
+    successor = uuid.uuid4()
     # Compare-and-set: only the first concurrent rotation flips revoked→true, so
     # two simultaneous /refresh calls can't both mint a new token (TOCTOU-safe).
+    if await _cas_rotate(session, token.id, successor, now):
+        return await _issue_tokens(
+            session, settings, user, token_id=successor, family_id=token.family_id
+        )
+    if not was_revoked:
+        # It was unrevoked when read: a concurrent rotation won (two tabs).
+        raise _LostRotationRace(status_code=bad.status_code, detail=bad.detail)
+    if rotated_at is None:
+        # Revoked by logout, sign-out or a password change, not rotated: no chain was
+        # continued with it, so it's no evidence of theft. Just refused.
+        raise bad
+    # A rotated token, presented again. Either a client died between our rotation and
+    # saving the new token (it replays the old one on relaunch), or someone else holds
+    # a copy. Grace: soon after the rotation, while the successor is still unused,
+    # hand out a fresh one in its place; the successor is retired (CAS again, so two
+    # replays can't both win).
+    grace = timedelta(seconds=settings.refresh_reuse_grace_seconds)
+    if (
+        replaced_by is not None
+        and now - ensure_utc(rotated_at) <= grace
+        and await _cas_rotate(session, replaced_by, successor, now)
+    ):
+        return await _issue_tokens(
+            session, settings, user, token_id=successor, family_id=token.family_id
+        )
+    # Theft, as far as we can tell: end this login's whole chain, whoever holds it.
+    # Only this family: the user's other devices are not implicated, and revoking
+    # them would sign the user out everywhere on every such event. Access tokens
+    # already minted in the family live out their TTL (15 min, stateless JWTs).
+    await session.execute(
+        update(RefreshToken)
+        .where(RefreshToken.family_id == token.family_id, RefreshToken.revoked.is_(False))
+        .values(revoked=True)
+    )
+    record_event(session, user.id, "refresh_token_reuse")
+    await session.commit()  # the revoke must outlive the 401
+    raise bad
+
+
+async def _cas_rotate(
+    session: AsyncSession, token_id: uuid.UUID, successor: uuid.UUID, now: datetime
+) -> bool:
+    """Retire a live token as rotated into ``successor``; False if it wasn't live."""
     result = cast(
         "CursorResult[Any]",
         await session.execute(
             update(RefreshToken)
-            .where(RefreshToken.id == token.id, RefreshToken.revoked.is_(False))
-            .values(revoked=True)
+            .where(RefreshToken.id == token_id, RefreshToken.revoked.is_(False))
+            .values(revoked=True, rotated_at=now, replaced_by_id=successor)
         ),
     )
-    if result.rowcount != 1 and not was_revoked:
-        # It was unrevoked when read: a concurrent rotation won (two tabs).
-        raise _LostRotationRace(status_code=bad.status_code, detail=bad.detail)
-    if result.rowcount != 1:
-        # Already rotated/revoked, or token reuse.
-        # TODO(Phase 0b): treat reuse of a revoked token as theft → revoke the family.
-        # Scope that to THIS token's own login lineage (one device's chain of
-        # rotations), never the user's other sessions: a client that dies between our
-        # rotation and its keychain write replays a stale token on next launch, and a
-        # user-wide revoke would then sign the user out everywhere on every such crash.
-        # (Needs a family id on refresh_tokens; brook-ios stay-signed-in plan, #58.)
-        raise bad
-    return await _issue_tokens(session, settings, user)
+    return result.rowcount == 1
 
 
 async def sign_out_everywhere(session: AsyncSession, user: User) -> int:

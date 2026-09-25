@@ -1,0 +1,129 @@
+"""Refresh-token reuse: families and the crash grace (routers/auth.py `_rotate`).
+
+A rotated token presented again is either a client that crashed after our rotation
+but before saving its successor, or a copy in someone else's hands. Within the grace
+window, while the successor is unused, it's the crash: the device stays signed in.
+Otherwise it's theft: that login's whole chain is revoked, and nothing else.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+
+import httpx
+from sqlalchemy import func, select, update
+
+from app import db
+from app.models import AuthEvent, RefreshToken, utcnow
+from app.security import hash_token
+
+AUTH = "/api/v1/auth"
+PW = "supersecret"
+
+
+async def _login(client: httpx.AsyncClient) -> str:
+    r = await client.post(f"{AUTH}/login", json={"handle": "alice", "password": PW})
+    assert r.status_code == 200, r.text
+    return str(r.json()["refresh_token"])
+
+
+async def _alice(client: httpx.AsyncClient) -> None:
+    body = {"handle": "alice", "display_name": "Alice", "password": PW}
+    assert (await client.post(f"{AUTH}/register", json=body)).status_code == 201
+
+
+async def _refresh(client: httpx.AsyncClient, token: str) -> httpx.Response:
+    return await client.post(f"{AUTH}/refresh", json={"refresh_token": token})
+
+
+async def _reuse_events() -> int:
+    async with db.get_sessionmaker()() as s:
+        n = await s.scalar(
+            select(func.count())
+            .select_from(AuthEvent)
+            .where(AuthEvent.kind == "refresh_token_reuse")
+        )
+        return int(n or 0)
+
+
+async def test_a_crash_replay_within_grace_keeps_the_device_signed_in(
+    client: httpx.AsyncClient,
+) -> None:
+    await _alice(client)
+    t = await _login(client)
+    assert (await _refresh(client, t)).status_code == 200  # S minted, never saved
+    again = await _refresh(client, t)  # relaunch replays T
+    assert again.status_code == 200
+    u = again.json()["refresh_token"]
+    assert (await _refresh(client, u)).status_code == 200  # and the chain goes on
+    assert await _reuse_events() == 0
+
+
+async def test_reuse_after_the_successor_was_used_revokes_that_family_only(
+    client: httpx.AsyncClient,
+) -> None:
+    await _alice(client)
+    other_device = await _login(client)
+    t = await _login(client)
+    s = (await _refresh(client, t)).json()["refresh_token"]
+    v = (await _refresh(client, s)).json()["refresh_token"]  # the chain moved on
+
+    assert (await _refresh(client, t)).status_code == 401  # a copy of T: theft
+    assert (await _refresh(client, v)).status_code == 401  # the whole chain is dead
+    assert (await _refresh(client, other_device)).status_code == 200  # not implicated
+    assert await _reuse_events() == 1
+
+
+async def test_reuse_after_the_grace_window_revokes_the_family(client: httpx.AsyncClient) -> None:
+    await _alice(client)
+    t = await _login(client)
+    s = (await _refresh(client, t)).json()["refresh_token"]
+    async with db.get_sessionmaker()() as session:  # the rotation was a minute ago
+        await session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.token_hash == hash_token(t))
+            .values(rotated_at=utcnow() - timedelta(seconds=60))
+        )
+        await session.commit()
+
+    assert (await _refresh(client, t)).status_code == 401
+    assert (await _refresh(client, s)).status_code == 401  # the unused successor too
+    assert await _reuse_events() == 1
+
+
+async def test_a_second_replay_is_theft(client: httpx.AsyncClient) -> None:
+    # The grace hands out one replacement: the successor it retires can't be retired
+    # twice, so a second copy of T lands on the theft path and ends the chain.
+    await _alice(client)
+    t = await _login(client)
+    await _refresh(client, t)
+    u = (await _refresh(client, t)).json()["refresh_token"]
+    assert (await _refresh(client, t)).status_code == 401
+    assert (await _refresh(client, u)).status_code == 401
+    assert await _reuse_events() == 1
+
+
+async def test_a_logged_out_token_is_refused_not_theft(client: httpx.AsyncClient) -> None:
+    await _alice(client)
+    other_device = await _login(client)
+    t = await _login(client)
+    assert (await client.post(f"{AUTH}/logout", json={"refresh_token": t})).status_code == 204
+    assert (await _refresh(client, t)).status_code == 401
+    assert (await _refresh(client, other_device)).status_code == 200
+    assert await _reuse_events() == 0
+
+
+async def test_a_login_starts_a_new_family_and_rotation_keeps_it(
+    client: httpx.AsyncClient,
+) -> None:
+    await _alice(client)
+    a, b = await _login(client), await _login(client)
+    a2 = (await _refresh(client, a)).json()["refresh_token"]
+    async with db.get_sessionmaker()() as s:
+        fam = {
+            raw: await s.scalar(
+                select(RefreshToken.family_id).where(RefreshToken.token_hash == hash_token(raw))
+            )
+            for raw in (a, b, a2)
+        }
+    assert fam[a] == fam[a2] != fam[b]

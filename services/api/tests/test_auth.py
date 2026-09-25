@@ -56,7 +56,11 @@ async def test_refresh_rotates_and_revokes_old(client: httpx.AsyncClient) -> Non
     assert rotated.status_code == 200
     assert rotated.json()["refresh_token"] != old_refresh
 
-    # the old token is now revoked
+    # once the new one has been used, the old one is dead (reuse: test_refresh_reuse.py)
+    newer = await client.post(
+        f"{API}/refresh", json={"refresh_token": rotated.json()["refresh_token"]}
+    )
+    assert newer.status_code == 200
     reused = await client.post(f"{API}/refresh", json={"refresh_token": old_refresh})
     assert reused.status_code == 401
 
