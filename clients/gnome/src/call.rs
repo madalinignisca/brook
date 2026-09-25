@@ -664,9 +664,20 @@ pub fn open_call(
                 };
                 match result {
                     Ok(()) => {
-                        if let Err(err) = runtime.spawn(async move { call.republish().await }).await
-                        {
+                        // The republish's own result, not just the task's.
+                        let republished = runtime
+                            .spawn(async move { call.republish().await })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r.map_err(|e| e.to_string()));
+                        if let Err(err) = republished {
                             tracing::warn!(%err, "republish after screen share toggle");
+                            if on {
+                                // Nobody will see this share: undo it.
+                                let _ = stop_share(&engine, &runtime);
+                                view.set_sharing(false, &quiet);
+                                view.set_status("Couldn't share the screen");
+                            }
                         }
                     }
                     Err(err) => {
