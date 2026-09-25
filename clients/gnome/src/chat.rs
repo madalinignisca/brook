@@ -2060,6 +2060,7 @@ fn pending_text(state: &PendingState) -> String {
             "not_found" | "authz.forbidden" | "http_403" | "http_404" => {
                 "Not sent: you can't post here any more".into()
             }
+            "message.reply_target_gone" => "Not sent: the quoted message was deleted".into(),
             _ => "Not sent".into(),
         },
     }
@@ -2146,8 +2147,18 @@ fn pending_row(chat: &Rc<Chat>, item: &PendingMessage) -> gtk::ListBoxRow {
     );
     if failed {
         column.set_opacity(1.0);
+        // A reply whose quote is gone can't succeed as is: offer it as a plain message,
+        // in place (same position in the queue), instead of a Retry that fails again.
+        let quote_gone = matches!(
+            &item.state,
+            PendingState::Failed { code } if code == "message.reply_target_gone"
+        );
         let retry = gtk::Button::builder()
-            .label("Retry")
+            .label(if quote_gone {
+                "Send without the quote"
+            } else {
+                "Retry"
+            })
             .css_classes(["flat"])
             .build();
         let delete = gtk::Button::builder()
@@ -2161,8 +2172,13 @@ fn pending_row(chat: &Rc<Chat>, item: &PendingMessage) -> gtk::ListBoxRow {
             let (chat, cid) = (chat.clone(), cid.clone());
             move |_| {
                 let (client, cid) = (chat.client.clone(), cid.clone());
-                chat.runtime
-                    .spawn(async move { client.retry_send(&cid).await });
+                chat.runtime.spawn(async move {
+                    if quote_gone {
+                        client.retry_without_reply(&cid).await
+                    } else {
+                        client.retry_send(&cid).await
+                    }
+                });
             }
         });
         delete.connect_clicked({
@@ -2482,6 +2498,10 @@ mod offline_tests {
             }),
             "Not sent"
         );
+        assert!(pending_text(&PendingState::Failed {
+            code: "message.reply_target_gone".into()
+        })
+        .contains("quoted message was deleted"));
     }
 }
 
