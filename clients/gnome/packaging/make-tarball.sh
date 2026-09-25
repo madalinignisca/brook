@@ -10,6 +10,7 @@ mkdir -p "$stage" "$out"
 
 install -m 0755 target/release/brook-gnome "$stage/brook-gnome"
 install -m 0644 clients/gnome/data/dev.brook.Brook.desktop "$stage/"
+install -m 0644 clients/gnome/data/icons/dev.brook.Brook.svg "$stage/"
 install -m 0755 clients/gnome/packaging/install.sh "$stage/install.sh"
 install -m 0644 clients/gnome/packaging/INSTALL.md "$stage/INSTALL.md"
 install -m 0644 LICENSE "$stage/LICENSE"
