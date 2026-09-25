@@ -25,8 +25,8 @@ Client constraints this wire is shaped around:
 
 ### 2.1 Login
 
-`POST /auth/login {handle, password}`, unchanged for users without TOTP. With TOTP active
-and a correct password:
+`POST /auth/login {handle, password, supports_totp?}`, unchanged for users without
+TOTP. With TOTP active and a correct password, and `supports_totp: true`:
 
 ```
 200 {"totp_required": true, "totp_token": "<jwt>", "expires_in": 300}
@@ -35,7 +35,15 @@ and a correct password:
 Wrong password: unchanged (401 `auth.invalid_credentials`). The client tells the two 200
 shapes apart by `totp_required`.
 
-`POST /auth/totp {totp_token, code}` or `{totp_token, recovery_code}`:
+**Clients that predate TOTP** don't send `supports_totp`. For a TOTP user they get
+`403 auth.totp_client_required` instead of a 200 they would misread as a login with no
+tokens. Old cores map that to "the server refused", and the user updates the app. The
+protocol has no capability negotiation otherwise, so this flag is the negotiation.
+
+`POST /auth/totp {totp_token, code}` or `{totp_token, recovery_code}`. The token must
+decode as `type == "totp_pending"`: an access or refresh token here is
+`403 auth.totp_expired` (test #4), so a leaked access token can never become an
+unbounded code-guessing credential.
 - `200` TokenPair. With a recovery code, plus `recovery_codes_left: int`.
 - `403 auth.invalid_code`: wrong code, a replayed code, a used or wrong recovery code,
   **or a decrypt failure of the stored secret** (§5).
@@ -51,9 +59,11 @@ A JWT signed with the same key as access tokens:
   accept only `type == "access"`, and `/auth/password` goes through the former. A test
   asserts each (REST 401, WS `auth_failed`, `/auth/password` 401).
 - **Single use.** The `jti` is recorded when `/auth/totp` *succeeds* and refused after.
-  It is kept in process memory until `exp` (bounded; one worker, like the hub). A restart
-  forgets used `jti`s, but a replay still needs a fresh valid code, and the per-user
-  `last_used_step` guard (§3) already refuses the same code twice.
+  It is kept in process memory until `exp` (bounded; one worker, like the hub and the
+  socket registry). Stated plainly: across a restart, or with a second worker, one
+  password entry could complete two logins within 300 s, but only with two different
+  valid codes (the DB-side `last_used_step` refuses a reused one). That bounds it to a
+  duplicate session, never a bypass.
 - A failed code does **not** burn the token, so a typo doesn't send the user back to the
   password. The rate limiter bounds the attempts instead.
 - Dead if the user signed out everywhere after it was issued (`session_revoked(iat_ms)`),
@@ -63,11 +73,11 @@ A JWT signed with the same key as access tokens:
 
 | Call | Body | Answer | Notes |
 |---|---|---|---|
-| `POST /auth/totp/enroll` | `{password}` | `200 {otpauth_uri}` | Returned **once**; no GET ever returns it. `409 conflict` if TOTP is already active. Replaces an unfinished pending enrolment. The pending secret expires after 10 min. |
-| `POST /auth/totp/activate` | `{code}` | `200 {recovery_codes: [10 strings]}` | Verifies against the pending secret; sets it active. The codes are shown once. `403 auth.invalid_code`; `409 conflict` if there's nothing pending or it expired. |
+| `POST /auth/totp/enroll` | `{password}` | `200 {otpauth_uri, expires_in: 600}` | Returned **once**; no GET ever returns it. `409 conflict` if TOTP is already active. Replaces an unfinished pending enrolment, so a QR code scanned earlier stops working and the client must show the new one. |
+| `POST /auth/totp/activate` | `{code}` | `200 {recovery_codes: [10 strings]}` | Verifies against the pending secret; sets it active. The codes are shown once. `403 auth.invalid_code`; `409 auth.totp_enrollment_expired` (scan again: call enroll); `409 conflict` if nothing is pending. |
 | `POST /auth/totp/disable` | `{password, code}` | `204` | `code` may be a recovery code. Removes the secret and all recovery codes. |
-| `POST /auth/totp/recovery-codes` | `{password, code}` | `200 {recovery_codes}` | Replaces all remaining codes. |
-| `GET /auth/me` | | `+ totp_enabled: bool` | So the app shows Enable or Disable. |
+| `POST /auth/totp/recovery-codes` | `{password, code}` | `200 {recovery_codes}` | Always issues 10 fresh codes and invalidates every old one, used or not, including when none are left. |
+| `GET /auth/me` | | `+ totp_enabled: bool, recovery_codes_left: int\|null` | So the app shows Enable or Disable, and warns when codes run low (null when TOTP is off). |
 
 A wrong password on these is `403 auth.invalid_credentials` (the #39 rule: never 401).
 
@@ -124,7 +134,8 @@ is recorded with `actor = NULL` and `via = "host_cli"`. The HTTP API has no bulk
 | `created_at` | timestamptz |
 
 Kinds: `totp_enrolled`, `totp_activated`, `totp_disabled`, `totp_reset`,
-`recovery_code_used`, `recovery_codes_regenerated`, `password_changed`, `password_reset`.
+`recovery_code_used`, `recovery_codes_regenerated`, `totp_guessing`, `password_changed`,
+`password_reset`.
 **No IP addresses or user agents** (GDPR minimisation: nothing here needs them). Rows go
 with the user (cascade). Retention beyond that is an owner decision, noted in §8.
 
@@ -138,18 +149,29 @@ with the user (cascade). Retention beyond that is an owner decision, noted in §
   The accepted step must be `> last_used_step`, else `403 auth.invalid_code` (replay).
   `last_used_step` is written in the same transaction, under the user-row lock (#39's
   `lock_user`), so two concurrent submissions of one code can't both pass.
+- **The replay guard covers every endpoint that accepts a code** (§7.3): `/auth/totp`,
+  `activate`, `disable` and `recovery-codes` all check and advance `last_used_step`
+  through one function. So a code accepted at `activate` (or typed into a phishing
+  "confirm" page) can't then be used to log in. Consequence, and intended: the first
+  login right after activation needs the **next** code (≤ 30 s).
 - **Recovery codes:** 10 codes of 10 characters from a 32-symbol alphabet without look-alike
   characters (50 bits), shown as `xxxxx-xxxxx`. Input is normalised (case, dashes, spaces)
   before verifying. Each is used once: `used_at` is set under the user lock.
 - **Key rotation:** after a successful verify, if `needs_rewrap(secret)`, re-encrypt with
   the primary key in the same transaction.
 
-## 5. Failure behaviour (§5.5 of the encryption spec)
+## 5. Failure behaviour (§5.5 and §5.8 of the encryption spec)
 
-Any `DecryptError` on `totp.secret` during `/auth/totp` is an authentication failure:
-`403 auth.invalid_code`, byte-identical to a wrong code. It is logged at ERROR with user
-id, key id and reason, never the value, and caught at the call site (never a 500). It
-must never fall through to "not enrolled".
+Any `DecryptError` on `totp.secret` (on every code-accepting endpoint) is an
+authentication failure: `403 auth.invalid_code`, byte-identical to a wrong code. It is
+logged at ERROR with user id, key id and reason, never the value, and caught at the call
+site (never a 500). It must never fall through to "not enrolled".
+
+**Detection (§5.8), implemented as that section specifies:** the decrypt-failure counter
+labelled by reason, and the startup canary. A decrypt failure is **not** recorded as a
+limiter failure. Counted as a wrong code, a key dropped one step early would show up as
+per-handle brute-force noise and 429s for every enrolled user, the exact silent failure
+§5.8 exists to surface. It is an operator fault, and it is reported as one.
 
 **Deliberate deviation from the encryption spec's wording:** §5.5 says "401". This spec
 uses 403 instead: core treats 401 as "refresh your access token", and the caller of
@@ -163,6 +185,14 @@ Everything here goes through #36's limiter **before** any Argon2 or HMAC work, k
 - `/auth/totp`: one failure per wrong code or recovery code; success resets. Per-handle
   slowdown applies, so a stolen password plus a spray of codes across IPs is paced per
   account (never locked).
+- **A stricter per-handle budget for codes, with numbers.** After 10 wrong codes for a
+  handle within 24 h, each further code attempt for that handle must be ≥ 15 min apart,
+  from any IP. That's ≤ 96 guesses per day. At ≈ 3 valid codes per 10⁶ (±1 step), an
+  attacker who already holds the password succeeds with ≈ 0.03 % per day, or ≈ 0.9 % per
+  month of continuous attack. Crossing the threshold writes an `auth_events` row
+  (`totp_guessing`) and logs a warning, so the owner sees it long before that. It is never
+  a lock: the real user waits at most 15 min, or uses a recovery code (the same budget
+  applies).
 - The password checks in `enroll`, `disable`, `recovery-codes` and the admin reset: as
   in #39.
 - Login's password stage succeeding with TOTP pending records **no** success yet. The IP's
@@ -171,10 +201,12 @@ Everything here goes through #36's limiter **before** any Argon2 or HMAC work, k
 ## 7. Tests (each must be seen red under mutation)
 
 1. RFC 6238 vectors.
-2. Replay: the same code twice gives `403`.
+2. Replay: the same code twice gives `403`, **across endpoints** (a code accepted at
+   `activate` or `disable` is refused at `/auth/totp`).
 3. Skew: ±1 step is accepted, ±2 is refused.
 4. The pending token is refused on REST, WS and `/auth/password`; it is single-use; it is
-   dead after a sign-out everywhere.
+   dead after a sign-out everywhere. **And the mirror:** an access token presented as
+   `totp_token` gives `403 auth.totp_expired`.
 5. Recovery codes are stored as Argon2id: a test asserts a stored hash verifies as Argon2
    and is **not** a hex SHA-256 digest (§7.1, the structural guard).
 6. Recovery codes are single-use; `recovery_codes_left` counts down.
@@ -188,10 +220,18 @@ Everything here goes through #36's limiter **before** any Argon2 or HMAC work, k
     `test_token_races.py`).
 12. App-level: `create_app()` refuses to start without a keyring (hardening left over from
     #43).
+13. A decrypt failure increments the §5.8 counter and does **not** add a limiter failure.
+14. The 24 h code budget: the 11th wrong code gets `Retry-After` ≥ 900, and a
+    `totp_guessing` event is written.
+15. A login without `supports_totp` for a TOTP user gives `403 auth.totp_client_required`.
 
 ## 8. Open points for the owner
 
 1. `auth_events` retention: keep as long as the account exists (proposed), or prune after
    N months?
+3. Should `auth_events` record the client IP for `totp_reset`, `recovery_code_used` and
+   `totp_guessing`? Useful forensically, and it is personal data under GDPR. Proposed:
+   no by default; the limiter's escalation log line (journald, host retention) already
+   carries the IP for abuse cases.
 2. Should enabling TOTP also sign out other devices (like the password-change checkbox)?
    Proposed: no. Enabling is an upgrade, not a sign of compromise.
