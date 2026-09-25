@@ -4,7 +4,7 @@
 //! `spawn_future_local`). Realtime `message.new` events are consumed from the
 //! core's broadcast channel on the main loop and appended live.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -91,6 +91,10 @@ struct MessageWidgets {
     reactions_box: gtk::Box,
     /// Current reaction tallies, kept in sync from `reaction.update` events.
     reactions: Rc<RefCell<Vec<ReactionSummary>>>,
+    /// Shown as a tombstone (the message was deleted).
+    deleted: Rc<Cell<bool>>,
+    /// The message carries files (its text may then be empty).
+    has_files: bool,
 }
 
 /// Build the chat view. `is_admin` controls whether channel creation is offered.
@@ -960,6 +964,10 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
         row.append(&quote);
     }
     row.append(&body_label);
+    let deleted = Rc::new(Cell::new(false));
+    if message.is_deleted() {
+        show_deleted(&body_label, &deleted);
+    }
     // Attached files (a tombstone has none): shown, and saved only on request.
     for file in &message.attachments {
         row.append(&crate::attachments::attachment_row(
@@ -1010,6 +1018,8 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
             channel_id: message.channel_id.clone(),
             reactions_box,
             reactions: Rc::new(RefCell::new(message.reactions.clone())),
+            deleted: deleted.clone(),
+            has_files: !message.attachments.is_empty(),
         },
     );
     render_reactions(chat, &message.id);
@@ -2111,12 +2121,12 @@ fn pending_row(chat: &Rc<Chat>, item: &PendingMessage) -> gtk::ListBoxRow {
         .build();
     if let Some(target) = &item.reply_to_id {
         // The quoted message as shown in this channel, if it's on screen.
-        let quoted = chat
-            .message_rows
-            .borrow()
-            .get(target)
-            .map(|w| w.body.text().to_string());
-        let excerpt = reply_excerpt(quoted.as_deref());
+        let quoted = chat.message_rows.borrow().get(target).map(|w| Quoted {
+            text: w.body.text().to_string(),
+            deleted: w.deleted.get(),
+            has_files: w.has_files,
+        });
+        let excerpt = reply_excerpt(quoted.as_ref());
         column.append(
             &gtk::Label::builder()
                 .label(format!("\u{21b3} Replying to {excerpt}"))
@@ -2273,8 +2283,14 @@ fn fill_from_cache(chat: &Rc<Chat>, channel_id: String) {
             return;
         }
         for message in page.messages.iter().rev() {
-            if !chat.message_rows.borrow().contains_key(&message.id) {
-                append_message(&chat, message);
+            let shown = chat.message_rows.borrow().get(&message.id).cloned();
+            match shown {
+                None => append_message(&chat, message),
+                // Deleted while on screen, and no live event said so.
+                Some(widgets) if message.is_deleted() && !widgets.deleted.get() => {
+                    show_deleted(&widgets.body, &widgets.deleted);
+                }
+                Some(_) => {}
             }
         }
     });
@@ -2586,32 +2602,64 @@ mod order_tests {
 }
 
 /// The quoted message on a queued reply's bubble: one line, at most 80 characters.
-fn reply_excerpt(quoted: Option<&str>) -> String {
-    match quoted {
-        None => "an earlier message".into(),
-        Some(text) => {
-            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            if flat.is_empty() {
-                "a deleted message".into() // a tombstone shows no body
-            } else {
-                flat.chars().take(80).collect()
-            }
-        }
+fn reply_excerpt(quoted: Option<&Quoted>) -> String {
+    let Some(quoted) = quoted else {
+        return "an earlier message".into();
+    };
+    if quoted.deleted {
+        return "a deleted message".into();
     }
+    let flat = quoted.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() && quoted.has_files {
+        "a file".into() // sent without a caption
+    } else {
+        flat.chars().take(80).collect()
+    }
+}
+
+/// A quoted message as it is shown on screen.
+struct Quoted {
+    text: String,
+    deleted: bool,
+    has_files: bool,
+}
+
+/// Show a row's text line as a tombstone.
+fn show_deleted(body: &gtk::Label, deleted: &Cell<bool>) {
+    body.set_markup("<i>Message deleted</i>");
+    body.add_css_class("dim-label");
+    body.set_visible(true);
+    deleted.set(true);
 }
 
 #[cfg(test)]
 mod reply_excerpt_tests {
-    use super::reply_excerpt;
+    use super::{reply_excerpt, Quoted};
+
+    fn quoted(text: &str, deleted: bool, has_files: bool) -> Quoted {
+        Quoted {
+            text: text.into(),
+            deleted,
+            has_files,
+        }
+    }
 
     #[test]
     fn a_quote_is_one_line_and_a_tombstone_says_so() {
+        let excerpt = |q: Quoted| reply_excerpt(Some(&q));
         assert_eq!(
-            reply_excerpt(Some("first line\nsecond  line")),
+            excerpt(quoted("first line\nsecond  line", false, false)),
             "first line second line"
         );
-        assert_eq!(reply_excerpt(Some("")), "a deleted message");
+        assert_eq!(excerpt(quoted("", true, false)), "a deleted message");
+        assert_eq!(excerpt(quoted("", false, true)), "a file");
+        assert_eq!(excerpt(quoted("see this", false, true)), "see this");
         assert_eq!(reply_excerpt(None), "an earlier message");
-        assert_eq!(reply_excerpt(Some(&"x".repeat(200))).chars().count(), 80);
+        assert_eq!(
+            excerpt(quoted(&"x".repeat(200), false, false))
+                .chars()
+                .count(),
+            80
+        );
     }
 }
