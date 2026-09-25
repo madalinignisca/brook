@@ -45,19 +45,77 @@ The owner's constraints:
 3. The data key is stored by the platform's per-app secure storage (§4). Brook
    never shows its own "allow access" prompt, and never relies on one.
 4. **Local data is disposable.** The server is the source of truth. If the key
-   is missing or unreadable (reinstall, wiped keychain, restored backup on a new
-   machine), the app deletes its local store, signs in again and re-syncs.
+   is **missing** (reinstall, wiped keychain, restored backup on a new machine),
+   the app deletes its local store, makes a new key, signs in again and re-syncs.
    Nothing is ever pulled from other devices.
+   - **Missing and unreadable are different.** Only "the item does not exist"
+     (`errSecItemNotFound` on Apple; no item on Linux) means lost. These never
+     delete anything:
+     - `errSecInteractionNotAllowed`: the device is locked before its first unlock;
+       on iOS a background or push launch meets this routinely;
+     - `errSecMissingEntitlement` (-34018): a signing or build fault, reported
+       loudly;
+     - a Secret Service that is locked or not answering;
+     - any other error.
+     The app then runs **online-only** (no local store opened) and tries again on
+     the next launch or unlock. Otherwise a locked phone would lose its cache on every
+     early wake.
+5. **Crypto-erase on every wipe.** Any wipe (a missing key, sign-out with "Remove
+   this device's data", a different user signing in) deletes the key **first**, then
+   the files, and makes a new key. Anything a file delete misses (SQLite free pages,
+   journals, filesystem snapshots) stays unreadable.
+6. **The session (stay signed in, #58).** On Apple the refresh token is its own
+   data-protection Keychain item (same attributes as §4, service
+   `dev.brook.Brook.session`); encrypting it again with a key from the same Keychain
+   would add nothing. On Linux it lives in the encrypted local store. Sign-out and a
+   remote sign-out delete it.
+
+## 3a. Core interface
+
+Core owns the key's use (generation, derivation, encryption, zeroizing); a platform
+only stores 32 bytes. One synchronous foreign trait over UniFFI (not async: async
+foreign traits force the generated Swift into Swift 5 mode), implemented in Swift for
+Apple and natively in Rust (`oo7`) for Linux:
+
+```rust
+pub trait KeySlot: Send + Sync {
+    /// The stored key, None if there is none (then core makes one), or an error.
+    fn load(&self) -> Result<Option<Vec<u8>>, KeySlotError>;
+    /// Create-only: if an item already exists (another process won), return
+    /// `Exists` and core loads that one. Never overwrites.
+    fn store(&self, key: Vec<u8>) -> Result<(), KeySlotError>;
+    fn delete(&self) -> Result<(), KeySlotError>;
+}
+pub enum KeySlotError {
+    Exists,        // store() lost a race: load again
+    Unavailable,   // locked or not answering: keep everything, run online-only
+    Fatal(String), // e.g. -34018: report, keep everything, run online-only
+}
+```
+
+- Core generates the key with `getrandom` and derives per-use subkeys with
+  HKDF-SHA256 (per store and per purpose, e.g. `brook.cache.v1 | origin | user id`),
+  so one device key serves every store. It zeroizes key material after use.
+- Tests run on an in-memory `KeySlot`. The Apple test host has no team signature, so
+  the data-protection keychain answers -34018 there.
 
 ## 4. Where the key lives, per platform (strongest first)
 
 | Platform | Store | Isolation from other apps | User prompts |
 |---|---|---|---|
-| macOS / iOS | Data-protection Keychain (`kSecUseDataProtectionKeychain`), `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, not synchronizable, the app's own access group | **Yes**, enforced by code signature | None |
+| macOS / iOS | Data-protection Keychain (`kSecUseDataProtectionKeychain`): `kSecClassGenericPassword`, service `dev.brook.Brook.datakey`, `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, `kSecAttrSynchronizable: false` set explicitly on both add and query, shared access group `$(TeamID).dev.brook.shared` (so a future notification or share extension can read it without a migration) | **Yes**, enforced by code signature | None |
 | Linux, Flatpak | Secret portal (`org.freedesktop.portal.Secret`): a per-app secret handed only to this app ID; data key derived from it with HKDF | **Yes**, per app ID | None |
 | Linux, native, with a Secret Service (gnome-keyring, KWallet) | Secret Service item tagged for Brook | **No**: any app in the session can read it | Usually none; it's unlocked at login |
 | Linux, no secret service (bare sway, etc.) | see §5 | see §5 | see §5 |
 | Windows (later) | DPAPI, user scope | No (user-scoped, not app-scoped) | None |
+
+Apple details:
+- **Development builds:** the data-protection keychain needs a team-signed build.
+  Debug is signed with the dev team (`Local.xcconfig`); an unsigned build gets -34018,
+  which is `Fatal` and never a wipe.
+- **Backups:** the local store's directory is excluded from backups
+  (`isExcludedFromBackup`). The key is ThisDeviceOnly anyway, so a backed-up store
+  would be unreadable ciphertext.
 
 In Rust, the `oo7` crate speaks both the Secret portal (inside Flatpak) and the
 Secret Service (outside), so core can own one Linux backend. Apple needs a small
@@ -130,7 +188,8 @@ key there.
 ## 8. Owner decisions (2026-09-25)
 
 1. **Sign-out** shows a "Remove this device's data" checkbox, **ticked by default**.
-   Ticked: the local store and the data key are deleted. Unticked: they are kept
+   Ticked: the data key is deleted first (crypto-erase, §3.5), then the local store,
+   and a new key is made at the next sign-in. Unticked: they are kept
    (the next sign-in of the same user reuses them; a *different* user signing in
    still gets a wiped store, since one device's cache never crosses accounts).
 2. **No keyring:** "no protection" is allowed, but only after the explicit
