@@ -62,7 +62,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 | Feature | Status | Phase | Notes |
 |---|---|---|---|
 | Send message (single path) | ✅ | P1 | REST → WS fan-out |
-| History pagination (`before`) | ✅ | P1 | `after`/forward-sync ⬜ (MVP+: catch-up for the offline cache) |
+| History pagination (`before`/`after`) | ✅ | P1 | a change feed for edits, deletes, reactions and membership ⬜ (MVP+ #60) |
 | Edit message | 🟢 | P1b | `PATCH /messages/{id}` (author-only) + `message.update`; UI in both clients |
 | Delete message (soft) | 🟢 | P1b | `DELETE /messages/{id}` (author/admin) + `message.delete`; UI in both clients |
 | Markdown formatting (bold/italic/code/links) | 🟢 | P1b | render: GNOME pulldown-cmark→Pango, KDE `Text.MarkdownText`; clickable links |
