@@ -10,7 +10,7 @@ from datetime import timedelta
 from typing import Annotated, Any, cast
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import func, select, update
 from sqlalchemy.engine import CursorResult
@@ -265,6 +265,7 @@ async def revoke_all_refresh_tokens(session: AsyncSession, user_id: uuid.UUID) -
 async def change_password(
     body: PasswordChangeIn,
     request: Request,
+    background: BackgroundTasks,
     user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_settings)],
@@ -316,7 +317,12 @@ async def change_password(
         return await _issue_tokens(session, settings, user)
     cutoff_ms = await sign_out_everywhere(session, user)
     pair = await _issue_tokens(session, settings, user)  # commits; issued after the cutoff
-    await revoke_sessions(user.id, cutoff_ms)
+    # Close the live sockets only AFTER this response is sent. The changing
+    # device's own socket is among them; closed first, its client would refresh
+    # with the old (now revoked) refresh token before it had the new pair, and
+    # sign itself out. Other devices lose at most the time to send this response:
+    # their access tokens are already refused on REST and on re-auth.
+    background.add_task(revoke_sessions, user.id, cutoff_ms)
     return pair
 
 
