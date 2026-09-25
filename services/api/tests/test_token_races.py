@@ -1,0 +1,168 @@
+"""Token issue/revoke ordering under concurrency: Postgres only.
+
+The race these guard (see routers/auth.lock_user): under READ COMMITTED a
+"revoke all" UPDATE does not see a refresh token committed after the statement
+started, so a refresh rotating in parallel with a password change would leave
+the attacker a live token. SQLite serialises writers and cannot show it, so
+these run only against the Postgres CI service (BROOK_TEST_DATABASE_URL), an
+explicitly declared precondition, not a skip on something that looks missing.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import uuid
+from datetime import timedelta
+
+import httpx
+import pytest
+from sqlalchemy import select, update
+
+from app import db
+from app.models import RefreshToken, User, utcnow
+from app.routers.auth import lock_user
+from app.security import hash_token, new_refresh_token
+
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("BROOK_TEST_DATABASE_URL", "").startswith("postgresql"),
+    reason="needs Postgres (BROOK_TEST_DATABASE_URL); SQLite serialises writers",
+)
+
+AUTH = "/api/v1/auth"
+PW = "supersecret"
+# Long enough for a request that is NOT blocked to finish; short enough to keep
+# the suite fast. A blocked request stays pending for as long as we hold the lock.
+SETTLE = 0.5
+
+
+async def _alice(client: httpx.AsyncClient) -> tuple[uuid.UUID, dict[str, str]]:
+    body = {"handle": "alice", "display_name": "Alice", "password": PW}
+    await client.post(f"{AUTH}/register", json=body)
+    pair = (await client.post(f"{AUTH}/login", json={"handle": "alice", "password": PW})).json()
+    me = await client.get(f"{AUTH}/me", headers={"Authorization": f"Bearer {pair['access_token']}"})
+    return uuid.UUID(me.json()["id"]), pair
+
+
+async def test_revoke_all_catches_token_from_inflight_refresh(client: httpx.AsyncClient) -> None:
+    user_id, pair = await _alice(client)
+
+    # Session A is a refresh caught mid-flight, doing exactly what /auth/refresh
+    # does: lock the user, revoke the old token, insert the new one, not committed.
+    async with db.get_sessionmaker()() as a:
+        await lock_user(a, user_id)
+        old = await a.scalar(
+            select(RefreshToken).where(RefreshToken.token_hash == hash_token(pair["refresh_token"]))
+        )
+        assert old is not None
+        await a.execute(update(RefreshToken).where(RefreshToken.id == old.id).values(revoked=True))
+        raw_new, new_hash = new_refresh_token()
+        a.add(
+            RefreshToken(
+                user_id=user_id, token_hash=new_hash, expires_at=utcnow() + timedelta(days=1)
+            )
+        )
+        await a.flush()
+
+        change = asyncio.create_task(
+            client.post(
+                f"{AUTH}/password",
+                json={"current_password": PW, "new_password": "brand-new-pass"},
+                headers={"Authorization": f"Bearer {pair['access_token']}"},
+            )
+        )
+        await asyncio.sleep(SETTLE)
+        assert not change.done()  # waits for the in-flight refresh
+        await a.commit()
+
+    assert (await change).status_code == 200
+    async with db.get_sessionmaker()() as check:
+        new = await check.scalar(select(RefreshToken).where(RefreshToken.token_hash == new_hash))
+        assert new is not None
+        # The whole point: the token the racing refresh minted is revoked too.
+        assert new.revoked is True
+    stale = await client.post(f"{AUTH}/refresh", json={"refresh_token": raw_new})
+    assert stale.status_code == 401
+
+
+@pytest.mark.parametrize("route", ["refresh", "login"])
+async def test_token_issuing_routes_take_the_user_lock(
+    client: httpx.AsyncClient, route: str
+) -> None:
+    user_id, pair = await _alice(client)
+    if route == "refresh":
+        call = client.post(f"{AUTH}/refresh", json={"refresh_token": pair["refresh_token"]})
+    else:
+        call = client.post(f"{AUTH}/login", json={"handle": "alice", "password": PW})
+
+    async with db.get_sessionmaker()() as holder:
+        # Hold exactly the lock a password change holds: an UPDATE of a non-key
+        # column (FOR NO KEY UPDATE). The token INSERT's foreign-key check only
+        # takes FOR KEY SHARE, which does NOT conflict with it, so a route that
+        # skips lock_user sails through here and mints a token the change's
+        # revoke-all cannot see. That is the bug; FOR UPDATE is what conflicts.
+        await holder.execute(
+            update(User).where(User.id == user_id).values(display_name="Alice (changing)")
+        )
+        task = asyncio.create_task(call)
+        await asyncio.sleep(SETTLE)
+        assert not task.done()
+        await holder.rollback()
+    assert (await task).status_code == 200
+
+
+async def test_admin_reset_takes_the_target_lock(client: httpx.AsyncClient) -> None:
+    _alice_id, alice = await _alice(client)
+    headers = {"Authorization": f"Bearer {alice['access_token']}"}
+    bob = {"handle": "bob", "display_name": "Bob", "password": PW}
+    await client.post(f"{AUTH}/register", json=bob, headers=headers)
+    async with db.get_sessionmaker()() as s:
+        bob_id = await s.scalar(select(User.id).where(User.handle == "bob"))
+    assert bob_id is not None
+
+    async with db.get_sessionmaker()() as holder:
+        await lock_user(holder, bob_id)  # e.g. bob's device refreshing
+        task = asyncio.create_task(
+            client.post(
+                f"/api/v1/users/{bob_id}/password",
+                json={"admin_password": PW, "new_password": "temporary-pass"},
+                headers=headers,
+            )
+        )
+        await asyncio.sleep(SETTLE)
+        assert not task.done()
+        await holder.rollback()
+    assert (await task).status_code == 204
+
+
+async def test_lost_refresh_race_is_not_a_failure(client: httpx.AsyncClient) -> None:
+    """Two tabs refresh the same token at once: one wins, the other gets 401, and
+    the loser must not count against the IP (it presented a valid token)."""
+    from app import ratelimit
+
+    user_id, pair = await _alice(client)
+    lim = ratelimit.get_limiter()
+    body = {"refresh_token": pair["refresh_token"]}
+
+    async with db.get_sessionmaker()() as holder:
+        # Park both refreshes on the user lock, after each has read the token as
+        # valid: that is the interleaving where the loser's CAS matches no row.
+        await lock_user(holder, user_id)
+        tab1 = asyncio.create_task(client.post(f"{AUTH}/refresh", json=body))
+        tab2 = asyncio.create_task(client.post(f"{AUTH}/refresh", json=body))
+        await asyncio.sleep(SETTLE)
+        assert not tab1.done() and not tab2.done()
+        await holder.rollback()
+    codes = sorted([(await tab1).status_code, (await tab2).status_code])
+    assert codes == [200, 401]
+
+    # Not counted: the IP can still fail backoff_after - 1 times without a 429.
+    # Had the lost race counted, the last of these would already be throttled.
+    for _ in range(lim.config.backoff_after - 1):
+        r = await client.post(f"{AUTH}/login", json={"handle": "alice", "password": "nope-x"})
+        assert r.status_code == 401
+    # And a genuinely reused (already revoked) token still is a failure.
+    reuse = await client.post(f"{AUTH}/refresh", json=body)
+    assert reuse.status_code == 401
+    throttled = await client.post(f"{AUTH}/login", json={"handle": "alice", "password": "nope-x"})
+    assert throttled.status_code == 429
