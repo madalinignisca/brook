@@ -36,18 +36,28 @@
     and `journal_mode = WAL`;
   - check `meta.format`. A mismatch in **cache.db** rebuilds it; in **outbox.db** it is
     surfaced (C4) before any rebuild;
-  - **Missing vs unreadable, on evidence.** `KeyStore::get_or_create` (#92) gains an outcome:
-    `KeyOutcome::{Loaded, Created}`. A `create` that finds `Exists` (a racing creator)
-    reloads and counts as `Loaded`. The decisions:
-    - `Loaded` and the database opens → normal;
-    - `Created` and a database file already exists → its key is **missing** (proven absent,
-      not merely failing): journal the old files, then rebuild. For **outbox.db**, first say
-      "Unsent messages on this device couldn't be recovered" (the count is unknowable
-      without the key);
-    - `Loaded` but the database won't decrypt (a wrong key, or damage) → `StoreState::Damaged`:
-      online-only, reported, and **nothing deleted**. A later explicit reset (sign-out with
-      "Remove this device's data") is the only way out;
+  - **Missing vs unreadable, on durable evidence.** Beside each database, a non-secret
+    **key check** file holds `HMAC-SHA256(key, "brook-store-check")`, written (temp, fsync,
+    rename) when the database is created. It reveals nothing about the key, and it answers
+    "does this file belong to this key?" across crashes. `KeyStore::get_or_create` (#92) also
+    reports `KeyOutcome::{Loaded, Created}` (an `Exists` race reloads and counts as `Loaded`).
+    The decisions:
+    - the key's check matches and the database opens → normal;
+    - the check **doesn't match** (or is absent) while a database exists → that database's
+      key is **missing** (a lost slot, or a crash between creating a new key and rebuilding):
+      journal the old files, then rebuild. For **outbox.db**, first say "Unsent messages on
+      this device couldn't be recovered" (the count is unknowable without the key);
+    - the check **matches** but the database won't decrypt → real damage →
+      `StoreState::Damaged`: online-only, reported, **nothing deleted automatically**;
     - `Unavailable` / `Fatal` → `StoreState::Locked`: nothing opened, nothing deleted.
+  - **One opener per store.** Stores are opened only through a process-wide registry
+    (store id → handle, under one lock), so two openers in one process can't race. Across
+    processes, the single-instance lock (#92 on the Mac; GApplication plus a flock on GTK).
+  - **Reset without reading.** `reset_local_data(store)` works on a `Damaged` or `Locked`
+    store without opening it: destroy the slots → delete the directory → report "unsent
+    messages: unknown". It needs no `meta.generation` write, since nothing of the store is
+    open. It is reachable from sign-out ("Remove this device's data") and from a signed-out
+    "Reset local data" action, so a damaged store never strands the user.
   - **Backups:** the Mac excludes the stores directory (`isExcludedFromBackup`). Linux:
     SQLCipher links the system `libcrypto.so.3`, so the Linux CI and release builds need the
     OpenSSL development package and INSTALL gets a line. That's the Linux client's call,
@@ -71,11 +81,22 @@
   - the per-row `seq` guard;
   - the removal fence (`removed`), cleared only by **the caller's own** membership row with a
     higher `seq`. Within a batch, the caller's own membership rows are applied **first**, so a
-    rejoin page's supplemental channel and member rows (sent whatever their `seq`, #91) land
-    after the fence is cleared, in the same transaction;
+    rejoin page's supplemental channel and member rows land after the fence is cleared, in the
+    same transaction. #91 keys the supplement on `joined_seq` and sends those rows with
+    their **original, lower** `seq`; that's fine, because the channel's rows were deleted by
+    the removal and an absent row always accepts;
+  - **a removal applies only above the caller's own membership `seq`** (from pages and live
+    events alike). Channel metadata or another member's newer row isn't evidence of the
+    caller's rejoin. This narrows the spec's "channel or membership `seq`" to the caller's
+    membership, which is the only row that means "I'm back";
+  - **the caller's removal is scoped** (C5): fence, then delete the channel's rows (messages,
+    memberships, coverage, the channel) in one transaction. The fence keeps the `seq`;
+  - **a rejoin reconciles members:** the rejoin page's supplemental member list is the
+    channel's complete membership. Any cached membership for that channel not in it is marked
+    `left` at the rejoin's `seq` (a member who left while the caller was away, whose departure
+    the caller was never sent);
   - history rows at `seq = 0`, applied only to a present, unfenced channel;
-  - **membership rows are never physically deleted by sync:** `left_members` marks the row
-    `left` with its `seq`. A later row for that pair applies only above it, so a delayed
+  - **`left_members` never deletes a row:** it marks the row `left` with its `seq`. A later row for that pair applies only above it, so a delayed
     older membership can't resurrect a departure.
 - **Mapping from #91's page:**
   - `channels`, `memberships`, `users`, `messages`: upsert through the guard;
@@ -87,6 +108,10 @@
   then every few minutes. Each page and the new cursor commit in **one** cache.db transaction.
   `410 sync.reset` → rebuild cache.db (C5) → `since=0` (state only). Live WebSocket events
   (`message.new/update/delete`, `channel.delete` with `seq`) go through `apply` as they arrive.
+  Membership and reaction changes have no live event yet. The server is adding `sync.hint
+  {seq}` ("run /sync now"), sent after commit to each user whose visible rows changed. Core
+  runs a sync on a hint whose `seq` is above its cursor (coalesced with one in flight); the
+  periodic sync is the backstop until then.
 - **Coverage (§4.3):** `coverage` rows; opening a channel with none fetches the head page;
   `before = oldest_id` extends down; a short page sets `complete_to_start`.
 - **Tests:** every ordering and coverage test in spec §9, plus: a page and its cursor commit
@@ -116,14 +141,23 @@
   | `408 file.upload_stalled`, `409 file.upload_in_progress`, `429 rate_limited` | pending; retry after `Retry-After` (upload PUTs restart from 0) |
   | `401` | refresh, then retry once. A refused refresh signs out: the sender **pauses** (no retries while signed out) and the rows wait for the next sign-in, or are surfaced by a wipe |
   | `507 file.no_space` (uploads, files plan) | **failed**, visibly, with Retry |
+  | `404` (channel gone), `403` (archived, or no longer a member), `409` (a conflict other than the transient two above), `413` (too large), `422` (incl. `file.not_attachable`) | **failed** with the server's code; Retry and Delete |
   | any other 4xx | **failed** with the server's code; Retry and Delete |
 
+- **Senders follow auth state, whatever ended the session** (a refused refresh, an explicit
+  `logout(remove_data: false)`, a remote sign-out, another task's sign-out): every attempt
+  checks the session epoch it captured before sending, and discards its result if the epoch
+  moved. On `LoggedOut`, every sender pauses and its `sending` rows go back to `pending`. On
+  `LoggedIn`, senders resume **only for the store of the user who signed in** (another user's
+  outbox waits, or is surfaced by #46 §8's switch rule). No restart needed.
 - Retry and Delete are serialised with the sender through the channel's task. Delete of an
   in-flight row waits for that attempt; if the send was accepted, it shows as sent.
 - **Outbox unusable (§5.7):** unreadable → sending disabled with the stated message;
   unwritable → direct send only in a channel with no pending or failed rows.
 - **Tests:** the spec §9 outbox list (minus the attachment items), plus the transient table
-  row by row (each code: pending, not failed), and the paused sender while signed out.
+  row by row (each code: pending, not failed), and the paused sender under each way a session
+  ends, including an explicit non-wiping logout during a backoff sleep (the woken sender
+  doesn't send).
 - **Live (itest, spec §9):** offline read, a queued message, reconnect, exactly one send; an
   edit made elsewhere while offline appears after reconnect.
 
@@ -178,3 +212,18 @@
   channel's history is legitimately visible again on the server. Messages edited or deleted
   meanwhile carry higher `seq`s, so the per-row guard keeps their newest state; the fence
   exists to stop resurrection *before* a rejoin, which it still does.
+
+**Round 2.**
+- Vibe: all fixed.
+- Codex: six fixed, four partly (the same points as round 1). Every remainder is accepted, so
+  there's no disagreement to escalate and no round 3:
+  - the caller's removal is scoped, and a rejoin reconciles the member list;
+  - only the caller's own membership `seq` gates a removal;
+  - a key-check file as durable evidence, one opener per store, and a reset that needs no
+    read;
+  - senders follow every way a session ends.
+- **Server review** (LGTM with notes):
+  - explicit failed rows for 404/403/409/413/422;
+  - the rejoin supplement's lower `seq` is stated;
+  - `sync.hint` is handled once the server sends it.
+
