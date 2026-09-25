@@ -19,15 +19,32 @@ if systemctl is-active -q firewalld; then
     exit 1
 fi
 dnf -y -q install firewalld
+# The package's systemd preset ENABLES firewalld on install. Undo that at once:
+# otherwise the next reboot starts it with the stock zone (ssh only), silently
+# cutting off the site and calls, and it bypasses the dead-man switch below.
+systemctl disable -q firewalld
 
 zone=public
-firewall-offline-cmd --set-default-zone="$zone" >/dev/null
-firewall-offline-cmd --zone="$zone" --add-service=ssh >/dev/null        # admin + git (TCP 22)
-firewall-offline-cmd --zone="$zone" --add-service=http >/dev/null       # ACME HTTP-01 + redirect
-firewall-offline-cmd --zone="$zone" --add-service=https >/dev/null      # TCP 443
-firewall-offline-cmd --zone="$zone" --add-port=443/udp >/dev/null       # HTTP/3
-firewall-offline-cmd --zone="$zone" --add-port=20000-20099/udp >/dev/null  # Janus media
-firewall-offline-cmd --zone="$zone" --remove-service=cockpit >/dev/null 2>&1 || true
+# firewall-offline-cmd exits non-zero on no-op changes (ZONE_ALREADY_SET, ...),
+# which aborts under `set -e`, so query first and change only what differs.
+[ "$(firewall-offline-cmd --get-default-zone)" = "$zone" ] \
+    || firewall-offline-cmd --set-default-zone="$zone" >/dev/null
+allow_service() {
+    firewall-offline-cmd --zone="$zone" --query-service="$1" >/dev/null \
+        || firewall-offline-cmd --zone="$zone" --add-service="$1" >/dev/null
+}
+allow_port() {
+    firewall-offline-cmd --zone="$zone" --query-port="$1" >/dev/null \
+        || firewall-offline-cmd --zone="$zone" --add-port="$1" >/dev/null
+}
+allow_service ssh             # admin + git (TCP 22)
+allow_service http            # ACME HTTP-01 + redirect
+allow_service https           # TCP 443
+allow_port 443/udp            # HTTP/3
+allow_port 20000-20099/udp    # Janus media
+if firewall-offline-cmd --zone="$zone" --query-service=cockpit >/dev/null; then
+    firewall-offline-cmd --zone="$zone" --remove-service=cockpit >/dev/null
+fi
 
 echo "zone $zone will allow:"
 firewall-offline-cmd --zone="$zone" --list-all
