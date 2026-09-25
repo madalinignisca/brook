@@ -42,6 +42,21 @@ pub(crate) enum Synced {
 /// Fetch and apply pages until `more` is false.
 pub(crate) async fn run(db: &Db, me: &str, fetch: &dyn Fetch) -> Result<Synced, SyncError> {
     let mut changed = Applied::default();
+    Ok(match run_into(db, me, fetch, &mut changed).await? {
+        Synced::Reset => Synced::Reset,
+        Synced::Done(_) => Synced::Done(changed),
+    })
+}
+
+/// `run`, adding what each committed page changed to `changed` as it goes: if a later
+/// page fails, the pages already committed are still reported (their changes are in the
+/// cache, and the next run starts after them).
+pub(crate) async fn run_into(
+    db: &Db,
+    me: &str,
+    fetch: &dyn Fetch,
+    changed: &mut Applied,
+) -> Result<Synced, SyncError> {
     loop {
         let since: String = db
             .call(|c| c.query_row("SELECT cursor FROM meta WHERE id = 1", [], |r| r.get(0)))
@@ -63,7 +78,14 @@ pub(crate) async fn run(db: &Db, me: &str, fetch: &dyn Fetch) -> Result<Synced, 
                     // Caught up: ranges reach the top of this snapshot. (`next` is ASCII
                     // digits, checked by `parse_page`.)
                     let cursor: i64 = next.parse().unwrap_or(0);
-                    crate::coverage::settle_tops(&tx, cursor)?;
+                    let mut applied = applied;
+                    // A range that grew is a change the UI can see (a page may stop
+                    // needing the network), even when no row changed.
+                    applied
+                        .channels
+                        .extend(crate::coverage::settle_tops(&tx, cursor)?);
+                    tx.commit()?;
+                    return Ok(applied);
                 }
                 tx.commit()?;
                 Ok(applied)
@@ -74,7 +96,7 @@ pub(crate) async fn run(db: &Db, me: &str, fetch: &dyn Fetch) -> Result<Synced, 
         changed.removed.extend(applied.removed);
         changed.users.extend(applied.users);
         if !more {
-            return Ok(Synced::Done(changed));
+            return Ok(Synced::Done(Applied::default()));
         }
     }
 }

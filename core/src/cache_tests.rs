@@ -446,3 +446,190 @@ mod http {
         assert_eq!(rows.len(), 1);
     }
 }
+
+// ---- Review round 1 ----
+
+/// A live message above the range's top may follow a missed one: not complete.
+#[tokio::test]
+async fn a_message_above_the_range_is_not_proof_of_no_gap() {
+    let s = setup(
+        vec![page(9, None, vec![], vec![])],
+        Hist {
+            ids: vec!["m5", "m4"],
+            gate: None,
+        },
+        None,
+    );
+    s.cache.sync_now().await.unwrap();
+    s.cache.load_head("c", 50).await.unwrap(); // covers m4..m5, complete
+    s.cache
+        .live_event("message.new", &msg("m7", "c", 12, "bob", "live"))
+        .await;
+    let p = s.cache.cached_messages("c", None, 2).await.unwrap();
+    assert_eq!(ids(&p.messages), vec!["m7", "m5"]);
+    assert!(p.needs_network, "m6 may be missing");
+}
+
+/// The start is known: a full page reaching below the range bottom (a tombstone history
+/// never lists) is still complete.
+#[tokio::test]
+async fn a_known_start_makes_any_page_complete() {
+    let s = setup(
+        vec![page(9, None, vec![], vec![])],
+        Hist {
+            ids: vec!["m2"],
+            gate: None,
+        },
+        None,
+    );
+    s.cache.sync_now().await.unwrap();
+    s.cache
+        .live_event(
+            "message.delete",
+            &json!({ "id": "m1", "channel_id": "c", "seq": 5 }),
+        )
+        .await;
+    s.cache.load_head("c", 50).await.unwrap(); // short: complete_to_start
+    let p = s.cache.cached_messages("c", None, 2).await.unwrap();
+    assert_eq!(ids(&p.messages), vec!["m2", "m1"]);
+    assert!(!p.needs_network);
+}
+
+/// The server caps a page at 100: a full capped page isn't "short, so that was the start".
+#[tokio::test]
+async fn a_capped_page_is_not_the_start() {
+    let many: Vec<&'static str> = (0..200)
+        .map(|i| &*Box::leak(format!("m{:03}", 199 - i).into_boxed_str()))
+        .collect();
+    let s = setup(
+        vec![page(9, None, vec![], vec![])],
+        Hist {
+            ids: many,
+            gate: None,
+        },
+        None,
+    );
+    s.cache.sync_now().await.unwrap();
+    s.cache.load_head("c", 500).await.unwrap();
+    let p = s
+        .cache
+        .cached_messages("c", Some("m100"), 50)
+        .await
+        .unwrap();
+    assert!(p.messages.is_empty());
+    assert!(
+        p.needs_network,
+        "the history below the capped page was taken as absent"
+    );
+}
+
+/// History for a channel not synced yet is dropped, so it must not leave coverage behind.
+#[tokio::test]
+async fn history_before_the_channel_arrives_leaves_no_coverage() {
+    let s = setup(
+        vec![page(9, None, vec![], vec![])],
+        Hist {
+            ids: vec!["m2", "m1"],
+            gate: None,
+        },
+        None,
+    );
+    s.cache.load_head("c", 50).await.unwrap(); // before any sync
+    s.cache.sync_now().await.unwrap();
+    let p = s.cache.cached_messages("c", None, 50).await.unwrap();
+    assert!(p.needs_network, "an empty channel claimed complete");
+}
+
+/// A cancelled sync doesn't leave the state saying "syncing".
+#[tokio::test]
+async fn a_cancelled_sync_stops_saying_syncing() {
+    let gate = Arc::new(Notify::new());
+    let s = setup(
+        vec![page(9, None, vec![], vec![])],
+        no_history(),
+        Some(gate),
+    );
+    let run = tokio::spawn({
+        let c = s.cache.clone();
+        async move { c.sync_now().await }
+    });
+    let server = s.server.clone();
+    eventually("the run", move || server.calls.load(Ordering::SeqCst) == 1).await;
+    assert!(s.cache.state().borrow().syncing);
+    run.abort();
+    let _ = run.await;
+    assert!(!s.cache.state().borrow().syncing);
+}
+
+/// Page one commits; page two fails. Page one's changes are still announced.
+#[tokio::test]
+async fn committed_pages_are_announced_even_if_a_later_one_fails() {
+    struct TwoPages(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Fetch for TwoPages {
+        async fn page(&self, _since: &str) -> Result<Page, crate::Error> {
+            match self.0.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    let mut p = page(5, None, vec![msg("m1", "c", 4, "bob", "a")], vec![]);
+                    p["more"] = json!(true);
+                    Ok(Page::Rows(p))
+                }
+                _ => Err(crate::Error::UnexpectedResponse),
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let slot: Arc<dyn KeySlot> = Arc::new(InMemoryKeySlot::default());
+    let db = match store::open(dir.path(), Kind::Cache, "s", &KeyStore::new(slot)).unwrap() {
+        Opened::Ready { db, .. } => db,
+        other => panic!("{other:?}"),
+    };
+    let cache = Cache::new(
+        db,
+        ME.into(),
+        Arc::new(TwoPages(AtomicUsize::new(0))),
+        Arc::new(no_history()),
+    );
+    let mut events = cache.events();
+    assert!(cache.sync_now().await.is_err());
+    assert_eq!(
+        events.try_recv().ok(),
+        Some(CacheEvent::Channels(vec!["c".into()]))
+    );
+}
+
+/// A sync that only grows a range (no row changed) still tells the UI: a page may no
+/// longer need the network.
+#[tokio::test]
+async fn a_range_that_grows_is_announced() {
+    let s = setup(
+        vec![
+            page(9, None, vec![], vec![]),
+            page(12, None, vec![msg("m1", "c", 11, "bob", "first")], vec![]),
+        ],
+        no_history(),
+        None,
+    );
+    s.cache.sync_now().await.unwrap();
+    s.cache.load_head("c", 50).await.unwrap(); // empty and complete
+    s.cache
+        .live_event("message.new", &msg("m1", "c", 11, "bob", "first"))
+        .await;
+    let mut events = s.cache.events();
+    s.cache.sync_now().await.unwrap(); // m1 again: no row change, but the range settles
+    let mut got = vec![];
+    while let Ok(e) = events.try_recv() {
+        got.push(e);
+    }
+    assert!(
+        got.contains(&CacheEvent::Channels(vec!["c".into()])),
+        "{got:?}"
+    );
+    assert!(
+        !s.cache
+            .cached_messages("c", None, 50)
+            .await
+            .unwrap()
+            .needs_network
+    );
+}

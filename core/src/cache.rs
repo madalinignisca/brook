@@ -17,6 +17,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, watch, Mutex};
 
 use crate::apply::{apply, floor_at, Applied, Batch, MessageRow};
+use crate::cache_http::HISTORY_MAX;
 use crate::coverage;
 use crate::store::{Db, StoreError};
 use crate::sync::{self, event_batch, message_row, Fetch, SyncError, Synced};
@@ -157,13 +158,21 @@ impl Cache {
     /// once more instead (it may already have fetched past the change that asked).
     pub(crate) async fn sync_now(&self) -> Result<(), SyncError> {
         use std::sync::atomic::Ordering;
-        let Ok(_run) = self.running.try_lock() else {
-            self.again.store(true, Ordering::SeqCst);
-            return Ok(());
-        };
         loop {
-            self.again.store(false, Ordering::SeqCst);
-            self.run_once().await?;
+            let Ok(run) = self.running.try_lock() else {
+                self.again.store(true, Ordering::SeqCst);
+                return Ok(());
+            };
+            loop {
+                self.again.store(false, Ordering::SeqCst);
+                self.run_once().await?;
+                if !self.again.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+            drop(run);
+            // Asked between our last check and letting go: nobody else took it, so go
+            // round again ourselves (or leave it to whoever holds the lock now).
             if !self.again.load(Ordering::SeqCst) {
                 return Ok(());
             }
@@ -171,20 +180,27 @@ impl Cache {
     }
 
     async fn run_once(&self) -> Result<(), SyncError> {
+        /// `syncing` goes back to false however the run ends, cancellation included.
+        struct Syncing<'a>(&'a watch::Sender<CacheState>);
+        impl Drop for Syncing<'_> {
+            fn drop(&mut self) {
+                self.0.send_modify(|s| s.syncing = false);
+            }
+        }
         self.state.send_modify(|s| s.syncing = true);
-        let result = sync::run(&self.db, &self.me, self.fetch.as_ref()).await;
+        let _syncing = Syncing(&self.state);
+        let mut applied = Applied::default();
+        let result = sync::run_into(&self.db, &self.me, self.fetch.as_ref(), &mut applied).await;
         self.state.send_modify(|s| {
-            s.syncing = false;
             s.offline = matches!(result, Err(SyncError::Net(_)));
             if result.is_ok() {
                 s.last_synced = Some(SystemTime::now());
             }
         });
+        // Pages committed before a failure are reported too.
+        self.notify(applied);
         match result {
-            Ok(Synced::Done(applied)) => {
-                self.notify(applied);
-                Ok(())
-            }
+            Ok(Synced::Done(_)) => Ok(()),
             Ok(Synced::Reset) => {
                 // The rebuild itself is C5's (it needs the store wipe); say so meanwhile.
                 let _ = self.events.send(CacheEvent::Reset);
@@ -301,16 +317,27 @@ impl Cache {
                     .map(|j| j.map(|j| serde_json::from_str(&j).unwrap_or(Value::Null)))
                     .collect::<rusqlite::Result<_>>()?;
                 drop(stmt);
+                let id_of = |m: &Value| m.get("id").and_then(Value::as_str).map(str::to_string);
                 let needs_network = match &range {
                     None => true, // never opened: fetch the head
-                    // A full page answers if it stays inside the covered range; a short one
-                    // only if nothing older exists.
-                    Some(r) if messages.len() >= limit => !messages
-                        .last()
-                        .and_then(|m| m.get("id")?.as_str())
-                        .zip(r.oldest_id.as_deref())
-                        .is_some_and(|(last, oldest)| last >= oldest),
-                    Some(r) => !r.complete_to_start,
+                    Some(r) => {
+                        // Nothing above the range's top: a live message there may follow one
+                        // not delivered yet (the next sync, or `load_head`, settles it).
+                        let top_ok = messages.first().and_then(id_of).is_none_or(|first| {
+                            r.newest_id
+                                .as_deref()
+                                .is_some_and(|top| first.as_str() <= top)
+                        });
+                        // Down to the start, or a full page that ends inside the range.
+                        let bottom_ok = r.complete_to_start
+                            || (messages.len() >= limit
+                                && messages
+                                    .last()
+                                    .and_then(id_of)
+                                    .zip(r.oldest_id.clone())
+                                    .is_some_and(|(last, oldest)| last >= oldest));
+                        !(top_ok && bottom_ok)
+                    }
                 };
                 Ok(MessagesPage {
                     messages,
@@ -367,6 +394,9 @@ impl Cache {
             })
             .await
             .map_err(|_| crate::Error::UnexpectedResponse)?;
+        // One limit for the request and for coverage: the server caps a page at 100, and a
+        // full capped page must never read as "short, so that was the start".
+        let limit = limit.clamp(1, HISTORY_MAX);
         let rows = self
             .history
             .page(channel_id, before.as_deref(), limit)
@@ -378,7 +408,13 @@ impl Cache {
             .db
             .call(move |c| {
                 let tx = c.transaction()?;
-                let unchanged_floor = floor_at(&tx, &id)? == floor;
+                // Coverage only from a page that could land: no removal since the request
+                // started, and the channel is here (history for a channel not yet synced
+                // is dropped by `apply`, so it proves nothing).
+                let unchanged_floor = floor_at(&tx, &id)? == floor
+                    && tx
+                        .query_row("SELECT 1 FROM channels WHERE id = ?1", [&id], |_| Ok(()))
+                        .is_ok();
                 let applied = apply(
                     &tx,
                     &me,
