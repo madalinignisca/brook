@@ -99,6 +99,9 @@ pub struct Message {
     /// True when `@channel`/`@here` mentioned everyone in the channel.
     #[serde(default)]
     pub mention_everyone: bool,
+    /// Attached files (none on a tombstone). Save under `filename`; show `original_name`.
+    #[serde(default)]
+    pub attachments: Vec<crate::FileInfo>,
 }
 
 /// An emoji's reaction tally on a message, plus whether the caller reacted.
