@@ -15,9 +15,17 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app import config, db
+from app import config, db, ratelimit
 from app.main import create_app
 from app.models import Base
+
+
+@pytest.fixture(autouse=True)
+def _fresh_limiter() -> Iterator[None]:
+    """Each test starts with an empty auth limiter (all test clients share one IP)."""
+    ratelimit.get_limiter.cache_clear()
+    yield
+    ratelimit.get_limiter.cache_clear()
 
 
 @pytest.fixture

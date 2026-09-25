@@ -37,6 +37,14 @@ class Settings(BaseSettings):
     # Off by default: it is a test tool, not a product client.
     dev_harness: bool = False
 
+    # Auth rate limiting (app/ratelimit.py). In-process, per worker; defaults suit a
+    # single node. Keys are client IPs (X-Forwarded-For is trusted only from 127.0.0.1).
+    ratelimit_max_keys: int = 10_000
+    ratelimit_burst: float = 10.0
+    ratelimit_per_minute: float = 10.0
+    ratelimit_backoff_after: int = 5
+    ratelimit_go_away_per_hour: int = 50
+
     # Must be explicitly enabled to run with a weak/default JWT key (local dev only).
     allow_insecure_auth: bool = False
 
