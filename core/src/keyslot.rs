@@ -27,8 +27,14 @@ pub enum KeySlotError {
     Fatal(i32),
 }
 
-/// Named-slot byte storage, implemented by the platform. Synchronous: every call is short, and
-/// callers run it inside their own critical sections.
+/// Named-slot byte storage, implemented by the platform. Synchronous: callers run it inside
+/// their own critical sections (the session store's write section), so **every call must
+/// return within a few seconds or report `Unavailable`**. A stuck or prompting store (a D-Bus
+/// keyring can block for 25 s) must be cut off by the implementation with its own deadline;
+/// core doesn't move these calls off the async worker (`block_in_place` panics on the
+/// current-thread runtimes core runs on in tests and some embedders).
+///
+/// `load` finding more than one item for a slot is `Unavailable`, never a guess.
 pub trait KeySlot: Send + Sync {
     /// The bytes under `slot`, `None` if the slot doesn't exist.
     fn load(&self, slot: String) -> Result<Option<Vec<u8>>, KeySlotError>;
