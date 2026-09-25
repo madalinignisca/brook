@@ -133,6 +133,7 @@ pub(crate) fn parse_page(page: &Value) -> Option<(Batch, String, bool)> {
             .collect::<Option<_>>()?,
         tombstones: Vec::new(),
         history: false,
+        history_floors: Default::default(),
         removed: list("removed_channels")?
             .iter()
             .map(|v| Some((s(v, "channel_id")?, seq(v)?)))

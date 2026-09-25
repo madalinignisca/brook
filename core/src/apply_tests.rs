@@ -198,6 +198,7 @@ async fn a_history_page_after_a_removal_is_dropped() {
         .apply(Batch {
             messages: vec![message("old", "c", 10, "history")],
             history: true,
+            history_floors: [("c".to_string(), None)].into(),
             ..Batch::default()
         })
         .await;
@@ -211,6 +212,7 @@ async fn a_history_row_never_replaces_a_stored_one() {
         .apply(Batch {
             messages: vec![message("m1", "c", 10, "from history")],
             history: true,
+            history_floors: [("c".to_string(), None)].into(),
             ..Batch::default()
         })
         .await;
@@ -219,6 +221,7 @@ async fn a_history_row_never_replaces_a_stored_one() {
         .apply(Batch {
             messages: vec![message("h", "c", 5, "older")],
             history: true,
+            history_floors: [("c".to_string(), None)].into(),
             ..Batch::default()
         })
         .await;
@@ -398,6 +401,7 @@ async fn a_stale_row_after_a_rejoin_stays_out() {
         .apply(Batch {
             messages: vec![message("m1", "c", 25, "edited while away")],
             history: true,
+            history_floors: [("c".to_string(), Some(20))].into(),
             ..Batch::default()
         })
         .await;
@@ -625,6 +629,7 @@ async fn an_old_history_version_never_rewrites_a_quote() {
         .apply(Batch {
             messages: vec![message("m1", "c", 5, "original")],
             history: true,
+            history_floors: [("c".to_string(), None)].into(),
             ..Batch::default()
         })
         .await;
@@ -700,8 +705,46 @@ async fn history_after_a_rejoin_brings_back_unchanged_old_messages() {
         .apply(Batch {
             messages: vec![message("m1", "c", 10, "hello")],
             history: true,
+            history_floors: [("c".to_string(), Some(20))].into(),
             ..Batch::default()
         })
         .await;
     assert_eq!(cache.body("m1").await.as_deref(), Some("hello"));
+}
+
+/// A history page requested before a removal, arriving after the rejoin: dropped, whatever
+/// the request's fate, so a message deleted while the caller was out can't come back.
+#[tokio::test]
+async fn a_history_page_from_before_a_removal_never_lands() {
+    let cache = joined().await;
+    let floor_then = cache
+        .db
+        .call(|c| {
+            let t = c.transaction()?;
+            crate::apply::floor_at(&t, "c")
+        })
+        .await
+        .unwrap();
+    cache
+        .apply(Batch {
+            removed: vec![("c".into(), 20)],
+            ..Batch::default()
+        })
+        .await;
+    cache
+        .apply(Batch {
+            channels: vec![channel("c", 30, "general")],
+            memberships: vec![member("c", ME, 30)],
+            ..Batch::default()
+        })
+        .await;
+    cache
+        .apply(Batch {
+            messages: vec![message("gone", "c", 12, "deleted while away")],
+            history: true,
+            history_floors: [("c".to_string(), floor_then)].into(),
+            ..Batch::default()
+        })
+        .await;
+    assert_eq!(cache.body("gone").await, None);
 }

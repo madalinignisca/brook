@@ -67,6 +67,12 @@ pub(crate) struct Batch {
     /// exempt from the removal floor, and never rewriting quotes (a later edit may already
     /// be cached).
     pub(crate) history: bool,
+    /// For history: each channel's removal floor as read when the request started
+    /// (`floor_at`). A removal since then changes it, and the page is dropped for that
+    /// channel: a page from before a removal must never land after it (it could bring back
+    /// a message deleted while the caller was out). Enforced here, on arrival, not only by
+    /// cancelling the request.
+    pub(crate) history_floors: std::collections::HashMap<String, Option<i64>>,
     /// Live deletes, which carry only ids: `(message id, channel id, seq)`. They patch the
     /// stored row into a tombstone (the author and time stay), never replace it.
     pub(crate) tombstones: Vec<(String, String, i64)>,
@@ -174,6 +180,12 @@ pub(crate) fn apply(tx: &Transaction<'_>, me: &str, batch: &Batch) -> rusqlite::
 
     // 4. Messages.
     for m in &batch.messages {
+        if batch.history
+            && batch.history_floors.get(&m.channel_id).copied().flatten()
+                != floor_of(tx, &m.channel_id)?
+        {
+            continue; // a removal happened since this page was requested
+        }
         if !message_may_land(tx, &m.channel_id, m.seq, batch.history)? {
             continue;
         }
@@ -323,6 +335,12 @@ fn floor_of(tx: &Transaction<'_>, channel_id: &str) -> rusqlite::Result<Option<i
         |r| r.get(0),
     )
     .optional()
+}
+
+/// A channel's removal floor, read before a history request starts (see
+/// `Batch::history_floors`).
+pub(crate) fn floor_at(tx: &Transaction<'_>, channel_id: &str) -> rusqlite::Result<Option<i64>> {
+    floor_of(tx, channel_id)
 }
 
 /// Whether a row with `seq` for this channel is at or below its active removal fence.
