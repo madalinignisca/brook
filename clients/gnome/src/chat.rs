@@ -768,10 +768,14 @@ fn send_current(chat: &Rc<Chat>) {
                     .map(|_| false)
             }
         });
-        match handle.await {
-            Ok(Ok(true)) => render_pending(&chat),
-            Ok(Ok(false)) => {}
-            Ok(Err(err)) => {
+        // A panicked or cancelled task is a failure too: nothing was confirmed sent.
+        match handle
+            .await
+            .unwrap_or(Err(brook_core::Error::UnexpectedResponse))
+        {
+            Ok(true) => render_pending(&chat),
+            Ok(false) => {}
+            Err(err) => {
                 tracing::warn!(%err, "failed to send message");
                 // Nothing was sent: give the text (and the reply) back, unless the
                 // user already started typing something new, and say why.
@@ -784,7 +788,6 @@ fn send_current(chat: &Rc<Chat>) {
                 }
                 show_send_error(&chat, &send_error_text(&err));
             }
-            Err(_) => {}
         }
     });
 }
