@@ -265,12 +265,14 @@ fn watch_auth_state(
                 AuthState::LoggedOut => {
                     // Signed out mid-session (session expired, refresh
                     // rejected): drop the chat view and its state, back to login.
+                    // Consumed on every LoggedOut, so a flag from one Sign Out can
+                    // never silence a later sign-out the user didn't ask for.
+                    let asked = ui.signed_out_by_user.replace(false);
                     if let Some(chat) = stack.child_by_name("chat") {
                         stack.set_visible_child_name("login");
                         stack.remove(&chat);
                         // Sign Out needs no explanation; anything else (a refresh
                         // rejected, a password changed elsewhere) does.
-                        let asked = ui.signed_out_by_user.replace(false);
                         error_label.set_text(if asked {
                             ""
                         } else {
