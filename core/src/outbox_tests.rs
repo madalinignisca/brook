@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use tokio::sync::{watch, Notify};
 
 use crate::cache::{Cache, History};
-use crate::outbox::{Deleted, Outbox, OutboxError, PendingState, Post, SendFailure};
+use crate::outbox::{Deleted, Outbox, OutboxError, Outgoing, PendingState, Post, SendFailure};
 use crate::store::{self, Db, Kind, Opened};
 use crate::sync::{Fetch, Page};
 use crate::{InMemoryKeySlot, KeySlot, KeyStore};
@@ -39,6 +39,8 @@ struct Server {
     stored: Mutex<HashMap<String, Value>>,
     /// Every send, in order: (channel, client_id, body).
     sends: Mutex<Vec<(String, String, String)>>,
+    /// Every send's reply target, in order: (client_id, reply_to_id).
+    replies: Mutex<Vec<(String, Option<String>)>>,
 }
 
 impl Server {
@@ -88,10 +90,15 @@ impl Post for Server {
     async fn send(
         &self,
         channel: &str,
-        body: &str,
+        msg: &Outgoing,
         client_id: &str,
         _epoch: u64,
     ) -> Result<Value, SendFailure> {
+        let body = msg.body.as_str();
+        self.replies
+            .lock()
+            .unwrap()
+            .push((client_id.into(), msg.reply_to_id.clone()));
         self.sends
             .lock()
             .unwrap()
@@ -238,7 +245,7 @@ async fn cached_bodies(s: &Setup, ch: &str) -> Vec<String> {
 async fn a_queued_message_is_durable_before_enqueue_returns() {
     let s = setup().await;
     s.session.send_replace(None); // signed out: nothing is sent
-    let id = s.outbox.enqueue("c1", "hello", None).await.unwrap();
+    let id = s.outbox.enqueue("c1", "hello", None, None).await.unwrap();
     // Reopen the store as a restart would: the row is there.
     let outbox = s.outbox;
     outbox.close().await;
@@ -261,7 +268,7 @@ async fn a_queued_message_is_durable_before_enqueue_returns() {
 async fn a_lost_answer_and_a_resend_make_one_message() {
     let s = setup().await;
     s.server.script([Answer::Lost, Answer::Ok]);
-    s.outbox.enqueue("c1", "once", None).await.unwrap();
+    s.outbox.enqueue("c1", "once", None, None).await.unwrap();
     drained(&s).await;
     let sends = s.server.sends();
     assert_eq!(sends.len(), 2);
@@ -275,7 +282,7 @@ async fn messages_go_in_the_order_written() {
     let s = setup().await;
     s.session.send_replace(None);
     for body in ["one", "two", "three", "four"] {
-        s.outbox.enqueue("c1", body, None).await.unwrap();
+        s.outbox.enqueue("c1", body, None, None).await.unwrap();
     }
     s.session.send_replace(Some(1));
     drained(&s).await;
@@ -288,7 +295,11 @@ async fn messages_go_in_the_order_written() {
 async fn a_row_left_sending_by_a_crash_is_resent_with_its_id() {
     let s = setup().await;
     s.session.send_replace(None);
-    let id = s.outbox.enqueue("c1", "mid-flight", None).await.unwrap();
+    let id = s
+        .outbox
+        .enqueue("c1", "mid-flight", None, None)
+        .await
+        .unwrap();
     let outbox = s.outbox;
     outbox.close().await;
     let db = open_db(s.outbox_dir.path(), Kind::Outbox, &s.slot);
@@ -322,9 +333,15 @@ async fn a_failed_message_blocks_only_its_own_channel() {
             code: "authz.forbidden".into(),
         })],
     );
-    s.outbox.enqueue("c1", "refused", None).await.unwrap();
-    s.outbox.enqueue("c1", "behind it", None).await.unwrap();
-    s.outbox.enqueue("c2", "elsewhere", None).await.unwrap();
+    s.outbox.enqueue("c1", "refused", None, None).await.unwrap();
+    s.outbox
+        .enqueue("c1", "behind it", None, None)
+        .await
+        .unwrap();
+    s.outbox
+        .enqueue("c2", "elsewhere", None, None)
+        .await
+        .unwrap();
     s.session.send_replace(Some(1));
     let server = s.server.clone();
     eventually("c2's send", move || {
@@ -358,7 +375,10 @@ async fn transient_answers_keep_the_message_pending() {
     ] {
         let s = setup().await;
         s.server.script([Answer::Fail(failure.clone()), Answer::Ok]);
-        s.outbox.enqueue("c1", "eventually", None).await.unwrap();
+        s.outbox
+            .enqueue("c1", "eventually", None, None)
+            .await
+            .unwrap();
         drained(&s).await;
         assert_eq!(s.server.stored_bodies(), vec!["eventually"], "{failure:?}");
     }
@@ -375,7 +395,7 @@ async fn a_refusal_fails_the_message_with_the_servers_code() {
         let s = setup().await;
         s.server
             .script([Answer::Fail(SendFailure::Refused { code: code.into() })]);
-        s.outbox.enqueue("c1", "no", None).await.unwrap();
+        s.outbox.enqueue("c1", "no", None, None).await.unwrap();
         let o = s.outbox.clone();
         let mut state = None;
         for _ in 0..500 {
@@ -399,7 +419,10 @@ async fn a_refusal_fails_the_message_with_the_servers_code() {
 async fn a_wrong_echo_fails_the_row_and_never_resends() {
     let s = setup().await;
     s.server.script([Answer::WrongEcho]);
-    s.outbox.enqueue("c1", "who am i", None).await.unwrap();
+    s.outbox
+        .enqueue("c1", "who am i", None, None)
+        .await
+        .unwrap();
     let o = s.outbox.clone();
     for _ in 0..500 {
         if matches!(
@@ -430,7 +453,11 @@ async fn delete_during_an_accepted_send_reports_it_sent() {
     let s = setup().await;
     let gate = Arc::new(Notify::new());
     s.server.script([Answer::Held(gate.clone())]);
-    let id = s.outbox.enqueue("c1", "too late", None).await.unwrap();
+    let id = s
+        .outbox
+        .enqueue("c1", "too late", None, None)
+        .await
+        .unwrap();
     let server = s.server.clone();
     eventually("the send in flight", move || server.sends().len() == 1).await;
     let delete = tokio::spawn({
@@ -447,7 +474,11 @@ async fn delete_during_an_accepted_send_reports_it_sent() {
 async fn delete_before_sending_removes_it() {
     let s = setup().await;
     s.session.send_replace(None);
-    let id = s.outbox.enqueue("c1", "never mind", None).await.unwrap();
+    let id = s
+        .outbox
+        .enqueue("c1", "never mind", None, None)
+        .await
+        .unwrap();
     assert_eq!(
         s.outbox.delete_pending(&id).await.unwrap(),
         Deleted::Removed
@@ -464,7 +495,7 @@ async fn a_sign_out_pauses_the_sender_mid_backoff() {
     s.server.script([Answer::Fail(SendFailure::Transient {
         retry_after: Some(1),
     })]);
-    s.outbox.enqueue("c1", "later", None).await.unwrap();
+    s.outbox.enqueue("c1", "later", None, None).await.unwrap();
     let server = s.server.clone();
     eventually("the first attempt", move || server.sends().len() == 1).await;
     s.session.send_replace(None); // a plain sign-out (no data removed)
@@ -479,8 +510,8 @@ async fn a_sign_out_pauses_the_sender_mid_backoff() {
 async fn unsent_messages_are_counted_for_the_sign_out_warning() {
     let s = setup().await;
     s.session.send_replace(None);
-    s.outbox.enqueue("c1", "a", None).await.unwrap();
-    s.outbox.enqueue("c2", "b", None).await.unwrap();
+    s.outbox.enqueue("c1", "a", None, None).await.unwrap();
+    s.outbox.enqueue("c2", "b", None, None).await.unwrap();
     assert_eq!(s.outbox.unsent_count().await.unwrap(), 2);
 }
 
@@ -499,11 +530,11 @@ async fn a_failed_ack_keeps_the_row() {
         async fn send(
             &self,
             ch: &str,
-            body: &str,
+            msg: &Outgoing,
             cid: &str,
             e: u64,
         ) -> Result<Value, SendFailure> {
-            let mut m = self.0.send(ch, body, cid, e).await?;
+            let mut m = self.0.send(ch, msg, cid, e).await?;
             m.as_object_mut().unwrap().remove("created_at"); // the cache can't take it
             Ok(m)
         }
@@ -520,7 +551,7 @@ async fn a_failed_ack_keeps_the_row() {
     )
     .await
     .unwrap();
-    outbox.enqueue("c1", "keep me", None).await.unwrap();
+    outbox.enqueue("c1", "keep me", None, None).await.unwrap();
     let server = s.server.clone();
     eventually("a send", move || !server.sends().is_empty()).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -553,16 +584,19 @@ async fn a_direct_send_is_signed_in_and_retryable_as_the_same_message() {
     trigger(&s, NO_INSERTS).await;
     s.session.send_replace(None);
     assert_eq!(
-        s.outbox.enqueue("c1", "hi", None).await,
+        s.outbox.enqueue("c1", "hi", None, None).await,
         Err(OutboxError::SignedOut)
     );
     s.session.send_replace(Some(1));
     s.server.script([Answer::Lost]);
-    let err = s.outbox.enqueue("c1", "hi", None).await.unwrap_err();
+    let err = s.outbox.enqueue("c1", "hi", None, None).await.unwrap_err();
     let OutboxError::NotSent { client_id, .. } = err else {
         panic!("{err:?}")
     };
-    s.outbox.enqueue("c1", "hi", Some(client_id)).await.unwrap();
+    s.outbox
+        .enqueue("c1", "hi", None, Some(client_id))
+        .await
+        .unwrap();
     assert_eq!(
         s.server.stored_bodies(),
         vec!["hi"],
@@ -574,12 +608,12 @@ async fn a_direct_send_is_signed_in_and_retryable_as_the_same_message() {
 async fn a_direct_send_never_overtakes_a_queued_message() {
     let s = setup().await;
     s.session.send_replace(None);
-    s.outbox.enqueue("c1", "first", None).await.unwrap();
+    s.outbox.enqueue("c1", "first", None, None).await.unwrap();
     trigger(&s, NO_INSERTS).await;
     s.session.send_replace(Some(1));
     // The queued one may go meanwhile; either way a direct send only runs with nothing
     // left queued, so it can't overtake.
-    match s.outbox.enqueue("c1", "second", None).await {
+    match s.outbox.enqueue("c1", "second", None, None).await {
         Err(OutboxError::WouldOvertake) => {}
         Ok(_) => assert_eq!(
             s.server
@@ -607,7 +641,7 @@ async fn an_outcome_the_store_cant_record_backs_off() {
         s.server
             .script([Answer::Fail(SendFailure::Refused { code: "x".into() })]);
     }
-    s.outbox.enqueue("c1", "stuck", None).await.unwrap();
+    s.outbox.enqueue("c1", "stuck", None, None).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let n = s.server.sends().len();
     assert!(n <= 2, "re-sent {n} times in 1.5 s");
@@ -619,7 +653,10 @@ async fn an_answer_after_a_sign_out_is_not_applied() {
     let s = setup().await;
     let gate = Arc::new(Notify::new());
     s.server.script([Answer::Held(gate.clone())]);
-    s.outbox.enqueue("c1", "in flight", None).await.unwrap();
+    s.outbox
+        .enqueue("c1", "in flight", None, None)
+        .await
+        .unwrap();
     let server = s.server.clone();
     eventually("the send", move || server.sends().len() == 1).await;
     s.session.send_replace(None);
@@ -645,11 +682,11 @@ async fn an_accepted_message_is_never_deleted_as_unsent() {
         async fn send(
             &self,
             ch: &str,
-            body: &str,
+            msg: &Outgoing,
             cid: &str,
             e: u64,
         ) -> Result<Value, SendFailure> {
-            let mut m = self.0.send(ch, body, cid, e).await?;
+            let mut m = self.0.send(ch, msg, cid, e).await?;
             m.as_object_mut().unwrap().remove("created_at");
             Ok(m)
         }
@@ -666,7 +703,10 @@ async fn an_accepted_message_is_never_deleted_as_unsent() {
     )
     .await
     .unwrap();
-    let id = outbox.enqueue("c1", "sent really", None).await.unwrap();
+    let id = outbox
+        .enqueue("c1", "sent really", None, None)
+        .await
+        .unwrap();
     let o = outbox.clone();
     for _ in 0..500 {
         if o.pending("c1")
@@ -697,7 +737,7 @@ async fn a_closed_outbox_takes_nothing() {
     let extra = s.outbox.clone(); // someone still holds it
     s.outbox.close().await;
     assert_eq!(
-        extra.enqueue("c1", "after", None).await,
+        extra.enqueue("c1", "after", None, None).await,
         Err(OutboxError::Closed)
     );
     assert_eq!(extra.retry("x").await, Err(OutboxError::Closed));
@@ -710,7 +750,10 @@ async fn a_refused_token_is_retried() {
     s.server.script([Answer::Fail(SendFailure::Transient {
         retry_after: Some(0),
     })]);
-    s.outbox.enqueue("c1", "after refresh", None).await.unwrap();
+    s.outbox
+        .enqueue("c1", "after refresh", None, None)
+        .await
+        .unwrap();
     drained(&s).await;
 }
 
@@ -731,7 +774,7 @@ async fn retry_after_zero_with_a_failing_store_is_still_bounded() {
             retry_after: Some(0),
         })]);
     }
-    s.outbox.enqueue("c1", "busy", None).await.unwrap();
+    s.outbox.enqueue("c1", "busy", None, None).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let n = s.server.sends().len();
     assert!(n <= 2, "re-sent {n} times in 1.5 s");
@@ -748,11 +791,11 @@ async fn an_accepted_row_is_never_resent_forever_nor_failed() {
         async fn send(
             &self,
             ch: &str,
-            body: &str,
+            msg: &Outgoing,
             cid: &str,
             e: u64,
         ) -> Result<Value, SendFailure> {
-            let mut m = self.0.send(ch, body, cid, e).await?;
+            let mut m = self.0.send(ch, msg, cid, e).await?;
             m.as_object_mut().unwrap().remove("created_at");
             Ok(m)
         }
@@ -776,7 +819,7 @@ async fn an_accepted_row_is_never_resent_forever_nor_failed() {
         )
         .await
         .unwrap();
-        outbox.enqueue("c1", "sent", None).await.unwrap();
+        outbox.enqueue("c1", "sent", None, None).await.unwrap();
         let o = outbox.clone();
         let mut gone = false;
         for _ in 0..600 {
@@ -802,14 +845,16 @@ async fn an_accepted_row_is_never_resent_forever_nor_failed() {
 async fn an_id_queued_for_another_channel_is_refused() {
     let s = setup().await;
     s.session.send_replace(None);
-    let id = s.outbox.enqueue("c1", "here", None).await.unwrap();
+    let id = s.outbox.enqueue("c1", "here", None, None).await.unwrap();
     assert_eq!(
-        s.outbox.enqueue("c2", "there", Some(id.clone())).await,
+        s.outbox
+            .enqueue("c2", "there", None, Some(id.clone()))
+            .await,
         Err(OutboxError::IdInUse)
     );
     // The same channel again is the same message (a retry), not an error.
     assert_eq!(
-        s.outbox.enqueue("c1", "here", Some(id.clone())).await,
+        s.outbox.enqueue("c1", "here", None, Some(id.clone())).await,
         Ok(id)
     );
 }
@@ -823,7 +868,7 @@ async fn retry_after_zero_waits_at_least_a_second() {
             retry_after: Some(0),
         })]);
     }
-    s.outbox.enqueue("c1", "busy", None).await.unwrap();
+    s.outbox.enqueue("c1", "busy", None, None).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let n = s.server.sends().len();
     assert!(n <= 2, "re-sent {n} times in 1.5 s");
@@ -837,7 +882,7 @@ async fn a_dropped_session_source_stops_the_sender() {
     s.server.script([Answer::Fail(SendFailure::Transient {
         retry_after: Some(1),
     })]);
-    s.outbox.enqueue("c1", "orphan", None).await.unwrap();
+    s.outbox.enqueue("c1", "orphan", None, None).await.unwrap();
     let server = s.server.clone();
     eventually("the first attempt", move || server.sends().len() == 1).await;
     drop(s.session); // last value: Some(1)
@@ -859,7 +904,7 @@ async fn an_uppercase_client_id_is_sent_and_cleared() {
     let s = setup().await;
     let id = s
         .outbox
-        .enqueue("c1", "shout", Some(UPPER.into()))
+        .enqueue("c1", "shout", None, Some(UPPER.into()))
         .await
         .unwrap();
     assert_eq!(id, LOWER, "the id wasn't made canonical");
@@ -874,7 +919,7 @@ async fn retry_and_delete_accept_the_callers_form_of_the_id() {
     s.server
         .script([Answer::Fail(SendFailure::Refused { code: "x".into() })]);
     s.outbox
-        .enqueue("c1", "again", Some(UPPER.into()))
+        .enqueue("c1", "again", None, Some(UPPER.into()))
         .await
         .unwrap();
     let outbox = s.outbox.clone();
@@ -892,7 +937,7 @@ async fn retry_and_delete_accept_the_callers_form_of_the_id() {
     drained(&s).await;
     s.session.send_replace(None);
     s.outbox
-        .enqueue("c1", "never", Some(UPPER.replace("ABCD", "ABCE")))
+        .enqueue("c1", "never", None, Some(UPPER.replace("ABCD", "ABCE")))
         .await
         .unwrap();
     assert_eq!(
@@ -913,14 +958,116 @@ async fn a_client_id_that_isnt_a_uuid_is_refused() {
         "0190a0000000-7000-8000-00000000abcd-",
     ] {
         assert_eq!(
-            s.outbox.enqueue("c1", "x", Some(bad.into())).await,
+            s.outbox.enqueue("c1", "x", None, Some(bad.into())).await,
             Err(OutboxError::BadId),
             "{bad} was accepted"
         );
     }
     assert!(s
         .outbox
-        .enqueue("c1", "x", Some("0190A00000007000800000000000ABCD".into()))
+        .enqueue(
+            "c1",
+            "x",
+            None,
+            Some("0190A00000007000800000000000ABCD".into())
+        )
         .await
         .is_ok_and(|id| id == LOWER));
+}
+
+// ---- Queued replies (#111) ----
+
+const Q: &str = "0190a000-0000-7000-8000-0000000000aa";
+const R: &str = "0190a000-0000-7000-8000-0000000000bb";
+const X: &str = "0190a000-0000-7000-8000-0000000000cc";
+
+fn reply(id: &str) -> Option<String> {
+    Some(id.to_string())
+}
+
+async fn failed(s: &Setup) {
+    for _ in 0..500 {
+        let p = s.outbox.pending("c1").await.unwrap();
+        if matches!(
+            p.first().map(|m| &m.state),
+            Some(PendingState::Failed { .. })
+        ) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the row never failed");
+}
+
+/// The pending row shows what it replies to.
+#[tokio::test]
+async fn a_queued_reply_shows_its_target() {
+    let s = setup().await;
+    s.session.send_replace(None);
+    s.outbox.enqueue("c1", "yes", reply(Q), None).await.unwrap();
+    let p = s.outbox.pending("c1").await.unwrap();
+    assert_eq!(p[0].reply_to_id.as_deref(), Some(Q));
+}
+
+/// The first send and the resend after a lost answer both carry the target: the server
+/// keeps the first POST per client_id, so a first send without it couldn't be mended.
+#[tokio::test]
+async fn every_send_of_a_reply_carries_its_target() {
+    let s = setup().await;
+    s.server.script([Answer::Lost, Answer::Ok]);
+    let id = s.outbox.enqueue("c1", "yes", reply(Q), None).await.unwrap();
+    drained(&s).await;
+    let sent = s.server.replies.lock().unwrap().clone();
+    assert_eq!(sent, vec![(id.clone(), reply(Q)), (id, reply(Q))]);
+}
+
+/// A refused reply, retried, still goes as a reply.
+#[tokio::test]
+async fn a_retried_reply_is_still_a_reply() {
+    let s = setup().await;
+    s.server
+        .script([Answer::Fail(SendFailure::Refused { code: "x".into() })]);
+    s.outbox.enqueue("c1", "yes", reply(Q), None).await.unwrap();
+    failed(&s).await;
+    let id = s.outbox.pending("c1").await.unwrap()[0].client_id.clone();
+    s.outbox.retry(&id).await.unwrap();
+    drained(&s).await;
+    let last = s.server.replies.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(last, (id, reply(Q)));
+}
+
+/// The outbox can't be written: the direct send is a reply too.
+#[tokio::test]
+async fn a_direct_send_carries_the_target() {
+    let s = setup().await;
+    trigger(&s, NO_INSERTS).await;
+    s.outbox.enqueue("c1", "yes", reply(Q), None).await.unwrap();
+    let sent = s.server.replies.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].1, reply(Q));
+}
+
+/// The same id again with another target: the stored row wins, on the pending row and on
+/// the wire. Quoting something else needs a new id.
+#[tokio::test]
+async fn the_stored_row_wins_on_the_reply_target() {
+    for (first, second) in [(None, reply(R)), (reply(Q), reply(R))] {
+        let s = setup().await;
+        s.session.send_replace(None);
+        s.outbox
+            .enqueue("c1", "yes", first.clone(), Some(X.into()))
+            .await
+            .unwrap();
+        s.outbox
+            .enqueue("c1", "yes", second, Some(X.into()))
+            .await
+            .unwrap();
+        let p = s.outbox.pending("c1").await.unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].reply_to_id, first, "the pending row changed target");
+        s.session.send_replace(Some(1));
+        drained(&s).await;
+        let sent = s.server.replies.lock().unwrap().clone();
+        assert_eq!(sent, vec![(X.to_string(), first)], "posted another target");
+    }
 }

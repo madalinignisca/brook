@@ -146,12 +146,12 @@ async fn a_lost_outbox_is_reported() {
     let local = open(root.path(), &slot).await;
     let s = local.open_user("https://a", "u1").await.unwrap();
     let id = s.store_id.clone();
-    assert!(!s.outbox_lost);
+    assert!(!local.take_lost_unsent());
     ready(s.cache).close().await;
     ready(s.outbox).close().await;
     slot.put(&format!("outbox:{id}"), vec![9; 32]); // not the outbox's key
-    let s = local.open_user("https://a", "u1").await.unwrap();
-    assert!(s.outbox_lost);
+    let _s = local.open_user("https://a", "u1").await.unwrap();
+    assert!(local.take_lost_unsent());
 }
 
 /// Startup: a directory no index row names (a wipe cut short) is erased; the rest, and
@@ -253,6 +253,46 @@ async fn a_locked_index_means_no_local_data_and_nothing_deleted() {
 /// An outbox in another format (pre-1.0: no migrations) is remade, and reported as lost.
 #[tokio::test]
 async fn an_outbox_in_another_format_is_reported_lost() {
+    // (rows as `state`s): only something not yet accepted is a loss.
+    for (states, lost) in [
+        (vec!["pending"], true),
+        (vec!["failed", "accepted"], true),
+        (vec!["accepted"], false),
+        (vec![], false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let slot = Arc::new(InMemoryKeySlot::default());
+        let local = open(root.path(), &slot).await;
+        let s = local.open_user("https://a", "u1").await.unwrap();
+        ready(s.cache).close().await;
+        let outbox = ready(s.outbox);
+        let rows: Vec<String> = states.iter().map(|s| s.to_string()).collect();
+        outbox
+            .call(move |c| {
+                for (n, state) in rows.iter().enumerate() {
+                    c.execute(
+                        "INSERT INTO outbox(client_id, channel_id, body, state, created_at)
+                         VALUES (?1, 'c', 'hi', ?2, 'now')",
+                        [format!("cid-{n}"), state.clone()],
+                    )?;
+                }
+                c.execute("UPDATE meta SET format = 1", []) // the format before replies
+            })
+            .await
+            .unwrap();
+        outbox.close().await;
+        let s = local.open_user("https://a", "u1").await.unwrap();
+        assert_eq!(local.take_lost_unsent(), lost, "{states:?}");
+        assert!(matches!(s.outbox, Opened::Ready { .. }));
+        ready(s.cache).close().await;
+        ready(s.outbox).close().await;
+    }
+}
+
+/// An old outbox whose rows can't be counted counts as a loss: saying so wrongly beats
+/// losing messages silently.
+#[tokio::test]
+async fn an_old_outbox_that_cant_be_counted_is_a_loss() {
     let root = tempfile::tempdir().unwrap();
     let slot = Arc::new(InMemoryKeySlot::default());
     let local = open(root.path(), &slot).await;
@@ -260,11 +300,12 @@ async fn an_outbox_in_another_format_is_reported_lost() {
     ready(s.cache).close().await;
     let outbox = ready(s.outbox);
     outbox
-        .call(|c| c.execute("UPDATE meta SET format = 0", []))
+        .call(|c| {
+            c.execute_batch("ALTER TABLE outbox RENAME TO elsewhere; UPDATE meta SET format = 1;")
+        })
         .await
         .unwrap();
     outbox.close().await;
-    let s = local.open_user("https://a", "u1").await.unwrap();
-    assert!(s.outbox_lost);
-    assert!(matches!(s.outbox, Opened::Ready { .. }));
+    let _s = local.open_user("https://a", "u1").await.unwrap();
+    assert!(local.take_lost_unsent());
 }

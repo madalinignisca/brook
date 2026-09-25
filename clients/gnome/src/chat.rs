@@ -757,7 +757,7 @@ fn send_current(chat: &Rc<Chat>) {
             let (body, reply_to) = (body.clone(), reply_to.clone());
             async move {
                 if queued {
-                    match client.send_queued(&channel_id, &body, None).await {
+                    match client.send_queued(&channel_id, &body, None, None).await {
                         Ok(_) => return Ok(true),
                         Err(brook_core::Error::Api { code, .. }) if code == "local.unavailable" => {
                         }

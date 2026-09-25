@@ -129,8 +129,16 @@ fn every_pending_state_and_delete_outcome_maps() {
         client_id: "x".into(),
         channel_id: "c".into(),
         body: "b".into(),
+        reply_to_id: Some("q".into()),
         state,
     };
+    assert_eq!(
+        FfiPendingMessage::from(p(PendingState::Pending))
+            .reply_to_id
+            .as_deref(),
+        Some("q"),
+        "a queued reply lost its target"
+    );
     let states: Vec<_> = [
         PendingState::Pending,
         PendingState::Sending,

@@ -305,7 +305,9 @@ impl BrookClient {
             .await
     }
 
-    /// Queue a message: saved before this returns, sent in order when possible. Pass the
+    /// Queue a message (a reply, with `reply_to_id`): saved before this returns, sent in
+    /// order when possible. The same `client_id` again returns the stored message, reply
+    /// target included: quoting something else needs a new id. Pass the
     /// `client_id` of an earlier attempt to retry it (a UUID, any case; anything else is
     /// `outbox.bad_id`). Returns its `client_id` in canonical lowercase form, which is how
     /// `pending_messages` and the sent message's `client_id` will show it.
@@ -313,11 +315,12 @@ impl BrookClient {
         &self,
         channel_id: &str,
         body: &str,
+        reply_to_id: Option<String>,
         client_id: Option<String>,
     ) -> Result<String> {
         let outbox = self.active_outbox().await?;
         outbox
-            .enqueue(channel_id, body, client_id)
+            .enqueue(channel_id, body, reply_to_id, client_id)
             .await
             .map_err(outbox_error)
     }

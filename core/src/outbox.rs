@@ -36,12 +36,20 @@ use crate::store::{Db, StoreError};
 /// Where a sent message goes (`POST /channels/{id}/messages`). `epoch` is the session the
 /// sender checked: an implementation refuses to send (`Transient`) if the signed-in session
 /// is no longer that one, so a message never goes out under another session.
+/// What a row sends. A struct, not more parameters: attachments add a field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Outgoing {
+    pub(crate) body: String,
+    /// The quoted message, for a reply.
+    pub(crate) reply_to_id: Option<String>,
+}
+
 #[async_trait::async_trait]
 pub(crate) trait Post: Send + Sync {
     async fn send(
         &self,
         channel_id: &str,
-        body: &str,
+        msg: &Outgoing,
         client_id: &str,
         epoch: u64,
     ) -> Result<Value, SendFailure>;
@@ -77,6 +85,8 @@ pub struct PendingMessage {
     pub client_id: String,
     pub channel_id: String,
     pub body: String,
+    /// The quoted message, for a reply ("Replying to …").
+    pub reply_to_id: Option<String>,
     pub state: PendingState,
 }
 
@@ -307,12 +317,14 @@ impl Outbox {
     }
 
     /// Queue a message: durable (committed) before this returns. Pass the `client_id` of an
-    /// earlier attempt to retry it (never a second message). If the outbox can't be
-    /// written, it's sent directly, only where nothing is waiting.
+    /// earlier attempt to retry it (never a second message): the stored row wins, body and
+    /// reply target included, so a different target needs a new id. If the outbox can't
+    /// be written, it's sent directly, only where nothing is waiting.
     pub(crate) async fn enqueue(
         self: &Arc<Self>,
         channel_id: &str,
         body: &str,
+        reply_to_id: Option<String>,
         client_id: Option<String>,
     ) -> Result<String, OutboxError> {
         let client_id = match client_id {
@@ -323,15 +335,19 @@ impl Outbox {
         // Woken before the insert, not after: a caller cancelled mid-insert leaves a
         // committed row, and the sender must still look (a spare wake-up is harmless).
         sender.wake.notify_one();
-        let (ch, b, cid) = (channel_id.to_string(), body.to_string(), client_id.clone());
+        let msg = Outgoing {
+            body: body.to_string(),
+            reply_to_id,
+        };
+        let (ch, m, cid) = (channel_id.to_string(), msg.clone(), client_id.clone());
         let queued = self
             .db
             .call(move |c| {
                 c.execute(
-                    "INSERT INTO outbox(client_id, channel_id, body, state, created_at)
-                     VALUES (?1, ?2, ?3, 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    "INSERT INTO outbox(client_id, channel_id, body, reply_to_id, state, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                      ON CONFLICT(client_id) DO NOTHING",
-                    [&cid, &ch, &b],
+                    rusqlite::params![cid, ch, m.body, m.reply_to_id],
                 )
             })
             .await;
@@ -362,7 +378,7 @@ impl Outbox {
                 self.changed(channel_id);
                 Ok(client_id)
             }
-            Err(_) => self.send_direct(&sender, channel_id, body, client_id).await,
+            Err(_) => self.send_direct(&sender, channel_id, &msg, client_id).await,
         }
     }
 
@@ -373,7 +389,7 @@ impl Outbox {
         &self,
         sender: &ChannelSender,
         channel_id: &str,
-        body: &str,
+        msg: &Outgoing,
         client_id: String,
     ) -> Result<String, OutboxError> {
         let _held = sender.lock.lock().await;
@@ -396,7 +412,7 @@ impl Outbox {
         if waiting > 0 {
             return Err(OutboxError::WouldOvertake);
         }
-        match self.post.send(channel_id, body, &client_id, epoch).await {
+        match self.post.send(channel_id, msg, &client_id, epoch).await {
             Ok(message) => {
                 let _ = self.cache.apply_ack(&message).await; // /sync brings it otherwise
                 Ok(client_id)
@@ -421,7 +437,7 @@ impl Outbox {
         self.db
             .call(move |c| {
                 c.prepare(
-                    "SELECT client_id, channel_id, body, state, error FROM outbox
+                    "SELECT client_id, channel_id, body, state, error, reply_to_id FROM outbox
                      WHERE channel_id = ?1 ORDER BY ordinal",
                 )?
                 .query_map([&ch], |r| {
@@ -430,6 +446,7 @@ impl Outbox {
                         client_id: r.get(0)?,
                         channel_id: r.get(1)?,
                         body: r.get(2)?,
+                        reply_to_id: r.get(5)?,
                         state: match state.as_str() {
                             "sending" => PendingState::Sending,
                             "accepted" => PendingState::Accepted,
@@ -550,8 +567,8 @@ impl Outbox {
             };
             let held = sender.lock.lock().await;
             let next = match self.next_row(channel_id).await {
-                Ok(Some((client_id, body, state))) if state != "failed" => {
-                    (client_id, body, state == "accepted")
+                Ok(Some((client_id, msg, state))) if state != "failed" => {
+                    (client_id, msg, state == "accepted")
                 }
                 // Nothing waiting, blocked by a failed row (until Retry or Delete), or the
                 // store can't be read (until it comes back): wait, bounded.
@@ -580,16 +597,27 @@ impl Outbox {
     async fn next_row(
         &self,
         channel_id: &str,
-    ) -> Result<Option<(String, String, String)>, StoreError> {
+    ) -> Result<Option<(String, Outgoing, String)>, StoreError> {
         let ch = channel_id.to_string();
         self.db
             .call(move |c| {
                 use rusqlite::OptionalExtension;
+                // Every attempt reads the whole row: a resend can't drop the reply target
+                // (the server keeps the first POST per client_id and answers with it).
                 c.query_row(
-                    "SELECT client_id, body, state FROM outbox
+                    "SELECT client_id, body, reply_to_id, state FROM outbox
                      WHERE channel_id = ?1 ORDER BY ordinal LIMIT 1",
                     [&ch],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            Outgoing {
+                                body: r.get(1)?,
+                                reply_to_id: r.get(2)?,
+                            },
+                            r.get(3)?,
+                        ))
+                    },
                 )
                 .optional()
             })
@@ -625,7 +653,7 @@ impl Outbox {
         &self,
         channel_id: &str,
         client_id: &str,
-        body: &str,
+        msg: &Outgoing,
         accepted: bool,
         epoch: u64,
     ) -> Attempt {
@@ -644,7 +672,7 @@ impl Outbox {
             let _ = self.set_state(client_id, waiting, None).await;
             return Attempt::Next; // the loop pauses until the next sign-in
         }
-        let answer = self.post.send(channel_id, body, client_id, epoch).await;
+        let answer = self.post.send(channel_id, msg, client_id, epoch).await;
         if !self.current(epoch) {
             // Signed out (or someone else signed in) while it was out: not applied here.
             // The row stays; a resend is answered with the stored message.
