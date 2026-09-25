@@ -15,6 +15,12 @@ mod account_tests;
 mod apply;
 #[cfg(test)]
 mod apply_tests;
+#[allow(dead_code)] // wired into the client once stores turn on (C5)
+mod cache;
+#[allow(dead_code)]
+mod cache_http;
+#[cfg(test)]
+mod cache_tests;
 mod call;
 #[cfg(test)]
 mod call_tests;
