@@ -48,4 +48,3 @@ modules:
           - target
           - services
           - clients/macos
-          - bindings/apple
