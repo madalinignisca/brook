@@ -133,6 +133,8 @@ final class ChangePasswordModelTests: XCTestCase {
             // No answer: the server may have committed, so never a plain "try again".
             (.Network(message: "x"), ChangePasswordModel.noAnswer),
             (.Timeout, ChangePasswordModel.noAnswer),
+            // A 200 whose body did not parse: the server committed.
+            (.UnexpectedResponse, ChangePasswordModel.noAnswer),
             (.NotAuthenticated, AccountMessage.signedOut),
         ]
         for (failure, message) in cases {
