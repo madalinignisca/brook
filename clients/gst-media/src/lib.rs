@@ -84,6 +84,8 @@ pub enum MicSource {
     Auto,
     /// A synthetic tone (tests).
     Test,
+    /// A WAV file played in real time (test clips, e.g. the echo check).
+    File(std::path::PathBuf),
     /// Don't publish audio at all.
     None,
 }
@@ -572,6 +574,18 @@ impl GstEngine {
             })
     }
 
+    /// The publish pipeline's base time: with a file or test mic its clock is
+    /// the system clock, so `base + running time` of a sent sample can be
+    /// compared with a received sample's `sink base + pts` (the echo check).
+    #[doc(hidden)]
+    pub fn publish_base_time(&self) -> Option<gst::ClockTime> {
+        self.publish
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|pc| pc.pipeline.base_time())
+    }
+
     /// Number of remote decode chains (decodebins) in the subscribe pipeline.
     /// For tests: retired chains must not accumulate across re-offers.
     #[doc(hidden)]
@@ -977,6 +991,11 @@ fn publish_description(config: &EngineConfig) -> Result<String> {
     let audio_src = match &config.mic {
         MicSource::Auto => Some("autoaudiosrc".to_string()),
         MicSource::Test => Some("audiotestsrc is-live=true wave=ticks volume=0.3".to_string()),
+        // `identity sync=true` paces the file in real time, like a live mic.
+        MicSource::File(path) => Some(format!(
+            "filesrc location={} ! wavparse ! audioconvert ! audioresample ! identity sync=true",
+            launch_quote(&path.to_string_lossy())
+        )),
         MicSource::None => None,
     };
     if let Some(src) = audio_src {
