@@ -201,6 +201,10 @@ pub(crate) fn apply(tx: &Transaction<'_>, me: &str, batch: &Batch) -> rusqlite::
         )?;
         if changed > 0 {
             applied.channels.insert(m.channel_id.clone());
+            if m.seq > 0 {
+                // Followed live (a /sync page or an event): a covered range grows at the top.
+                crate::coverage::extend_top(tx, &m.channel_id, &m.id)?;
+            }
         }
     }
     for (id, channel_id, seq) in &batch.tombstones {

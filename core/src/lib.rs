@@ -22,6 +22,10 @@ mod call_types;
 mod chat;
 mod client;
 mod config;
+#[allow(dead_code)] // read by cached_messages (C3)
+mod coverage;
+#[cfg(test)]
+mod coverage_tests;
 mod error;
 mod keyslot;
 #[cfg(test)]
