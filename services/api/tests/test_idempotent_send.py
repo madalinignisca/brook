@@ -163,6 +163,7 @@ async def test_removed_member_resend_is_refused_like_a_fresh_send(
         f"/api/v1/channels/{ch}/messages", json={"body": "hi", "client_id": cid}, headers=hb
     )
     fresh = await client.post(f"/api/v1/channels/{ch}/messages", json={"body": "new"}, headers=hb)
-    # A resend gets exactly what a fresh send gets (not the stored copy).
-    assert fresh.status_code in (403, 404)
+    # A resend gets exactly what a fresh send gets (not the stored copy): 404, since a
+    # non-member never learns the channel exists (403 means archived; clients rely on it).
+    assert fresh.status_code == 404
     assert again.status_code == fresh.status_code
