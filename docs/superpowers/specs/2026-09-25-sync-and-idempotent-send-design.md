@@ -108,7 +108,7 @@ look if write latency ever shows up.
 - **The cursor stays opaque** in PROTOCOL.md too (it's a string to clients), so a
   composite cursor later is free.
 - **Per-row `seq`:** every returned row carries its `seq`. WebSocket events for the same
-  rows (`message.created`, `.updated`, `.deleted`, `reaction.*`, `channel.*`, `member.*`)
+  rows (`message.new`, `.updated`, `.deleted`, `reaction.*`, `channel.*`, `member.*`)
   carry it too. The client keeps the highest `seq` per row and ignores older data, so a
   `/sync` page computed a moment before a live event can't overwrite it. The client's
   cursor only advances from `/sync`, never from live events.
@@ -121,8 +121,14 @@ client).
   not null.
 - A retry with a `client_id` already stored for this author returns the **stored**
   message, `200` instead of `201`, unchanged, **even if the body differs** (it's the same
-  outbox entry; the client trusts the stored one). Never a 409, never a duplicate.
-- `client_id` is echoed in the POST response and in the `message.created` WebSocket event,
+  outbox entry; the client trusts the stored one). Never a duplicate. A deleted message
+  comes back as its tombstone.
+- **A resend gets exactly what a fresh send would:** the membership and archive checks run
+  first, so after removal or archiving it is refused like any send (a 404 or 403), never
+  answered with the stored copy.
+- **Reusing a `client_id` in another channel is `409 conflict`:** it's a different message,
+  not a resend. That holds on the concurrent-resend path too.
+- `client_id` is echoed in the POST response and in the `message.new` WebSocket event,
   so the sender's cache matches the pending outbox entry to the stored message without a
   race.
 - A concurrent double submit is resolved by the unique index: the loser catches the
