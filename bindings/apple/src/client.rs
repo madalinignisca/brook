@@ -14,7 +14,7 @@ use crate::call::{
 };
 use crate::listener::{subscribe_receiver, AuthStateListener, Subscription};
 use crate::runtime::runtime;
-use crate::types::{FfiChannel, LoginError, LoginResult};
+use crate::types::{FfiChannel, FfiUserSummary, LoginError, LoginResult};
 
 /// Swift-facing wrapper around [`BrookClient`].
 #[derive(uniffi::Object)]
@@ -51,6 +51,47 @@ impl FfiBrookClient {
         let inner = Arc::clone(&self.inner);
         let channels = run(async move { inner.list_channels().await }).await?;
         Ok(channels.into_iter().map(Into::into).collect())
+    }
+
+    /// Change the signed-in user's password; this device keeps a fresh token pair. Returns
+    /// whether the server signed the other devices out (nil: an older server that does not say).
+    /// A wrong current password is `Api { code: "auth.invalid_credentials" }`.
+    pub async fn change_password(
+        &self,
+        current: String,
+        new: String,
+        sign_out_other_devices: bool,
+    ) -> Result<Option<bool>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move {
+            inner
+                .change_password(&current, &new, sign_out_other_devices)
+                .await
+        })
+        .await
+    }
+
+    /// Admin: set another (non-admin) user's password, re-entering the admin's own password.
+    pub async fn admin_reset_password(
+        &self,
+        user_id: String,
+        admin_password: String,
+        new: String,
+    ) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move {
+            inner
+                .admin_reset_password(&user_id, &admin_password, &new)
+                .await
+        })
+        .await
+    }
+
+    /// Admin: every user, by handle.
+    pub async fn list_users(&self) -> Result<Vec<FfiUserSummary>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let users = run(async move { inner.list_users().await }).await?;
+        Ok(users.into_iter().map(Into::into).collect())
     }
 
     /// Realtime events the Apple UI uses (`Ready`, `ChannelCall`); others are skipped.

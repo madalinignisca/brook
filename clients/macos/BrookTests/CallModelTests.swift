@@ -42,6 +42,9 @@ final class FakeRealtime: FfiBrookClientProtocol, @unchecked Sendable {
     }
     func login(handle: String, password: String) async throws -> LoginResult { throw LoginError.Disconnected }
     func subscribe(listener: AuthStateListener) -> Subscription { FakeSubscription() }
+    func changePassword(current: String, new: String, signOutOtherDevices: Bool) async throws -> Bool? { nil }
+    func adminResetPassword(userId: String, adminPassword: String, new: String) async throws {}
+    func listUsers() async throws -> [FfiUserSummary] { [] }
 
     func deliver(_ event: FfiServerEvent) { listener.withLock { $0 }?.onEvent(event: event) }
 }
