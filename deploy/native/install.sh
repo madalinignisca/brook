@@ -154,6 +154,17 @@ BROOK_JANUS_URL=ws://127.0.0.1:8188
 BROOK_JANUS_API_SECRET=$janus_secret
 EOF
 fi
+# Keyring for encrypted secrets at rest (TOTP, later bot secrets), spec
+# docs/superpowers/specs/2026-09-22-app-secret-encryption-design.md §5.1. The
+# api refuses to boot without it once that code lands, so it is appended to an
+# EXISTING api.env too, not only written on first install. Generated once:
+# regenerating would make every stored secret undecryptable. Format is
+# `<id>:<32 random bytes, base64url, no padding>`; ids are never reused.
+if ! grep -q '^BROOK_SECRET_KEYS=' /etc/brook/api.env; then
+    key=$(python3 -c 'import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="))')
+    printf 'BROOK_SECRET_KEYS=1:%s\nBROOK_SECRET_PRIMARY_KEY_ID=1\n' "$key" >> /etc/brook/api.env
+    unset key
+fi
 umask 022
 chown root:janus /etc/brook/janus.env && chmod 0640 /etc/brook/janus.env
 chown root:brook /etc/brook/api.env && chmod 0640 /etc/brook/api.env
