@@ -123,6 +123,8 @@ class RefreshToken(Base):
     # token presented again is evidence of theft, or of a client that crashed before
     # saving its successor.
     rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # No foreign key on purpose: rotation writes this on the old row before the
+    # successor row is inserted (same transaction), which a non-deferred FK refuses.
     replaced_by_id: Mapped[uuid.UUID | None] = mapped_column(default=None)
 
 

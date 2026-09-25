@@ -240,11 +240,21 @@ async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) ->
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail={"code": "auth.invalid_token", "message": "Invalid or expired refresh token"},
     )
-    if token is None or ensure_utc(token.expires_at) <= utcnow():
+    if token is None:
         raise bad
     # Lock the user BEFORE the compare-and-set below (see lock_user).
     user = await lock_user(session, token.user_id)
     if user is None or user.status != "active":
+        raise bad
+    # Re-read under the lock. The row read above predates it: a grace replay by
+    # someone else that committed while we waited would otherwise look like a lost
+    # two-tab race (a silent, uncounted 401), and the device would sign itself out
+    # while the other holder kept the chain. Read now, the device sees its token
+    # retired by that replay and takes the grace path, reclaiming the chain; the
+    # other holder's next use is then reuse, and the family ends.
+    await session.refresh(token)
+    expired = ensure_utc(token.expires_at) <= utcnow()
+    if expired and not token.revoked:
         raise bad
     # Read before the UPDATE: the ORM UPDATE's synchronize_session sets
     # token.revoked=True (and rotated_at, replaced_by_id) in memory even when it
@@ -256,12 +266,13 @@ async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) ->
     successor = uuid.uuid4()
     # Compare-and-set: only the first concurrent rotation flips revoked→true, so
     # two simultaneous /refresh calls can't both mint a new token (TOCTOU-safe).
-    if await _cas_rotate(session, token.id, successor, now):
+    if not was_revoked and await _cas_rotate(session, token.id, successor, now):
         return await _issue_tokens(
             session, settings, user, token_id=successor, family_id=token.family_id
         )
     if not was_revoked:
-        # It was unrevoked when read: a concurrent rotation won (two tabs).
+        # Unrevoked under the lock, yet the CAS matched nothing. Can't happen while
+        # lock_user serialises token routes; kept as the benign answer if it ever does.
         raise _LostRotationRace(status_code=bad.status_code, detail=bad.detail)
     if rotated_at is None:
         # Revoked by logout, sign-out or a password change, not rotated: no chain was
@@ -272,16 +283,26 @@ async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) ->
     # a copy. Grace: soon after the rotation, while the successor is still unused,
     # hand out a fresh one in its place; the successor is retired (CAS again, so two
     # replays can't both win).
+    #
+    # Not "once" per token: the successor retired here keeps rotated_at, so it is
+    # grace-eligible for 30 s too. That is deliberate: it is how the device reclaims
+    # its chain after someone else's replay (above). Every grace use is recorded, and
+    # any use outside the window, or of a used successor, ends the family.
     grace = timedelta(seconds=settings.refresh_reuse_grace_seconds)
     if (
-        replaced_by is not None
+        not expired
+        and replaced_by is not None
         and now - ensure_utc(rotated_at) <= grace
         and await _cas_rotate(session, replaced_by, successor, now)
     ):
+        record_event(session, user.id, "refresh_token_grace")
         return await _issue_tokens(
             session, settings, user, token_id=successor, family_id=token.family_id
         )
     # Theft, as far as we can tell: end this login's whole chain, whoever holds it.
+    # (Also reached by an old rotated token replayed after sign-out-everywhere: the
+    # UPDATE then changes nothing, but the event is still written. An operator reading
+    # auth_events should expect that.)
     # Only this family: the user's other devices are not implicated, and revoking
     # them would sign the user out everywhere on every such event. Access tokens
     # already minted in the family live out their TTL (15 min, stateless JWTs).

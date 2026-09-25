@@ -36,14 +36,16 @@ async def _refresh(client: httpx.AsyncClient, token: str) -> httpx.Response:
     return await client.post(f"{AUTH}/refresh", json={"refresh_token": token})
 
 
-async def _reuse_events() -> int:
+async def _events(kind: str) -> int:
     async with db.get_sessionmaker()() as s:
         n = await s.scalar(
-            select(func.count())
-            .select_from(AuthEvent)
-            .where(AuthEvent.kind == "refresh_token_reuse")
+            select(func.count()).select_from(AuthEvent).where(AuthEvent.kind == kind)
         )
         return int(n or 0)
+
+
+async def _reuse_events() -> int:
+    return await _events("refresh_token_reuse")
 
 
 async def test_a_crash_replay_within_grace_keeps_the_device_signed_in(
@@ -57,6 +59,7 @@ async def test_a_crash_replay_within_grace_keeps_the_device_signed_in(
     u = again.json()["refresh_token"]
     assert (await _refresh(client, u)).status_code == 200  # and the chain goes on
     assert await _reuse_events() == 0
+    assert await _events("refresh_token_grace") == 1  # every grace use leaves a trace
 
 
 async def test_reuse_after_the_successor_was_used_revokes_that_family_only(
@@ -127,3 +130,35 @@ async def test_a_login_starts_a_new_family_and_rotation_keeps_it(
             for raw in (a, b, a2)
         }
     assert fam[a] == fam[a2] != fam[b]
+
+
+async def test_an_expired_rotated_token_still_ends_the_family(client: httpx.AsyncClient) -> None:
+    # Expiry doesn't hide a reuse: the chain it started may still be live.
+    await _alice(client)
+    t = await _login(client)
+    s = (await _refresh(client, t)).json()["refresh_token"]
+    v = (await _refresh(client, s)).json()["refresh_token"]
+    async with db.get_sessionmaker()() as session:
+        await session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.token_hash == hash_token(t))
+            .values(expires_at=utcnow() - timedelta(seconds=1))
+        )
+        await session.commit()
+    assert (await _refresh(client, t)).status_code == 401
+    assert (await _refresh(client, v)).status_code == 401
+    assert await _reuse_events() == 1
+
+
+async def test_an_expired_live_token_is_just_refused(client: httpx.AsyncClient) -> None:
+    await _alice(client)
+    t = await _login(client)
+    async with db.get_sessionmaker()() as session:
+        await session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.token_hash == hash_token(t))
+            .values(expires_at=utcnow() - timedelta(seconds=1))
+        )
+        await session.commit()
+    assert (await _refresh(client, t)).status_code == 401
+    assert await _reuse_events() == 0

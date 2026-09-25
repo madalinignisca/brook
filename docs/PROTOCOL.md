@@ -48,15 +48,26 @@
   already-rotated token again is treated as **theft** and revokes that family only:
   that device must sign in again, the user's other devices are untouched. Access
   tokens already issued in the family live out their 15 minutes.
-- **Crash grace:** within **30 s** of a rotation, the rotated token is accepted once
-  more *if its successor was never used*. This covers a client that died after the
-  server rotated but before it saved the new token: on relaunch it replays the old
-  one and gets a fresh pair (the lost successor is retired). A second replay, a
-  replay after the successor was used, or one after 30 s is theft as above.
+- **Crash grace:** within **30 s** of a rotation, the rotated token is accepted again
+  *if its successor was never used*. This covers a client that died after the server
+  rotated but before it saved the new token: on relaunch it replays the old one and
+  gets a fresh pair (the lost successor is retired, and is itself grace-eligible for
+  30 s, which is how a device reclaims its chain from someone else's replay). A
+  replay after the successor was used, or after 30 s, is theft as above, and so is a
+  rotated token presented after it expired.
+- **What the grace costs:** someone holding a copy of a just-rotated token can use it
+  within those 30 s. They are caught when the device next refreshes (at most ~10
+  minutes on the native clients): the family ends and the device signs in again. So
+  a stolen token buys at most that long plus one 15-minute access token.
+- Every grace use and every reuse verdict is recorded in the account's security
+  events (`refresh_token_grace`, `refresh_token_reuse`). A reuse event can also come
+  from an old token replayed after "sign out everywhere"; the family was already
+  revoked then.
 - A token revoked by logout, sign-out or a password change is simply refused
   (401 `auth.invalid_token`); only rotation reuse ends a family.
-- Two refreshes racing with the same token (two tabs): one wins, the other gets
-  401 without counting as a failed attempt; a client should share one refresh.
+- Two refreshes racing with the same token (two tabs) are serialised by the server:
+  the first rotates, the second takes the grace path. A client should still share
+  one refresh (single-flight): two chains from one token end in a reuse verdict.
 
 ### 1.1 Password changes and sessions
 
