@@ -65,6 +65,8 @@ struct Chat {
     active_calls: Rc<RefCell<HashMap<String, u32>>>,
     /// The open call window, if any (one call at a time).
     call_window: Rc<RefCell<Option<glib::WeakRef<adw::Window>>>>,
+    /// Sign Out in the main menu: set by the app shell (it knows the login view).
+    sign_out: Rc<dyn Fn()>,
 }
 
 /// The widgets of a rendered message we may mutate after an edit/delete/reaction.
@@ -82,7 +84,12 @@ struct MessageWidgets {
 }
 
 /// Build the chat view. `is_admin` controls whether channel creation is offered.
-pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::Widget {
+pub fn build(
+    client: Arc<BrookClient>,
+    runtime: Handle,
+    is_admin: bool,
+    sign_out: Rc<dyn Fn()>,
+) -> gtk::Widget {
     let channel_list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::Single)
         .css_classes(["navigation-sidebar"])
@@ -183,6 +190,7 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
         call_button: call_button.clone(),
         active_calls: Rc::default(),
         call_window: Rc::default(),
+        sign_out,
     });
 
     // --- sidebar ---
@@ -1199,8 +1207,21 @@ fn main_menu_popover(chat: &Rc<Chat>) -> gtk::Popover {
         .margin_start(4)
         .margin_end(4)
         .build();
+    let sign_out = gtk::Button::builder()
+        .label("Sign Out")
+        .has_frame(false)
+        .build();
     menu.append(&change_password);
+    menu.append(&sign_out);
     popover.set_child(Some(&menu));
+    sign_out.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        move |_| {
+            popover.popdown();
+            (chat.sign_out)();
+        }
+    });
     change_password.connect_clicked({
         let chat = chat.clone();
         let popover = popover.clone();
