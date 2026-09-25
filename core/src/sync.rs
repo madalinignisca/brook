@@ -72,6 +72,7 @@ pub(crate) async fn run(db: &Db, me: &str, fetch: &dyn Fetch) -> Result<Synced, 
             .map_err(SyncError::Store)?;
         changed.channels.extend(applied.channels);
         changed.removed.extend(applied.removed);
+        changed.users.extend(applied.users);
         if !more {
             return Ok(Synced::Done(changed));
         }
@@ -131,6 +132,7 @@ pub(crate) fn parse_page(page: &Value) -> Option<(Batch, String, bool)> {
             .map(message_row)
             .collect::<Option<_>>()?,
         tombstones: Vec::new(),
+        history: false,
         removed: list("removed_channels")?
             .iter()
             .map(|v| Some((s(v, "channel_id")?, seq(v)?)))

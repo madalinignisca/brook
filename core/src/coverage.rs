@@ -118,8 +118,11 @@ pub(crate) fn record_older(
 /// cached message. Live messages alone never move the top: one could have been missed.
 ///
 /// Only rows the run's snapshot accounts for count: `0 < seq <= cursor`. A live message
-/// newer than the snapshot (it may follow one not yet delivered) and history rows (seq 0,
-/// possibly outside the range) don't.
+/// newer than the snapshot (it may follow one not yet delivered) doesn't; history rows can
+/// count, harmlessly: a covered channel's history pages hold only ids at or below its range
+/// (older pages below its bottom, a head refetch merged by `record_head`). Partial
+/// tombstones for messages never seen sit at their delete's `seq`, and count only when the
+/// snapshot includes that delete.
 pub(crate) fn settle_tops(tx: &Transaction<'_>, cursor: i64) -> rusqlite::Result<()> {
     tx.execute(
         "UPDATE coverage SET

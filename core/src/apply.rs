@@ -12,8 +12,10 @@
 //!    from before the removal is never current, so it's never stored again.
 //! 3. **Everything else** through the per-row guard: a row replaces the stored one only with
 //!    a higher `seq`, and a fenced channel's rows apply only above the fence.
-//! 4. **Messages:** history rows (`seq = 0`) land only in a present, unfenced channel and
-//!    never over a stored row. A live delete patches the row (or leaves a partial tombstone),
+//! 4. **Messages:** history rows (`Batch::history`, with their real `seq`) land only in a
+//!    present, unfenced channel, through the same guard, and aren't held to the floor (a
+//!    history page is fetched now, so it is current; a removal cancels the channel's
+//!    in-flight history requests, C5). A live delete patches the row (or leaves a partial tombstone),
 //!    and every reply quoting a changed message follows it, so deleted words don't survive
 //!    in an excerpt. The server's full row replaces a partial one at the same `seq`.
 //!
@@ -61,6 +63,10 @@ pub(crate) struct Batch {
     pub(crate) removed: Vec<(String, i64)>,
     /// Other members' departures: `(channel id, user id, seq)`.
     pub(crate) left: Vec<(String, String, i64)>,
+    /// A history page (`GET /channels/{id}/messages`): current rows with their real `seq`,
+    /// exempt from the removal floor, and never rewriting quotes (a later edit may already
+    /// be cached).
+    pub(crate) history: bool,
     /// Live deletes, which carry only ids: `(message id, channel id, seq)`. They patch the
     /// stored row into a tombstone (the author and time stay), never replace it.
     pub(crate) tombstones: Vec<(String, String, i64)>,
@@ -71,6 +77,8 @@ pub(crate) struct Batch {
 pub(crate) struct Applied {
     pub(crate) channels: HashSet<String>,
     pub(crate) removed: HashSet<String>,
+    /// Profiles that changed (names, status): authors to re-render.
+    pub(crate) users: HashSet<String>,
 }
 
 /// Apply `batch` for the signed-in user `me`. The caller commits (with the cursor, for a
@@ -159,12 +167,14 @@ pub(crate) fn apply(tx: &Transaction<'_>, me: &str, batch: &Batch) -> rusqlite::
         }
     }
     for u in &batch.users {
-        guarded_upsert(tx, "users", &u.id, u.seq, &u.json)?;
+        if guarded_upsert(tx, "users", &u.id, u.seq, &u.json)? {
+            applied.users.insert(u.id.clone());
+        }
     }
 
-    // 4. Messages (history rows have seq 0).
+    // 4. Messages.
     for m in &batch.messages {
-        if !message_may_land(tx, &m.channel_id, m.seq)? {
+        if !message_may_land(tx, &m.channel_id, m.seq, batch.history)? {
             continue;
         }
         // Also replaces a partial row (a tombstone made from a live delete) at the same seq:
@@ -181,9 +191,9 @@ pub(crate) fn apply(tx: &Transaction<'_>, me: &str, batch: &Batch) -> rusqlite::
             applied.channels.insert(m.channel_id.clone());
             let deleted = !m.json.get("deleted_at").is_none_or(Value::is_null);
             let body = m.json.get("body").and_then(Value::as_str).unwrap_or("");
-            // A history row (seq 0) may be older than a quote already cached: only a live or
-            // synced version (the newest), or a deletion, rewrites the quotes.
-            if deleted || m.seq > 0 {
+            // A history row may be older than a quote already cached: only a live or synced
+            // version (the newest), or a deletion, rewrites the quotes.
+            if deleted || !batch.history {
                 refresh_excerpts(tx, &m.id, if deleted { None } else { Some(body) })?;
             }
             // A reply landing after its target was deleted takes "(deleted)" from the cached
@@ -200,7 +210,7 @@ pub(crate) fn apply(tx: &Transaction<'_>, me: &str, batch: &Batch) -> rusqlite::
         }
     }
     for (id, channel_id, seq) in &batch.tombstones {
-        if !message_may_land(tx, channel_id, *seq)? {
+        if !message_may_land(tx, channel_id, *seq, false)? {
             continue;
         }
         // Patch a cached row: its content goes, its author and time stay. Absent: a partial
@@ -233,12 +243,17 @@ pub(crate) fn apply(tx: &Transaction<'_>, me: &str, batch: &Batch) -> rusqlite::
 /// Whether a message row with `seq` may be stored for this channel: the channel is here and
 /// not fenced, and the row isn't from before a removal the caller has since come back from
 /// (such a row can't be current: anything changed while the caller was away comes back with
-/// a higher `seq`, or through history at seq 0).
-fn message_may_land(tx: &Transaction<'_>, channel_id: &str, seq: i64) -> rusqlite::Result<bool> {
+/// a higher `seq`, or through history). History is exempt: a page fetched now is current.
+fn message_may_land(
+    tx: &Transaction<'_>,
+    channel_id: &str,
+    seq: i64,
+    history: bool,
+) -> rusqlite::Result<bool> {
     if !channel_present(tx, channel_id)? || fenced_at_or_above(tx, channel_id, seq)? {
         return Ok(false);
     }
-    Ok(!(seq > 0 && floor_of(tx, channel_id)?.is_some_and(|f| seq <= f)))
+    Ok(history || !floor_of(tx, channel_id)?.is_some_and(|f| seq <= f))
 }
 
 /// Replies quote their target's body (`reply_to.body`, first 140 characters, "(deleted)" once

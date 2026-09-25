@@ -196,7 +196,8 @@ async fn a_history_page_after_a_removal_is_dropped() {
         .await;
     cache
         .apply(Batch {
-            messages: vec![message("old", "c", 0, "history")],
+            messages: vec![message("old", "c", 10, "history")],
+            history: true,
             ..Batch::default()
         })
         .await;
@@ -208,14 +209,16 @@ async fn a_history_row_never_replaces_a_stored_one() {
     let cache = joined().await;
     cache
         .apply(Batch {
-            messages: vec![message("m1", "c", 0, "from history")],
+            messages: vec![message("m1", "c", 10, "from history")],
+            history: true,
             ..Batch::default()
         })
         .await;
     assert_eq!(cache.body("m1").await.as_deref(), Some("hello"));
     cache
         .apply(Batch {
-            messages: vec![message("h", "c", 0, "older")],
+            messages: vec![message("h", "c", 5, "older")],
+            history: true,
             ..Batch::default()
         })
         .await;
@@ -393,10 +396,14 @@ async fn a_stale_row_after_a_rejoin_stays_out() {
     // History (seq 0) brings the current version; a new row lands too.
     cache
         .apply(Batch {
-            messages: vec![
-                message("m1", "c", 0, "edited while away"),
-                message("m2", "c", 35, "new"),
-            ],
+            messages: vec![message("m1", "c", 25, "edited while away")],
+            history: true,
+            ..Batch::default()
+        })
+        .await;
+    cache
+        .apply(Batch {
+            messages: vec![message("m2", "c", 35, "new")],
             ..Batch::default()
         })
         .await;
@@ -415,10 +422,11 @@ async fn a_delete_before_the_message_keeps_its_content_out() {
             ..Batch::default()
         })
         .await;
-    for (seq, body) in [(20, "secret"), (0, "secret from history")] {
+    for (seq, body, history) in [(20, "secret", false), (20, "secret from history", true)] {
         cache
             .apply(Batch {
                 messages: vec![message("m7", "c", seq, body)],
+                history,
                 ..Batch::default()
             })
             .await;
@@ -615,7 +623,8 @@ async fn an_old_history_version_never_rewrites_a_quote() {
     // The target arrives from an older history page, with its original words.
     cache
         .apply(Batch {
-            messages: vec![message("m1", "c", 0, "original")],
+            messages: vec![message("m1", "c", 5, "original")],
+            history: true,
             ..Batch::default()
         })
         .await;
@@ -629,4 +638,70 @@ async fn an_old_history_version_never_rewrites_a_quote() {
             .as_deref(),
         Some("edited")
     );
+}
+
+/// A profile change is reported, so the UI re-renders that author (a stale one isn't).
+#[tokio::test]
+async fn profile_changes_are_reported() {
+    let cache = joined().await;
+    let user = |seq: i64| Row {
+        id: "bob".into(),
+        seq,
+        json: json!({ "id": "bob", "seq": seq }),
+    };
+    let applied = cache
+        .db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let a = crate::apply::apply(
+                &tx,
+                ME,
+                &Batch {
+                    users: vec![user(30)],
+                    ..Batch::default()
+                },
+            )?;
+            let b = crate::apply::apply(
+                &tx,
+                ME,
+                &Batch {
+                    users: vec![user(20)],
+                    ..Batch::default()
+                },
+            )?;
+            tx.commit()?;
+            Ok((a.users, b.users))
+        })
+        .await
+        .unwrap();
+    assert!(applied.0.contains("bob"));
+    assert!(applied.1.is_empty(), "a stale profile row was reported");
+}
+
+/// History carries each row's real seq. After a rejoin, an unchanged message from before the
+/// removal (seq below the floor) comes back through history: a page fetched now is current.
+#[tokio::test]
+async fn history_after_a_rejoin_brings_back_unchanged_old_messages() {
+    let cache = joined().await; // m1 at seq 10
+    cache
+        .apply(Batch {
+            removed: vec![("c".into(), 20)],
+            ..Batch::default()
+        })
+        .await;
+    cache
+        .apply(Batch {
+            channels: vec![channel("c", 30, "general")],
+            memberships: vec![member("c", ME, 30)],
+            ..Batch::default()
+        })
+        .await;
+    cache
+        .apply(Batch {
+            messages: vec![message("m1", "c", 10, "hello")],
+            history: true,
+            ..Batch::default()
+        })
+        .await;
+    assert_eq!(cache.body("m1").await.as_deref(), Some("hello"));
 }
