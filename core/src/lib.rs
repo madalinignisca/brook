@@ -19,8 +19,12 @@ mod chat;
 mod client;
 mod config;
 mod error;
+mod keyslot;
 #[cfg(test)]
 mod log_secrecy_tests;
+mod persist;
+#[cfg(test)]
+mod restore_tests;
 mod session;
 mod session_store;
 #[cfg(test)]
@@ -41,9 +45,10 @@ pub use call_types::{
     TrackLabel,
 };
 pub use chat::{Channel, ChannelMember, Message, ReactionSummary, ReplyExcerpt};
-pub use client::{BrookClient, LoginOutcome, TotpChallenge};
+pub use client::{BrookClient, LoginOutcome, RestoreOutcome, TotpChallenge};
 pub use config::CoreConfig;
 pub use error::{Error, Result};
+pub use keyslot::{InMemoryKeySlot, KeySlot, KeySlotError, KeyStore};
 pub use session::{Session, User};
 pub use state::AuthState;
 pub use ws::ServerEvent;

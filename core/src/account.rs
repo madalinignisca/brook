@@ -219,6 +219,8 @@ impl Ctx {
             .await
         {
             RefreshApplied::Committed => Ok(out.other_devices_signed_out),
+            // The client quit meanwhile; the stored copy kept the new pair for the next launch.
+            RefreshApplied::Stored => Err(Error::NotAuthenticated),
             RefreshApplied::Discarded => {
                 self.session.revoke_detached(fresh); // issued for a session no longer held
                 Err(Error::NotAuthenticated)
@@ -257,6 +259,8 @@ impl Ctx {
             .await
         {
             RefreshApplied::Committed => Ok(out.recovery_codes),
+            // The client quit meanwhile; the stored copy kept the new pair for the next launch.
+            RefreshApplied::Stored => Err(Error::NotAuthenticated),
             RefreshApplied::Discarded => {
                 self.session.revoke_detached(fresh); // issued for a session no longer held
                 Err(Error::NotAuthenticated)
