@@ -56,12 +56,16 @@ members of a non-archived channel:
 
 **Upload:** `PUT /files/{id}/content`, by the uploader. The body is the raw bytes (not
 multipart).
-- The server **streams the body to `<id>.part`**, counting bytes. It stops and answers
-  `413` the moment the count exceeds the declared `size`, and deletes the part. It never
-  buffers the whole file in memory.
+- The server **streams the body to its own part file**, `<id>.<random>.part`, opened with
+  `O_EXCL`, counting bytes. It stops and answers `413` the moment the count exceeds the
+  declared `size`, and deletes its part. It never buffers the whole file in memory.
+  - Why a part file per PUT: a client retrying after a timeout while its first PUT is still
+    streaming would otherwise interleave two bodies into one file and commit a corrupt one.
 - When the stream ends: `422 file.size_mismatch` if the count differs from `size`.
-  Otherwise it fsyncs, **atomically renames** to `<id>`, and marks the file `committed`.
-  The answer is `200 FileOut`.
+  Otherwise it fsyncs, then **under the file row's lock and only while `status ==
+  pending`**, atomically renames its part to `<id>` and marks the file `committed`.
+- The answer is `200 FileOut`. A concurrent PUT that finishes second finds the file
+  committed, deletes its own part, and gets `409 conflict`.
 - Caddy caps the request body at 100 MB on this path, a second limit in front of the api.
 - A second PUT to a committed file is `409 conflict`. Uploads don't resume: a failed upload
   is restarted with PUT (the part is overwritten).
@@ -75,7 +79,9 @@ files).
   can't change attachments in MVP+.
 
 **Download:** `GET /files/{id}/content`, by a member of the file's channel, with the normal
-bearer token. The api streams the file (Starlette `FileResponse`), and **`Range` is
+bearer token. A `pending` file is `404`, since it doesn't exist yet for anyone. Auth is checked
+when the request starts, so a long download outlives token expiry, and a resume is just a
+new `Range` request with a fresh token. The api streams the file (Starlette `FileResponse`), and **`Range` is
 supported** (206 and `Content-Range`), so an interrupted download resumes. There are no
 signed URLs, so none can leak through logs or sharing.
 
@@ -127,7 +133,8 @@ preview.
 
 - 100 MB per file.
 - 5 GB per user, counting committed and pending files.
-- The `BROOK_FILES_MIN_FREE` disk floor.
+- The `BROOK_FILES_MIN_FREE` disk floor. It counts the declared sizes of `pending`
+  uploads as already used, so parallel uploads can't jointly overshoot it.
 - Creates are rate-limited per user, through a new bucket in the #36 limiter.
 
 ## 7. Lifecycle
@@ -169,6 +176,8 @@ With an index on `(status, created_at)` and on `uploader_id`.
    CJK.
 2. **Streaming cap:** a body over the declared size gives 413 and leaves no part file behind;
    a short body gives 422; memory stays bounded (a large upload through a test client).
+2a. **Overlapping PUTs** to one pending file: exactly one commits, the stored bytes and
+    sha256 are exactly that body's, the other gets 409, and no part files remain.
 3. **Atomic commit:** a crash before the rename leaves no committed row and no final file;
    the sha256 is stored.
 4. **Attach rules:** another user's file, another channel's file, a pending file and an
