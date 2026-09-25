@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Brook: a rounded tile with three flowing stream lines (placeholder mark). -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b8ee8"/>
+      <stop offset="1" stop-color="#1c5fb8"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#bg)"/>
+  <g fill="none" stroke="#ffffff" stroke-linecap="round" stroke-width="9">
+    <path d="M28 46 C42 34, 54 58, 68 46 S94 34, 100 44" stroke-opacity="0.95"/>
+    <path d="M28 66 C42 54, 54 78, 68 66 S94 54, 100 64" stroke-opacity="0.8"/>
+    <path d="M28 86 C42 74, 54 98, 68 86 S94 74, 100 84" stroke-opacity="0.65"/>
+  </g>
+</svg>
