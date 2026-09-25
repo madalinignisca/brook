@@ -16,7 +16,7 @@ from .config import get_settings
 from .db import get_sessionmaker, init_models
 from .errors import register_error_handlers
 from .models import Totp
-from .routers import auth, channels, files, health, totp, users, ws
+from .routers import auth, channels, files, health, sync, totp, users, ws
 from .secretbox import DecryptError, Purpose, get_secret_box
 
 
@@ -72,6 +72,7 @@ def create_app() -> FastAPI:
     app.include_router(channels.router, prefix="/api/v1")
     app.include_router(users.router, prefix="/api/v1")
     app.include_router(files.router, prefix="/api/v1")
+    app.include_router(sync.router, prefix="/api/v1")
     app.include_router(ws.router)  # /ws at the root, not under /api/v1
     # Importing app.calls registers the call.* WebSocket commands; holding the
     # manager on app.state makes that dependency explicit, so no tool (or person)

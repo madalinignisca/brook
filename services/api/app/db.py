@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from . import sync as _sync  # noqa: F401 - registers the change-sequence flush hook
 from .config import get_settings
 from .models import Base
 

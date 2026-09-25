@@ -20,6 +20,7 @@
 | `POST /auth/password` | change own password `{current_password, new_password}` → fresh `{access_token, refresh_token}`; see §1.1 |
 | `GET  /users` · `?handle=` | **admin**: all users by handle · exact handle (404 `not_found` if none) |
 | `POST /users/{id}/password` | **admin**: set a member's password `{admin_password, new_password}` → 204; see §1.1 |
+| `GET  /sync?since=<cursor>&limit=` | what changed since the cursor, for the offline cache: `{channels, removed_channels, memberships, left_members, users, messages, next, more}`. `since=0` is **state only** (no messages; page history with `before=`). Every row and every live event carries `seq`: keep the highest per row. `410 sync.reset` means wipe the cache and sync from 0. The cursor is opaque. Design: `docs/superpowers/specs/2026-09-25-sync-and-idempotent-send-design.md` |
 | `GET  /health` | liveness/readiness (also on `sfu`; unauthenticated) |
 | `GET  /me` · `PATCH /me` | current user · update profile/avatar |
 | `GET  /channels` | channels/DMs the user belongs to |

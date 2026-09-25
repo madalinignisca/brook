@@ -201,6 +201,8 @@ class ChannelOut(BaseModel):
     unread_count: int = 0
     public: bool = False
     archived: bool = False
+    # Change sequence (sync spec §3): the cache keeps the highest per row.
+    seq: int = 0
 
 
 class ChannelPatch(BaseModel):
@@ -317,6 +319,8 @@ class MessageOut(BaseModel):
     reactions: list[ReactionSummary] = Field(default_factory=list)
     # Echoed so the sender's cache matches its pending outbox entry to this message.
     client_id: uuid.UUID | None = None
+    # Change sequence (sync spec §3): the cache keeps the highest per row.
+    seq: int = 0
     attachments: list[FileOut] = Field(default_factory=list)
     # Specific @handle mentions resolved to member ids (set only on the live send).
     mentions: list[uuid.UUID] = Field(default_factory=list)

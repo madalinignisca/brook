@@ -110,7 +110,9 @@ def test_ws_delivers_message_new(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             )
             delete = ws.receive_json()
             assert delete["type"] == "message.delete"
-            assert delete["data"] == {"id": mid, "channel_id": dm["id"]}
+            data = delete["data"]
+            assert {k: data[k] for k in ("id", "channel_id")} == {"id": mid, "channel_id": dm["id"]}
+            assert data["seq"] > 0  # sync spec §3: live events carry the change seq
 
     config.get_settings.cache_clear()
     db._engine = None
