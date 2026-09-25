@@ -95,6 +95,8 @@ struct MessageWidgets {
     deleted: Rc<Cell<bool>>,
     /// The message carries files (its text may then be empty).
     has_files: bool,
+    /// The message text as sent (markdown, not the rendered markup), for editing.
+    source: Rc<RefCell<String>>,
 }
 
 /// Build the chat view. `is_admin` controls whether channel creation is offered.
@@ -442,6 +444,7 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     let widgets = chat.message_rows.borrow().get(&message.id).cloned();
                     if let Some(widgets) = widgets {
                         widgets.body.set_markup(&markdown_to_pango(&message.body));
+                        widgets.source.replace(message.body.clone());
                         // An edit can add or clear a file message's caption (the server refuses
                         // a blank edit on a message without files), so follow the new text.
                         widgets.body.set_visible(!message.body.trim().is_empty());
@@ -1026,6 +1029,7 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
             reactions: Rc::new(RefCell::new(message.reactions.clone())),
             deleted: deleted.clone(),
             has_files: !message.attachments.is_empty(),
+            source: Rc::new(RefCell::new(message.body.clone())),
         },
     );
     render_reactions(chat, &message.id);
@@ -1224,7 +1228,7 @@ fn message_actions_button(chat: &Rc<Chat>, message: &Message, is_own: bool) -> g
                 .message_rows
                 .borrow()
                 .get(&message_id)
-                .map(|w| w.body.label().to_string())
+                .map(|w| (w.source.borrow().clone(), w.has_files))
                 .unwrap_or_default();
             edit_message_dialog(&chat, channel_id.clone(), message_id.clone(), current);
         }
@@ -1249,7 +1253,15 @@ fn message_actions_button(chat: &Rc<Chat>, message: &Message, is_own: bool) -> g
 }
 
 /// Edit dialog: prefilled entry → `edit_message` (the WS `message.update` re-renders).
-fn edit_message_dialog(chat: &Rc<Chat>, channel_id: String, message_id: String, current: String) {
+/// `current` is the text as sent and whether the message has files: a file message's
+/// caption may be cleared, a text-only message can't be emptied.
+fn edit_message_dialog(
+    chat: &Rc<Chat>,
+    channel_id: String,
+    message_id: String,
+    current: (String, bool),
+) {
+    let (current, has_files) = current;
     let entry = gtk::Entry::builder().text(&current).hexpand(true).build();
     let dialog = adw::AlertDialog::builder()
         .heading("Edit message")
@@ -1266,7 +1278,7 @@ fn edit_message_dialog(chat: &Rc<Chat>, channel_id: String, message_id: String, 
                 return;
             }
             let body = entry.text().to_string();
-            if body.trim().is_empty() {
+            if body.trim().is_empty() && !has_files {
                 return;
             }
             let chat = chat.clone();
