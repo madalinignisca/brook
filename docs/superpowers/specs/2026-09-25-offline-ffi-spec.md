@@ -1,6 +1,6 @@
 # Offline data over the Apple bindings (C5 follow-up)
 
-Status: spec, revised after review round 1. Builds on C5 (#109). Review dial: **Standard**
+Status: spec, closed after review round 2. Builds on C5 (#109). Review dial: **Standard**
 (the bindings mirror core; no new storage, auth or wire behaviour).
 
 ## Done means
@@ -31,17 +31,19 @@ Status: spec, revised after review round 1. Builds on C5 (#109). Review dial: **
    - `subscribe_cache_state(listener)`: `{syncing, last_synced_unix_ms?, offline}`, latest
      state wins. **Signing out, a user switch, a wipe and the client closing each deliver
      the default state**, and nothing from the previous user's cache reaches it after.
-5. **Lost unsent messages are retained state, not only an event.** Core keeps a
-   `outbox_lost` flag (set by `OutboxLost` from any source, including during
-   `enable_local_data` before anyone subscribed) until `acknowledge_outbox_lost()`. The
-   app reads it on start and after any `OutboxLost`/`Reset` event.
+5. **Lost unsent messages are retained state, not only an event.** Core numbers each loss
+   (any source, including during `enable_local_data` before anyone subscribed).
+   `outbox_lost() -> Option<u64>` is the newest unacknowledged loss;
+   `acknowledge_outbox_lost(n)` clears only if `n` is still the newest, so a loss that
+   happens between the app reading and acknowledging stays reported. The app reads it on
+   start and after any `OutboxLost`/`Reset` event. (Spec round 2.)
 6. Errors stay `LoginError::Api { code }` with the core codes (`local.unavailable`,
    `local.store`, `outbox.*`); Swift switches on the code (2 makes the missing id moot).
 7. Tests, each watched failing under a mutant:
    - `brook-ffi`: the event mapping (every variant), lag → `Reset`, record mapping (unread,
      members, client id, tombstone, every pending state and `Deleted` outcome).
-   - core: `outbox_lost` survives until acknowledged and is set when the loss happens
-     before any subscriber; the state feed goes to default on sign-out, switch and close; a
+   - core: `outbox_lost` survives until acknowledged, is set when the loss happens before
+     any subscriber, and a loss between read and acknowledge survives the acknowledge; the state feed goes to default on sign-out, switch and close; a
      state update from user A's cache held back until after the switch to B never
      overwrites B's state.
 8. The Swift package builds (`swift build` in `bindings/apple/swift/BrookCore`) with the
