@@ -27,7 +27,7 @@
 | `GET /channels/{id}` · `PATCH /channels/{id}` · `DELETE /channels/{id}` | get / rename-topic / delete |
 | `GET /channels/{id}/members` · `POST` · `DELETE /channels/{id}/members/{uid}` | list / add / remove member |
 | `GET  /channels/{id}/messages?before=&after=&limit=` | history: `before=<id>` (back-paginate) or `after=<id>` (**forward-sync** missed messages on reconnect) |
-| `POST /channels/{id}/messages` | **send a message (the only send path)**; server persists then fans out via WS |
+| `POST /channels/{id}/messages` | **send a message (the only send path)**; server persists then fans out via WS. Optional `client_id` (UUID, per message): a resend with one the author already stored returns that message, **200** and unchanged (even with a different body), never a duplicate; `client_id` is echoed in the response and in `message.new` |
 | `PATCH /messages/{id}` · `DELETE /messages/{id}` | edit / soft-delete (author or channel owner) |
 | `POST /channels/{id}/files` | begin upload → **S3 POST Policy** (`{url, fields}` with a `content-length-range`) + `file_id` (state `pending`) |
 | `POST /files/{id}/commit` | finalize: server confirms the object exists + type ok → state `committed` (attachable) |
