@@ -83,19 +83,26 @@ impl<S: KeySlot + ?Sized> KeyStore<S> {
 
     /// The key in `slot`, making one if (and only if) the slot is absent.
     pub fn get_or_create(&self, slot: &str) -> Result<Key, KeySlotError> {
+        self.get_or_create_reporting(slot).map(|(key, _)| key)
+    }
+
+    /// Like `get_or_create`, and whether this call made the key (`true`) or found one. A key
+    /// made just now can't be the key of anything already on disk; a key another creator
+    /// won the race with counts as found.
+    pub fn get_or_create_reporting(&self, slot: &str) -> Result<(Key, bool), KeySlotError> {
         if let Some(bytes) = self.slots.load(slot.to_string())? {
-            return key_from(bytes);
+            return key_from(bytes).map(|k| (k, false));
         }
         // Absent: the one state that makes a key. An entropy failure is an error, never a
         // weaker key.
         let mut fresh = Zeroizing::new([0u8; 32]);
         getrandom::fill(fresh.as_mut()).map_err(|_| KeySlotError::Unavailable)?;
         match self.slots.create(slot.to_string(), fresh.to_vec()) {
-            Ok(()) => Ok(Key(fresh)),
+            Ok(()) => Ok((Key(fresh), true)),
             // Another process made it between our load and our create: use theirs. If that
             // reload finds nothing (or can't read), don't make another one.
             Err(KeySlotError::Exists) => match self.slots.load(slot.to_string())? {
-                Some(bytes) => key_from(bytes),
+                Some(bytes) => key_from(bytes).map(|k| (k, false)),
                 None => Err(KeySlotError::Unavailable),
             },
             Err(err) => Err(err),
