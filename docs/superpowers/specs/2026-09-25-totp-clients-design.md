@@ -1,6 +1,6 @@
 # TOTP two-factor sign-in: core and macOS (PR D, client side)
 
-> Status: **draft** · 2026-09-25 · Dial: **Heavy** (auth) · Wire: the server spec
+> Status: **approved** (Heavy, two rounds) · 2026-09-25 · Dial: **Heavy** (auth) · Wire: the server spec
 > [2026-09-25-totp-server-design.md](2026-09-25-totp-server-design.md) (#48, under review)
 > The server side (endpoints, data model, and the requirements in
 > [2026-09-22-app-secret-encryption-design.md](2026-09-22-app-secret-encryption-design.md) §7) is
@@ -138,3 +138,5 @@ code. Vibe: "activation keeps this device's tokens, so no socket close or lock i
 Rejected with evidence: server spec §2.3 applies the #45 cutoff on activation (every token issued
 before it, this device's included) and keeps this device signed in only through the returned
 pair; the Linux client's review read it the same way. §4 now states this explicitly.
+**Round 2 — Codex + Vibe.** Both: none (Vibe no longer objects to the rejected point). The gate
+closes.
