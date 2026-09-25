@@ -10,6 +10,9 @@ final class LoginForm {
     var server: String
     var handle = ""
     var password = ""
+    /// The code step (TOTP): a 6-digit code, or a recovery code when `useRecovery`.
+    var code = ""
+    var useRecovery = false
     let store: SessionStore
 
     init(store: SessionStore) {
@@ -17,11 +20,18 @@ final class LoginForm {
         server = store.settings.serverPrefill
     }
 
-    var isBusy: Bool { store.phase == .signingIn }
+    var isBusy: Bool { store.phase == .signingIn || store.codeBusy }
+
+    var needsCode: Bool {
+        if case .needsCode = store.phase { return true }
+        return false
+    }
 
     var error: String? {
-        if case let .signedOut(error) = store.phase { return error }
-        return nil
+        switch store.phase {
+        case let .signedOut(error), let .needsCode(error): error
+        default: nil
+        }
     }
 
     var insecureWarning: String? {
@@ -33,5 +43,22 @@ final class LoginForm {
         if await store.signIn(server: server, handle: handle, password: password) {
             password = ""
         }
+    }
+
+    /// Send the code (or recovery code); the field is cleared after each attempt.
+    func submitCode() async {
+        let entered = code
+        code = ""
+        if useRecovery {
+            await store.submitRecovery(entered)
+        } else {
+            await store.submitCode(entered)
+        }
+    }
+
+    func back() {
+        code = ""
+        useRecovery = false
+        store.back()
     }
 }

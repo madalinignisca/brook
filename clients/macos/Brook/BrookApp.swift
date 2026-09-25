@@ -31,9 +31,11 @@ struct BrookApp: App {
                 switch store.phase {
                 case let .signedIn(user):
                     if let client = store.client {
-                        SignedInView(user: user, client: client, calls: calls) { store.signOut() }
+                        SignedInView(
+                            user: user, client: client, calls: calls, signOut: { store.signOut() },
+                            recoveryCodesLeft: store.recoveryCodesLeft)
                     }
-                case .signedOut, .signingIn: LoginView(form: form)
+                case .signedOut, .signingIn, .needsCode: LoginView(form: form)
                 }
             }
             .frame(minWidth: 380, minHeight: 480)
