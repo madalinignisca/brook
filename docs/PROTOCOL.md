@@ -39,21 +39,31 @@
 
 ### 1.1 Password changes and sessions
 
-- `POST /auth/password` needs a full access token and the current password.
-  On success **every** refresh token of the user is revoked (all devices signed
-  out), and the response carries a new pair for the calling client.
+- `POST /auth/password {current_password, new_password, sign_out_other_devices?}`
+  needs a full access token and the current password. The response always carries
+  a new pair for the calling client.
+- `sign_out_other_devices` (default **true**; the client shows it as a checkbox,
+  checked by default) signs out **every other session at once**: all refresh
+  tokens are revoked, every access token issued before the change is refused on
+  REST (401 `auth.invalid_token`) and WebSocket, and open sockets are closed with
+  `1008` / `session_revoked` (§2). With `false`, the password changes and other
+  devices stay signed in.
 - **The old refresh token is dead the moment the server commits.** A client that
   loses the response (timeout, dropped connection) still holds revoked tokens: its
   next `/auth/refresh` gets 401 `auth.invalid_token`, it looks signed out, and
   signing in with the **new** password works. There is no idempotent retry.
-- Access tokens already issued are stateless JWTs and stay valid until they expire
-  (≤ `access_ttl_seconds`, 15 min), on every device. Revoking refresh tokens is
-  what ends the sessions; open WebSockets end at their next re-auth.
+- The cut-off is millisecond-precise (`iat_ms` claim, compared with the user's
+  `sessions_valid_after`), so a token minted earlier in the same second as the
+  change is refused too. Tokens without `iat_ms` compare as `iat × 1000`, which
+  can only make them look older.
+- The **changing** device's own socket is closed as well (its token predates the
+  change); its client already holds the new pair, so it reconnects and resumes any
+  call (`call.resume`, §3).
 - Wrong current password: **403** `auth.invalid_credentials`, deliberately not 401,
   so clients do not mistake it for an expired access token and refresh-and-retry.
   New password outside 8–256 characters, or equal to the current one: 422.
-- `POST /users/{id}/password` (admin) revokes the target's refresh tokens the same
-  way. The admin re-authenticates with `admin_password` (wrong: 403
+- `POST /users/{id}/password` (admin) always signs the target out everywhere, the
+  same way (there is no opt-out: a reset is how a lost device is cut off). The admin re-authenticates with `admin_password` (wrong: 403
   `auth.invalid_credentials`), so a stolen admin access token alone cannot hand
   the thief lasting logins. It only works on **members**: the admin's own account
   is 400 `invalid`, another admin is 403 `authz.forbidden`. An admin password only
@@ -79,6 +89,13 @@
   frames share one budget). The token may still be valid. Wait; do not refresh in a
   loop, since `/auth/refresh` answers the same condition with `429` +
   `Retry-After`. Then reconnect.
+- `1008` / `session_revoked`: the user signed out everywhere (a password change
+  with `sign_out_other_devices`, or an admin reset; §1.1) after this token was
+  issued. Sent to open sockets at once, and to a reconnect with such a token. Not
+  counted as a failed login. The remedy is the usual refresh: on another device it
+  fails (refresh tokens are revoked) and the app signs out; on the changing device
+  it succeeds with the new pair. Clients that don't know this reason already treat
+  it as a generic `1008` auth close, which is exactly this behaviour.
 - The socket also closes with `1008` / `token_expired` when its access token
   expires. To avoid that, the client may send the same `auth` frame **again on the
   open socket** with a fresh token for the same user; the server answers another

@@ -32,6 +32,7 @@ from ..security import (
     new_refresh_token,
     verify_password,
 )
+from .ws import revoke_sessions
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -232,6 +233,20 @@ async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) ->
     return await _issue_tokens(session, settings, user)
 
 
+async def sign_out_everywhere(session: AsyncSession, user: User) -> int:
+    """Revoke every session of ``user`` (not committed); returns the cutoff in ms.
+
+    Refresh tokens are revoked, and ``sessions_valid_after`` makes every access
+    token issued before now fail at once on REST and WebSocket. After commit the
+    caller closes the live sockets with ``ws.revoke_sessions(user.id, cutoff)``.
+    A pair issued after this call is on the right side of the cutoff.
+    """
+    now = utcnow()
+    user.sessions_valid_after = now
+    await revoke_all_refresh_tokens(session, user.id)
+    return int(now.timestamp() * 1000)
+
+
 async def revoke_all_refresh_tokens(session: AsyncSession, user_id: uuid.UUID) -> None:
     """Revoke every live refresh token of ``user_id`` (signs out all devices).
 
@@ -297,8 +312,12 @@ async def change_password(
             detail={"code": "invalid", "message": "New password must differ from the current one"},
         )
     user.password_hash = hash_password(body.new_password)
-    await revoke_all_refresh_tokens(session, user.id)
-    return await _issue_tokens(session, settings, user)
+    if not body.sign_out_other_devices:
+        return await _issue_tokens(session, settings, user)
+    cutoff_ms = await sign_out_everywhere(session, user)
+    pair = await _issue_tokens(session, settings, user)  # commits; issued after the cutoff
+    await revoke_sessions(user.id, cutoff_ms)
+    return pair
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)

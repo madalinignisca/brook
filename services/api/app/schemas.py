@@ -23,6 +23,10 @@ class PasswordChangeIn(BaseModel):
     # accounts may predate the policy. The cap bounds argon2 work per request.
     current_password: str = Field(max_length=256)
     new_password: str = Field(min_length=8, max_length=256)
+    # The "Sign out of other devices" checkbox, on by default: revoke every other
+    # session at once (refresh tokens, access tokens, open sockets). Off keeps the
+    # other devices signed in, e.g. a routine change on a trusted set of devices.
+    sign_out_other_devices: bool = True
 
 
 class AdminPasswordIn(BaseModel):

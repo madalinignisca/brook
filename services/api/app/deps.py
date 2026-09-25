@@ -26,7 +26,7 @@ async def get_current_user(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> User:
     """Resolve the authenticated, active user from a Bearer access token."""
-    from .security import decode_access_token  # local import avoids cycle
+    from .security import decode_access_token, issued_at_ms  # local import avoids cycle
 
     invalid = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -50,6 +50,8 @@ async def get_current_user(
     user = await session.get(User, user_id)
     if user is None or user.status != "active":
         raise invalid
+    if user.session_revoked(issued_at_ms(payload)):
+        raise invalid  # signed out everywhere after this token was issued
     return user
 
 
