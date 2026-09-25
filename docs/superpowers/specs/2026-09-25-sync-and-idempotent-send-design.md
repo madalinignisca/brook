@@ -49,12 +49,18 @@ Stamped rows:
 | `memberships.seq` | Join or add, last-read change, and a removal (see tombstones). |
 | `users.seq` | `display_name` or status change. It's delivered to users who share a channel. |
 
+**Cost note:** `last_read` changes take the counter lock too, so every read-marker update
+serialises with message writes. That is fine at family scale, and it's the first place to
+look if write latency ever shows up.
+
 **Tombstones:**
 - A deleted message keeps its row with `deleted_at`, an empty body and no reactions (and
   later no attachments), and it is stamped.
 - A removed membership becomes a row in `sync_tombstones(kind, channel_id, user_id, seq)`,
   so both the removed user (`removed_channels`) and the remaining members (member left)
   learn about it.
+- **A hard channel delete**, if one ever exists, writes a `removed_channels` tombstone for
+  **every** member. It must never just vanish. Archive is already a stamped row change.
 - Tombstones are kept indefinitely pre-1.0 (small). Any later pruning must raise
   `sync_floor`, see §3.
 
@@ -83,10 +89,24 @@ Stamped rows:
   pruned) or above the server's current `seq` (a database restored from backup, a wiped
   test server). The client wipes its cache and syncs from `0`. Pre-1.0 this is the entire
   client migration story.
-- **Channels added later:** a channel I'm added to, or re-added to, appears in `channels`,
-  but its **history predates my cursor and is not included**. The client sees a channel it
-  doesn't have and back-fills with `before=` paging as today. This is deliberate: do not
-  "fix" it by dumping history into `/sync`.
+- **Initial sync is state only.** `since=0`, and the first sync after a `410 sync.reset`,
+  returns channels, memberships and users, **no messages**, and a cursor at the current
+  `seq`. The client pages messages per channel with `before=` as it needs them. From then
+  on `/sync` delivers message changes after that cursor. That is coherent: anything older
+  than the cursor comes from paging, anything newer from sync, and the per-row `seq` rule
+  makes the overlap harmless. Downloading all history on a phone is exactly what §1 set
+  out to avoid.
+- **A channel new to me arrives complete.** When the page contains the caller's **own**
+  membership row for a channel (joined, re-added, or a DM someone opened with me), the
+  response also includes that channel's **full current member list** in `memberships`, and
+  every one of those members in `users`, **regardless of `seq`**. Otherwise the older
+  members' rows, stamped before my cursor, would never arrive, and a non-admin can't call
+  `/users` to fill in the names.
+- **Channels added later: history is not included.** A channel I'm added to, or re-added
+  to, has history that predates my cursor. The client back-fills it with `before=` paging
+  as today. This is deliberate: do not "fix" it by dumping history into `/sync`.
+- **The cursor stays opaque** in PROTOCOL.md too (it's a string to clients), so a
+  composite cursor later is free.
 - **Per-row `seq`:** every returned row carries its `seq`. WebSocket events for the same
   rows (`message.created`, `.updated`, `.deleted`, `reaction.*`, `channel.*`, `member.*`)
   carry it too. The client keeps the highest `seq` per row and ignores older data, so a
@@ -128,6 +148,10 @@ client).
    add or remove member, read change, display-name change.
 3. Scope: nothing from channels I'm not in; `removed_channels` after removal; other users'
    `last_read` never leaks.
+3a. Added to a channel with existing members: the first `/sync` returns every member and
+    their display names.
+3b. `since=0` returns no messages and a cursor at the current `seq`; a message after that
+    arrives on the next sync.
 4. `410 sync.reset` for a cursor above the maximum.
 5. Paging never splits a `seq`; `more`/`next` walk to the end.
 6. `client_id`: a retry returns the stored message with 200, a different body is ignored,
