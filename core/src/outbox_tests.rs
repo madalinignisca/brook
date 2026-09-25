@@ -1,0 +1,533 @@
+//! The outbox (plan C4, spec §5 and §9 "Outbox"): durable before pending, one message per
+//! send whatever is lost on the way, order kept, failures scoped to their channel, the
+//! status table row by row, and paused while signed out.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use tokio::sync::{watch, Notify};
+
+use crate::cache::{Cache, History};
+use crate::outbox::{Deleted, Outbox, OutboxError, PendingState, Post, SendFailure};
+use crate::store::{self, Db, Kind, Opened};
+use crate::sync::{Fetch, Page};
+use crate::{InMemoryKeySlot, KeySlot, KeyStore};
+
+const ME: &str = "me";
+
+/// What the fake server does with the next send.
+#[derive(Clone)]
+enum Answer {
+    /// Store it (once per client_id) and answer with it.
+    Ok,
+    /// Store it, but the answer is lost on the way.
+    Lost,
+    Fail(SendFailure),
+    /// Answer with somebody else's client_id (a bug).
+    WrongEcho,
+    /// Hold the answer until released, then store and answer.
+    Held(Arc<Notify>),
+}
+
+#[derive(Default)]
+struct Server {
+    script: Mutex<VecDeque<Answer>>,
+    /// Answers for one message body (taken before the shared script).
+    by_body: Mutex<HashMap<String, VecDeque<Answer>>>,
+    stored: Mutex<HashMap<String, Value>>,
+    /// Every send, in order: (channel, client_id, body).
+    sends: Mutex<Vec<(String, String, String)>>,
+}
+
+impl Server {
+    fn script(&self, answers: impl IntoIterator<Item = Answer>) {
+        self.script.lock().unwrap().extend(answers);
+    }
+    fn script_for(&self, body: &str, answers: impl IntoIterator<Item = Answer>) {
+        self.by_body
+            .lock()
+            .unwrap()
+            .entry(body.into())
+            .or_default()
+            .extend(answers);
+    }
+    fn sends(&self) -> Vec<(String, String, String)> {
+        self.sends.lock().unwrap().clone()
+    }
+    fn stored_bodies(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .stored
+            .lock()
+            .unwrap()
+            .values()
+            .map(|m| m["body"].as_str().unwrap().to_string())
+            .collect();
+        v.sort();
+        v
+    }
+    fn store(&self, channel: &str, body: &str, client_id: &str) -> Value {
+        let mut stored = self.stored.lock().unwrap();
+        let n = stored.len() + 1;
+        stored
+            .entry(client_id.to_string())
+            .or_insert_with(|| {
+                json!({ "id": format!("m{n:03}"), "channel_id": channel, "author_id": ME,
+                        "body": body, "created_at": "2026-09-25T10:00:00Z",
+                        "seq": 100 + n as i64, "client_id": client_id })
+            })
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Post for Server {
+    async fn send(&self, channel: &str, body: &str, client_id: &str) -> Result<Value, SendFailure> {
+        self.sends
+            .lock()
+            .unwrap()
+            .push((channel.into(), client_id.into(), body.into()));
+        let scripted = self
+            .by_body
+            .lock()
+            .unwrap()
+            .get_mut(body)
+            .and_then(VecDeque::pop_front);
+        let answer = scripted
+            .or_else(|| self.script.lock().unwrap().pop_front())
+            .unwrap_or(Answer::Ok);
+        match answer {
+            Answer::Ok => Ok(self.store(channel, body, client_id)),
+            Answer::Lost => {
+                self.store(channel, body, client_id);
+                Err(SendFailure::Transient {
+                    retry_after: Some(0),
+                })
+            }
+            Answer::Fail(f) => Err(f),
+            Answer::WrongEcho => {
+                let mut m = self.store(channel, body, client_id);
+                m["client_id"] = json!("someone-else");
+                Ok(m)
+            }
+            Answer::Held(gate) => {
+                gate.notified().await;
+                Ok(self.store(channel, body, client_id))
+            }
+        }
+    }
+}
+
+struct NoSync;
+#[async_trait::async_trait]
+impl Fetch for NoSync {
+    async fn page(&self, _: &str) -> Result<Page, crate::Error> {
+        Err(crate::Error::Timeout)
+    }
+}
+#[async_trait::async_trait]
+impl History for NoSync {
+    async fn page(&self, _: &str, _: Option<&str>, _: usize) -> Result<Vec<Value>, crate::Error> {
+        Ok(vec![])
+    }
+}
+
+struct Setup {
+    outbox: Arc<Outbox>,
+    server: Arc<Server>,
+    cache: Arc<Cache>,
+    session: watch::Sender<Option<u64>>,
+    outbox_dir: tempfile::TempDir,
+    slot: Arc<InMemoryKeySlot>,
+    _cache_dir: tempfile::TempDir,
+}
+
+fn open_db(dir: &std::path::Path, kind: Kind, slot: &Arc<InMemoryKeySlot>) -> Db {
+    let keys = KeyStore::new(slot.clone() as Arc<dyn KeySlot>);
+    match store::open(dir, kind, "s", &keys).unwrap() {
+        Opened::Ready { db, .. } => db,
+        other => panic!("{other:?}"),
+    }
+}
+
+async fn setup() -> Setup {
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let cache_dir = tempfile::tempdir().unwrap();
+    let outbox_dir = tempfile::tempdir().unwrap();
+    let cache = Cache::new(
+        open_db(cache_dir.path(), Kind::Cache, &slot),
+        ME.into(),
+        Arc::new(NoSync),
+        Arc::new(NoSync),
+    );
+    // The channels exist in the cache (acks apply only to a present channel).
+    for ch in ["c1", "c2"] {
+        cache
+            .live_event("channel.update", &json!({ "id": ch, "name": ch, "seq": 1 }))
+            .await;
+    }
+    let server = Arc::new(Server::default());
+    let (session, rx) = watch::channel(Some(1));
+    let outbox = Outbox::open(
+        open_db(outbox_dir.path(), Kind::Outbox, &slot),
+        cache.clone(),
+        server.clone(),
+        rx,
+    )
+    .await
+    .unwrap();
+    Setup {
+        outbox,
+        server,
+        cache,
+        session,
+        outbox_dir,
+        slot,
+        _cache_dir: cache_dir,
+    }
+}
+
+async fn eventually(what: &str, f: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !f() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn drained(s: &Setup) {
+    for _ in 0..500 {
+        if s.outbox.unsent_count().await.unwrap() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "the outbox never drained: {:?}",
+        s.outbox.pending("c1").await.unwrap()
+    );
+}
+
+async fn cached_bodies(s: &Setup, ch: &str) -> Vec<String> {
+    let mut v: Vec<String> = s
+        .cache
+        .cached_messages(ch, None, 100)
+        .await
+        .unwrap()
+        .messages
+        .iter()
+        .map(|m| m["body"].as_str().unwrap().to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+#[tokio::test]
+async fn a_queued_message_is_durable_before_enqueue_returns() {
+    let s = setup().await;
+    s.session.send_replace(None); // signed out: nothing is sent
+    let id = s.outbox.enqueue("c1", "hello").await.unwrap();
+    // Reopen the store as a restart would: the row is there.
+    let outbox = s.outbox;
+    outbox.close().await;
+    let db = open_db(s.outbox_dir.path(), Kind::Outbox, &s.slot);
+    let rows: i64 = db
+        .call(move |c| {
+            c.query_row(
+                "SELECT count(*) FROM outbox WHERE client_id = ?1",
+                [&id],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap_or(0);
+    assert_eq!(rows, 1);
+}
+
+/// The answer is lost; the resend (same client_id) gets the stored message: one message.
+#[tokio::test]
+async fn a_lost_answer_and_a_resend_make_one_message() {
+    let s = setup().await;
+    s.server.script([Answer::Lost, Answer::Ok]);
+    s.outbox.enqueue("c1", "once").await.unwrap();
+    drained(&s).await;
+    let sends = s.server.sends();
+    assert_eq!(sends.len(), 2);
+    assert_eq!(sends[0].1, sends[1].1, "the resend used another client_id");
+    assert_eq!(s.server.stored_bodies(), vec!["once"]);
+    assert_eq!(cached_bodies(&s, "c1").await, vec!["once"]);
+}
+
+#[tokio::test]
+async fn messages_go_in_the_order_written() {
+    let s = setup().await;
+    s.session.send_replace(None);
+    for body in ["one", "two", "three", "four"] {
+        s.outbox.enqueue("c1", body).await.unwrap();
+    }
+    s.session.send_replace(Some(1));
+    drained(&s).await;
+    let order: Vec<String> = s.server.sends().into_iter().map(|x| x.2).collect();
+    assert_eq!(order, vec!["one", "two", "three", "four"]);
+}
+
+/// A crash while `sending`: at the next start the row goes out again with the same id.
+#[tokio::test]
+async fn a_row_left_sending_by_a_crash_is_resent_with_its_id() {
+    let s = setup().await;
+    s.session.send_replace(None);
+    let id = s.outbox.enqueue("c1", "mid-flight").await.unwrap();
+    let outbox = s.outbox;
+    outbox.close().await;
+    let db = open_db(s.outbox_dir.path(), Kind::Outbox, &s.slot);
+    db.call(|c| c.execute("UPDATE outbox SET state = 'sending'", []))
+        .await
+        .unwrap();
+    let (session, rx) = watch::channel(None);
+    let outbox = Outbox::open(db, s.cache.clone(), s.server.clone(), rx)
+        .await
+        .unwrap();
+    // Before anything is sent again, it reads as waiting, not as mid-send.
+    assert_eq!(
+        outbox.pending("c1").await.unwrap()[0].state,
+        PendingState::Pending
+    );
+    session.send_replace(Some(1));
+    outbox.resume().await.unwrap();
+    let server = s.server.clone();
+    eventually("the resend", move || !server.sends().is_empty()).await;
+    assert_eq!(s.server.sends()[0].1, id);
+    drop(session);
+}
+
+#[tokio::test]
+async fn a_failed_message_blocks_only_its_own_channel() {
+    let s = setup().await;
+    s.session.send_replace(None);
+    s.server.script_for(
+        "refused",
+        [Answer::Fail(SendFailure::Refused {
+            code: "authz.forbidden".into(),
+        })],
+    );
+    s.outbox.enqueue("c1", "refused").await.unwrap();
+    s.outbox.enqueue("c1", "behind it").await.unwrap();
+    s.outbox.enqueue("c2", "elsewhere").await.unwrap();
+    s.session.send_replace(Some(1));
+    let server = s.server.clone();
+    eventually("c2's send", move || {
+        server.sends().iter().any(|x| x.2 == "elsewhere")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let c1 = s.outbox.pending("c1").await.unwrap();
+    assert_eq!(c1.len(), 2, "a later message overtook the failed one");
+    assert_eq!(
+        c1[0].state,
+        PendingState::Failed {
+            code: "authz.forbidden".into()
+        }
+    );
+    assert_eq!(c1[1].state, PendingState::Pending);
+    assert!(!s.server.sends().iter().any(|x| x.2 == "behind it"));
+    // Retry: it goes, then the one behind it.
+    s.outbox.retry(&c1[0].client_id).await.unwrap();
+    drained(&s).await;
+}
+
+/// The status table, row by row: these stay pending (and go out later), never failed.
+#[tokio::test]
+async fn transient_answers_keep_the_message_pending() {
+    for failure in [
+        SendFailure::Transient {
+            retry_after: Some(0),
+        },
+        SendFailure::Transient { retry_after: None },
+    ] {
+        let s = setup().await;
+        s.server.script([Answer::Fail(failure.clone()), Answer::Ok]);
+        s.outbox.enqueue("c1", "eventually").await.unwrap();
+        drained(&s).await;
+        assert_eq!(s.server.stored_bodies(), vec!["eventually"], "{failure:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_fails_the_message_with_the_servers_code() {
+    for code in [
+        "authz.forbidden",
+        "not_found",
+        "validation_error",
+        "file.not_attachable",
+    ] {
+        let s = setup().await;
+        s.server
+            .script([Answer::Fail(SendFailure::Refused { code: code.into() })]);
+        s.outbox.enqueue("c1", "no").await.unwrap();
+        let o = s.outbox.clone();
+        let mut state = None;
+        for _ in 0..500 {
+            state = o
+                .pending("c1")
+                .await
+                .unwrap()
+                .first()
+                .map(|m| m.state.clone());
+            if matches!(state, Some(PendingState::Failed { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state, Some(PendingState::Failed { code: code.into() }));
+    }
+}
+
+/// An answer that echoes another message's client_id is a bug: the row fails, never resent.
+#[tokio::test]
+async fn a_wrong_echo_fails_the_row_and_never_resends() {
+    let s = setup().await;
+    s.server.script([Answer::WrongEcho]);
+    s.outbox.enqueue("c1", "who am i").await.unwrap();
+    let o = s.outbox.clone();
+    for _ in 0..500 {
+        if matches!(
+            o.pending("c1")
+                .await
+                .unwrap()
+                .first()
+                .map(|m| m.state.clone()),
+            Some(PendingState::Failed { .. })
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(s.server.sends().len(), 1, "a mismatched row was resent");
+    assert_eq!(
+        s.outbox.pending("c1").await.unwrap()[0].state,
+        PendingState::Failed {
+            code: "outbox.echo_mismatch".into()
+        }
+    );
+}
+
+/// Delete while the send is in flight and the server accepts it: it's sent, and stays.
+#[tokio::test]
+async fn delete_during_an_accepted_send_reports_it_sent() {
+    let s = setup().await;
+    let gate = Arc::new(Notify::new());
+    s.server.script([Answer::Held(gate.clone())]);
+    let id = s.outbox.enqueue("c1", "too late").await.unwrap();
+    let server = s.server.clone();
+    eventually("the send in flight", move || server.sends().len() == 1).await;
+    let delete = tokio::spawn({
+        let (o, id) = (s.outbox.clone(), id.clone());
+        async move { o.delete_pending(&id).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.notify_one();
+    assert_eq!(delete.await.unwrap().unwrap(), Deleted::AlreadySent);
+    assert_eq!(cached_bodies(&s, "c1").await, vec!["too late"]);
+}
+
+#[tokio::test]
+async fn delete_before_sending_removes_it() {
+    let s = setup().await;
+    s.session.send_replace(None);
+    let id = s.outbox.enqueue("c1", "never mind").await.unwrap();
+    assert_eq!(
+        s.outbox.delete_pending(&id).await.unwrap(),
+        Deleted::Removed
+    );
+    s.session.send_replace(Some(1));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(s.server.sends().is_empty());
+}
+
+/// Signed out during a backoff sleep: the woken sender doesn't send until the next sign-in.
+#[tokio::test]
+async fn a_sign_out_pauses_the_sender_mid_backoff() {
+    let s = setup().await;
+    s.server.script([Answer::Fail(SendFailure::Transient {
+        retry_after: Some(1),
+    })]);
+    s.outbox.enqueue("c1", "later").await.unwrap();
+    let server = s.server.clone();
+    eventually("the first attempt", move || server.sends().len() == 1).await;
+    s.session.send_replace(None); // a plain sign-out (no data removed)
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(s.server.sends().len(), 1, "sent while signed out");
+    assert_eq!(s.outbox.unsent_count().await.unwrap(), 1);
+    s.session.send_replace(Some(2));
+    drained(&s).await;
+}
+
+/// A 401 waits for the session to change (renewed), then goes.
+#[tokio::test]
+async fn a_refused_token_waits_for_the_session_to_be_renewed() {
+    let s = setup().await;
+    s.server.script([Answer::Fail(SendFailure::Unauthorized)]);
+    s.outbox.enqueue("c1", "after refresh").await.unwrap();
+    let server = s.server.clone();
+    eventually("the first attempt", move || server.sends().len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(s.server.sends().len(), 1, "retried without a new session");
+    s.session.send_replace(Some(2)); // renewed
+    drained(&s).await;
+}
+
+#[tokio::test]
+async fn unsent_messages_are_counted_for_the_sign_out_warning() {
+    let s = setup().await;
+    s.session.send_replace(None);
+    s.outbox.enqueue("c1", "a").await.unwrap();
+    s.outbox.enqueue("c2", "b").await.unwrap();
+    assert_eq!(s.outbox.unsent_count().await.unwrap(), 2);
+}
+
+#[test]
+fn would_overtake_is_its_own_error() {
+    assert_ne!(OutboxError::WouldOvertake, OutboxError::Store);
+}
+
+/// The ack is applied to the cache first; if that fails the row stays (it's resent, and the
+/// server answers with the stored message): the message is never lost between the two.
+#[tokio::test]
+async fn a_failed_ack_keeps_the_row() {
+    struct Garbled(Arc<Server>);
+    #[async_trait::async_trait]
+    impl Post for Garbled {
+        async fn send(&self, ch: &str, body: &str, cid: &str) -> Result<Value, SendFailure> {
+            let mut m = self.0.send(ch, body, cid).await?;
+            m.as_object_mut().unwrap().remove("created_at"); // the cache can't take it
+            Ok(m)
+        }
+    }
+    let s = setup().await;
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let dir = tempfile::tempdir().unwrap();
+    let (session, rx) = watch::channel(Some(1));
+    let outbox = Outbox::open(
+        open_db(dir.path(), Kind::Outbox, &slot),
+        s.cache.clone(),
+        Arc::new(Garbled(s.server.clone())),
+        rx,
+    )
+    .await
+    .unwrap();
+    outbox.enqueue("c1", "keep me").await.unwrap();
+    let server = s.server.clone();
+    eventually("a send", move || !server.sends().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        outbox.unsent_count().await.unwrap(),
+        1,
+        "the row went before the cache had it"
+    );
+    drop(session);
+}
