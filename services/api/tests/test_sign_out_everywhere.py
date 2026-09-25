@@ -4,6 +4,7 @@ when the 15-minute access token expires."""
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 
 import httpx
@@ -48,6 +49,7 @@ async def test_change_signs_other_devices_out_immediately(client: httpx.AsyncCli
         headers=_h(laptop["access_token"]),
     )
     assert r.status_code == 200
+    assert r.json()["other_devices_signed_out"] is True
     # The phone's access token is still inside its 15 minutes, and refused now.
     me = await client.get(f"{AUTH}/me", headers=_h(phone["access_token"]))
     assert me.status_code == 401
@@ -69,6 +71,7 @@ async def test_unchecked_keeps_other_devices_signed_in(client: httpx.AsyncClient
         headers=_h(laptop["access_token"]),
     )
     assert r.status_code == 200
+    assert r.json()["other_devices_signed_out"] is False
     assert (await client.get(f"{AUTH}/me", headers=_h(phone["access_token"]))).status_code == 200
     refreshed = await client.post(f"{AUTH}/refresh", json={"refresh_token": phone["refresh_token"]})
     assert refreshed.status_code == 200
@@ -183,3 +186,68 @@ def test_unchecked_leaves_other_sockets_open(sync_client: TestClient) -> None:
         # Still usable: a re-auth with the same (unrevoked) token is answered.
         ws.send_json({"type": "auth", "id": "r1", "data": {"access_token": phone["access_token"]}})
         assert ws.receive_json()["type"] == "ready"
+
+
+async def test_register_refuses_a_revoked_admin_token(client: httpx.AsyncClient) -> None:
+    """A stolen admin token cut off by a password change can't still create accounts.
+
+    register resolves its optional caller separately from get_current_user; it once
+    skipped the revocation check (auth review of #45)."""
+    stolen, laptop = await _setup(client)
+    r = await client.post(
+        f"{AUTH}/password",
+        json={"current_password": PW, "new_password": "brand-new-pass"},
+        headers=_h(laptop["access_token"]),
+    )
+    assert r.status_code == 200
+    body = {"handle": "mallory", "display_name": "Mallory", "password": "mallory-pass"}
+    created = await client.post(f"{AUTH}/register", json=body, headers=_h(stolen["access_token"]))
+    assert created.status_code == 403
+    login = await client.post(
+        f"{AUTH}/login", json={"handle": "mallory", "password": "mallory-pass"}
+    )
+    assert login.status_code == 401  # no account was created
+
+
+def test_reauth_with_a_revoked_token_is_session_revoked(sync_client: TestClient) -> None:
+    """The on-socket `auth` frame path: a revoked token closes `session_revoked`
+    (not `auth_failed`, which would count against the owner's IP)."""
+    http = sync_client
+    body = {"handle": "alice", "display_name": "Alice", "password": PW}
+    assert http.post(f"{AUTH}/register", json=body).status_code == 201
+    old = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
+    r = http.post(
+        f"{AUTH}/password",
+        json={"current_password": PW, "new_password": "brand-new-pass"},
+        headers=_h(old["access_token"]),
+    )
+    fresh = r.json()
+    with http.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "auth", "data": {"access_token": fresh["access_token"]}})
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "auth", "id": "r1", "data": {"access_token": old["access_token"]}})
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+        assert closed.value.reason == "session_revoked"
+
+
+def test_a_socket_registering_after_the_sweep_is_closed(
+    sync_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registration race: a token checked just before a revocation committed
+    must not survive by registering after revoke_sessions() swept the live set."""
+    from app.routers import ws as ws_module
+
+    http = sync_client
+    body = {"handle": "alice", "display_name": "Alice", "password": PW}
+    assert http.post(f"{AUTH}/register", json=body).status_code == 201
+    pair = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
+    user_id = http.get(f"{AUTH}/me", headers=_h(pair["access_token"])).json()["id"]
+    # The sweep already ran (cutoff recorded) but the DB read that authenticated
+    # this socket happened before the commit: model it by recording the cutoff only.
+    monkeypatch.setitem(ws_module._cutoffs, uuid.UUID(user_id), 2**62)
+    with http.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "auth", "data": {"access_token": pair["access_token"]}})
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+        assert closed.value.reason == "session_revoked"

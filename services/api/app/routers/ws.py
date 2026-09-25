@@ -139,8 +139,16 @@ EXPIRED = "expired"  # a genuine token past its exp: stale, not an attack
 REVOKED = "revoked"  # a genuine token from before a sign-out-everywhere: not an attack
 
 # Live sockets per user, so a password change can close the other devices' sockets
-# at once instead of leaving them open until their token expires.
+# at once instead of leaving them open until their token expires. Per process, like
+# the hub: correct only while the api runs ONE uvicorn worker (deploy/native, the
+# container entrypoint). With --workers N a revocation would only close the sockets
+# held by the worker that served the password change.
 _live: dict[uuid.UUID, set[Connection]] = {}
+# The latest cutoff per user. A socket whose token passed the DB check just before
+# a revocation committed can finish registering after revoke_sessions() swept
+# _live; it re-checks this right after registering (ws_endpoint). Per process,
+# like the hub: this api runs one uvicorn worker (see _live above).
+_cutoffs: dict[uuid.UUID, int] = {}
 
 
 async def revoke_sessions(user_id: uuid.UUID, cutoff_ms: int) -> int:
@@ -150,6 +158,7 @@ async def revoke_sessions(user_id: uuid.UUID, cutoff_ms: int) -> int:
     The changing device's own socket is closed too (its token predates the
     change). Its client already holds the new pair, so it reconnects and resumes
     any call (PROTOCOL.md §3 call.resume); every other device fails to refresh."""
+    _cutoffs[user_id] = max(cutoff_ms, _cutoffs.get(user_id, 0))
     stale = [c for c in _live.get(user_id, set()) if c.issued_ms < cutoff_ms]
     for conn in stale:
         await conn.close(CLOSE_POLICY, "session_revoked")
@@ -216,6 +225,10 @@ async def _reauth(conn: Connection, frame: dict[str, Any], settings: Settings) -
     if conn.expiry is not None:
         conn.expiry.cancel()
     conn.issued_ms = authed[2]
+    if conn.issued_ms < _cutoffs.get(conn.user_id, 0):
+        # Same race as at registration: the DB read preceded a revocation's commit.
+        await conn.close(CLOSE_POLICY, "session_revoked")
+        return
     conn.expiry = asyncio.create_task(_expire(conn, authed[1]))
     await conn.send(envelope("ready", {"user_id": str(conn.user_id)}, re=_frame_id(frame)))
 
@@ -267,6 +280,10 @@ async def ws_endpoint(ws: WebSocket) -> None:
     _live.setdefault(user.id, set()).add(conn)
     conn.expiry = asyncio.create_task(_expire(conn, exp))
     try:
+        if issued_ms < _cutoffs.get(user.id, 0):
+            # Revoked between our token check and this registration (see _cutoffs).
+            await conn.close(CLOSE_POLICY, "session_revoked")
+            return
         # Confirm the subscription so the client knows it will now receive fan-out
         # (and so senders racing a just-connected socket aren't silently missed).
         ready_re = _frame_id(first) if isinstance(first, dict) else None

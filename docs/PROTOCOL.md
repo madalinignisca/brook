@@ -41,17 +41,23 @@
 
 - `POST /auth/password {current_password, new_password, sign_out_other_devices?}`
   needs a full access token and the current password. The response always carries
-  a new pair for the calling client.
+  a new pair for the calling client, plus `other_devices_signed_out: bool` saying
+  what the server did. Word the confirmation from that field; if it is absent,
+  the server predates the option (it revoked other devices' refresh tokens, but
+  their access tokens lived out their 15 minutes).
 - `sign_out_other_devices` (default **true**; the client shows it as a checkbox,
   checked by default) signs out **every other session at once**: all refresh
   tokens are revoked, every access token issued before the change is refused on
   REST (401 `auth.invalid_token`) and WebSocket, and open sockets are closed with
   `1008` / `session_revoked` (§2). With `false`, the password changes and other
   devices stay signed in.
-- **The old refresh token is dead the moment the server commits.** A client that
-  loses the response (timeout, dropped connection) still holds revoked tokens: its
-  next `/auth/refresh` gets 401 `auth.invalid_token`, it looks signed out, and
-  signing in with the **new** password works. There is no idempotent retry.
+- **With `sign_out_other_devices` (the default), the old refresh token is dead the
+  moment the server commits.** A client that loses the response (timeout, dropped
+  connection) still holds revoked tokens: its next `/auth/refresh` gets 401
+  `auth.invalid_token`, it looks signed out, and signing in with the **new**
+  password works. There is no idempotent retry. With `false`, nothing is revoked:
+  the caller's old refresh token stays valid next to the new pair, and the client
+  should keep the new one.
 - The cut-off is millisecond-precise (`iat_ms` claim, compared with the user's
   `sessions_valid_after`), so a token minted earlier in the same second as the
   change is refused too. Tokens without `iat_ms` compare as `iat × 1000`, which

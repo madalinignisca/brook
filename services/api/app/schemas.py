@@ -58,6 +58,17 @@ class TokenPair(BaseModel):
     token_type: str = "bearer"  # noqa: S105 - field name trips the secret heuristic; not a secret
 
 
+class PasswordChangeOut(TokenPair):
+    """``POST /auth/password``: the new pair, plus what the server actually did.
+
+    The protocol has no capability signal, so a client cannot know whether a
+    server understood ``sign_out_other_devices``. Echoing the outcome lets it
+    word its message from what happened; a missing field means an older server
+    (which always signed out the other devices' refresh tokens)."""
+
+    other_devices_signed_out: bool
+
+
 class UserOut(BaseModel):
     """Public representation of a user."""
 
