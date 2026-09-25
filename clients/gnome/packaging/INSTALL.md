@@ -18,8 +18,7 @@ Enter your server as `https://your.server` and sign in.
 
 Brook keeps you signed in between launches through your desktop's keyring
 (GNOME Keyring or KWallet), and never asks for the keyring's password itself. With
-no keyring, or a locked one, you sign in each time. Your local data is encrypted
-with OpenSSL 3 (the `libcrypto.so.3` your distribution already ships).
+no keyring, or a locked one, you sign in each time.
 
 Calls use H.264 (x264 or openh264, whichever is installed) and fall back to VP8.
 `BROOK_HW_ENCODE=1 brook-gnome` tries GPU H.264 encoding (Intel/AMD, needs the
