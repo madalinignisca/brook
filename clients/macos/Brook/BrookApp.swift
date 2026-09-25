@@ -31,13 +31,19 @@ struct BrookApp: App {
                 switch store.phase {
                 case let .signedIn(user):
                     if let client = store.client {
-                        SignedInView(user: user, client: client, calls: calls)
+                        SignedInView(user: user, client: client, calls: calls) { store.signOut() }
                     }
                 case .signedOut, .signingIn: LoginView(form: form)
                 }
             }
             .frame(minWidth: 380, minHeight: 480)
             .onAppear { appDelegate.quit = calls.quit }
+            // Signed out (by the user or remotely): a call can't outlive its session. Its
+            // own end path runs, and the call window closes itself once the call is gone.
+            .onChange(of: store.phase) { _, phase in
+                if case .signedIn = phase { return }
+                Task { await calls.endAll() }
+            }
         }
         .defaultSize(width: 720, height: 560)
 

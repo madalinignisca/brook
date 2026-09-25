@@ -14,6 +14,9 @@ final class FakeClient: FfiBrookClient, @unchecked Sendable {
         var calls: [Call] = []
         var gate: CheckedContinuation<Void, Never>?
         var gateOpen: Bool
+        var listener: AuthStateListener?
+        var logouts = 0
+        var coreState: FfiAuthState = .loggedIn(user: alice)
     }
 
     private let result: Result<LoginResult, LoginError>
@@ -61,8 +64,28 @@ final class FakeClient: FfiBrookClient, @unchecked Sendable {
         return try result.get()
     }
 
-    override func subscribe(listener _: AuthStateListener) -> Subscription {
-        Subscription(noHandle: Subscription.NoHandle())
+    /// Keeps the listener so a test can deliver core's auth states in any order.
+    override func subscribe(listener: AuthStateListener) -> Subscription {
+        state.withLock { $0.listener = listener }
+        return FakeSubscription()
+    }
+
+    /// Deliver an auth state as core would (on a background thread in production).
+    func emit(_ auth: FfiAuthState) {
+        let listener = state.withLock { $0.listener }
+        listener?.onState(state: auth)
+    }
+
+    var logouts: Int { state.withLock { $0.logouts } }
+
+    /// What core's state is right now (`authState()`), independent of what was delivered: the
+    /// real subscription keeps only the latest value and can skip states.
+    func setCoreState(_ auth: FfiAuthState) { state.withLock { $0.coreState = auth } }
+
+    override func authState() -> FfiAuthState { state.withLock { $0.coreState } }
+
+    override func logout() async {
+        state.withLock { $0.logouts += 1 }
     }
 }
 

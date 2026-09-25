@@ -1,5 +1,6 @@
 import BrookCore
 @testable import Brook
+import Synchronization
 import XCTest
 
 @MainActor
@@ -136,5 +137,119 @@ final class SessionStoreTests: XCTestCase {
         await on.signIn(server: "https://h", handle: "alice", password: "pw")
         XCTAssertEqual(offRecorder.all.map(\.allowInsecureHttp), [false])
         XCTAssertEqual(onRecorder.all.map(\.allowInsecureHttp), [true])
+    }
+
+    // MARK: sign out, and following a remote sign-out (spec 2026-09-25-sign-out §4)
+
+    /// Waits (bounded) until `predicate` holds on the store.
+    private func until(_ store: SessionStore, _ predicate: (SessionStore) -> Bool) async {
+        for _ in 0 ..< 500 where !predicate(store) { try? await Task.sleep(for: .milliseconds(2)) }
+    }
+
+    private func signedIn(_ fake: FakeClient) async -> SessionStore {
+        let (store, _) = store(fake)
+        await store.signIn(server: "https://h", handle: "alice", password: "pw")
+        fake.emit(.loggedIn(user: alice))
+        XCTAssertEqual(store.phase, .signedIn(alice))
+        return store
+    }
+
+    func testSignOutEndsTheSessionQuietlyAndSignsOutOfCore() async {
+        let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)))
+        let store = await signedIn(fake)
+        store.signOut()
+        XCTAssertEqual(store.phase, .signedOut(error: nil))
+        XCTAssertNil(store.client)
+        for _ in 0 ..< 500 where fake.logouts == 0 { try? await Task.sleep(for: .milliseconds(2)) }
+        XCTAssertEqual(fake.logouts, 1, "core never signed out")
+    }
+
+    func testARemoteSignOutShowsTheSignInScreenWithTheMessage() async {
+        let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)))
+        let store = await signedIn(fake)
+        fake.setCoreState(.loggedOut)
+        fake.emit(.loggedOut)
+        await until(store) { $0.phase != .signedIn(alice) }
+        XCTAssertEqual(store.phase, .signedOut(error: SessionStore.Message.signedOut))
+        XCTAssertNil(store.client)
+    }
+
+    func testAFreshClientsInitialLoggedOutIsNotASignOut() async {
+        let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)), gated: true)
+        let (store, _) = store(fake)
+        let signIn = Task { await store.signIn(server: "https://h", handle: "alice", password: "pw") }
+        await waitForCalls(fake, 1)
+        fake.emit(.loggedOut) // core's initial state, before any sign-in
+        fake.release()
+        _ = await signIn.value
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(store.phase, .signedIn(alice))
+    }
+
+    /// Core signed in and then lost the session before the app handled its own login result:
+    /// that sign-out wins, and the late login result is ignored.
+    func testASignOutBeforeTheLoginResultIsHandledWins() async {
+        let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)), gated: true)
+        let (store, _) = store(fake)
+        let signIn = Task { await store.signIn(server: "https://h", handle: "alice", password: "pw") }
+        await waitForCalls(fake, 1)
+        fake.emit(.loggedIn(user: alice))
+        fake.emit(.loggedOut)
+        fake.setCoreState(.loggedOut)
+        fake.release()
+        _ = await signIn.value
+        XCTAssertEqual(store.phase, .signedOut(error: SessionStore.Message.signedOut))
+        XCTAssertNil(store.client)
+    }
+
+    /// The subscription keeps only the latest value: a LoggedIn then LoggedOut can arrive as
+    /// just LoggedOut. The app reads core's state when its login completes, so this sign-out is
+    /// caught, never mistaken for a fresh client's initial state.
+    func testACoalescedSignOutDuringSignInIsCaught() async {
+        let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)), gated: true)
+        let (store, _) = store(fake)
+        let signIn = Task { await store.signIn(server: "https://h", handle: "alice", password: "pw") }
+        await waitForCalls(fake, 1)
+        fake.emit(.loggedOut) // the LoggedIn before it was coalesced away
+        fake.setCoreState(.loggedOut)
+        fake.release()
+        _ = await signIn.value
+        XCTAssertEqual(store.phase, .signedOut(error: SessionStore.Message.signedOut))
+        XCTAssertNil(store.client)
+    }
+
+    /// A LoggedOut delivered late (the fresh client's initial state, held up in delivery) while
+    /// core is in fact signed in: not a sign-out.
+    func testALateInitialLoggedOutNeverEndsAGoodSession() async {
+        let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)))
+        let store = await signedIn(fake) // core's state: LoggedIn
+        fake.emit(.loggedOut)
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(store.phase, .signedIn(alice))
+    }
+
+    func testARemoteSignOutAfterTheUsersOwnHasNoMessage() async {
+        let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)))
+        let store = await signedIn(fake)
+        store.signOut()
+        fake.emit(.loggedOut)
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(store.phase, .signedOut(error: nil))
+    }
+
+    func testALoggedOutFromThePreviousClientNeverSignsOutTheNextOne() async {
+        let first = FakeClient(result: .success(.loggedIn(session: aliceSession)))
+        let second = FakeClient(result: .success(.loggedIn(session: aliceSession)))
+        let clients = Mutex([first, second])
+        let recorder = FactoryRecorder { clients.withLock { $0.removeFirst() } }
+        let store = SessionStore(settings: Settings(defaults: defaults, environment: [:]), makeClient: recorder.factory)
+        await store.signIn(server: "https://h", handle: "alice", password: "pw")
+        first.emit(.loggedIn(user: alice))
+        store.signOut()
+        await store.signIn(server: "https://h", handle: "alice", password: "pw")
+        second.emit(.loggedIn(user: alice))
+        first.emit(.loggedOut) // late, from the dropped client
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(store.phase, .signedIn(alice))
     }
 }
