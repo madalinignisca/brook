@@ -58,7 +58,11 @@ A JWT signed with the same key as access tokens:
 - **Refused everywhere else.** `deps.user_from_access_token` and the WebSocket already
   accept only `type == "access"`, and `/auth/password` goes through the former. A test
   asserts each (REST 401, WS `auth_failed`, `/auth/password` 401).
-- **Single use.** The `jti` is recorded when `/auth/totp` *succeeds* and refused after.
+- **Single use, claimed atomically.** `/auth/totp` takes the user-row lock (`lock_user`)
+  *before* checking the `jti`, and records it in the same critical section, before tokens
+  are issued. Two concurrent requests carrying one pending token (say a recovery code and
+  a `now+1` code) are serialised by the lock, and the second finds the `jti` used. The
+  `jti` is recorded when `/auth/totp` *succeeds* and refused after.
   It is kept in process memory until `exp` (bounded; one worker, like the hub and the
   socket registry). Stated plainly: across a restart, or with a second worker, one
   password entry could complete two logins within 300 s, but only with two different
@@ -67,22 +71,26 @@ A JWT signed with the same key as access tokens:
 - A failed code does **not** burn the token, so a typo doesn't send the user back to the
   password. The rate limiter bounds the attempts instead.
 - Dead if the user signed out everywhere after it was issued (`session_revoked(iat_ms)`),
-  or if TOTP was disabled or reset in between.
+  if TOTP was disabled or reset in between, or if the **password changed** after it was
+  issued. That includes a change with the sign-out box unchecked: a new column
+  `users.password_changed_at`, set by `/auth/password` and the admin reset, is compared
+  with the token's `iat_ms`. A token minted by proving the old password dies with it.
 
 ### 2.3 Enrolment and management (full access session only, §7.5)
 
 | Call | Body | Answer | Notes |
 |---|---|---|---|
 | `POST /auth/totp/enroll` | `{password}` | `200 {otpauth_uri, expires_in: 600}` | Returned **once**; no GET ever returns it. `409 conflict` if TOTP is already active. Replaces an unfinished pending enrolment, so a QR code scanned earlier stops working and the client must show the new one. |
-| `POST /auth/totp/activate` | `{code}` | `200 {recovery_codes: [10 strings]}` | Verifies against the pending secret; sets it active. The codes are shown once. `403 auth.invalid_code`; `409 auth.totp_enrollment_expired` (scan again: call enroll); `409 conflict` if nothing is pending. |
+| `POST /auth/totp/activate` | `{code}` | `200 {recovery_codes: [10 strings], access_token, refresh_token}` | Verifies against the pending secret; sets it active; **signs out every other session** (#45 cutoff). Otherwise a refresh token stolen before enrolment would keep the account open without ever meeting the new factor. The new pair keeps this device signed in (same ordering as `/auth/password`: sockets close after the response). The codes are shown once. `403 auth.invalid_code`; `409 auth.totp_enrollment_expired` (scan again: call enroll); `409 conflict` if nothing is pending. |
 | `POST /auth/totp/disable` | `{password, code}` | `204` | `code` may be a recovery code. Removes the secret and all recovery codes. |
 | `POST /auth/totp/recovery-codes` | `{password, code}` | `200 {recovery_codes}` | Always issues 10 fresh codes and invalidates every old one, used or not, including when none are left. |
 | `GET /auth/me` | | `+ totp_enabled: bool, recovery_codes_left: int\|null` | So the app shows Enable or Disable, and warns when codes run low (null when TOTP is off). |
 
 A wrong password on these is `403 auth.invalid_credentials` (the #39 rule: never 401).
 
-`otpauth_uri` = `otpauth://totp/{issuer}:{handle}?secret={base32}&issuer={issuer}&algorithm=SHA1&digits=6&period=30`.
-`issuer` comes from `BROOK_TOTP_ISSUER` (default `Brook`), percent-encoded.
+`otpauth_uri` = `otpauth://totp/{label}?secret={base32}&issuer={issuer}&algorithm=SHA1&digits=6&period=30`,
+where `label` = `{issuer}:{handle}`. The label as a whole and every query value are
+percent-encoded independently. `issuer` comes from `BROOK_TOTP_ISSUER` (default `Brook`).
 
 ### 2.4 Admin reset (§7.6)
 
@@ -119,7 +127,8 @@ is recorded with `actor = NULL` and `via = "host_cli"`. The HTTP API has no bulk
 |---|---|---|
 | `id` | uuid PK | |
 | `user_id` | uuid | FK, cascade, indexed |
-| `code_hash` | text | **Argon2id** via the existing `PasswordHasher` (§7.1) |
+| `lookup` | text(4) | The code's public id prefix. Indexed, unique per user. It finds the one row to verify, so a guess costs one Argon2, not ten. |
+| `code_hash` | text | **Argon2id** of the secret part, via the existing `PasswordHasher` (§7.1) |
 | `used_at` | timestamptz, null | |
 
 **`auth_events`**, append-only (§7.6):
@@ -154,9 +163,13 @@ with the user (cascade). Retention beyond that is an owner decision, noted in §
   through one function. So a code accepted at `activate` (or typed into a phishing
   "confirm" page) can't then be used to log in. Consequence, and intended: the first
   login right after activation needs the **next** code (≤ 30 s).
-- **Recovery codes:** 10 codes of 10 characters from a 32-symbol alphabet without look-alike
-  characters (50 bits), shown as `xxxxx-xxxxx`. Input is normalised (case, dashes, spaces)
-  before verifying. Each is used once: `used_at` is set under the user lock.
+- **Recovery codes:** 10 codes, each a 4-character public `lookup` id plus 16 secret
+  characters, from a 32-symbol alphabet without look-alike characters: **80 bits** of
+  secret, shown as `iiii-xxxx-xxxx-xxxx-xxxx`. They are a passwordless substitute for the
+  second factor, so they need real offline resistance even behind Argon2id. Input is
+  normalised (case, dashes, spaces), the row is found by `lookup` (an unknown id still
+  spends one dummy Argon2 for timing), and it is used once: `used_at` is set under the
+  user lock.
 - **Key rotation:** after a successful verify, if `needs_rewrap(secret)`, re-encrypt with
   the primary key in the same transaction.
 
@@ -172,6 +185,10 @@ labelled by reason, and the startup canary. A decrypt failure is **not** recorde
 limiter failure. Counted as a wrong code, a key dropped one step early would show up as
 per-handle brute-force noise and 429s for every enrolled user, the exact silent failure
 §5.8 exists to surface. It is an operator fault, and it is reported as one.
+
+That exemption must not become a free amplifier: **decrypt failures have their own
+budget**, per user, of 5 per hour. Beyond it `/auth/totp` answers 429 without attempting
+decryption, and logs one line per window rather than one per request.
 
 **Deliberate deviation from the encryption spec's wording:** §5.5 says "401". This spec
 uses 403 instead: core treats 401 as "refresh your access token", and the caller of
@@ -190,9 +207,16 @@ Everything here goes through #36's limiter **before** any Argon2 or HMAC work, k
   from any IP. That's ≤ 96 guesses per day. At ≈ 3 valid codes per 10⁶ (±1 step), an
   attacker who already holds the password succeeds with ≈ 0.03 % per day, or ≈ 0.9 % per
   month of continuous attack. Crossing the threshold writes an `auth_events` row
-  (`totp_guessing`) and logs a warning, so the owner sees it long before that. It is never
-  a lock: the real user waits at most 15 min, or uses a recovery code (the same budget
-  applies).
+  (`totp_guessing`) and logs a warning, so the owner sees it long before that.
+- **What ends the budget:** a successful code or recovery code, a password change (the
+  owner's remedy for "someone has my password"), and an admin TOTP reset all clear the
+  handle's code-failure history.
+- **It can't be turned against the owner.** An attacker holding the password could
+  otherwise spend the budget and keep the real user waiting indefinitely. So the budget
+  exempts IPs that completed a login for this handle recently (the limiter's existing
+  trusted-IP set, 30-day TTL, #36). The owner's own devices and home network are never
+  paced by an attacker elsewhere. From a new network the owner waits at most 15 min per
+  attempt, or changes the password from a trusted device, which resets the budget.
 - The password checks in `enroll`, `disable`, `recovery-codes` and the admin reset: as
   in #39.
 - Login's password stage succeeding with TOTP pending records **no** success yet. The IP's
@@ -224,6 +248,17 @@ Everything here goes through #36's limiter **before** any Argon2 or HMAC work, k
 14. The 24 h code budget: the 11th wrong code gets `Retry-After` ≥ 900, and a
     `totp_guessing` event is written.
 15. A login without `supports_totp` for a TOTP user gives `403 auth.totp_client_required`.
+16. Activation signs out other sessions: a refresh token from before activation gets 401,
+    and the activating device's returned pair works.
+17. A pending token dies on a password change with the box unchecked.
+18. Two concurrent `/auth/totp` calls with one pending token and two valid inputs: exactly
+    one TokenPair (Postgres).
+19. Recovery codes: one Argon2 per guess (an unknown `lookup` spends a dummy), 80-bit
+    secret part.
+20. The code budget resets on success, on password change and on admin reset; a trusted IP
+    is not paced.
+21. Decrypt-failure budget: the 6th decrypt failure in an hour gives 429 with no decrypt
+    attempted.
 
 ## 8. Open points for the owner
 
@@ -233,5 +268,5 @@ Everything here goes through #36's limiter **before** any Argon2 or HMAC work, k
    `totp_guessing`? Useful forensically, and it is personal data under GDPR. Proposed:
    no by default; the limiter's escalation log line (journald, host retention) already
    carries the IP for abuse cases.
-2. Should enabling TOTP also sign out other devices (like the password-change checkbox)?
-   Proposed: no. Enabling is an upgrade, not a sign of compromise.
+2. ~~Should enabling TOTP also sign out other devices?~~ **Decided: yes, always** (review):
+   otherwise a token stolen before enrolment bypasses the new factor.
