@@ -163,6 +163,32 @@ async def test_attach_and_see_it_in_history(client: httpx.AsyncClient) -> None:
     assert history[0]["attachments"][0]["filename"] == "report.pdf"
 
 
+async def test_attachments_keep_the_senders_order_on_every_read(
+    client: httpx.AsyncClient,
+) -> None:
+    # Uploaded first → attached last: history, /sync and a resend must all show the
+    # sender's order, the same as the send's own answer (not upload order).
+    ha, hb, ch = await _setup(client)
+    first = await _upload(client, ha, ch, b"one", name="one.txt")
+    second = await _upload(client, ha, ch, b"two", name="two.txt")
+    third = await _upload(client, ha, ch, b"three", name="three.txt")
+    order = [third["id"], first["id"], second["id"]]
+    cid = str(uuid.uuid4())
+    body = {"body": "files", "attachments": order, "client_id": cid}
+    url = f"/api/v1/channels/{ch}/messages"
+    sent = await client.post(url, json=body, headers=ha)
+    assert sent.status_code == 201
+    assert [a["id"] for a in sent.json()["attachments"]] == order
+
+    history = (await client.get(url, headers=hb)).json()
+    assert [a["id"] for a in history[-1]["attachments"]] == order
+    resend = await client.post(url, json=body, headers=ha)
+    assert [a["id"] for a in resend.json()["attachments"]] == order
+    synced = (await client.get("/api/v1/sync", params={"since": "1"}, headers=hb)).json()
+    (msg,) = [m for m in synced["messages"] if m["id"] == sent.json()["id"]]
+    assert [a["id"] for a in msg["attachments"]] == order
+
+
 async def test_attach_rules(client: httpx.AsyncClient) -> None:
     ha, hb, ch = await _setup(client)
     other = (

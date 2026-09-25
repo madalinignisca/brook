@@ -595,7 +595,7 @@ async def _attachments_for(
         await session.scalars(
             select(File)
             .where(File.message_id.in_(message_ids), File.status == "committed")
-            .order_by(File.created_at)
+            .order_by(File.position, File.created_at)
         )
     ).all()
     out: dict[uuid.UUID, list[FileOut]] = {}
@@ -624,7 +624,7 @@ async def _attach_files(
     )
     by_id = {row.id: row for row in rows}
     attached: list[FileOut] = []
-    for file_id in file_ids:
+    for position, file_id in enumerate(file_ids):
         row = by_id.get(file_id)
         if (
             row is None
@@ -635,6 +635,7 @@ async def _attach_files(
         ):
             raise _unattachable()
         row.message_id = message.id
+        row.position = position
         attached.append(storage.file_out(row))
     return attached
 
