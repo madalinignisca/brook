@@ -141,3 +141,24 @@ impl From<Error> for LoginError {
         }
     }
 }
+
+/// A channel or DM the user belongs to (the fields the Apple UI needs).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiChannel {
+    pub id: String,
+    /// `"channel"` or `"dm"`.
+    pub kind: String,
+    pub name: Option<String>,
+    pub archived: bool,
+}
+
+impl From<brook_core::Channel> for FfiChannel {
+    fn from(c: brook_core::Channel) -> Self {
+        Self {
+            id: c.id,
+            kind: c.kind,
+            name: c.name,
+            archived: c.archived,
+        }
+    }
+}

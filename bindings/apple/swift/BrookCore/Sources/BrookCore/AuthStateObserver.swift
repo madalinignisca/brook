@@ -1,3 +1,4 @@
+import BrookCoreGenerated
 import Synchronization
 
 /// Observes a client's authentication state; the base of the app's observable store.

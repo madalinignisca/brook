@@ -6,7 +6,13 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The in-process test origin (REST + /ws) for other crates' tests (e.g. the Apple bindings).
+# Never enabled by a client build.
+test-support = ["dep:axum", "tokio/net"]
+
 [dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"], optional = true }
 # dyn-compatible async trait for the platform MediaEngine.
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

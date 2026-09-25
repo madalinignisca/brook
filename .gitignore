@@ -39,7 +39,7 @@ caddydata/
 bindings/apple/build/
 bindings/apple/.itest.env
 bindings/apple/swift/BrookCore/BrookCoreFFI.xcframework/
-bindings/apple/swift/BrookCore/Sources/BrookCore/Generated/
+bindings/apple/swift/BrookCore/Sources/BrookCoreGenerated/
 bindings/apple/swift/BrookCore/.build/
 bindings/apple/swift/BrookCore/.swiftpm/
 
@@ -48,3 +48,4 @@ clients/macos/Brook.xcodeproj/
 clients/macos/build/
 clients/macos/Brook/Info.plist
 clients/macos/Brook/Brook.entitlements
+clients/macos/Local.xcconfig
