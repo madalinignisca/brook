@@ -28,6 +28,8 @@ jobs:
 
       - name: Build
         run: |
+          flatpak remote-add --user --if-not-exists flathub \
+            https://dl.flathub.org/repo/flathub.flatpakrepo
           flatpak-builder --user --install-deps-from=flathub --force-clean \
             --repo=repo build clients/gnome/packaging/flatpak/dev.brook.Brook.yml
 
