@@ -38,6 +38,8 @@ jobs:
           set -u
           m=clients/gnome/packaging/flatpak/dev.brook.Brook.yml
           missing=0
+          # Show one full answer, so a broken probe is not mistaken for missing plugins.
+          flatpak-builder --run build "$m" gst-inspect-1.0 videoconvert | head -5
           # Required: every call uses these.
           for e in webrtcbin nicesrc nicesink dtlssrtpenc dtlssrtpdec srtpenc srtpdec \
                    rtpopuspay opusenc opusdec rtph264pay rtph264depay h264parse \
