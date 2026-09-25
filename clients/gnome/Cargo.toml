@@ -20,6 +20,9 @@ gst = { package = "gstreamer", version = "0.23" }
 gst-webrtc = { package = "gstreamer-webrtc", version = "0.23" }
 # Two-factor enrolment: the otpauth QR code is rendered locally (it carries the secret).
 qrcode = { version = "0.14", default-features = false }
+# Staying signed in (#58): the session and store keys in the desktop keyring (Secret
+# Service over D-Bus). Same ashpd/zbus majors as gst-media, so no duplicates.
+oo7 = { version = "0.6", default-features = false, features = ["tokio", "native_crypto"] }
 
 [dev-dependencies]
 # Scans the rendered QR code back in tests.
