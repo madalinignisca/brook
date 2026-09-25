@@ -45,6 +45,15 @@ final class FakeRealtime: FfiBrookClientProtocol, @unchecked Sendable {
     func changePassword(current: String, new: String, signOutOtherDevices: Bool) async throws -> Bool? { nil }
     func logout() async {}
     func authState() -> FfiAuthState { .loggedOut }
+    func completeTotp(challenge: FfiTotpChallenge, code: String) async throws -> UInt32? { nil }
+    func completeRecovery(challenge: FfiTotpChallenge, recoveryCode: String) async throws -> UInt32? { nil }
+    func cancelTotp(challenge: FfiTotpChallenge) async {}
+    func me() async throws -> FfiMe { throw LoginError.NotAuthenticated }
+    func totpEnroll(password: String) async throws -> FfiTotpEnrollment { throw LoginError.NotAuthenticated }
+    func totpActivate(code: String) async throws -> [String] { [] }
+    func totpDisable(password: String, factor: FfiSecondFactor) async throws {}
+    func totpRegenerateRecoveryCodes(password: String, factor: FfiSecondFactor) async throws -> [String] { [] }
+    func adminResetTotp(userId: String, adminPassword: String) async throws {}
     func adminResetPassword(userId: String, adminPassword: String, new: String) async throws {}
     func listUsers() async throws -> [FfiUserSummary] { [] }
 

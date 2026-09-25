@@ -23,6 +23,54 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 /// — short enough to recover well before the access token expires.
 pub(crate) const REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
+/// What a password login produced.
+#[derive(Debug)]
+pub enum LoginOutcome {
+    /// Signed in.
+    LoggedIn(Session),
+    /// The account has TOTP on: complete the sign-in with a code (or a recovery code).
+    TotpRequired(TotpChallenge),
+}
+
+/// The second step of a TOTP sign-in. Opaque: the server's pending token never leaves it (not
+/// in `Debug`, never a bearer). Only the current attempt's challenge can complete.
+#[derive(Clone)]
+pub struct TotpChallenge {
+    /// The client (session store) it came from, and that client's login attempt.
+    store: u64,
+    gen: u64,
+    token: String,
+    expires_at: tokio::time::Instant,
+}
+
+impl TotpChallenge {
+    /// When the server stops accepting it (then sign in with the password again).
+    pub fn expires_at(&self) -> tokio::time::Instant {
+        self.expires_at
+    }
+
+    /// Seconds until it expires (0 once expired).
+    pub fn seconds_left(&self) -> u64 {
+        self.expires_at
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_secs()
+    }
+}
+
+impl std::fmt::Debug for TotpChallenge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpChallenge")
+            .field("seconds_left", &self.seconds_left())
+            .finish_non_exhaustive() // the token is never shown
+    }
+}
+
+/// A password login's answer: a pair (not yet a session), or a TOTP step.
+enum Issued {
+    Pair(TokenPair),
+    Totp { token: String, expires_in: u64 },
+}
+
 /// Shared client: networking + observable auth state.
 ///
 /// Cheap to clone-by-`Arc` from the UI; safe to call from any async task.
@@ -101,6 +149,103 @@ impl BrookClient {
         }
     }
 
+    /// Complete a TOTP sign-in with a 6-digit code. `Ok(None)`: signed in. A wrong code is
+    /// `Api { code: "auth.invalid_code" }` and keeps the challenge; `auth.totp_expired` ends it
+    /// (sign in with the password again); `ChallengeSuperseded`: it is no longer the current
+    /// attempt (Back, a newer login, a sign-out, or already completed) and nothing changed.
+    pub async fn complete_totp(
+        &self,
+        challenge: &TotpChallenge,
+        code: &str,
+    ) -> Result<Option<u32>> {
+        let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        self.complete_challenge(challenge, json!({ "code": code }))
+            .await
+    }
+
+    /// Complete a TOTP sign-in with a recovery code; returns how many unused codes are left.
+    /// Errors as [`Self::complete_totp`].
+    pub async fn complete_recovery(
+        &self,
+        challenge: &TotpChallenge,
+        recovery_code: &str,
+    ) -> Result<Option<u32>> {
+        let code = recovery_code.trim().to_string();
+        self.complete_challenge(challenge, json!({ "recovery_code": code }))
+            .await
+    }
+
+    /// Back from the code step: end this challenge (only if it is still the current one; a
+    /// stale Back never cancels a newer attempt). Idempotent.
+    pub async fn cancel_totp(&self, challenge: &TotpChallenge) {
+        if challenge.store == self.session.id() {
+            self.session.end_challenge(challenge.gen).await;
+        }
+    }
+
+    async fn complete_challenge(
+        &self,
+        challenge: &TotpChallenge,
+        mut body: serde_json::Value,
+    ) -> Result<Option<u32>> {
+        self.session.note_runtime();
+        if challenge.store != self.session.id() {
+            return Err(Error::ChallengeSuperseded); // another client's: nothing sent
+        }
+        body["totp_token"] = json!(challenge.token);
+        let gen = challenge.gen;
+        let (session, http, base) = (self.session.clone(), self.http.clone(), self.base.clone());
+        // Its own task holding the refresh lock, like login: a cancelled caller cannot stop it
+        // between the server issuing a pair and core installing (or revoking) it.
+        let task = tokio::spawn(async move {
+            let _flight = session.refresh_lock.clone().lock_owned().await;
+            if !session.challenge_current(gen).await {
+                return Err(Error::ChallengeSuperseded); // nothing sent
+            }
+            let url = base.join("api/v1/auth/totp")?;
+            let resp = http.post(url).json(&body).send().await?;
+            if !resp.status().is_success() {
+                // Status and code only: the body may echo the submitted code or the token.
+                let err = match crate::account::account_error(resp).await {
+                    // A malformed code (the server's 422) is, to the user, a wrong code.
+                    Error::Api { code, .. } if code == "validation" => Error::Api {
+                        code: "auth.invalid_code".into(),
+                        message: "the code was refused".into(),
+                    },
+                    other => other,
+                };
+                // Back, a sign-out or a newer login meanwhile: that decided, not this refusal.
+                if !session.challenge_current(gen).await {
+                    return Err(Error::ChallengeSuperseded);
+                }
+                if matches!(&err, Error::Api { code, .. } if code == "auth.totp_expired") {
+                    session.end_challenge(gen).await;
+                }
+                return Err(err);
+            }
+            #[derive(serde::Deserialize)]
+            struct TotpAnswer {
+                access_token: String,
+                refresh_token: String,
+                recovery_codes_left: Option<u32>,
+            }
+            let answer: TotpAnswer = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
+            let left = answer.recovery_codes_left;
+            let pair = TokenPair {
+                access_token: answer.access_token,
+                refresh_token: answer.refresh_token,
+            };
+            let new = session_for(&http, &base, pair).await?;
+            if session.install_for_challenge(gen, new.clone()).await {
+                Ok(left)
+            } else {
+                session.revoke_detached(new.refresh_token); // Back or a sign-out won
+                Err(Error::ChallengeSuperseded)
+            }
+        });
+        task.await.map_err(|_| Error::UnexpectedResponse)?
+    }
+
     /// The background loops' handles (tests: to see them end).
     #[cfg(test)]
     pub(crate) fn take_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
@@ -113,7 +258,7 @@ impl BrookClient {
     }
 
     /// Log in with a local handle + password, publishing state transitions.
-    pub async fn login(&self, handle: &str, password: &str) -> Result<Session> {
+    pub async fn login(&self, handle: &str, password: &str) -> Result<LoginOutcome> {
         self.session.note_runtime();
         // `send` only fails if all receivers are dropped; `self` holds `state_rx`,
         // so it can never fail here. Ignoring the result is safe.
@@ -140,20 +285,45 @@ impl BrookClient {
             if let Some(old) = displaced {
                 session.revoke_detached(old.refresh_token);
             }
-            match do_login(&http, &base, &handle, &password).await {
-                Ok(new) => {
-                    if session.install_for_login(gen, new.clone()).await {
-                        Ok(new) // LoggedIn published by the install, under its lock
-                    } else {
-                        session.revoke_detached(new.refresh_token); // superseded meanwhile
-                        Err(Error::NotAuthenticated)
-                    }
-                }
+            let issued = match do_login(&http, &base, &handle, &password).await {
+                Ok(issued) => issued,
                 Err(err) => {
                     session
                         .publish_failed_if_current(gen, err.to_string())
                         .await;
-                    Err(err)
+                    return Err(err);
+                }
+            };
+            match issued {
+                Issued::Totp { token, expires_in } => {
+                    // Nothing is installed: the password alone never yields a session.
+                    if !session.open_challenge(gen).await {
+                        return Err(Error::NotAuthenticated); // superseded meanwhile
+                    }
+                    let expires_at = tokio::time::Instant::now() + Duration::from_secs(expires_in);
+                    Ok(LoginOutcome::TotpRequired(TotpChallenge {
+                        store: session.id(),
+                        gen,
+                        token,
+                        expires_at,
+                    }))
+                }
+                Issued::Pair(pair) => {
+                    let new = match session_for(&http, &base, pair).await {
+                        Ok(new) => new,
+                        Err(err) => {
+                            session
+                                .publish_failed_if_current(gen, err.to_string())
+                                .await;
+                            return Err(err);
+                        }
+                    };
+                    if session.install_for_login(gen, new.clone()).await {
+                        Ok(LoginOutcome::LoggedIn(new)) // LoggedIn published by the install
+                    } else {
+                        session.revoke_detached(new.refresh_token); // superseded meanwhile
+                        Err(Error::NotAuthenticated)
+                    }
                 }
             }
         });
@@ -577,40 +747,72 @@ async fn api_error(resp: reqwest::Response) -> Error {
     }
 }
 
-/// Password login: the new session, not installed (the caller installs or revokes it).
+/// Password login, `supports_totp` always sent: a pair, or a TOTP step.
 async fn do_login(
     http: &reqwest::Client,
     base: &Url,
     handle: &str,
     password: &str,
-) -> Result<Session> {
+) -> Result<Issued> {
     let url = base.join("api/v1/auth/login")?;
     let resp = http
         .post(url)
-        .json(&json!({ "handle": handle, "password": password }))
+        .json(&json!({ "handle": handle, "password": password, "supports_totp": true }))
         .send()
         .await?;
     if !resp.status().is_success() {
         return Err(api_error(resp).await);
     }
-    let tokens: TokenPair = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
-    let user = match fetch_me(http, base, &tokens.access_token).await {
-        Ok(user) => user,
+    #[derive(serde::Deserialize)]
+    struct LoginAnswer {
+        #[serde(default)]
+        totp_required: bool,
+        totp_token: Option<String>,
+        expires_in: Option<u64>,
+        access_token: Option<String>,
+        refresh_token: Option<String>,
+    }
+    let answer: LoginAnswer = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
+    match answer {
+        LoginAnswer {
+            totp_required: true,
+            totp_token: Some(token),
+            expires_in,
+            ..
+        } => Ok(Issued::Totp {
+            token,
+            expires_in: expires_in.unwrap_or(300),
+        }),
+        LoginAnswer {
+            access_token: Some(access_token),
+            refresh_token: Some(refresh_token),
+            ..
+        } => Ok(Issued::Pair(TokenPair {
+            access_token,
+            refresh_token,
+        })),
+        _ => Err(Error::UnexpectedResponse),
+    }
+}
+
+/// The session a freshly issued pair belongs to. If `/me` fails the pair was issued but will
+/// never be held, so it is revoked before the error is returned.
+async fn session_for(http: &reqwest::Client, base: &Url, tokens: TokenPair) -> Result<Session> {
+    match fetch_me(http, base, &tokens.access_token).await {
+        Ok(user) => Ok(Session {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            user,
+        }),
         Err(err) => {
-            // Issued but never held: not left live.
             let _ = http
                 .post(base.join("api/v1/auth/logout")?)
                 .json(&json!({ "refresh_token": tokens.refresh_token }))
                 .send()
                 .await;
-            return Err(err);
+            Err(err)
         }
-    };
-    Ok(Session {
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-        user,
-    })
+    }
 }
 
 async fn fetch_me(http: &reqwest::Client, base: &Url, access_token: &str) -> Result<User> {
@@ -811,7 +1013,10 @@ mod tests {
 
         let client = client_for(&server).await;
         let mut state = client.state();
-        let session = client.login("alice", "supersecret").await.unwrap();
+        let LoginOutcome::LoggedIn(session) = client.login("alice", "supersecret").await.unwrap()
+        else {
+            panic!("expected a session");
+        };
 
         assert_eq!(session.user.handle, "alice");
         assert_eq!(session.access_token, "a");

@@ -39,6 +39,76 @@ struct PasswordChangeOut {
     other_devices_signed_out: Option<bool>,
 }
 
+/// The signed-in user with their second-factor state (`GET /auth/me`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Me {
+    /// Who is signed in.
+    pub user: crate::User,
+    /// Whether TOTP two-factor sign-in is on (the app shows Turn On or Turn Off).
+    pub totp_enabled: bool,
+    /// Unused recovery codes, when TOTP is on (the app warns when it runs low).
+    pub recovery_codes_left: Option<u32>,
+}
+
+/// A started TOTP enrolment: the `otpauth://` URI to show as a QR code (rendered on the device)
+/// and as a key for manual entry. It carries the secret, so it is never shown in `Debug`.
+#[derive(Clone, Deserialize)]
+pub struct TotpEnrollment {
+    otpauth_uri: String,
+    expires_in: u64,
+}
+
+impl TotpEnrollment {
+    /// The URI to render as a QR code; the secret inside it is the manual-entry key.
+    pub fn otpauth_uri(&self) -> &str {
+        &self.otpauth_uri
+    }
+
+    /// Seconds until the server drops this enrolment (then enrol again, with a new QR code).
+    pub fn expires_in(&self) -> u64 {
+        self.expires_in
+    }
+}
+
+impl std::fmt::Debug for TotpEnrollment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpEnrollment")
+            .field("expires_in", &self.expires_in)
+            .finish_non_exhaustive() // the URI carries the secret
+    }
+}
+
+/// The second factor that confirms turning TOTP off or replacing the recovery codes.
+#[derive(Clone)]
+pub enum SecondFactor {
+    /// A 6-digit code from the authenticator.
+    Code(String),
+    /// An unused recovery code.
+    Recovery(String),
+}
+
+impl std::fmt::Debug for SecondFactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Code(_) => "SecondFactor::Code(..)",
+            Self::Recovery(_) => "SecondFactor::Recovery(..)",
+        })
+    }
+}
+
+impl SecondFactor {
+    fn into_json(self, mut body: serde_json::Value) -> serde_json::Value {
+        match self {
+            Self::Code(code) => {
+                let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+                body["code"] = json!(code);
+            }
+            Self::Recovery(code) => body["recovery_code"] = json!(code.trim()),
+        }
+        body
+    }
+}
+
 /// How a 401 on an account call refreshes before its single retry.
 enum OnExpired {
     /// The caller holds the refresh lock: refresh directly (the single-flight path would wait
@@ -157,6 +227,44 @@ impl Ctx {
     }
 }
 
+impl Ctx {
+    /// The locked section of TOTP activation, run in its own task. Activation revokes every
+    /// token issued before it, this device's included, and answers with a new pair and the
+    /// recovery codes; the pair is committed like a password change's.
+    async fn totp_activate(&self, epoch: u64, code: String) -> Result<Vec<String>> {
+        let url = self.base.join("api/v1/auth/totp/activate")?;
+        let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        let body = json!({ "code": code });
+        let (resp, used_refresh) = self
+            .send(epoch, OnExpired::LockHeld, |access| {
+                self.http.post(url.clone()).bearer_auth(access).json(&body)
+            })
+            .await?;
+        if !resp.status().is_success() {
+            return Err(account_error(resp).await);
+        }
+        #[derive(Deserialize)]
+        struct ActivateOut {
+            #[serde(flatten)]
+            pair: TokenPair,
+            recovery_codes: Vec<String>,
+        }
+        let out: ActivateOut = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
+        let fresh = out.pair.refresh_token.clone();
+        match self
+            .session
+            .commit_refresh(&used_refresh, out.pair.access_token, out.pair.refresh_token)
+            .await
+        {
+            RefreshApplied::Committed => Ok(out.recovery_codes),
+            RefreshApplied::Discarded => {
+                self.session.revoke_detached(fresh); // issued for a session no longer held
+                Err(Error::NotAuthenticated)
+            }
+        }
+    }
+}
+
 impl BrookClient {
     fn ctx(&self) -> Ctx {
         Ctx {
@@ -239,6 +347,136 @@ impl BrookClient {
         Ok(())
     }
 
+    /// The signed-in user and their second-factor state.
+    pub async fn me(&self) -> Result<Me> {
+        #[derive(Deserialize)]
+        struct MeOut {
+            #[serde(flatten)]
+            user: crate::User,
+            #[serde(default)]
+            totp_enabled: bool,
+            recovery_codes_left: Option<u32>,
+        }
+        let epoch = self.session.snapshot().await.0.epoch;
+        let url = self.base.join("api/v1/auth/me")?;
+        let (resp, _) = self
+            .ctx()
+            .send(epoch, OnExpired::SingleFlight, |access| {
+                self.http.get(url.clone()).bearer_auth(access)
+            })
+            .await?;
+        if !resp.status().is_success() {
+            return Err(account_error(resp).await);
+        }
+        let out: MeOut = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
+        Ok(Me {
+            user: out.user,
+            totp_enabled: out.totp_enabled,
+            recovery_codes_left: out.recovery_codes_left,
+        })
+    }
+
+    /// Start turning TOTP on: the password is re-checked (wrong: `auth.invalid_credentials`),
+    /// and the enrolment's URI is returned once (409 `conflict` if TOTP is already on).
+    pub async fn totp_enroll(&self, password: &str) -> Result<TotpEnrollment> {
+        let body = json!({ "password": password });
+        let resp = self.account_post("api/v1/auth/totp/enroll", body).await?;
+        resp.json().await.map_err(|_| Error::UnexpectedResponse)
+    }
+
+    /// Finish turning TOTP on with a code from the authenticator: returns the recovery codes
+    /// (show them once). Every other session is signed out; this device keeps a new pair,
+    /// committed under the refresh lock like a password change. `auth.invalid_code`: try the
+    /// next code; `auth.totp_enrollment_expired`: enrol again (a new QR code).
+    pub async fn totp_activate(&self, code: &str) -> Result<Vec<String>> {
+        let epoch = self.session.snapshot().await.0.epoch;
+        let lock: OwnedMutexGuard<()> = self.session.refresh_lock.clone().lock_owned().await;
+        let ctx = self.ctx();
+        let code = code.to_string();
+        let bound = self.locked_bound;
+        // Its own task with the bound inside, as `change_password`.
+        let task = tokio::spawn(async move {
+            let _lock = lock;
+            tokio::time::timeout(bound, ctx.totp_activate(epoch, code))
+                .await
+                .unwrap_or(Err(Error::Timeout))
+        });
+        task.await.map_err(|_| Error::UnexpectedResponse)?
+    }
+
+    /// Turn TOTP off: the password and a second factor (a current code or a recovery code).
+    pub async fn totp_disable(&self, password: &str, factor: SecondFactor) -> Result<()> {
+        let body = factor.into_json(json!({ "password": password }));
+        self.account_post("api/v1/auth/totp/disable", body).await?;
+        Ok(())
+    }
+
+    /// Replace every recovery code (used or not) with ten new ones; show them once.
+    pub async fn totp_regenerate_recovery_codes(
+        &self,
+        password: &str,
+        factor: SecondFactor,
+    ) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct CodesOut {
+            recovery_codes: Vec<String>,
+        }
+        let body = factor.into_json(json!({ "password": password }));
+        let resp = self
+            .account_post("api/v1/auth/totp/recovery-codes", body)
+            .await?;
+        let out: CodesOut = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
+        Ok(out.recovery_codes)
+    }
+
+    /// Admin: turn off another (non-admin) user's TOTP (their authenticator is lost). The admin
+    /// re-enters their own password; the target is signed out everywhere. Refused locally for
+    /// the caller's own id, read from the same snapshot whose epoch the request is bound to.
+    pub async fn admin_reset_totp(&self, user_id: &str, admin_password: &str) -> Result<()> {
+        let (rev, session) = self.session.snapshot().await;
+        let me = session.ok_or(Error::NotAuthenticated)?.user.id;
+        if me == user_id {
+            return Err(Error::Api {
+                code: "invalid".into(),
+                message: "turn your own two-factor sign-in off from your account".into(),
+            });
+        }
+        let mut url = self.base.join("api/v1/users/")?;
+        url.path_segments_mut()
+            .map_err(|_| Error::MissingHost)?
+            .pop_if_empty()
+            .push(user_id)
+            .push("totp")
+            .push("reset");
+        let body = json!({ "admin_password": admin_password });
+        let (resp, _) = self
+            .ctx()
+            .send(rev.epoch, OnExpired::SingleFlight, |access| {
+                self.http.post(url.clone()).bearer_auth(access).json(&body)
+            })
+            .await?;
+        if !resp.status().is_success() {
+            return Err(account_error(resp).await);
+        }
+        Ok(())
+    }
+
+    /// POST an account call with the usual 401 handling and body-free errors.
+    async fn account_post(&self, path: &str, body: serde_json::Value) -> Result<Response> {
+        let epoch = self.session.snapshot().await.0.epoch;
+        let url = self.base.join(path)?;
+        let (resp, _) = self
+            .ctx()
+            .send(epoch, OnExpired::SingleFlight, |access| {
+                self.http.post(url.clone()).bearer_auth(access).json(&body)
+            })
+            .await?;
+        if !resp.status().is_success() {
+            return Err(account_error(resp).await);
+        }
+        Ok(resp)
+    }
+
     /// Admin: every user, by handle.
     pub async fn list_users(&self) -> Result<Vec<UserSummary>> {
         let epoch = self.session.snapshot().await.0.epoch;
@@ -258,7 +496,7 @@ impl BrookClient {
 
 /// Errors of the account endpoints, from the status and the envelope's `code` only. The body is
 /// never carried: FastAPI's 422 echoes the submitted value (the password) back.
-async fn account_error(resp: Response) -> Error {
+pub(crate) async fn account_error(resp: Response) -> Error {
     #[derive(Deserialize)]
     struct Envelope {
         error: Option<Code>,

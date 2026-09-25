@@ -29,9 +29,11 @@ mod state;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;
+#[cfg(test)]
+mod totp_tests;
 mod ws;
 
-pub use account::UserSummary;
+pub use account::{Me, SecondFactor, TotpEnrollment, UserSummary};
 pub use call::CallHandle;
 pub use call_types::{
     default_labels, CallState, CallStatus, EndReason, EngineError, IceCandidate, IceServer,
@@ -39,7 +41,7 @@ pub use call_types::{
     TrackLabel,
 };
 pub use chat::{Channel, ChannelMember, Message, ReactionSummary, ReplyExcerpt};
-pub use client::BrookClient;
+pub use client::{BrookClient, LoginOutcome, TotpChallenge};
 pub use config::CoreConfig;
 pub use error::{Error, Result};
 pub use session::{Session, User};

@@ -35,6 +35,9 @@ struct Cell {
     /// The current login attempt. `login` reserves one before it waits for anything; `logout`,
     /// a newer login and `close` move past it, so a stale login installs nothing.
     login_gen: u64,
+    /// The current attempt is waiting for its TOTP step (its challenge is open). Closed by a
+    /// success, `cancel_totp`, an expired challenge, and anything that moves `login_gen`.
+    challenge_open: bool,
 }
 
 /// Revoking refresh tokens core stops holding, from anywhere, including a `Drop` on a thread
@@ -69,7 +72,11 @@ pub(crate) struct SessionStore {
     /// Set synchronously when the client is dropped, and read inside every install or commit's
     /// write section: nothing lands in an abandoned store, even before its cleanup task runs.
     closed: Arc<AtomicBool>,
+    /// Unique per store (per client): what binds a TOTP challenge to the client it came from.
+    id: u64,
 }
+
+static NEXT_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl SessionStore {
     pub(crate) fn new(state_tx: Arc<watch::Sender<AuthState>>) -> Self {
@@ -82,7 +89,13 @@ impl SessionStore {
             state_tx,
             detached: Arc::default(),
             closed: Arc::default(),
+            id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// This store's identity (a challenge from another client never matches it).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     fn is_closed(&self) -> bool {
@@ -137,6 +150,7 @@ impl SessionStore {
     pub(crate) async fn reserve_login(&self) -> u64 {
         let mut cell = self.cell.write().await;
         cell.login_gen += 1;
+        cell.challenge_open = false;
         cell.login_gen
     }
 
@@ -167,6 +181,57 @@ impl SessionStore {
         Ok(old)
     }
 
+    /// Attempt `gen` got a TOTP challenge: open it (false if the attempt is already stale).
+    pub(crate) async fn open_challenge(&self, gen: u64) -> bool {
+        let mut cell = self.cell.write().await;
+        if self.is_closed() || cell.login_gen != gen {
+            return false;
+        }
+        cell.challenge_open = true;
+        true
+    }
+
+    /// Whether `gen`'s challenge is still open and current.
+    pub(crate) async fn challenge_current(&self, gen: u64) -> bool {
+        let cell = self.cell.read().await;
+        !self.is_closed() && cell.login_gen == gen && cell.challenge_open
+    }
+
+    /// Install the session a completed challenge `gen` produced, closing the challenge and
+    /// publishing `LoggedIn` in the same write. False: no longer current; revoke the pair.
+    pub(crate) async fn install_for_challenge(&self, gen: u64, session: Session) -> bool {
+        let mut installed = false;
+        let rev = {
+            let mut cell = self.cell.write().await;
+            if !self.is_closed() && cell.login_gen == gen && cell.challenge_open {
+                let user = session.user.clone();
+                cell.challenge_open = false;
+                cell.session = Some(session);
+                cell.rev.epoch += 1;
+                cell.rev.credential_rev = 0;
+                let _ = self.state_tx.send(AuthState::LoggedIn(user));
+                installed = true;
+            }
+            cell.rev
+        };
+        if installed {
+            *self.refresh_not_before.lock().unwrap() = None;
+            self.rev_tx.send_replace(rev);
+        }
+        installed
+    }
+
+    /// End challenge `gen` if it is still the open, current one (Back, or the server said it
+    /// expired): the attempt is over and `LoggedOut` is published. Otherwise nothing.
+    pub(crate) async fn end_challenge(&self, gen: u64) {
+        let mut cell = self.cell.write().await;
+        if !self.is_closed() && cell.login_gen == gen && cell.challenge_open {
+            cell.challenge_open = false;
+            cell.login_gen += 1;
+            let _ = self.state_tx.send(AuthState::LoggedOut);
+        }
+    }
+
     /// Install login attempt `gen`'s session and publish `LoggedIn`, in the same write that
     /// checks the attempt is still current (a sign-out can't slip between install and publish).
     /// False: stale; the caller revokes the pair.
@@ -195,6 +260,7 @@ impl SessionStore {
         let (rev, old) = {
             let mut cell = self.cell.write().await;
             cell.login_gen += 1;
+            cell.challenge_open = false;
             if close {
                 self.closed.store(true, Ordering::SeqCst);
             }

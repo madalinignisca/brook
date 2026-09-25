@@ -1,5 +1,7 @@
 //! FFI-safe mirrors of `brook-core`'s public types.
 
+use std::sync::Arc;
+
 use brook_core::{AuthState, Error, Session, User};
 
 /// A Brook user (`UserOut`).
@@ -56,7 +58,85 @@ impl From<Session> for FfiSession {
 /// additive: Swift switches exhaustively, so every client is told at compile time.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum LoginResult {
-    LoggedIn { session: FfiSession },
+    LoggedIn {
+        session: FfiSession,
+    },
+    /// The account has TOTP on: finish with `complete_totp` / `complete_recovery`.
+    TotpRequired {
+        challenge: Arc<FfiTotpChallenge>,
+    },
+}
+
+/// The second step of a TOTP sign-in, as an object: the server's pending token never crosses
+/// into Swift.
+#[derive(uniffi::Object)]
+pub struct FfiTotpChallenge {
+    pub(crate) inner: brook_core::TotpChallenge,
+}
+
+impl std::fmt::Debug for FfiTotpChallenge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f) // redacted by core
+    }
+}
+
+#[uniffi::export]
+impl FfiTotpChallenge {
+    /// Seconds until the server stops accepting it (then sign in with the password again).
+    pub fn seconds_left(&self) -> u64 {
+        self.inner.seconds_left()
+    }
+}
+
+/// A started TOTP enrolment, as an object: the URI carries the secret, so it is read on
+/// demand (for the QR code and the manual key) rather than living in a printable struct.
+#[derive(uniffi::Object)]
+pub struct FfiTotpEnrollment {
+    pub(crate) inner: brook_core::TotpEnrollment,
+}
+
+#[uniffi::export]
+impl FfiTotpEnrollment {
+    pub fn otpauth_uri(&self) -> String {
+        self.inner.otpauth_uri().to_string()
+    }
+    pub fn expires_in(&self) -> u64 {
+        self.inner.expires_in()
+    }
+}
+
+/// The second factor confirming TOTP off or new recovery codes.
+#[derive(Clone, uniffi::Enum)]
+pub enum FfiSecondFactor {
+    Code { code: String },
+    Recovery { code: String },
+}
+
+impl From<FfiSecondFactor> for brook_core::SecondFactor {
+    fn from(f: FfiSecondFactor) -> Self {
+        match f {
+            FfiSecondFactor::Code { code } => Self::Code(code),
+            FfiSecondFactor::Recovery { code } => Self::Recovery(code),
+        }
+    }
+}
+
+/// The signed-in user with their second-factor state.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiMe {
+    pub user: FfiUser,
+    pub totp_enabled: bool,
+    pub recovery_codes_left: Option<u32>,
+}
+
+impl From<brook_core::Me> for FfiMe {
+    fn from(m: brook_core::Me) -> Self {
+        Self {
+            user: m.user.into(),
+            totp_enabled: m.totp_enabled,
+            recovery_codes_left: m.recovery_codes_left,
+        }
+    }
 }
 
 /// Authentication state as observed by the UI.
@@ -96,6 +176,9 @@ pub enum LoginError {
     /// The call needs a signed-in session and there is none.
     #[error("not signed in")]
     NotAuthenticated,
+    /// A TOTP challenge that is no longer the current sign-in attempt: change nothing.
+    #[error("that sign-in attempt is no longer current")]
+    ChallengeSuperseded,
     /// The realtime connection is down (or dropped before the server answered).
     #[error("not connected to the server")]
     Disconnected,
@@ -129,6 +212,7 @@ impl From<Error> for LoginError {
             Error::Api { code, message } => Self::Api { code, message },
             Error::UnexpectedResponse => Self::UnexpectedResponse,
             Error::NotAuthenticated => Self::NotAuthenticated,
+            Error::ChallengeSuperseded => Self::ChallengeSuperseded,
             Error::Disconnected => Self::Disconnected,
             Error::Timeout => Self::Timeout,
             Error::CallEnded => Self::CallEnded,

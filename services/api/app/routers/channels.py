@@ -497,7 +497,8 @@ async def send_message(
     With a ``client_id`` the send is idempotent (sync spec §4): a resend of one the
     author already stored returns that message, 200 instead of 201, unchanged even
     if the body differs (same outbox entry; the stored one wins), and is not fanned
-    out again (members already got it). Never a 409, never a duplicate."""
+    out again (members already got it). Never a duplicate; the one 409 is a
+    client_id reused in a different channel (a different message, not a resend)."""
     channel = await _require_member(session, channel_id, user)
     if channel.archived_at is not None:
         raise _forbidden("This channel is archived")
@@ -506,17 +507,7 @@ async def send_message(
     if body.client_id is not None:
         stored = await _stored_send(session, user, body.client_id)
         if stored is not None:
-            if stored.channel_id != channel_id:
-                # Not a resend: the client reused a client_id for a different message.
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail={
-                        "code": "conflict",
-                        "message": "client_id already used in another channel",
-                    },
-                )
-            response.status_code = status.HTTP_200_OK
-            return stored
+            return _resend_answer(stored, channel_id, response)
 
     # Quote-reply: the target must be a live message in this same channel.
     reply: ReplyExcerpt | None = None
@@ -545,8 +536,7 @@ async def send_message(
         stored = await _stored_send(session, user, body.client_id)
         if stored is None:
             raise
-        response.status_code = status.HTTP_200_OK
-        return stored
+        return _resend_answer(stored, channel_id, response)
     # Sending implicitly reads the channel up to your own message — but only ever
     # advance the marker (don't rewind past a newer message read concurrently).
     membership = await _membership(session, channel_id, user.id)
@@ -563,6 +553,18 @@ async def send_message(
     member_ids = [m.id for m in members]
     await hub.send_to_users(member_ids, _envelope("message.new", jsonable_encoder(out)))
     return out
+
+
+def _resend_answer(stored: MessageOut, channel_id: uuid.UUID, response: Response) -> MessageOut:
+    """The answer to a resend (both the early lookup and the lost-race path): the
+    stored message with 200, or 409 if the client reused the client_id elsewhere."""
+    if stored.channel_id != channel_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "conflict", "message": "client_id already used in another channel"},
+        )
+    response.status_code = status.HTTP_200_OK
+    return stored
 
 
 async def _stored_send(
