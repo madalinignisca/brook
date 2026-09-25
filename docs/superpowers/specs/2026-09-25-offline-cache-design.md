@@ -1,6 +1,6 @@
 # Offline cache, outbox and file cache in core (MVP+ #61, #63, #65, #67)
 
-> Status: **draft, review round 1 applied** · 2026-09-25 · Dial: **Heavy** (local data at rest,
+> Status: **approved** (Heavy, two rounds) · 2026-09-25 · Dial: **Heavy** (local data at rest,
 > data deletion). Core's side of MVP+. It builds on:
 > - the server's sync and idempotent-send spec (#71);
 > - the attachments spec (#73, local files, `409 file.already_committed` with `FileOut`);
@@ -22,8 +22,8 @@ connection**, and catches up exactly on what it missed. Done means, observably:
   - Stated exceptions: a file the user **Saves**, written where they chose; and the copy
     **Open** hands to another app (§6.4), deleted at quit, at the next launch and by startup
     reconciliation.
-- Wipes follow #46 §8 and §7 below, with true crypto-erase: each store's and each file's key is
-  destroyed, not just its ciphertext.
+- Wipes follow #46 §8 and §7 below, with crypto-erase **per store**: a wiped store's key is
+  destroyed, not just its ciphertext (per-file deletion is best-effort, §3).
 
 ## 2. Not doing
 - Search in the cache; eviction of messages (history is kept once fetched; files are evicted,
@@ -43,13 +43,17 @@ connection**, and catches up exactly on what it missed. Done means, observably:
   **Decision worth arguing:** SQLCipher, over per-row AES-GCM on plain SQLite. Per-row
   encryption avoids libcrypto on Linux but leaves ids, times and counts readable, and indexes
   work only on cleartext columns.
-- **Keys are random and independently destroyable** (true crypto-erase):
+- **Keys are random, and a store's key is independently destroyable** (crypto-erase per store):
   - each store has its own random 256-bit key, held in the `KeySlot` under a named slot
     (`cache:<store id>`, `outbox:<store id>`; #46 §3a takes a slot name);
-  - each cached file has its own random key, stored in its row in the encrypted cache.db;
-  - destroying a store's slot makes that store, its WAL and any snapshot of it undecryptable,
-    and deleting a file's row does the same for the file.
-  Nothing is derived from a device key that could re-derive it later.
+  - destroying a store's slot makes that store, its WAL, its files and any copy or snapshot of
+    them undecryptable. Nothing is derived from a device key that could re-derive it;
+  - each cached file and outbox snapshot has its own random key (for the nonce scheme, §6.1),
+    stored in its row inside the encrypted database.
+  **Per-file deletion is best-effort, not crypto-erase:** a deleted file's key can survive in
+  SQLite free pages, the WAL, or an older copy of the database, and anyone holding that copy
+  *and* the live store key could still decrypt the file. The crypto-erase guarantee is per
+  store, and every wipe in §7.1 destroys whole stores.
 - **Location:**
   - the app's data directory (the Mac container's `Application Support/Brook/stores/`;
     `$XDG_DATA_HOME/brook/stores/` on Linux);
@@ -118,12 +122,15 @@ connection**, and catches up exactly on what it missed. Done means, observably:
 2. **Sender:** one per channel, by `ordinal`. A failed row blocks later rows of that channel
    only. On startup, rows left `sending` by a crash go back to `pending` and are re-sent with
    the same `client_id` (idempotent).
-3. **Acknowledgement (200 or 201):**
-   - the returned message is applied through §4.1's guard, so a later edit or tombstone
-     already in the cache wins;
-   - in the same transaction, the outbox row whose `client_id` equals the **echoed**
-     `client_id` is deleted;
-   - an echo that doesn't match is a bug: the row is marked failed and never auto-resent.
+3. **Acknowledgement (200 or 201).** Two databases, so no single transaction; the order makes
+   a crash safe:
+   1. apply the returned message to cache.db through §4.1's guard (a later edit or tombstone
+      already there wins) and commit;
+   2. then delete the outbox row whose `client_id` equals the **echoed** `client_id`.
+   A crash between the two leaves the row; on restart it is re-sent with the same `client_id`,
+   the server returns the stored message (200), step 1 re-applies idempotently, and step 2
+   runs.
+   An echo that doesn't match is a bug: the row is marked failed and never auto-resent.
 4. **Attachments:**
    - create each file with its `file_client_id` (#73);
    - PUT the decrypted snapshot, streamed;
@@ -141,9 +148,13 @@ connection**, and catches up exactly on what it missed. Done means, observably:
    - An outbox format change, a missing key, sign-out with "Remove this device's data", or a
      different user signing in **would** delete unsent messages. The app says so first ("2
      messages haven't been sent and will be deleted"), and for sign-out the user can cancel.
-7. **Online-only** (the key is unreadable, or the store can't be written): sends go straight
-   to the server as today, are **not** shown as queued, and the app says offline sending is
-   unavailable.
+7. **When the outbox can't be used, order still holds:**
+   - **Unreadable** (the key is locked or not answering): its pending order is unknown, not
+     empty, so **sending is disabled** until it can be read ("Sending resumes when Brook can
+     read its storage"). Reading still works.
+   - **Readable but not writable** (disk full): a new message is sent straight to the server,
+     not shown as queued, **only in a channel with no pending or failed rows**. Elsewhere it's
+     refused with the reason, so it can never overtake an earlier message.
 
 ## 6. Files (#65, #67)
 ### 6.1 Format
@@ -187,19 +198,31 @@ connection**, and catches up exactly on what it missed. Done means, observably:
 | **A different user signs in** (owner, #46 §8) | the other users' stores on this device are wiped, after surfacing their unsent messages |
 | Sign-out with "Remove this device's data" (ticked by default) | this user's stores and files wiped, **locally and first**, whether or not the logout request succeeds |
 | A channel is removed | §4.1 |
-### 7.2 Quiesce, then erase
-A wipe or channel removal:
+### 7.2 Quiesce, then erase (whole-store wipes only)
+A **store wipe** (every row of §7.1 except channel removal):
 1. bumps the store's `generation` (in memory and in `meta`);
 2. cancels in-flight downloads, uploads, history requests and the sender for that store or
    channel, and waits for them to stop;
 3. closes database handles;
 4. destroys the key slot (crypto-erase) **before** deleting files.
+5. deletes that store's Open copies (§6.4; the app keeps them in a per-store temp directory)
+   **before** reporting the wipe done, whether the app then keeps running or not.
 Every operation checks the generation it started under before writing, so nothing recreates
 wiped data.
+
+**Channel removal is scoped**, never a store wipe:
+- in one cache.db transaction: write the fence, delete the channel's rows, and journal its
+  files (§7.3);
+- cancel that channel's history requests and downloads;
+- delete its Open copies;
+- mark its outbox rows failed with the server's code (the user sees them, and can Delete);
+- other channels, the store key and other unsent messages are untouched.
 ### 7.3 Crash-safe deletion
 - File deletions are journalled in `deletions` inside the transaction that removes their rows.
   The unlink happens after the commit, and the journal entry is cleared after the unlink.
-- **Startup reconciliation**, before anything else:
+- **Startup reconciliation** runs per store, and **only after that store opened with its key
+  and its tables were read successfully**. With an unreadable key, nothing of that store is
+  classified as an orphan or deleted. Before anything else, it:
   - finish journalled deletions;
   - delete files in the store directory with no row;
   - delete download partials of files no longer wanted;
@@ -257,6 +280,15 @@ wiped data.
   - sign-out surfaces the unsent count.
 - **Wipes:**
   - each row of §7.1;
+  - a channel removal leaves other channels' data and other unsent messages intact, and fails
+    only that channel's outbox rows;
+  - a sign-out wipe deletes the Open copies while the app keeps running;
+  - an unreadable-key startup with real cached files and snapshots deletes none of them;
+  - a crash between the two acknowledgement commits: one message, and the outbox row cleared;
+  - an outbox that is unreadable blocks sending; an unwritable one sends directly only where
+    nothing is pending;
+  - a deleted file stays decryptable from an earlier database copy while the store key lives
+    (documents the limit), and not after the store is wiped (the guarantee);
   - an unreadable key never deletes;
   - a wipe during a download leaves nothing behind;
   - a crash between commit and unlink is finished at the next startup;
@@ -292,3 +324,14 @@ wiped data.
   sign-out's local deletion independent of the network.
 - The account-switch rule follows #46 §8.
 - The test list covers the interleavings.
+
+**Round 2 — Codex + Vibe.** Vibe: none. Codex raised six new points, all accepted, with no round 3
+and nothing disputed:
+- per-file crypto-erase isn't claimed (the guarantee is per store, and per-file deletion is
+  best-effort);
+- channel removal is scoped and never a store wipe;
+- wipes delete the store's Open copies before reporting done;
+- a crash-safe two-database acknowledgement order;
+- an unusable outbox never lets a send overtake queued ones;
+- startup reconciliation only after a successful unlock and read.
+Each has a test in §9. The gate closes.
