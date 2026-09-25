@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _DEV_JWT_KEY = "dev-insecure-change-me"  # noqa: S105 - sentinel for the guard, not a secret
@@ -54,6 +54,13 @@ class Settings(BaseSettings):
 
     # Must be explicitly enabled to run with a weak/default JWT key (local dev only).
     allow_insecure_auth: bool = False
+
+    @field_validator("secret_primary_key_id", mode="before")
+    @classmethod
+    def _unset_primary_is_none(cls, value: object) -> object:
+        # Compose passes an unset variable as "" (`${VAR:-}`): treat that as not set, so
+        # the keyring guard refuses it with its own message instead of an int parse error.
+        return None if value == "" else value
 
     def assert_secure(self) -> None:
         """Refuse to start with a forgeable JWT key or an unusable secret keyring,

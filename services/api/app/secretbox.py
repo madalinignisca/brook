@@ -90,20 +90,36 @@ def _aad(key_id: int, purpose: Purpose, row_pk: uuid.UUID) -> bytes:
     return f"brook.{FORMAT}|{key_id}|{table}|{column}|{row_pk}".encode()
 
 
+# Key ids are canonical decimal: ASCII digits only (``str.isdigit`` also accepts "²" and
+# "１"), no leading zero, at most 10 digits. The bound keeps ``int()`` from raising its own
+# ValueError on a huge id (the 4300-digit limit), which would escape DecryptError.
+MAX_KEY_ID_DIGITS = 10
+
+
+def _key_id(text: str) -> int | None:
+    """``text`` as a key id, or None if it is not a canonical one."""
+    if not 1 <= len(text) <= MAX_KEY_ID_DIGITS or not (text.isascii() and text.isdigit()):
+        return None
+    if len(text) > 1 and text[0] == "0":
+        return None
+    return int(text)
+
+
 def parse_keyring(spec: str) -> dict[int, bytes]:
-    """Parse ``BROOK_SECRET_KEYS`` (``1:<b64url 32 bytes>,2:<...>``), strictly."""
+    """Parse ``BROOK_SECRET_KEYS`` (``1:<b64url 32 bytes>,2:<...>``), strictly.
+
+    Id 0 is reserved for the dev escape hatch's well-known key, so a real ring never
+    shares an id with it."""
     keys: dict[int, bytes] = {}
     if not spec:
         raise KeyringError("BROOK_SECRET_KEYS is empty")
     for entry in spec.split(","):
         key_id_text, sep, material = entry.partition(":")
-        if (
-            not sep
-            or not (key_id_text.isascii() and key_id_text.isdigit())
-            or key_id_text != key_id_text.strip()
-        ):
-            raise KeyringError("each key must be <id>:<base64url>")
-        key_id = int(key_id_text)
+        key_id = _key_id(key_id_text)
+        if not sep or key_id is None:
+            raise KeyringError("each key must be <id>:<base64url>, id 1-10 digits")
+        if key_id == _DEV_KEY_ID:
+            raise KeyringError(f"key id {_DEV_KEY_ID} is reserved for the dev key")
         if key_id in keys:
             raise KeyringError(f"duplicate key id {key_id}")
         try:
@@ -142,7 +158,10 @@ class SecretBox:
         return f"{FORMAT}.{self.primary_id}.{_b64e(nonce)}.{_b64e(ct)}"
 
     def decrypt(self, stored: str, *, purpose: Purpose, row_pk: uuid.UUID) -> str:
-        """Decrypt a stored value. Every failure is a :class:`DecryptError`."""
+        """Decrypt a stored value. Every failure of the *value* is a :class:`DecryptError`
+        (a non-Purpose ``purpose`` is a programming error, as in :meth:`encrypt`)."""
+        if not isinstance(purpose, Purpose):
+            raise TypeError("purpose must be a registered Purpose")
         try:
             key_id, nonce, ct = self._parse(stored)
             cipher = self._keys.get(key_id)
@@ -178,7 +197,8 @@ class SecretBox:
         version, key_id_text, nonce_text, ct_text = parts
         if version != FORMAT:
             raise DecryptError("unknown_version")
-        if not (key_id_text.isascii() and key_id_text.isdigit()):
+        key_id = _key_id(key_id_text)
+        if key_id is None:
             raise DecryptError("malformed")
         try:
             nonce, ct = _b64d(nonce_text), _b64d(ct_text)
@@ -186,7 +206,7 @@ class SecretBox:
             raise DecryptError("malformed") from exc
         if len(nonce) != NONCE_BYTES or len(ct) < 16:
             raise DecryptError("malformed")
-        return int(key_id_text), nonce, ct
+        return key_id, nonce, ct
 
 
 # The well-known key the dev escape hatch substitutes (BROOK_ALLOW_INSECURE_AUTH=1

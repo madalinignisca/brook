@@ -42,8 +42,23 @@ def test_the_purpose_registry_is_exactly_this() -> None:
 
 
 def test_free_form_purposes_are_refused() -> None:
+    b = box()
     with pytest.raises(TypeError):
-        box().encrypt("x", purpose=("totp", "secret"), row_pk=ROW)  # type: ignore[arg-type]
+        b.encrypt("x", purpose=("totp", "secret"), row_pk=ROW)  # type: ignore[arg-type]
+    stored = b.encrypt("x", purpose=Purpose.TOTP_SECRET, row_pk=ROW)
+    with pytest.raises(TypeError):
+        b.decrypt(stored, purpose=("totp", "secret"), row_pk=ROW)  # type: ignore[arg-type]
+
+
+def test_aad_golden_vector() -> None:
+    """Every part of the field identity is in the AAD (the swap tests change several
+    parts at once, so dropping one alone would not fail them)."""
+    assert secretbox._aad(1, Purpose.TOTP_SECRET, ROW) == (
+        b"brook.v1|1|totp|secret|00000000-0000-4000-8000-000000000001"
+    )
+    assert secretbox._aad(42, Purpose.BOT_OUTBOUND_SECRET, OTHER_ROW) == (
+        b"brook.v1|42|bots|outbound_secret_enc|00000000-0000-4000-8000-000000000002"
+    )
 
 
 # ---- format and round trip ---------------------------------------------------------
@@ -119,6 +134,11 @@ def test_the_key_id_is_authenticated() -> None:
         # Non-ASCII digits: isdigit() alone accepts them; int() then raises or reads "1".
         (lambda s: "v1.\u00b2." + s.split(".", 2)[2], "malformed"),  # superscript two
         (lambda s: "v1.\uff11." + s.split(".", 2)[2], "malformed"),  # fullwidth one
+        # A huge ASCII id: int() would raise its own ValueError (4300-digit limit).
+        (lambda s: "v1." + "1" * 5000 + "." + s.split(".", 2)[2], "malformed"),
+        (lambda s: "v1.12345678901." + s.split(".", 2)[2], "malformed"),  # 11 digits
+        (lambda s: "v1.01." + s.split(".", 2)[2], "malformed"),  # non-canonical 1
+        (lambda s: "v1.." + s.split(".", 2)[2], "malformed"),  # empty id
     ],
 )
 def test_decrypt_failures_fail_closed_with_a_reason(mutate, reason) -> None:  # type: ignore[no-untyped-def]
@@ -129,6 +149,25 @@ def test_decrypt_failures_fail_closed_with_a_reason(mutate, reason) -> None:  # 
         b.decrypt(mutate(stored), purpose=Purpose.TOTP_SECRET, row_pk=ROW)
     assert err.value.reason == reason
     assert secretbox.decrypt_failures[reason] == before + 1  # counted for the operator
+
+
+def test_an_oversized_well_formed_value_is_refused_by_length() -> None:
+    """Well-formed apart from its length, so only the length bound can refuse it
+    (without the bound it would reach AES-GCM and fail as invalid_tag)."""
+    b = box()
+    _, key_id, nonce, _ = b.encrypt("s", purpose=Purpose.TOTP_SECRET, row_pk=ROW).split(".")
+    stored = f"v1.{key_id}.{nonce}." + "A" * secretbox.MAX_STORED_CHARS
+    assert len(stored.split(".")) == 4
+    with pytest.raises(DecryptError) as err:
+        b.decrypt(stored, purpose=Purpose.TOTP_SECRET, row_pk=ROW)
+    assert err.value.reason == "malformed"
+
+
+def test_needs_rewrap_never_raises_on_a_bad_id() -> None:
+    b = box()
+    tail = b.encrypt("s", purpose=Purpose.TOTP_SECRET, row_pk=ROW).split(".", 2)[2]
+    for bad in ("1" * 5000, "01", "\u00b2", ""):
+        assert b.needs_rewrap(f"v1.{bad}.{tail}") is False
 
 
 def test_decrypt_error_never_carries_material() -> None:
@@ -181,6 +220,11 @@ def test_parse_keyring() -> None:
         "1:not+base64/==",
         f"\u00b2:{b64(os.urandom(32))}",  # superscript two: int() raises ValueError
         f"\uff11:{b64(os.urandom(32))}",  # fullwidth one: int() would read it as 1
+        f"{'1' * 5000}:{b64(os.urandom(32))}",  # int() would raise its own ValueError
+        f"12345678901:{b64(os.urandom(32))}",  # 11 digits
+        f"01:{b64(os.urandom(32))}",  # non-canonical 1
+        f"0:{b64(os.urandom(32))}",  # reserved for the dev key
+        f":{b64(os.urandom(32))}",  # empty id
     ],
 )
 def test_parse_keyring_is_strict(spec: str) -> None:
@@ -227,6 +271,32 @@ def test_startup_errors_never_show_key_material() -> None:
     assert material not in str(err.value)
 
 
+def test_the_insecure_flag_never_excuses_a_malformed_ring() -> None:
+    """The dev hatch only covers an *absent* ring; a present but broken one still
+    refuses to boot."""
+    s = settings(
+        secret_keys=SecretStr("1:short"), secret_primary_key_id=1, allow_insecure_auth=True
+    )
+    with pytest.raises(RuntimeError, match="secret keyring rejected"):
+        s.assert_secure()
+    s = settings(secret_keys=SecretStr(""), secret_primary_key_id=1, allow_insecure_auth=True)
+    with pytest.raises(RuntimeError, match="secret keyring rejected"):
+        s.assert_secure()
+
+
+def test_an_empty_primary_from_compose_is_refused_by_the_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compose passes an unset `${VAR:-}` as "": that is "not set" (the guard's own
+    message), never a guessed primary and never a pydantic parse error."""
+    monkeypatch.setenv("BROOK_SECRET_KEYS", f"1:{b64(key())}")
+    monkeypatch.setenv("BROOK_SECRET_PRIMARY_KEY_ID", "")
+    s = Settings(jwt_signing_key=_JWT)
+    assert s.secret_primary_key_id is None
+    with pytest.raises(RuntimeError, match="PRIMARY_KEY_ID is not set"):
+        s.assert_secure()
+
+
 def test_a_valid_ring_boots() -> None:
     settings(secret_keys=SecretStr(f"1:{b64(key())}"), secret_primary_key_id=1).assert_secure()
 
@@ -255,7 +325,7 @@ def test_dev_escape_hatch_uses_a_fixed_key_never_plaintext(
 
 def test_get_secret_box_never_guesses_the_primary(monkeypatch: pytest.MonkeyPatch) -> None:
     s = settings(
-        secret_keys=SecretStr(f"0:{b64(key())},1:{b64(key())}"), secret_primary_key_id=None
+        secret_keys=SecretStr(f"1:{b64(key())},2:{b64(key())}"), secret_primary_key_id=None
     )
     monkeypatch.setattr("app.config.get_settings", lambda: s)
     secretbox.get_secret_box.cache_clear()

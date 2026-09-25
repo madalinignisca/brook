@@ -14,12 +14,15 @@ from .config import get_settings
 from .db import init_models
 from .errors import register_error_handlers
 from .routers import auth, channels, health, users, ws
+from .secretbox import get_secret_box
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Startup/shutdown. Refuse to boot with an insecure JWT key; init schema (Phase 0)."""
+    """Startup/shutdown. Refuse to boot with an insecure JWT key or keyring; init schema."""
     get_settings().assert_secure()
+    # Build the keyring now: after this, DecryptError is the only runtime failure type.
+    get_secret_box()
     await init_models()
     yield
 

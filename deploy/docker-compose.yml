@@ -29,7 +29,7 @@ services:
       # Not `:?`: that would break every compose command for an older .env. The api's
       # startup guard refuses a missing or invalid ring itself (fails closed).
       BROOK_SECRET_KEYS: ${BROOK_SECRET_KEYS:-}
-      BROOK_SECRET_PRIMARY_KEY_ID: ${BROOK_SECRET_PRIMARY_KEY_ID:-1}
+      BROOK_SECRET_PRIMARY_KEY_ID: ${BROOK_SECRET_PRIMARY_KEY_ID:-}
       # Schema is owned by Alembic: the api entrypoint runs `alembic upgrade head`
       # on start, so create_all must stay off (avoids drift between the two paths).
       BROOK_AUTO_CREATE_SCHEMA: "false"
