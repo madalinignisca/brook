@@ -5,10 +5,12 @@
 //! is the persistence order. A sign-out that can't delete the stored copy writes a **fence**
 //! (a small non-secret file); a fenced origin is never restored.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -28,6 +30,20 @@ impl std::fmt::Debug for Stored {
             .field("user", &self.user)
             .finish_non_exhaustive() // the refresh token is never shown
     }
+}
+
+/// Who may touch each slot in this process. Every client orders its own writes, but clients
+/// share `session:<origin>`, and nothing orders one client's writes against another's: an old
+/// client's late rotation, rejection or restore could overwrite, delete or resurrect a newer
+/// sign-in. So every login attempt takes a process-wide ticket, the newest attempt that
+/// installed owns the slot, and an older ticket never touches it. The map's lock is held for
+/// the slot operation itself, so operations from different clients are also serialized.
+static OWNERS: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(Mutex::default);
+static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
+
+/// A new login attempt's ticket (newer than every earlier one, in any client).
+pub(crate) fn ticket() -> u64 {
+    NEXT_TICKET.fetch_add(1, Ordering::Relaxed)
 }
 
 pub(crate) struct Persistence {
@@ -57,6 +73,26 @@ impl Persistence {
             fence_dir,
             fence,
         }
+    }
+
+    /// Run `op` on the slot if `ticket` is not older than the slot's owner; with `claim`,
+    /// `ticket` becomes the owner. None: a newer attempt owns the slot; nothing was done.
+    pub(crate) fn guarded<T>(
+        &self,
+        ticket: u64,
+        claim: bool,
+        op: impl FnOnce(&Self) -> T,
+    ) -> Option<T> {
+        let mut owners = OWNERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if owners.get(&self.name).is_some_and(|&owner| ticket < owner) {
+            return None;
+        }
+        if claim {
+            owners.insert(self.name.clone(), ticket);
+        }
+        Some(op(self))
     }
 
     pub(crate) fn load(&self) -> Result<Option<Stored>, crate::KeySlotError> {
@@ -110,6 +146,24 @@ impl Persistence {
         }
     }
 
+    /// The client is gone but the server already rotated `rotated_from` into `fresh`: the
+    /// stored token is dead, so store the fresh one, if the stored copy is still the one that
+    /// was rotated. True: stored (the caller must not revoke it).
+    pub(crate) fn follow_rotation(&self, rotated_from: &str, fresh: &str) -> bool {
+        let Ok(Some(stored)) = self.load() else {
+            return false;
+        };
+        if stored.refresh_token != rotated_from {
+            return false;
+        }
+        let next = Stored {
+            user: stored.user,
+            refresh_token: fresh.to_owned(),
+        };
+        let bytes = Zeroizing::new(serde_json::to_vec(&next).unwrap_or_default());
+        self.slot.replace(self.name.clone(), bytes.to_vec()).is_ok()
+    }
+
     /// Whether this origin is fenced. Fails closed: an unreadable fence directory is a fence.
     pub(crate) fn fenced(&self) -> bool {
         match fs::metadata(&self.fence) {
@@ -124,9 +178,16 @@ impl Persistence {
         }
     }
 
-    /// Atomically: a temp file, fsync, rename, fsync of the directory.
+    /// Atomically: a temp file, fsync, rename, fsync of the directory (and, the first time, of
+    /// the parent that gained the directory: without it the new directory entry, and the fence
+    /// in it, may not survive a power loss).
     fn write_fence(&self) -> std::io::Result<()> {
-        fs::create_dir_all(&self.fence_dir)?;
+        if !self.fence_dir.is_dir() {
+            fs::create_dir_all(&self.fence_dir)?;
+            if let Some(parent) = self.fence_dir.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
+        }
         let tmp = self.fence_dir.join(format!(".{}.tmp", std::process::id()));
         {
             let mut f = fs::File::create(&tmp)?;

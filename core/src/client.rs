@@ -316,7 +316,7 @@ impl BrookClient {
             if !resp.status().is_success() {
                 // Refused: forget it, but only if it's still the stored one.
                 session
-                    .clear_persisted_if_holds(&stored.refresh_token)
+                    .clear_persisted_if_holds(gen, &stored.refresh_token)
                     .await;
                 return RestoreOutcome::NotSignedIn;
             }
@@ -1059,7 +1059,12 @@ pub(crate) async fn refresh_once(
         return Ok(RefreshOutcome::Rejected);
     }
     if !resp.status().is_success() {
-        return Err(api_error(resp).await); // 5xx → transient
+        // 5xx → transient. Body-free: the body of a failed refresh can echo the submitted
+        // token, and this error is logged by the refresh loop.
+        return Err(Error::Api {
+            code: format!("http_{}", resp.status().as_u16()),
+            message: format!("request failed with status {}", resp.status().as_u16()),
+        });
     }
     let tokens: TokenPair = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
     let fresh = tokens.refresh_token.clone();
@@ -1069,6 +1074,7 @@ pub(crate) async fn refresh_once(
             .await
         {
             RefreshApplied::Committed => RefreshOutcome::Committed,
+            RefreshApplied::Stored => RefreshOutcome::Discarded, // kept for the next launch
             RefreshApplied::Discarded => {
                 session.revoke_detached(fresh); // rotated for a session no longer held
                 RefreshOutcome::Discarded

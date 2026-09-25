@@ -30,8 +30,10 @@ final class RestoreTests: XCTestCase {
         return (SessionStore(settings: settings, persistence: persistence, makeClient: recorder.factory), recorder)
     }
 
-    private func restored(_ outcome: FfiRestoreOutcome) async -> (SessionStore, FakeClient, FactoryRecorder) {
-        let fake = FakeClient(result: .failure(.UnexpectedResponse))
+    private func restored(
+        _ outcome: FfiRestoreOutcome, login: Result<LoginResult, LoginError> = .failure(.UnexpectedResponse)
+    ) async -> (SessionStore, FakeClient, FactoryRecorder) {
+        let fake = FakeClient(result: login)
         fake.setRestore(outcome)
         let (store, recorder) = store(fake, persistence: on)
         XCTAssertEqual(store.phase, .restoring, "the form flashed before the restore")
@@ -130,9 +132,22 @@ final class RestoreTests: XCTestCase {
         let (store, fake, _) = await restored(.loggedIn(user: alice))
         fake.setSignOutComplete(false)
         store.signOut()
-        XCTAssertEqual(store.phase, .signedOut(error: nil))
-        for _ in 0 ..< 500 where store.phase == .signedOut(error: nil) { try? await Task.sleep(for: .milliseconds(2)) }
-        XCTAssertEqual(store.phase, .signedOut(error: SessionStore.Message.signOutIncomplete))
+        // Typing into the form before core answers must not hide the warning.
+        await store.signIn(server: "https://h", handle: "", password: "")
+        for _ in 0 ..< 500 where store.signOutWarning == nil { try? await Task.sleep(for: .milliseconds(2)) }
+        XCTAssertEqual(store.signOutWarning, SessionStore.Message.signOutIncomplete)
+        XCTAssertEqual(store.phase, .signedOut(error: SessionStore.Message.missingFields))
+    }
+
+    func testASignInClearsTheSignOutWarning() async {
+        let (store, fake, _) = await restored(.loggedIn(user: alice), login: .success(.loggedIn(session: aliceSession)))
+        fake.setSignOutComplete(false)
+        store.signOut()
+        for _ in 0 ..< 500 where store.signOutWarning == nil { try? await Task.sleep(for: .milliseconds(2)) }
+        fake.setSignOutComplete(true)
+        await store.signIn(server: "https://h", handle: "alice", password: "pw")
+        XCTAssertEqual(store.phase, .signedIn(alice))
+        XCTAssertNil(store.signOutWarning)
     }
 
     func testACompleteSignOutStaysQuiet() async {
@@ -141,6 +156,7 @@ final class RestoreTests: XCTestCase {
         for _ in 0 ..< 500 where fake.logouts == 0 { try? await Task.sleep(for: .milliseconds(2)) }
         try? await Task.sleep(for: .milliseconds(20))
         XCTAssertEqual(store.phase, .signedOut(error: nil))
+        XCTAssertNil(store.signOutWarning)
     }
 
     // MARK: Choosing persistence (P3)

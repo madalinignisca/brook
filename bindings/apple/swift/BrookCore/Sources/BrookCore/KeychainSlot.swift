@@ -81,9 +81,15 @@ public final class KeychainSlot: FfiKeySlot, Sendable {
         }
     }
 
-    /// Atomic overwrite (one `SecItemUpdate`), or create when absent.
+    /// Atomic overwrite (one `SecItemUpdate`), or create when absent. The protection is set
+    /// again with the data: an item that somehow had a weaker one never gets fresh secrets
+    /// under it.
     public func replace(slot: String, bytes: Data) throws {
-        switch calls.update(query(slot), [kSecValueData as String: bytes]) {
+        let attributes: [String: Any] = [
+            kSecValueData as String: bytes,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+        switch calls.update(query(slot), attributes) {
         case errSecSuccess: return
         case errSecItemNotFound:
             do { try create(slot: slot, bytes: bytes) } catch FfiKeySlotError.Exists {

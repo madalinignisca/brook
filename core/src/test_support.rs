@@ -31,6 +31,8 @@ pub enum RefreshMode {
     RateLimited(u32),
     /// Never answer (a stalled request).
     Stall,
+    /// A 500 whose plain-text body echoes the submitted token (a misbehaving proxy).
+    EchoFail,
 }
 
 /// How the password endpoints answer (`/auth/password`, `/users/{id}/password`).
@@ -672,6 +674,14 @@ async fn refresh(State(state): State<Shared>, Json(body): Json<Value>) -> Respon
     }
     match mode {
         RefreshMode::Stall | RefreshMode::Rotate => unreachable!(),
+        RefreshMode::EchoFail => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "upstream said: {}",
+                body["refresh_token"].as_str().unwrap_or_default()
+            ),
+        )
+            .into_response(),
         RefreshMode::Strict => error(
             401,
             "auth.invalid_token",

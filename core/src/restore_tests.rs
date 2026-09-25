@@ -380,3 +380,155 @@ fn restore_writable(p: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
 }
+
+// ---- Several clients in one process share the slot (implementation review round 1) ----
+
+fn refresher(c: &BrookClient) -> Refresher {
+    Refresher {
+        http: c.http.clone(),
+        base: c.base.clone(),
+        session: c.session.clone(),
+    }
+}
+
+async fn refresh_now(c: &BrookClient) {
+    let seen = c.session.snapshot().await.0;
+    let _ = refresher(c).refresh(seen).await;
+}
+
+/// An older client's rotation after a newer sign-in in another client never overwrites it.
+#[tokio::test]
+async fn an_older_clients_rotation_never_overwrites_a_newer_sign_in() {
+    let server = TestServer::start().await; // Rotate: any token rotates
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let alice = signed_in(&server, &slot, dir.path(), "alice").await;
+    let bob = signed_in(&server, &slot, dir.path(), "bob").await;
+    let bobs = held_token(&bob).await;
+    refresh_now(&alice).await;
+    assert_ne!(held_token(&alice).await, bobs);
+    assert_eq!(
+        stored_token(&slot, &server),
+        Some(bobs),
+        "alice's rotation overwrote bob"
+    );
+}
+
+/// An older client's rejection after a newer sign-in never deletes the newer one.
+#[tokio::test]
+async fn an_older_clients_rejection_never_deletes_a_newer_sign_in() {
+    let server = strict().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let alice = signed_in(&server, &slot, dir.path(), "alice").await;
+    let bob = signed_in(&server, &slot, dir.path(), "bob").await;
+    let bobs = held_token(&bob).await;
+    server.set_refresh_mode(RefreshMode::Fail(401));
+    refresh_now(&alice).await;
+    assert!(matches!(*alice.state().borrow(), AuthState::LoggedOut));
+    assert_eq!(
+        stored_token(&slot, &server),
+        Some(bobs),
+        "alice's rejection deleted bob"
+    );
+}
+
+/// A restore that started before another client's sign-in and sign-out never brings the old
+/// session back.
+#[tokio::test]
+async fn a_late_restore_never_resurrects_a_session_signed_out_elsewhere() {
+    let server = strict().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    drop(signed_in(&server, &slot, dir.path(), "alice").await);
+    let gate = server.gate_refresh();
+    let old = client(&server, &slot, dir.path());
+    let old2 = old.clone();
+    let restore = tokio::spawn(async move { old2.restore().await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let bob = client(&server, &slot, dir.path());
+    let login = tokio::spawn({
+        let bob = bob.clone();
+        async move { bob.login("bob", "pw").await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Bob's login is a refresh-free path; only alice's restore waits on the gate.
+    assert!(matches!(
+        login.await.unwrap().unwrap(),
+        LoginOutcome::LoggedIn(_)
+    ));
+    bob.logout().await;
+    gate.add_permits(1);
+    let outcome = restore.await.unwrap();
+    assert!(
+        !matches!(outcome, RestoreOutcome::LoggedIn(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        stored_token(&slot, &server),
+        None,
+        "the late restore stored alice again"
+    );
+}
+
+/// An older client's rotation never lifts the fence of a newer sign-in's sign-out.
+#[tokio::test]
+async fn an_older_clients_rotation_never_lifts_a_newer_fence() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let alice = signed_in(&server, &slot, dir.path(), "alice").await;
+    let bob = signed_in(&server, &slot, dir.path(), "bob").await;
+    slot.fail_next("delete", KeySlotError::Unavailable);
+    bob.logout().await; // the delete fails: fenced
+    assert!(bob.sign_out_complete());
+    refresh_now(&alice).await;
+    let (_, outcome) = relaunch(&server, &slot, dir.path()).await;
+    assert!(
+        matches!(outcome, RestoreOutcome::NotSignedIn),
+        "{outcome:?}"
+    );
+}
+
+/// Quitting while a refresh is in flight: the server already rotated, so the stored copy
+/// follows the new token, which is not revoked, and the next launch is signed in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quit_during_a_refresh_keeps_the_rotated_session() {
+    let server = strict().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let c = signed_in(&server, &slot, dir.path(), "alice").await;
+    let gate = server.gate_refresh();
+    let r = refresher(&c);
+    let seen = c.session.snapshot().await.0;
+    let inflight = tokio::spawn(async move { r.refresh(seen).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(c); // quit while the rotated pair is on its way
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.add_permits(1);
+    let _ = inflight.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(server.logouts().is_empty(), "the rotated token was revoked");
+    gate.add_permits(1); // the relaunch's own refresh
+    let (_, outcome) = relaunch(&server, &slot, dir.path()).await;
+    assert!(
+        matches!(outcome, RestoreOutcome::LoggedIn(_)),
+        "{outcome:?}"
+    );
+}
+
+/// A failed refresh's body can echo the token: the error (which the refresh loop logs) never
+/// carries it.
+#[tokio::test]
+async fn a_refresh_error_never_carries_the_response_body() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let c = signed_in(&server, &slot, dir.path(), "alice").await;
+    let token = held_token(&c).await;
+    server.set_refresh_mode(RefreshMode::EchoFail);
+    let seen = c.session.snapshot().await.0;
+    let err = refresher(&c).refresh(seen).await.unwrap_err();
+    assert!(!err.to_string().contains(&token), "{err}");
+    assert!(!format!("{err:?}").contains(&token), "{err:?}");
+}

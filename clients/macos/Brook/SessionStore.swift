@@ -43,7 +43,7 @@ final class SessionStore {
         static let recoveryFormat = "Enter one of your recovery codes."
         static let keychainUnavailable = "Your saved sign-in couldn't be read (the keychain may be locked). Sign in again."
         static let restoreOffline = "Couldn't reach the server to resume your session. It's kept for next time; you can also sign in again."
-        static let signOutIncomplete = "You're signed out on the server, but this Mac couldn't forget your saved sign-in. Sign out again, or remove Brook from the keychain."
+        static let signOutIncomplete = "This Mac couldn't forget your saved sign-in, so Brook may sign you in again at the next launch. Sign in and out again to retry."
         static let secondInstance = "Brook is already open. This window won't remember your sign-in."
     }
 
@@ -163,6 +163,9 @@ final class SessionStore {
         return true
     }
 
+    /// Set when a sign-out couldn't make the stored session unusable; shown until a sign-in.
+    private(set) var signOutWarning: String?
+
     /// After a sign-in with a recovery code: how many are left (the app warns when few).
     private(set) var recoveryCodesLeft: UInt32?
     /// A code is being checked (the button stays disabled).
@@ -187,6 +190,7 @@ final class SessionStore {
             return
         }
         self.client = client
+        signOutWarning = nil // the new sign-in replaced the stored copy
         settings.saveLastGoodServer(address)
         phase = .signedIn(user)
     }
@@ -260,13 +264,12 @@ final class SessionStore {
         guard case .signedIn = phase, let client else { return }
         end()
         phase = .signedOut(error: nil)
-        let mine = attempt
         Task {
-            await client.logout() // core revokes the token and forgets the stored copy
+            await client.logout() // core forgets the stored copy, then revokes (best effort)
             // Both the keychain delete and the fence failed: the next launch could sign in
-            // again, so say so (unless something else already replaced this screen).
-            guard !client.signOutComplete(), mine == attempt, phase == .signedOut(error: nil) else { return }
-            phase = .signedOut(error: Message.signOutIncomplete)
+            // again. Its own value, not the form's error: typing into the form meanwhile must
+            // not hide it. Only a later sign-in (which replaces the stored copy) clears it.
+            if !client.signOutComplete() { signOutWarning = Message.signOutIncomplete }
         }
     }
 

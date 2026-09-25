@@ -10,6 +10,8 @@ final class FakeSecItem: SecItemCalls, @unchecked Sendable {
     private let lock = NSLock()
     private var items: [String: Data] = [:]
     private var queries: [[String: Any]] = []
+    private var updates: [[String: Any]] = []
+    var lastUpdate: [String: Any]? { lock.withLock { updates.last } }
     var failWith: OSStatus?
 
     var lastQuery: [String: Any]? { lock.withLock { queries.last } }
@@ -33,6 +35,7 @@ final class FakeSecItem: SecItemCalls, @unchecked Sendable {
     }
     func update(_ query: [String: Any], _ attributes: [String: Any]) -> OSStatus {
         record(query)
+        lock.withLock { updates.append(attributes) }
         if let failWith { return failWith }
         return lock.withLock {
             guard items[key(query)] != nil else { return errSecItemNotFound }
@@ -64,6 +67,15 @@ final class KeychainSlotTests: XCTestCase {
         // Queries, not just the add, say "never synced".
         _ = try slot.load(slot: "session:x")
         XCTAssertEqual(calls.lastQuery?[kSecAttrSynchronizable as String] as? Bool, false)
+    }
+
+    func testAReplaceSetsTheProtectionAgain() throws {
+        let calls = FakeSecItem()
+        let slot = KeychainSlot(accessGroup: nil, calls: calls)
+        try slot.create(slot: "a", bytes: Data([1]))
+        try slot.replace(slot: "a", bytes: Data([2]))
+        XCTAssertEqual(calls.lastUpdate?[kSecAttrAccessible as String] as? String,
+                       kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String)
     }
 
     func testCreateIsCreateOnlyAndReplaceOverwritesOrCreates() throws {
