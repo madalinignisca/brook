@@ -166,3 +166,46 @@ async def test_lost_refresh_race_is_not_a_failure(client: httpx.AsyncClient) -> 
     assert reuse.status_code == 401
     throttled = await client.post(f"{AUTH}/login", json={"handle": "alice", "password": "nope-x"})
     assert throttled.status_code == 429
+
+
+async def test_one_pending_token_completes_one_login(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two concurrent /auth/totp calls with one pending token and two different valid
+    inputs (a code and a recovery code): exactly one TokenPair (TOTP spec §2.2)."""
+    from urllib.parse import parse_qs, urlparse
+
+    from app import totp as totp_core
+    from app.routers import totp as totp_router
+
+    monkeypatch.setattr(totp_router, "_now", lambda: 1_800_000_000.0)
+    user_id, pair = await _alice(client)
+    h = {"Authorization": f"Bearer {pair['access_token']}"}
+    r = await client.post(f"{AUTH}/totp/enroll", json={"password": PW}, headers=h)
+    secret = parse_qs(urlparse(r.json()["otpauth_uri"]).query)["secret"][0]
+    step = totp_core.step_for(1_800_000_000.0)
+    act = await client.post(
+        f"{AUTH}/totp/activate", json={"code": totp_core.code_at(secret, step)}, headers=h
+    )
+    recovery = act.json()["recovery_codes"][0]
+    login = await client.post(
+        f"{AUTH}/login", json={"handle": "alice", "password": PW, "supports_totp": True}
+    )
+    token = login.json()["totp_token"]
+
+    async with db.get_sessionmaker()() as holder:
+        await lock_user(holder, user_id)  # park both behind the user lock
+        with_code = asyncio.create_task(
+            client.post(
+                f"{AUTH}/totp",
+                json={"totp_token": token, "code": totp_core.code_at(secret, step + 1)},
+            )
+        )
+        with_recovery = asyncio.create_task(
+            client.post(f"{AUTH}/totp", json={"totp_token": token, "recovery_code": recovery})
+        )
+        await asyncio.sleep(SETTLE)
+        assert not with_code.done() and not with_recovery.done()
+        await holder.rollback()
+    codes = sorted([(await with_code).status_code, (await with_recovery).status_code])
+    assert codes == [200, 403]

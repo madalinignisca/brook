@@ -118,6 +118,15 @@ class LimitConfig:
     handle_max_delay_s: float = 60.0
     trusted_ips_per_handle: int = 8
     trust_ttl_s: float = 30 * 24 * HOUR
+    # TOTP code budget (spec 2026-09-25-totp §6): after code_budget wrong codes for a
+    # handle within code_window_s, each further attempt waits code_spacing_s after the
+    # last failure. <= 96 guesses/day at these values, never a lock.
+    code_budget: int = 10
+    code_window_s: float = 24 * HOUR
+    code_spacing_s: float = 15 * 60.0
+    # Decrypt failures of a user's TOTP secret: an operator fault, not a guess, so
+    # not a limiter failure, but bounded so it can't amplify logs or CPU (§5).
+    decrypt_per_hour: int = 5
 
 
 class AuthLimiter:
@@ -137,6 +146,8 @@ class AuthLimiter:
         self._trusted: BoundedLRU[str, OrderedDict[str, float]] = BoundedLRU(
             self.config.max_keys, OrderedDict
         )
+        self._codes: BoundedLRU[str, deque[float]] = BoundedLRU(self.config.max_keys, deque)
+        self._decrypts: BoundedLRU[str, deque[float]] = BoundedLRU(self.config.max_keys, deque)
 
     # ---- decisions -------------------------------------------------------------
 
@@ -216,6 +227,55 @@ class AuthLimiter:
             trusted.move_to_end(ip)
             while len(trusted) > self.config.trusted_ips_per_handle:
                 trusted.popitem(last=False)
+
+    # ---- TOTP code budget (spec 2026-09-25-totp §6) --------------------------------
+
+    def code_check(self, handle: str, ip: str) -> int | None:
+        """Before verifying a TOTP or recovery code for ``handle``: seconds to wait, or
+        ``None``. IPs that completed a login for this handle recently are exempt, so
+        an attacker holding the password can't keep the owner waiting; this budget
+        only, the per-IP tiers in :meth:`check` still apply to them."""
+        if self._is_trusted(handle, ip):
+            return None
+        fails = self._codes.peek(handle)
+        if not fails:
+            return None
+        now = self._clock()
+        self._prune(fails, now - self.config.code_window_s)
+        if len(fails) < self.config.code_budget:
+            return None
+        until = fails[-1] + self.config.code_spacing_s
+        return _ceil(until - now) if now < until else None
+
+    def code_failure(self, handle: str) -> bool:
+        """A wrong code for ``handle``. True when this failure crosses the budget
+        (the caller records a ``totp_guessing`` event, once per crossing)."""
+        now = self._clock()
+        fails = self._codes.get(handle)
+        self._prune(fails, now - self.config.code_window_s)
+        fails.append(now)
+        crossed = len(fails) == self.config.code_budget
+        if crossed:
+            log.warning("totp guessing: handle over its code budget")
+        return crossed
+
+    def code_reset(self, handle: str) -> None:
+        """Clear ``handle``'s code failures: a correct code, a password change or an
+        admin TOTP reset (the owner's remedies must end the waiting)."""
+        fails = self._codes.peek(handle)
+        if fails is not None:
+            fails.clear()
+
+    def decrypt_check(self, handle: str) -> int | None:
+        now = self._clock()
+        fails = self._decrypts.get(handle)
+        self._prune(fails, now - HOUR)
+        if len(fails) >= self.config.decrypt_per_hour:
+            return _ceil(fails[0] + HOUR - now)
+        return None
+
+    def decrypt_failure(self, handle: str) -> None:
+        self._decrypts.get(handle).append(self._clock())
 
     # ---- helpers ---------------------------------------------------------------
 
