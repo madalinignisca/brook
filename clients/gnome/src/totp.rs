@@ -1,10 +1,7 @@
 //! Two-factor sign-in (TOTP): the parts of the GNOME UI that don't touch the network.
 //!
 //! QR rendering, the manual-entry key, input clean-up and wording live here as plain
-//! functions with tests; the dialogs wire them to core's calls (PROTOCOL.md §1.2).
-
-// Temporary, until the dialogs land on top of core's TOTP API (same PR, never merged alone).
-#![allow(dead_code)]
+//! functions with tests; `totp_ui` wires them to core's calls (PROTOCOL.md §1.2).
 
 use brook_core::Error;
 use gtk::{gdk, glib};
@@ -115,6 +112,31 @@ pub fn step_error_text(err: &Error, factor: Factor) -> String {
     }
 }
 
+/// A failed settings action (turn on, turn off, new recovery codes), in words.
+pub fn manage_error_text(err: &Error) -> String {
+    match err {
+        Error::Api { code, .. } => match code.as_str() {
+            "auth.invalid_credentials" => "The password is wrong.".into(),
+            "auth.invalid_code" => {
+                "That code is wrong or already used. Check your phone's time, then try the next \
+                 code."
+                    .into()
+            }
+            "auth.totp_enrollment_expired" => "The setup expired. Start again.".into(),
+            "auth.rate_limited" => "Too many attempts. Wait a while, then try again.".into(),
+            "conflict" => {
+                "Two-factor sign-in changed elsewhere. Close this and open it again.".into()
+            }
+            _ => "The server refused the request.".into(),
+        },
+        Error::NotAuthenticated => "You were signed out. Sign in again.".into(),
+        // After the request left, the server may have applied it.
+        _ => "The server didn't answer. The change may have gone through: close this and open \
+              it again to see the current state."
+            .into(),
+    }
+}
+
 /// The notice after signing in with a recovery code, or when `/me` shows few left.
 pub fn low_codes_notice(left: u32) -> Option<String> {
     match left {
@@ -199,6 +221,18 @@ mod tests {
         assert!(recovery.contains("Try another one"));
         assert!(step_error_text(&api("auth.totp_expired"), Factor::Code).contains("Sign in again"));
         assert!(step_error_text(&api("auth.rate_limited"), Factor::Code).contains("Too many"));
+    }
+
+    #[test]
+    fn settings_errors_never_claim_nothing_happened_after_a_timeout() {
+        let api = |code: &str| Error::Api {
+            code: code.into(),
+            message: String::new(),
+        };
+        assert!(manage_error_text(&api("auth.invalid_credentials")).contains("password is wrong"));
+        assert!(manage_error_text(&api("auth.invalid_code")).contains("next code"));
+        assert!(manage_error_text(&api("auth.totp_enrollment_expired")).contains("expired"));
+        assert!(manage_error_text(&Error::Timeout).contains("may have gone through"));
     }
 
     #[test]

@@ -14,13 +14,14 @@ mod call;
 mod chat;
 mod prefs;
 mod totp;
+mod totp_ui;
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
-use brook_core::{AuthState, BrookClient, CoreConfig};
+use brook_core::{AuthState, BrookClient, CoreConfig, LoginOutcome};
 use gtk::glib;
 
 const APP_ID: &str = "dev.brook.Brook";
@@ -185,10 +186,17 @@ fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
             };
             error_label.set_text("");
             login_button.set_sensitive(false);
-            ui.runtime.spawn(async move {
-                // Result is intentionally discarded: state transitions published by
-                // `login` drive the UI via the state watcher.
-                let _ = client.login(&handle, &password).await;
+            let login = ui.runtime.spawn({
+                let client = client.clone();
+                async move { client.login(&handle, &password).await }
+            });
+            // Signed in, or failed: the published state drives the UI (the watcher).
+            // Only the second step needs the result itself: its challenge.
+            let ui = ui.clone();
+            glib::spawn_future_local(async move {
+                if let Ok(Ok(LoginOutcome::TotpRequired(challenge))) = login.await {
+                    show_code_step(&ui, client, challenge);
+                }
             });
         }
     });
@@ -203,6 +211,40 @@ fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
     });
 
     window.present();
+}
+
+/// Replace the login form with the two-factor code step (the password was right).
+fn show_code_step(ui: &LoginUi, client: Arc<BrookClient>, challenge: brook_core::TotpChallenge) {
+    let Some(stack) = ui.stack.upgrade() else {
+        return;
+    };
+    let back: Rc<dyn Fn(&str)> = Rc::new({
+        let ui = ui.clone();
+        move |message: &str| back_to_password(&ui, message)
+    });
+    let page = totp_ui::code_step(client, ui.runtime.clone(), challenge, back);
+    if let Some(old) = stack.child_by_name("totp") {
+        stack.remove(&old);
+    }
+    stack.add_named(&page, Some("totp"));
+    stack.set_visible_child_name("totp");
+}
+
+/// Leave the code step for the password form, with `message` (empty for a plain Back).
+fn back_to_password(ui: &LoginUi, message: &str) {
+    let (Some(stack), Some(error_label), Some(login_button)) = (
+        ui.stack.upgrade(),
+        ui.error_label.upgrade(),
+        ui.login_button.upgrade(),
+    ) else {
+        return;
+    };
+    stack.set_visible_child_name("login");
+    if let Some(page) = stack.child_by_name("totp") {
+        stack.remove(&page);
+    }
+    error_label.set_text(message);
+    login_button.set_sensitive(true);
 }
 
 /// Build a core client for `server`. Plain http is only allowed for loopback,
@@ -269,6 +311,12 @@ fn watch_auth_state(
                     // Consumed on every LoggedOut, so a flag from one Sign Out can
                     // never silence a later sign-out the user didn't ask for.
                     let asked = ui.signed_out_by_user.replace(false);
+                    // A code step that ended (expired): back to the password form. Its
+                    // own handler sets the message; don't overwrite it here.
+                    if let Some(page) = stack.child_by_name("totp") {
+                        stack.set_visible_child_name("login");
+                        stack.remove(&page);
+                    }
                     if let Some(chat) = stack.child_by_name("chat") {
                         stack.set_visible_child_name("login");
                         stack.remove(&chat);
@@ -314,6 +362,9 @@ fn watch_auth_state(
                         }
                     }
                     stack.set_visible_child_name("chat");
+                    if let Some(page) = stack.child_by_name("totp") {
+                        stack.remove(&page);
+                    }
                 }
                 AuthState::Failed(message) => {
                     error_label.set_text(&message);
