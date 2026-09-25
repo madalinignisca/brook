@@ -17,10 +17,10 @@ from datetime import timedelta
 
 import httpx
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from app import db
-from app.models import RefreshToken, User, utcnow
+from app.models import AuthEvent, RefreshToken, User, utcnow
 from app.routers.auth import lock_user
 from app.security import hash_token, new_refresh_token
 
@@ -135,9 +135,10 @@ async def test_admin_reset_takes_the_target_lock(client: httpx.AsyncClient) -> N
     assert (await task).status_code == 204
 
 
-async def test_lost_refresh_race_is_not_a_failure(client: httpx.AsyncClient) -> None:
-    """Two tabs refresh the same token at once: one wins, the other gets 401, and
-    the loser must not count against the IP (it presented a valid token)."""
+async def test_two_tabs_racing_both_stay_signed_in_uncounted(client: httpx.AsyncClient) -> None:
+    """Two tabs refresh the same token at once. The server serialises them on the
+    user lock: the first rotates, the second (reading the token under the lock) takes
+    the crash grace. Neither is a failure against the IP."""
     from app import ratelimit
 
     user_id, pair = await _alice(client)
@@ -145,27 +146,55 @@ async def test_lost_refresh_race_is_not_a_failure(client: httpx.AsyncClient) -> 
     body = {"refresh_token": pair["refresh_token"]}
 
     async with db.get_sessionmaker()() as holder:
-        # Park both refreshes on the user lock, after each has read the token as
-        # valid: that is the interleaving where the loser's CAS matches no row.
+        # Park both refreshes on the user lock, after each has read the token as valid.
         await lock_user(holder, user_id)
         tab1 = asyncio.create_task(client.post(f"{AUTH}/refresh", json=body))
         tab2 = asyncio.create_task(client.post(f"{AUTH}/refresh", json=body))
         await asyncio.sleep(SETTLE)
         assert not tab1.done() and not tab2.done()
         await holder.rollback()
-    codes = sorted([(await tab1).status_code, (await tab2).status_code])
-    assert codes == [200, 401]
+    assert [(await tab1).status_code, (await tab2).status_code] == [200, 200]
 
     # Not counted: the IP can still fail backoff_after - 1 times without a 429.
-    # Had the lost race counted, the last of these would already be throttled.
     for _ in range(lim.config.backoff_after - 1):
         r = await client.post(f"{AUTH}/login", json={"handle": "alice", "password": "nope-x"})
         assert r.status_code == 401
-    # And a genuinely reused (already revoked) token still is a failure.
+    # A genuine reuse still is a failure: the grace retired the original's successor,
+    # so the original is now a reuse (theft verdict, counted).
     reuse = await client.post(f"{AUTH}/refresh", json=body)
     assert reuse.status_code == 401
     throttled = await client.post(f"{AUTH}/login", json={"handle": "alice", "password": "nope-x"})
     assert throttled.status_code == 429
+
+
+async def test_a_replay_racing_the_device_is_never_a_silent_sign_out(
+    client: httpx.AsyncClient,
+) -> None:
+    """Someone replays the device's just-rotated token T while the device refreshes
+    its successor S, both parked on the user lock. Whatever order they run in, a 401
+    must come with a reuse verdict (the family ends), never as a silent lost race that
+    signs the device out and leaves the other holder a live chain. Reading the token
+    before the lock produced exactly that."""
+    user_id, pair = await _alice(client)
+    t = pair["refresh_token"]
+    s = (await client.post(f"{AUTH}/refresh", json={"refresh_token": t})).json()["refresh_token"]
+
+    async with db.get_sessionmaker()() as holder:
+        await lock_user(holder, user_id)
+        replay = asyncio.create_task(client.post(f"{AUTH}/refresh", json={"refresh_token": t}))
+        device = asyncio.create_task(client.post(f"{AUTH}/refresh", json={"refresh_token": s}))
+        await asyncio.sleep(SETTLE)
+        assert not replay.done() and not device.done()
+        await holder.rollback()
+    codes = [(await replay).status_code, (await device).status_code]
+
+    async with db.get_sessionmaker()() as check:
+        reuse = await check.scalar(
+            select(func.count())
+            .select_from(AuthEvent)
+            .where(AuthEvent.kind == "refresh_token_reuse")
+        )
+    assert codes.count(401) <= (reuse or 0), (codes, reuse)
 
 
 async def test_one_pending_token_completes_one_login(
