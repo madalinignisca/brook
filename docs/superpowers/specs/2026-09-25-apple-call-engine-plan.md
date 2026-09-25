@@ -83,8 +83,8 @@ Each task ends in a check; tests are written first and seen failing under a name
 - `itest.sh` requires the new call suite by name **and keeps the login suite gate**. Call suite (test
   server, account `mac`, channel `calltest`): join → Connected; publish answer applied; a second
   participant's subscribe offer answered; leave → Ended(Left) and `closed`.
-- **Second participant procedure:** brook-linux starts `call_participant` as `linux` in `calltest`,
-  confirms it is joined and receiving nothing yet, then the Mac joins; brook-linux reports frames,
+- **Second participant procedure:** the Linux side starts `call_participant` as `linux` in `calltest`,
+  confirms it is joined and receiving nothing yet, then the Mac joins; the Linux side reports frames,
   audio bytes and the roster every 5 s and leaves on request; the server session reads Janus logs by
   call_id + UTC time if media does not flow.
 - **Real TCC (Finder-launched, signed, sandboxed):** fresh prompts on first join; microphone denied →
@@ -129,7 +129,7 @@ Each task ends in a check; tests are written first and seen failing under a name
 | E2 | synthetic video source not available in the ObjC API | use `RTCVideoSource` + a timer feeding `RTCVideoFrame`s from a CVPixelBuffer |
 | E2 | loopback flaky on CI-less local runs | frame/byte counters with generous bounds; loop 20× |
 | E4 | re-signing order breaks the app signature | verify on the Release bundle every time; the check is the gate |
-| E6 | UDP from the Mac to 192.168.1.192 or brook-linux's subnet blocked | brook-linux confirms routing on its first join; the server session reads Janus logs by call_id |
+| E6 | UDP from the Mac to 192.168.1.192 or the Linux side's subnet blocked | the Linux side confirms routing on its first join; the server session reads Janus logs by call_id |
 | E6 | AEC3 echo on speakers | the named fallback (custom `RTCAudioDevice` with Apple voice processing) becomes its own spec before merge |
 
 ## If it stops halfway

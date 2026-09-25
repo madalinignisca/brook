@@ -216,7 +216,7 @@ trace-level subscriber on core's targets and asserts neither token appears raw, 
 ## 4. Not doing
 
 - UniFFI exposure of `CallHandle`/`MediaEngine` (next step, with the macOS engine — C2).
-- Any media code; the GTK adapter (brook-linux's, over `gst-media`).
+- Any media code; the GTK adapter (the Linux side's, over `gst-media`).
 - STUN/TURN `ice_servers` (additive later), screen share (`source: screen`, later).
 - Changing the Phase 1 event path or chat API.
 - Server behaviour (PR #10 is the source of truth; divergences are reported, not patched here).
