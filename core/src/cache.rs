@@ -274,6 +274,34 @@ impl Cache {
         }
     }
 
+    /// A send's acknowledgement (the stored message the server returned): through the same
+    /// guard as everything else (a later edit or tombstone already cached wins), committed
+    /// before this returns, so the outbox may then drop its row (spec §5.3).
+    pub(crate) async fn apply_ack(&self, message: &Value) -> Result<(), StoreError> {
+        let Some(row) = message_row(message) else {
+            return Err(StoreError::Sql);
+        };
+        let me = self.me.clone();
+        let applied = self
+            .db
+            .call(move |c| {
+                let tx = c.transaction()?;
+                let applied = apply(
+                    &tx,
+                    &me,
+                    &Batch {
+                        messages: vec![row],
+                        ..Batch::default()
+                    },
+                )?;
+                tx.commit()?;
+                Ok(applied)
+            })
+            .await?;
+        self.notify(applied);
+        Ok(())
+    }
+
     /// The channels the caller is in, with unread counts.
     pub(crate) async fn cached_channels(&self) -> Result<Vec<CachedChannel>, StoreError> {
         let me = self.me.clone();
