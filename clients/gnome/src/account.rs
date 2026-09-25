@@ -72,7 +72,11 @@ pub fn error_text(err: &Error) -> String {
         Error::Http(_) => "The connection failed mid-way. The change may have gone through: \
                            if you're signed out, sign in with the new password."
             .into(),
-        _ => "Something went wrong. Your password may not have changed.".into(),
+        // An unreadable answer (UnexpectedResponse), a dropped socket and anything else after
+        // the request left: the server may have committed, so never claim it didn't.
+        _ => "Something went wrong. The change may have gone through: if you're signed out, \
+              sign in with the new password."
+            .into(),
     }
 }
 
@@ -264,6 +268,11 @@ mod tests {
         let text = error_text(&Error::Timeout);
         assert!(text.contains("may have gone through"));
         assert!(!text.contains("not changed"));
+    }
+
+    #[test]
+    fn an_unreadable_answer_may_have_gone_through() {
+        assert!(error_text(&Error::UnexpectedResponse).contains("may have gone through"));
     }
 
     #[test]
