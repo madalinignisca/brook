@@ -1071,3 +1071,50 @@ async fn the_stored_row_wins_on_the_reply_target() {
         assert_eq!(sent, vec![(X.to_string(), first)], "posted another target");
     }
 }
+
+/// The quote is gone: retried as a plain message, in place and under the same id, ahead of
+/// a message queued after it.
+#[tokio::test]
+async fn a_reply_whose_quote_is_gone_is_retried_plain_in_place() {
+    let s = setup().await;
+    s.server.script([Answer::Fail(SendFailure::Refused {
+        code: "message.reply_target_gone".into(),
+    })]);
+    let id = s
+        .outbox
+        .enqueue("c1", "first", reply(Q), None)
+        .await
+        .unwrap();
+    failed(&s).await;
+    s.outbox.enqueue("c1", "second", None, None).await.unwrap();
+    // Only a failed row changes; a pending one keeps its quote.
+    s.outbox.retry_without_reply(&id).await.unwrap();
+    drained(&s).await;
+    let sends = s.server.replies.lock().unwrap().clone();
+    let last_of_first = sends.iter().rposition(|(c, _)| c == &id).unwrap();
+    assert_eq!(sends[last_of_first].1, None, "still sent as a reply");
+    let order: Vec<String> = s
+        .server
+        .sends
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, _, b)| b.clone())
+        .collect();
+    assert_eq!(
+        order.last().map(String::as_str),
+        Some("second"),
+        "{order:?}"
+    );
+}
+
+/// A row that isn't failed keeps its quote (only a refused reply is changed).
+#[tokio::test]
+async fn retry_without_reply_leaves_a_pending_reply_alone() {
+    let s = setup().await;
+    s.session.send_replace(None);
+    let id = s.outbox.enqueue("c1", "yes", reply(Q), None).await.unwrap();
+    s.outbox.retry_without_reply(&id).await.unwrap();
+    let p = s.outbox.pending("c1").await.unwrap();
+    assert_eq!(p[0].reply_to_id.as_deref(), Some(Q));
+}

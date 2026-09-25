@@ -493,6 +493,25 @@ impl Outbox {
 
     /// Put a failed message back in line.
     pub(crate) async fn retry(self: &Arc<Self>, client_id: &str) -> Result<(), OutboxError> {
+        self.retry_row(client_id, false).await
+    }
+
+    /// Retry a failed reply as a plain message (its quote is gone: `422
+    /// message.reply_target_gone`). In place, keeping its position: Delete and a new send
+    /// would put it behind later messages. The same `client_id` is safe to reuse because
+    /// the server stored nothing for a refused send.
+    pub(crate) async fn retry_without_reply(
+        self: &Arc<Self>,
+        client_id: &str,
+    ) -> Result<(), OutboxError> {
+        self.retry_row(client_id, true).await
+    }
+
+    async fn retry_row(
+        self: &Arc<Self>,
+        client_id: &str,
+        drop_reply: bool,
+    ) -> Result<(), OutboxError> {
         self.check_open()?;
         // Stored canonical: the caller may still hold the form it passed to `enqueue`.
         let canonical = canonical_client_id(client_id);
@@ -506,9 +525,10 @@ impl Outbox {
         self.db
             .call(move |c| {
                 c.execute(
-                    "UPDATE outbox SET state = 'pending', error = NULL
+                    "UPDATE outbox SET state = 'pending', error = NULL,
+                         reply_to_id = CASE WHEN ?2 THEN NULL ELSE reply_to_id END
                      WHERE client_id = ?1 AND state = 'failed'",
-                    [&cid],
+                    rusqlite::params![cid, drop_reply],
                 )
             })
             .await
