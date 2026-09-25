@@ -16,7 +16,7 @@
 | `POST /auth/oidc/exchange` | app exchanges the Brook code + PKCE verifier → `{access_token, refresh_token}` |
 | `POST /auth/ldap` | LDAP bind credentials → tokens |
 | `POST /auth/refresh` | refresh → new access token (rotates refresh token) |
-| `POST /auth/logout` | revoke refresh token |
+| `POST /auth/logout` | `{refresh_token}` → 204: ends this device's login (the token's whole family, see §1.0); idempotent, no access token needed |
 | `POST /auth/password` | change own password `{current_password, new_password}` → fresh `{access_token, refresh_token}`; see §1.1 |
 | `GET  /users` · `?handle=` | **admin**: all users by handle · exact handle (404 `not_found` if none) |
 | `POST /users/{id}/password` | **admin**: set a member's password `{admin_password, new_password}` → 204; see §1.1 |
@@ -63,6 +63,9 @@
   events (`refresh_token_grace`, `refresh_token_reuse`). A reuse event can also come
   from an old token replayed after "sign out everywhere"; the family was already
   revoked then.
+- **Logout** ends the presented token's whole family, so a refresh that was in flight
+  when the user signed out can't leave its new token live. Send whichever token you
+  hold; the user's other devices are untouched.
 - A token revoked by logout, sign-out or a password change is simply refused
   (401 `auth.invalid_token`); only rotation reuse ends a family.
 - Two refreshes racing with the same token (two tabs) are serialised by the server:

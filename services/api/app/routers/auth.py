@@ -437,13 +437,21 @@ async def logout(
     body: RefreshIn,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> None:
-    """Revoke a refresh token (idempotent)."""
+    """End this device's login: every token of the presented token's family (idempotent).
+
+    The family, not just the token: a refresh in flight when the user signs out has
+    already rotated the presented token into a successor the client will discard,
+    and revoking only the presented one would leave that successor live for its whole
+    TTL. Any token of the family will do, rotated or not; one that already can't
+    refresh (it was rotated) could end the family through /refresh anyway, so this
+    gives nobody a new power. The user's other devices are other families. Revoked
+    here, not rotated: presenting one of these later is a plain 401, not a reuse."""
+    family = select(RefreshToken.family_id).where(
+        RefreshToken.token_hash == hash_token(body.refresh_token)
+    )
     await session.execute(
         update(RefreshToken)
-        .where(
-            RefreshToken.token_hash == hash_token(body.refresh_token),
-            RefreshToken.revoked.is_(False),
-        )
+        .where(RefreshToken.family_id.in_(family), RefreshToken.revoked.is_(False))
         .values(revoked=True)
     )
     await session.commit()
