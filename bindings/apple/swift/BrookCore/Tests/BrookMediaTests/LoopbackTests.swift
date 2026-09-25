@@ -198,4 +198,72 @@ final class LoopbackTests: XCTestCase {
         await a.close()
         await b.close()
     }
+
+    /// Screen share on the same publish connection: the share's m-line is labelled `screen`
+    /// and decodes on the other side; stopping leaves it inactive (still labelled, same mid);
+    /// sharing again reuses that mid (never a recycled slot).
+    func testScreenShareStartStopRestartOnOneMline() async throws {
+        let a = WebRTCEngine(options: MediaOptions(
+            audio: true, video: SyntheticVideoCapture(), audioDevice: SyntheticAudioDevice(toneHz: nil)))
+        let b = WebRTCEngine(options: MediaOptions(
+            audio: false, video: nil, audioDevice: SyntheticAudioDevice(toneHz: nil)))
+        let wire = LoopbackWire(publisher: a, subscriber: b)
+        a.attach(wire.fromA)
+        b.attach(wire.fromB)
+        let screenFrames = FrameCounter()
+        let attached = Locked(Set<String>())
+        b.onRemoteTracks { tracks in
+            for t in tracks where t.source == .screen {
+                let fresh = attached.withLock { $0.insert(t.mid).inserted }
+                if fresh { (t.track as? RTCVideoTrack)?.add(screenFrames) }
+            }
+        }
+        func negotiate() async throws -> FfiPublishOffer {
+            let offer = try await a.createLabelledOffer()
+            let sources = Dictionary(uniqueKeysWithValues: offer.tracks.map { ($0.mid, $0.source) })
+            let streams = mediaSections(offer.sdp).map {
+                FfiSubStream(mid: $0.mid, participantId: "p-a", kind: $0.kind, source: sources[$0.mid] ?? .unknown)
+            }
+            let answer = try await b.applySubscribeOffer(sdp: offer.sdp, streams: streams)
+            wire.subscriberHasOffer()
+            try await a.applyPublishAnswer(sdp: answer)
+            wire.publisherHasAnswer()
+            return offer
+        }
+
+        let first = try await negotiate()
+        XCTAssertEqual(first.tracks.map(\.source), [.mic, .camera])
+
+        try await a.startScreenShare(SyntheticVideoCapture(width: 1280, height: 720))
+        let sharing = try await negotiate()
+        let screen = try XCTUnwrap(sharing.tracks.first { $0.source == .screen }, "\(sharing.tracks)")
+        XCTAssertEqual(sharing.tracks.count, 3)
+        await eventually("screen frames decoded on the other side") { screenFrames.frames > 20 }
+
+        await a.stopScreenShare()
+        let stopped = try await negotiate()
+        XCTAssertEqual(stopped.tracks.first { $0.mid == screen.mid }?.source, .screen, "stopped share lost its label")
+        XCTAssertTrue(section(stopped.sdp, mid: screen.mid).contains("a=inactive"), "stopped share not inactive")
+        let asleep = screenFrames.frames
+        try? await Task.sleep(for: .milliseconds(500))
+        XCTAssertLessThan(screenFrames.frames - asleep, 5, "frames still flowing after stop")
+
+        try await a.startScreenShare(SyntheticVideoCapture(width: 1280, height: 720))
+        let again = try await negotiate()
+        XCTAssertEqual(again.tracks.filter { $0.source == .screen }.map(\.mid), [screen.mid], "not the same m-line")
+        XCTAssertEqual(mediaSections(again.sdp).count, 3, "a new m-line was added")
+        let before = screenFrames.frames
+        await eventually("screen frames again after restart") { screenFrames.frames > before + 20 }
+        await a.close()
+        await b.close()
+    }
+}
+
+/// The attribute lines of one m-section of an SDP, by mid.
+func section(_ sdp: String, mid: String) -> String {
+    var sections: [[Substring]] = []
+    for line in sdp.split(whereSeparator: \.isNewline) {
+        if line.hasPrefix("m=") { sections.append([line]) } else if !sections.isEmpty { sections[sections.count - 1].append(line) }
+    }
+    return sections.first { $0.contains("a=mid:\(mid)") }?.joined(separator: "\n") ?? ""
 }
