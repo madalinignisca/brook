@@ -217,9 +217,10 @@ impl Commands {
         self.conn.clone()
     }
 
-    /// Server events as they came (`type`, `data`), for the offline cache.
-    pub(crate) fn raw_events(&self) -> broadcast::Receiver<(String, Value)> {
-        self.raw.subscribe()
+    /// Server events as they came (`type`, `data`), for the offline cache: subscribe per
+    /// user's stores.
+    pub(crate) fn raw_events_sender(&self) -> broadcast::Sender<(String, Value)> {
+        self.raw.clone()
     }
 
     /// Send `frame` (a `{type, data}` object; the `id` is assigned here) on socket

@@ -581,8 +581,9 @@ pub(crate) async fn store_id(
         .await
 }
 
-/// Whether persistence may put a store on disk at all (plan: one switch, off until C5
-/// lands). Every store-opening path asks this first.
+/// Whether local data may be put on disk at all (plan: one switch, off until wipes landed;
+/// they did, with C5). Every store-opening path asks this first. It only takes effect where
+/// an app calls `enable_local_data` with a durable key store.
 pub(crate) fn stores_enabled() -> bool {
-    false
+    true
 }

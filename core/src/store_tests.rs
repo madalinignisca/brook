@@ -268,11 +268,8 @@ async fn store_ids_are_random_and_stable() {
 }
 
 #[test]
-fn stores_stay_off_until_wipes_land() {
-    assert!(
-        !store::stores_enabled(),
-        "the durable-store switch turned on before C5"
-    );
+fn stores_are_on_now_that_wipes_landed() {
+    assert!(store::stores_enabled());
 }
 
 /// A job that panics stops the store's thread, but the store is released: `close` returns,

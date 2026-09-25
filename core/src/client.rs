@@ -112,6 +112,10 @@ pub struct BrookClient {
     shutdown: watch::Sender<()>,
     /// The background loops (refresh, realtime), for tests to observe that they end.
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The offline cache and outbox of whoever is signed in (client_offline.rs).
+    pub(crate) offline: Arc<tokio::sync::Mutex<Option<crate::offline::Offline>>>,
+    /// The app's cache notices, stable across sign-ins.
+    pub(crate) cache_events: broadcast::Sender<crate::cache::CacheEvent>,
 }
 
 impl Drop for BrookClient {
@@ -154,6 +158,8 @@ impl BrookClient {
             transfers: crate::transfer::Transfers::new(),
             shutdown,
             tasks: std::sync::Mutex::default(),
+            offline: Arc::default(),
+            cache_events: broadcast::channel(512).0,
         })
     }
 
@@ -351,6 +357,16 @@ impl BrookClient {
     #[cfg(test)]
     pub(crate) fn take_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
         std::mem::take(&mut *self.tasks.lock().unwrap())
+    }
+
+    /// Ends when the client is dropped (the background loops race it).
+    pub(crate) fn shutdown_signal(&self) -> watch::Receiver<()> {
+        self.shutdown.subscribe()
+    }
+
+    /// Keep a background task's handle with the client's others.
+    pub(crate) fn track(&self, task: tokio::task::JoinHandle<()>) {
+        self.tasks.lock().unwrap().push(task);
     }
 
     /// A receiver the UI can watch for [`AuthState`] transitions.

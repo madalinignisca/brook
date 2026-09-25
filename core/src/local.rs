@@ -19,6 +19,7 @@ use crate::{KeySlot, KeyStore};
 
 /// A user's two stores, as opened.
 pub(crate) struct UserStores {
+    #[cfg_attr(not(test), allow(dead_code))] // tests follow a store by its id
     pub(crate) store_id: String,
     pub(crate) cache: Opened,
     pub(crate) outbox: Opened,
@@ -196,6 +197,7 @@ impl LocalData {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // tests reopen the index
     pub(crate) async fn close(self) {
         self.index.close().await;
     }

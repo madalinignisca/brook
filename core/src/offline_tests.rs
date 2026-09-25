@@ -234,3 +234,63 @@ async fn cache_notices_reach_the_app() {
     .expect("no outbox notice");
     assert_eq!(got, "c");
 }
+
+// ---- Through BrookClient (the auth watcher wiring) ----
+
+mod client {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::test_support::TestServer;
+    use crate::{BrookClient, CoreConfig, InMemoryKeySlot, KeySlot, LoginOutcome};
+
+    async fn active(c: &BrookClient) -> bool {
+        for _ in 0..300 {
+            if c.other_local_users().await.is_ok() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// Enabled, then signed in: the user's stores open; "Remove this device's data" erases
+    /// them locally before signing out; reads then say local data is unavailable.
+    #[tokio::test]
+    async fn sign_in_opens_the_stores_and_forget_erases_them() {
+        let server = TestServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let slot: Arc<dyn KeySlot> = Arc::new(InMemoryKeySlot::default());
+        let c = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        assert!(c.enable_local_data(slot, dir.path().to_path_buf()).await);
+        assert!(
+            c.cached_channels().await.is_err(),
+            "open before anyone signed in"
+        );
+        assert!(matches!(
+            c.login("alice", "pw").await.unwrap(),
+            LoginOutcome::LoggedIn(_)
+        ));
+        assert!(
+            active(&c).await,
+            "the stores never opened for the signed-in user"
+        );
+        assert!(c.cached_channels().await.unwrap().is_empty());
+        let stores = dir.path().join("stores");
+        let store_dirs = || {
+            std::fs::read_dir(&stores)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_type().unwrap().is_dir())
+                .count()
+        };
+        assert_eq!(store_dirs(), 1);
+        c.sign_out_and_forget().await.unwrap();
+        assert_eq!(
+            store_dirs(),
+            0,
+            "the user's data survived \"Remove this device's data\""
+        );
+        assert!(c.cached_channels().await.is_err());
+    }
+}

@@ -54,8 +54,13 @@ pub(crate) struct Offline {
 }
 
 impl Offline {
+    #[cfg(test)]
     pub(crate) fn new(local: LocalData) -> Self {
-        let (events, _) = broadcast::channel(512);
+        Self::with_events(local, broadcast::channel(512).0)
+    }
+
+    /// Notices go to `events` (the client's, which outlives any one user's stores).
+    pub(crate) fn with_events(local: LocalData, events: broadcast::Sender<CacheEvent>) -> Self {
         Self {
             local,
             active: None,
@@ -63,6 +68,7 @@ impl Offline {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn events(&self) -> broadcast::Receiver<CacheEvent> {
         self.events.subscribe()
     }
@@ -185,11 +191,6 @@ impl Offline {
             self.local.wipe(&o, &u).await?;
         }
         Ok(())
-    }
-
-    pub(crate) async fn close(mut self) {
-        self.close_active().await;
-        self.local.close().await;
     }
 }
 
