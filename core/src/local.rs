@@ -105,10 +105,13 @@ impl LocalData {
             ) {
                 lost.store(true, Ordering::SeqCst);
             }
-            if matches!(outbox, Opened::NeedsRebuild) {
-                // A format change: flagged as lost first, then remade (pre-1.0: no
-                // migration). Flagged before, so a rebuild that fails still reports it.
-                lost.store(true, Ordering::SeqCst);
+            if let Opened::NeedsRebuild { unsent } = outbox {
+                // A format change: remade (pre-1.0: no migration). A loss only if something
+                // was waiting (or can't be counted), flagged before the rebuild so one that
+                // fails still reports it.
+                if unsent != Some(0) {
+                    lost.store(true, Ordering::SeqCst);
+                }
                 outbox = store::rebuild(&dir, Kind::Outbox, &id, &keys)?;
             }
             Ok::<_, StoreError>((cache, outbox))

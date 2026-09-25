@@ -149,7 +149,11 @@ pub(crate) enum Opened {
     /// `reset` clears it.
     Damaged,
     /// An outbox in another format: the caller surfaces what will be lost, then `rebuild`s.
-    NeedsRebuild,
+    /// `unsent`: its messages not yet accepted by the server, counted before anything is
+    /// removed; `None` when they can't be counted (then they count as lost).
+    NeedsRebuild {
+        unsent: Option<i64>,
+    },
 }
 
 impl std::fmt::Debug for Opened {
@@ -158,7 +162,7 @@ impl std::fmt::Debug for Opened {
             Opened::Ready { rebuilt, .. } => write!(f, "Ready({rebuilt:?})"),
             Opened::Locked => f.write_str("Locked"),
             Opened::Damaged => f.write_str("Damaged"),
-            Opened::NeedsRebuild => f.write_str("NeedsRebuild"),
+            Opened::NeedsRebuild { unsent } => write!(f, "NeedsRebuild({unsent:?})"),
         }
     }
 }
@@ -274,7 +278,18 @@ fn open_reserved(
         // reservation.
         match format_of(&conn) {
             Ok(f) if f == kind.format() => inner = Inner::Ready(conn, None),
-            Ok(_) if kind == Kind::Outbox => return Ok(Opened::NeedsRebuild),
+            Ok(_) if kind == Kind::Outbox => {
+                // Every outbox format so far has `outbox.state`: count what a rebuild would
+                // lose, so an upgrade with nothing waiting reports nothing.
+                let unsent = conn
+                    .query_row(
+                        "SELECT count(*) FROM outbox WHERE state != 'accepted'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                return Ok(Opened::NeedsRebuild { unsent });
+            }
             Ok(_) => {
                 drop(conn);
                 remove_all(paths)?;

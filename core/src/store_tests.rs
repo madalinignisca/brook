@@ -233,7 +233,7 @@ async fn a_cache_in_another_format_rebuilds_but_an_outbox_waits() {
     let (_cache, rebuilt) = ready(store::open(dir.path(), Kind::Cache, "s1", &keys(&slot)));
     assert_eq!(rebuilt, Some(Rebuilt::FormatChanged));
     let o = store::open(dir.path(), Kind::Outbox, "s1", &keys(&slot)).unwrap();
-    assert!(matches!(o, Opened::NeedsRebuild), "{o:?}");
+    assert!(matches!(o, Opened::NeedsRebuild { .. }), "{o:?}");
     assert!(
         dir.path().join("outbox.db").exists(),
         "the outbox was rebuilt before surfacing"

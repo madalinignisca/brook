@@ -401,7 +401,14 @@ async fn an_old_outbox_is_reported_lost_when_its_user_signs_in() {
             panic!("outbox not ready");
         };
         outbox
-            .call(|c| c.execute("UPDATE meta SET format = 1", []))
+            .call(|c| {
+                c.execute(
+                    "INSERT INTO outbox(client_id, channel_id, body, state, created_at)
+                     VALUES ('x', 'c', 'hi', 'pending', 'now')",
+                    [],
+                )?;
+                c.execute("UPDATE meta SET format = 1", [])
+            })
             .await
             .unwrap();
         outbox.close().await;
