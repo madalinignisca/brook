@@ -135,8 +135,10 @@ impl BrookClient {
                 if stop {
                     // Close the stores (their threads joined) rather than leave them to
                     // whenever the last handle drops.
-                    if let Some(off) = offline.lock().await.as_mut() {
-                        off.close_active().await;
+                    // Held through the close: an empty slot means everything is shut.
+                    let mut guard = offline.lock().await;
+                    if let Some(off) = guard.take() {
+                        off.close().await;
                     }
                     return;
                 }

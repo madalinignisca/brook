@@ -530,9 +530,12 @@ impl Db {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        // Awaited in place and cleared only once it fired: a close that is cancelled
+        // mid-wait leaves the receiver for the next close to wait on.
         let mut stopped = self.stopped.lock().await;
-        if let Some(rx) = stopped.take() {
+        if let Some(rx) = stopped.as_mut() {
             let _ = rx.await;
+            *stopped = None;
         }
     }
 }

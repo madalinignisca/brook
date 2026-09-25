@@ -167,6 +167,12 @@ impl Offline {
         }
     }
 
+    /// The client is going away: close the open stores and the index, threads joined.
+    pub(crate) async fn close(mut self) {
+        self.close_active().await;
+        self.local.close().await;
+    }
+
     /// "Remove this device's data" for `(origin, user_id)`, signed in at `epoch`: close
     /// their stores if open and erase them, locally and first (the caller signs out of the
     /// server afterwards, whether or not that works). Stores that never opened (locked,

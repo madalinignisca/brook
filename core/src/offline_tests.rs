@@ -354,7 +354,8 @@ mod client {
         );
     }
 
-    /// Dropping the client closes the open stores: their files can be opened again at once.
+    /// Dropping the client closes the open stores and the index: once it has, every file
+    /// opens again at once (nothing is left to whenever the last handle drops).
     #[tokio::test]
     async fn dropping_the_client_closes_the_stores() {
         let server = TestServer::start().await;
@@ -367,21 +368,33 @@ mod client {
         );
         c.login("alice", "pw").await.unwrap();
         assert!(active(&c).await);
+        let user = c.session.snapshot().await.1.unwrap().user.id;
+        let origin = server.base.trim_end_matches('/').to_string();
         let offline = c.offline.clone();
         drop(c);
         let mut closed = false;
         for _ in 0..300 {
-            if offline
-                .lock()
-                .await
-                .as_ref()
-                .is_some_and(|off| off.active().is_none())
-            {
+            if offline.lock().await.is_none() {
                 closed = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(closed, "the stores stayed open after the client went away");
+        assert!(
+            closed,
+            "the local data stayed open after the client went away"
+        );
+        let local = crate::local::LocalData::open(&dir.path().join("stores"), slot)
+            .await
+            .expect("the index is still open")
+            .unwrap();
+        let stores = local.open_user(&origin, &user).await.unwrap();
+        assert!(
+            matches!(
+                stores.cache,
+                crate::store::Opened::Ready { rebuilt: None, .. }
+            ),
+            "the cache is still open"
+        );
     }
 }

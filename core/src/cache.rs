@@ -246,8 +246,9 @@ impl Cache {
 
     /// Empty the synced tables and start the cursor over, in one transaction; bumps the
     /// generation so a history page requested before this can't land after it. Returns the
-    /// cursor it replaced. (`files` and `deletions` stay: the file cache keys on content
-    /// and its journal must survive whatever the rows do.)
+    /// cursor it replaced. (`files` and `deletions` are left alone: nothing writes them yet.
+    /// The file cache, when it lands, must drop the old server's file rows here too, and
+    /// journal their blobs in `deletions` rather than orphan them.)
     async fn reset_rows(&self) -> Result<String, StoreError> {
         self.db
             .call(|c| {

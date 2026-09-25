@@ -63,11 +63,19 @@ async fn an_open_store_cant_be_wiped_under_its_user() {
     let slot = Arc::new(InMemoryKeySlot::default());
     let local = open(root.path(), &slot).await;
     let stores = local.open_user("https://a", "u1").await.unwrap();
+    // The cache closed, the outbox still open: the outbox's files stay under it.
+    ready(stores.cache).close().await;
     assert!(
         local.wipe("https://a", "u1").await.is_err(),
         "wiped while open"
     );
-    ready(stores.cache).close().await;
+    assert!(
+        root.path()
+            .join(&stores.store_id)
+            .join("outbox.db")
+            .exists(),
+        "an open store's files were deleted"
+    );
     ready(stores.outbox).close().await;
     local.wipe("https://a", "u1").await.unwrap();
 }
@@ -166,24 +174,60 @@ async fn reconciliation_erases_only_orphans() {
     assert_eq!(dirs(root.path()), want);
 }
 
-/// The index's key is gone: nobody knows whose stores these are, so they're all erased.
-#[tokio::test]
-async fn a_lost_index_key_orphans_every_store() {
+/// Orphans `n` stores after the index key goes, the first holding `unsent` queued messages;
+/// returns whether the reopened data said unsent messages were lost.
+async fn lose_the_index_key(unsent: usize) -> bool {
     let root = tempfile::tempdir().unwrap();
     let slot = Arc::new(InMemoryKeySlot::default());
     let local = open(root.path(), &slot).await;
-    let s = local.open_user("https://a", "u1").await.unwrap();
-    ready(s.cache).close().await;
-    ready(s.outbox).close().await;
+    for (i, user) in ["u1", "u2"].into_iter().enumerate() {
+        let s = local.open_user("https://a", user).await.unwrap();
+        ready(s.cache).close().await;
+        let outbox = ready(s.outbox);
+        let rows = if i == 0 { unsent } else { 0 };
+        outbox
+            .call(move |c| {
+                for n in 0..rows {
+                    c.execute(
+                        "INSERT INTO outbox(client_id, channel_id, body, state, created_at)
+                         VALUES (?1, 'c', 'hi', 'queued', 'now')",
+                        [format!("cid-{n}")],
+                    )?;
+                }
+                // An accepted one is not unsent.
+                c.execute(
+                    "INSERT INTO outbox(client_id, channel_id, body, state, created_at)
+                     VALUES ('done', 'c', 'hi', 'accepted', 'now')",
+                    [],
+                )
+            })
+            .await
+            .unwrap();
+        outbox.close().await;
+    }
     local.close().await;
     slot.put("index", vec![5; 32]);
     let local = open(root.path(), &slot).await;
     assert!(dirs(root.path()).is_empty(), "{:?}", dirs(root.path()));
-    assert!(
-        local.take_lost_unsent(),
-        "an erased outbox went unmentioned"
-    );
+    let lost = local.take_lost_unsent();
     assert!(!local.take_lost_unsent(), "said twice");
+    lost
+}
+
+/// The index's key is gone: nobody knows whose stores these are, so they're all erased, and
+/// unsent messages among them are reported lost.
+#[tokio::test]
+async fn a_lost_index_key_orphans_every_store() {
+    assert!(
+        lose_the_index_key(2).await,
+        "erased unsent messages went unmentioned"
+    );
+}
+
+/// Only an outbox that held something is a loss.
+#[tokio::test]
+async fn orphaned_empty_outboxes_are_not_a_loss() {
+    assert!(!lose_the_index_key(0).await, "a loss reported for nothing");
 }
 
 #[tokio::test]

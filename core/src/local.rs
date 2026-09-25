@@ -194,8 +194,9 @@ impl LocalData {
             .await
     }
 
-    /// Every step is attempted, whatever failed before it (a partial erase leaves no more
-    /// than it must). `Ok(true)` only if both keys were destroyed and the files are gone.
+    /// Both stores are attempted whatever the other did. The directory goes only if neither
+    /// refused (a store still open refuses: its files are never pulled from under it).
+    /// `Ok(true)` only if both keys were destroyed and the files are gone.
     async fn erase(&self, store_id: &str) -> Result<bool, StoreError> {
         let dir = self.dir(store_id);
         let keys = KeyStore::new(self.keys.slots());
@@ -203,14 +204,12 @@ impl LocalData {
         tokio::task::spawn_blocking(move || {
             let cache = store::reset(&dir, Kind::Cache, &id, &keys);
             let outbox = store::reset(&dir, Kind::Outbox, &id, &keys);
-            let files = match std::fs::remove_dir_all(&dir) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(_) => Err(StoreError::Io),
-            };
             let keys_gone = cache? & outbox?; // both attempted before either error returns
-            files?;
-            Ok(keys_gone)
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => Ok(keys_gone),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(keys_gone),
+                Err(_) => Err(StoreError::Io),
+            }
         })
         .await
         .map_err(|_| StoreError::Io)?
@@ -250,7 +249,7 @@ impl LocalData {
             // Store ids are 32 hex characters: nothing else here is ours to erase.
             let ours = name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit());
             if kind.is_dir() && ours && !known.contains(&name) {
-                if entry.path().join("outbox.db").exists() {
+                if self.orphan_had_unsent(&name).await {
                     self.lost_unsent
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -260,6 +259,39 @@ impl LocalData {
         Ok(())
     }
 
+    /// Whether an ownerless store's outbox holds anything unsent. Its own key usually
+    /// survives the index's, so it is read; an outbox that can't be read counts as holding
+    /// something (saying "lost" wrongly beats losing messages silently).
+    async fn orphan_had_unsent(&self, store_id: &str) -> bool {
+        let dir = self.dir(store_id);
+        if !dir.join("outbox.db").exists() {
+            return false;
+        }
+        let keys = KeyStore::new(self.keys.slots());
+        let id = store_id.to_string();
+        let opened =
+            tokio::task::spawn_blocking(move || store::open(&dir, Kind::Outbox, &id, &keys)).await;
+        let (db, rebuilt) = match opened {
+            Ok(Ok(Opened::Ready { db, rebuilt })) => (db, rebuilt),
+            _ => return true,
+        };
+        if rebuilt.is_some() {
+            db.close().await; // closed before the erase that follows, which needs it shut
+            return true; // its key was gone: whatever it held is unreadable
+        }
+        let count = db
+            .call(|c| {
+                c.query_row(
+                    "SELECT count(*) FROM outbox WHERE state != 'accepted'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .await;
+        db.close().await;
+        !matches!(count, Ok(0))
+    }
+
     /// Whether a store with an outbox was erased for want of an owner (then cleared): the app
     /// says once that unsent messages were lost.
     pub(crate) fn take_lost_unsent(&self) -> bool {
@@ -267,7 +299,6 @@ impl LocalData {
             .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // tests reopen the index
     pub(crate) async fn close(self) {
         self.index.close().await;
     }
