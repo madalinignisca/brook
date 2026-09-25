@@ -23,6 +23,10 @@ class PasswordChangeIn(BaseModel):
     # accounts may predate the policy. The cap bounds argon2 work per request.
     current_password: str = Field(max_length=256)
     new_password: str = Field(min_length=8, max_length=256)
+    # The "Sign out of other devices" checkbox, on by default: revoke every other
+    # session at once (refresh tokens, access tokens, open sockets). Off keeps the
+    # other devices signed in, e.g. a routine change on a trusted set of devices.
+    sign_out_other_devices: bool = True
 
 
 class AdminPasswordIn(BaseModel):
@@ -52,6 +56,17 @@ class TokenPair(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"  # noqa: S105 - field name trips the secret heuristic; not a secret
+
+
+class PasswordChangeOut(TokenPair):
+    """``POST /auth/password``: the new pair, plus what the server actually did.
+
+    The protocol has no capability signal, so a client cannot know whether a
+    server understood ``sign_out_other_devices``. Echoing the outcome lets it
+    word its message from what happened; a missing field means an older server
+    (which always signed out the other devices' refresh tokens)."""
+
+    other_devices_signed_out: bool
 
 
 class UserOut(BaseModel):
