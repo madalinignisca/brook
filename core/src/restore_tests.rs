@@ -666,3 +666,73 @@ async fn a_4xx_not_from_the_api_never_signs_out() {
     );
     assert_eq!(stored_token(&slot, &server), None);
 }
+
+// ---- H3: a restore that loses the slot revokes nothing ----
+
+/// Waits for the gated refresh to reach the server.
+async fn refresh_arrived(server: &TestServer, before: u32) {
+    for _ in 0..300 {
+        if server.refresh_calls() > before {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the restore's refresh never arrived");
+}
+
+/// A newer client takes the slot while an older client's restore is refreshing: the pair
+/// that restore got is in the same login as whatever the newer client restores, and the
+/// server ends a whole login on logout, so revoking it would sign the newer client out.
+#[tokio::test]
+async fn a_restore_that_loses_the_slot_revokes_nothing() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    drop(signed_in(&server, &slot, dir.path(), "alice").await);
+    let old = client(&server, &slot, dir.path());
+    let gate = server.gate_refresh();
+    let before = server.refresh_calls();
+    let restore = tokio::spawn({
+        let old = old.clone();
+        async move { old.restore().await }
+    });
+    refresh_arrived(&server, before).await;
+    let _newer = client(&server, &slot, dir.path()); // takes the slot
+    gate.add_permits(1);
+    let outcome = restore.await.unwrap();
+    assert!(matches!(outcome, RestoreOutcome::Superseded), "{outcome:?}");
+    tokio::time::sleep(Duration::from_millis(200)).await; // a detached revoke would be out
+    assert!(
+        server.logouts().is_empty(),
+        "the restore revoked a login the newer client shares"
+    );
+}
+
+/// A sign-out that wins against a restore still revokes the pair the restore got: that
+/// login is nobody's.
+#[tokio::test]
+async fn a_restore_overtaken_by_a_sign_out_revokes_its_pair() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    drop(signed_in(&server, &slot, dir.path(), "alice").await);
+    let old = client(&server, &slot, dir.path());
+    let gate = server.gate_refresh();
+    let before = server.refresh_calls();
+    let restore = tokio::spawn({
+        let old = old.clone();
+        async move { old.restore().await }
+    });
+    refresh_arrived(&server, before).await;
+    old.logout().await;
+    gate.add_permits(1);
+    let outcome = restore.await.unwrap();
+    assert!(matches!(outcome, RestoreOutcome::Superseded), "{outcome:?}");
+    for _ in 0..300 {
+        if !server.logouts().is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the orphaned pair was never revoked");
+}

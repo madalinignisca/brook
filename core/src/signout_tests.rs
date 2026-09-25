@@ -68,6 +68,41 @@ async fn logout_revokes_the_session_and_publishes_logged_out() {
     assert!(server.live_refresh_tokens("alice").is_empty());
 }
 
+/// When `logout` returns, the server has heard it: an app quitting right after (Sign Out,
+/// then Quit) doesn't leave the refresh token live.
+#[tokio::test]
+async fn logout_returns_once_the_server_heard_it() {
+    let server = strict().await;
+    let client = signed_in(&server, "alice").await;
+    let token = refresh_token(&client).await;
+    client.logout().await;
+    assert_eq!(
+        server.logouts(),
+        vec![token],
+        "logout returned before the revoke went out"
+    );
+}
+
+/// A server that doesn't answer delays the sign-out by the bound at most; it is local and
+/// already done by then.
+#[tokio::test]
+async fn logout_waits_for_the_revoke_only_so_long() {
+    let server = strict().await;
+    let mut client = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+    client.revoke_wait = Duration::from_millis(200);
+    client.login("alice", "pw").await.unwrap();
+    server.set_stall_logout(true);
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(2), client.logout())
+        .await
+        .expect("logout waited past its bound");
+    assert!(
+        started.elapsed() >= Duration::from_millis(150),
+        "it didn't wait at all"
+    );
+    assert!(logged_out(&client));
+}
+
 #[tokio::test]
 async fn logout_without_a_session_sends_nothing() {
     let server = strict().await;

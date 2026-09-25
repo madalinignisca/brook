@@ -10,7 +10,7 @@ use serde_json::json;
 use tokio::sync::{broadcast, watch};
 use url::Url;
 
-use crate::session_store::{RefreshApplied, Revision, SessionStore};
+use crate::session_store::{Install, RefreshApplied, Revision, SessionStore};
 use crate::ws::{self, Commands, ServerEvent, Transport};
 use crate::{
     AuthState, Channel, CoreConfig, Error, Message, ReactionSummary, Result, Session, User,
@@ -106,6 +106,8 @@ pub struct BrookClient {
     transport: std::sync::Mutex<Option<Transport>>,
     /// Bound on a password change's locked section (tests shorten it).
     pub(crate) locked_bound: std::time::Duration,
+    /// How long `logout` waits for the server to hear the revoke (tests shorten it).
+    pub(crate) revoke_wait: std::time::Duration,
     /// Attachment transfers: progress events and cancel flags (transfer.rs).
     pub(crate) transfers: crate::transfer::Transfers,
     /// Dropped with the client: the background loops end on it, from whatever wait.
@@ -162,6 +164,7 @@ impl BrookClient {
             commands,
             transport: std::sync::Mutex::new(Some(transport)),
             locked_bound: std::time::Duration::from_secs(30),
+            revoke_wait: std::time::Duration::from_secs(3),
             transfers: crate::transfer::Transfers::new(),
             shutdown,
             tasks: std::sync::Mutex::default(),
@@ -178,7 +181,13 @@ impl BrookClient {
     pub async fn logout(&self) {
         self.session.note_runtime();
         if let Some(old) = self.session.sign_out(false).await {
-            self.session.revoke_detached(old.refresh_token);
+            // Signed out locally already. Wait a moment for the server to hear it: an app
+            // that quits right after (Sign Out, then Quit) would otherwise kill the request
+            // and leave the refresh token live on the server until it expires. Past the
+            // bound the request carries on detached; the sign-out never waits longer.
+            if let Some(revoke) = self.session.revoke_detached(old.refresh_token) {
+                let _ = tokio::time::timeout(self.revoke_wait, revoke).await;
+            }
         }
     }
 
@@ -352,11 +361,16 @@ impl BrookClient {
             };
             let user = restored.user.clone();
             // Install and re-store in one write section, only if still current.
-            if session.install_for_login(gen, restored.clone()).await {
-                RestoreOutcome::LoggedIn(user)
-            } else {
-                session.revoke_detached(restored.refresh_token);
-                RestoreOutcome::Superseded
+            match session.install_for_login(gen, restored.clone()).await {
+                Install::Installed => RestoreOutcome::LoggedIn(user),
+                Install::Stale => {
+                    session.revoke_detached(restored.refresh_token);
+                    RestoreOutcome::Superseded
+                }
+                // Refreshed from the stored token, so it's the same login as the newer
+                // client that took the slot: the server ends a whole login on logout, and
+                // revoking this would sign that client out. It's left to expire.
+                Install::SlotTaken => RestoreOutcome::Superseded,
             }
         });
         task.await.unwrap_or(RestoreOutcome::Offline)
@@ -444,7 +458,9 @@ impl BrookClient {
                             return Err(err);
                         }
                     };
-                    if session.install_for_login(gen, new.clone()).await {
+                    // A fresh login is a login of its own: whatever refused it, revoking it
+                    // touches nobody else.
+                    if session.install_for_login(gen, new.clone()).await == Install::Installed {
                         Ok(LoginOutcome::LoggedIn(new)) // LoggedIn published by the install
                     } else {
                         session.revoke_detached(new.refresh_token); // superseded meanwhile
