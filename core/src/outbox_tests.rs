@@ -711,3 +711,118 @@ async fn a_refused_token_is_retried() {
     s.outbox.enqueue("c1", "after refresh", None).await.unwrap();
     drained(&s).await;
 }
+
+// ---- Review round 2 ----
+
+/// A server saying "retry now" while the store can't record "pending": still no tight loop.
+#[tokio::test]
+async fn retry_after_zero_with_a_failing_store_is_still_bounded() {
+    let s = setup().await;
+    trigger(
+        &s,
+        "CREATE TEMP TRIGGER nopending BEFORE UPDATE ON outbox WHEN NEW.state = 'pending'
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .await;
+    for _ in 0..50 {
+        s.server.script([Answer::Fail(SendFailure::Transient {
+            retry_after: Some(0),
+        })]);
+    }
+    s.outbox.enqueue("c1", "busy", None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let n = s.server.sends().len();
+    assert!(n <= 2, "re-sent {n} times in 1.5 s");
+}
+
+/// A post that the cache can never take: accepted, one more try, then the row goes (the
+/// server has it; /sync brings it) instead of being resent forever. A refusal after
+/// acceptance never turns it into "failed".
+#[tokio::test]
+async fn an_accepted_row_is_never_resent_forever_nor_failed() {
+    struct Garbled(Arc<Server>);
+    #[async_trait::async_trait]
+    impl Post for Garbled {
+        async fn send(
+            &self,
+            ch: &str,
+            body: &str,
+            cid: &str,
+            e: u64,
+        ) -> Result<Value, SendFailure> {
+            let mut m = self.0.send(ch, body, cid, e).await?;
+            m.as_object_mut().unwrap().remove("created_at");
+            Ok(m)
+        }
+    }
+    for then in [
+        Answer::Ok,
+        Answer::Fail(SendFailure::Refused {
+            code: "authz.forbidden".into(),
+        }),
+    ] {
+        let s = setup().await;
+        let slot = Arc::new(InMemoryKeySlot::default());
+        let dir = tempfile::tempdir().unwrap();
+        let (_session, rx) = watch::channel(Some(1));
+        s.server.script([Answer::Ok, then]);
+        let outbox = Outbox::open(
+            open_db(dir.path(), Kind::Outbox, &slot),
+            s.cache.clone(),
+            Arc::new(Garbled(s.server.clone())),
+            rx,
+        )
+        .await
+        .unwrap();
+        outbox.enqueue("c1", "sent", None).await.unwrap();
+        let o = outbox.clone();
+        let mut gone = false;
+        for _ in 0..600 {
+            let rows = o.pending("c1").await.unwrap();
+            assert!(
+                !rows
+                    .iter()
+                    .any(|m| matches!(m.state, PendingState::Failed { .. })),
+                "an accepted message was marked failed"
+            );
+            if rows.is_empty() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(gone, "the accepted row never went");
+        assert!(s.server.sends().len() <= 2);
+    }
+}
+
+#[tokio::test]
+async fn an_id_queued_for_another_channel_is_refused() {
+    let s = setup().await;
+    s.session.send_replace(None);
+    let id = s.outbox.enqueue("c1", "here", None).await.unwrap();
+    assert_eq!(
+        s.outbox.enqueue("c2", "there", Some(id.clone())).await,
+        Err(OutboxError::IdInUse)
+    );
+    // The same channel again is the same message (a retry), not an error.
+    assert_eq!(
+        s.outbox.enqueue("c1", "here", Some(id.clone())).await,
+        Ok(id)
+    );
+}
+
+/// "Retry now" from the server still waits at least a second between sends.
+#[tokio::test]
+async fn retry_after_zero_waits_at_least_a_second() {
+    let s = setup().await;
+    for _ in 0..50 {
+        s.server.script([Answer::Fail(SendFailure::Transient {
+            retry_after: Some(0),
+        })]);
+    }
+    s.outbox.enqueue("c1", "busy", None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let n = s.server.sends().len();
+    assert!(n <= 2, "re-sent {n} times in 1.5 s");
+}

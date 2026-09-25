@@ -109,6 +109,9 @@ pub enum OutboxError {
     NotSent { client_id: String, reason: String },
     #[error("the outbox is closed")]
     Closed,
+    /// This `client_id` is already queued for another channel.
+    #[error("that message id is already used")]
+    IdInUse,
 }
 
 /// Transient failures back off up to this.
@@ -278,6 +281,27 @@ impl Outbox {
             })
             .await;
         match queued {
+            Ok(0) => {
+                // The id is taken: the same message again (the stored one wins), unless it
+                // was queued for another channel, where it would never be sent.
+                let cid = client_id.clone();
+                let theirs: String = self
+                    .db
+                    .call(move |c| {
+                        c.query_row(
+                            "SELECT channel_id FROM outbox WHERE client_id = ?1",
+                            [&cid],
+                            |r| r.get(0),
+                        )
+                    })
+                    .await
+                    .map_err(|_| OutboxError::Store)?;
+                if theirs != channel_id {
+                    return Err(OutboxError::IdInUse);
+                }
+                sender.wake.notify_one();
+                Ok(client_id)
+            }
             Ok(_) => {
                 sender.wake.notify_one();
                 Ok(client_id)
@@ -297,6 +321,7 @@ impl Outbox {
         client_id: String,
     ) -> Result<String, OutboxError> {
         let _held = sender.lock.lock().await;
+        self.check_open()?; // closed while waiting for the lock
         let Some(epoch) = *self.session.borrow() else {
             return Err(OutboxError::SignedOut);
         };
@@ -460,7 +485,9 @@ impl Outbox {
             };
             let held = sender.lock.lock().await;
             let next = match self.next_row(channel_id).await {
-                Ok(Some((client_id, body, failed))) if !failed => (client_id, body),
+                Ok(Some((client_id, body, state))) if state != "failed" => {
+                    (client_id, body, state == "accepted")
+                }
                 // Nothing waiting, blocked by a failed row (until Retry or Delete), or the
                 // store can't be read (until it comes back): wait, bounded.
                 _ => {
@@ -469,7 +496,9 @@ impl Outbox {
                     continue;
                 }
             };
-            let outcome = self.attempt(channel_id, &next.0, &next.1, epoch).await;
+            let outcome = self
+                .attempt(channel_id, &next.0, &next.1, next.2, epoch)
+                .await;
             drop(held);
             match outcome {
                 Attempt::Next => backoff = Duration::from_secs(1),
@@ -485,13 +514,13 @@ impl Outbox {
     async fn next_row(
         &self,
         channel_id: &str,
-    ) -> Result<Option<(String, String, bool)>, StoreError> {
+    ) -> Result<Option<(String, String, String)>, StoreError> {
         let ch = channel_id.to_string();
         self.db
             .call(move |c| {
                 use rusqlite::OptionalExtension;
                 c.query_row(
-                    "SELECT client_id, body, state = 'failed' FROM outbox
+                    "SELECT client_id, body, state FROM outbox
                      WHERE channel_id = ?1 ORDER BY ordinal LIMIT 1",
                     [&ch],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -524,23 +553,35 @@ impl Outbox {
         *self.session.borrow() == Some(epoch)
     }
 
-    async fn attempt(&self, channel_id: &str, client_id: &str, body: &str, epoch: u64) -> Attempt {
+    /// One send of the channel's first row. `accepted`: the server already took it (only its
+    /// acknowledgement couldn't be stored); that knowledge is never overwritten.
+    async fn attempt(
+        &self,
+        channel_id: &str,
+        client_id: &str,
+        body: &str,
+        accepted: bool,
+        epoch: u64,
+    ) -> Attempt {
+        // What a retryable outcome leaves the row as.
+        let waiting = if accepted { "accepted" } else { "pending" };
         // Every outcome below is recorded before the next attempt; a store that can't
         // record it means waiting, never re-sending in a tight loop.
-        if self.set_state(client_id, "sending", None).await.is_err() {
+        if !accepted && self.set_state(client_id, "sending", None).await.is_err() {
             return Attempt::Wait(None);
         }
-        // Checked right before sending, after every await, and handed to `Post`.
+        // Checked right before sending, after every await, and handed to `Post`. (A POST
+        // already on the wire when a sign-out lands can't be taken back; it carries this
+        // user's old token, never the next session's.)
         if !self.current(epoch) {
-            let _ = self.set_state(client_id, "pending", None).await;
+            let _ = self.set_state(client_id, waiting, None).await;
             return Attempt::Next; // the loop pauses until the next sign-in
         }
         let answer = self.post.send(channel_id, body, client_id, epoch).await;
         if !self.current(epoch) {
-            // Signed out (or someone else signed in) while it was out: this session's
-            // result isn't applied here. The row stays; the server answers a resend with
-            // the stored message if it took this one.
-            let _ = self.set_state(client_id, "pending", None).await;
+            // Signed out (or someone else signed in) while it was out: not applied here.
+            // The row stays; a resend is answered with the stored message.
+            let _ = self.set_state(client_id, waiting, None).await;
             return Attempt::Next;
         }
         match answer {
@@ -557,23 +598,17 @@ impl Outbox {
                     };
                 }
                 // 1. the message into the cache, committed; 2. only then, the row goes.
-                if self.cache.apply_ack(&message).await.is_err() {
+                // The second time the cache can't take it, the row goes anyway: the server
+                // has the message and /sync brings it (never resent forever).
+                if self.cache.apply_ack(&message).await.is_err() && !accepted {
                     let _ = self.set_state(client_id, "accepted", None).await;
                     return Attempt::Wait(None);
                 }
-                let cid = client_id.to_string();
-                match self
-                    .db
-                    .call(move |c| c.execute("DELETE FROM outbox WHERE client_id = ?1", [&cid]))
-                    .await
-                {
-                    Ok(_) => Attempt::Next,
-                    Err(_) => {
-                        let _ = self.set_state(client_id, "accepted", None).await;
-                        Attempt::Wait(None)
-                    }
-                }
+                self.drop_row(client_id, accepted).await
             }
+            // The server has an accepted message: a later refusal (removed from the channel
+            // meanwhile) only means it can't be fetched back here. It stays sent.
+            Err(SendFailure::Refused { .. }) if accepted => self.drop_row(client_id, true).await,
             Err(SendFailure::Refused { code }) => {
                 match self.set_state(client_id, "failed", Some(code)).await {
                     Ok(()) => Attempt::Next,
@@ -581,8 +616,29 @@ impl Outbox {
                 }
             }
             Err(SendFailure::Transient { retry_after }) => {
-                let _ = self.set_state(client_id, "pending", None).await;
-                Attempt::Wait(retry_after.map(Duration::from_secs))
+                if self.set_state(client_id, waiting, None).await.is_err() {
+                    return Attempt::Wait(None);
+                }
+                // At least a second, whatever the server said: never a tight loop.
+                Attempt::Wait(retry_after.map(|s| Duration::from_secs(s.max(1))))
+            }
+        }
+    }
+
+    /// The message is on the server: its row goes.
+    async fn drop_row(&self, client_id: &str, accepted: bool) -> Attempt {
+        let cid = client_id.to_string();
+        match self
+            .db
+            .call(move |c| c.execute("DELETE FROM outbox WHERE client_id = ?1", [&cid]))
+            .await
+        {
+            Ok(_) => Attempt::Next,
+            Err(_) => {
+                if !accepted {
+                    let _ = self.set_state(client_id, "accepted", None).await;
+                }
+                Attempt::Wait(None)
             }
         }
     }
