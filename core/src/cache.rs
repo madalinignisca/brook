@@ -114,6 +114,8 @@ impl Cache {
         })
     }
 
+    /// Change notices. A receiver that falls behind gets `RecvError::Lagged`: it missed
+    /// notices, so it re-reads everything it shows (the cache itself lost nothing).
     pub(crate) fn events(&self) -> broadcast::Receiver<CacheEvent> {
         self.events.subscribe()
     }
@@ -158,21 +160,19 @@ impl Cache {
     /// once more instead (it may already have fetched past the change that asked).
     pub(crate) async fn sync_now(&self) -> Result<(), SyncError> {
         use std::sync::atomic::Ordering;
+        // The request is recorded before trying the lock: either the owner sees it (it
+        // checks after every run and again after letting go), or the lock is free and this
+        // caller runs it. No moment exists where neither happens.
+        self.again.store(true, Ordering::SeqCst);
         loop {
             let Ok(run) = self.running.try_lock() else {
-                self.again.store(true, Ordering::SeqCst);
                 return Ok(());
             };
-            loop {
-                self.again.store(false, Ordering::SeqCst);
+            // Each run starts after the requests it clears, so it covers them.
+            while self.again.swap(false, Ordering::SeqCst) {
                 self.run_once().await?;
-                if !self.again.load(Ordering::SeqCst) {
-                    break;
-                }
             }
             drop(run);
-            // Asked between our last check and letting go: nobody else took it, so go
-            // round again ourselves (or leave it to whoever holds the lock now).
             if !self.again.load(Ordering::SeqCst) {
                 return Ok(());
             }
@@ -187,18 +187,25 @@ impl Cache {
                 self.0.send_modify(|s| s.syncing = false);
             }
         }
+        /// What committed pages changed, announced however the run ends: after an error,
+        /// and also if the run is cancelled mid-way (the next run starts after them).
+        struct Announce<'a>(&'a Cache, Applied);
+        impl Drop for Announce<'_> {
+            fn drop(&mut self) {
+                self.0.notify(std::mem::take(&mut self.1));
+            }
+        }
         self.state.send_modify(|s| s.syncing = true);
         let _syncing = Syncing(&self.state);
-        let mut applied = Applied::default();
-        let result = sync::run_into(&self.db, &self.me, self.fetch.as_ref(), &mut applied).await;
+        let mut applied = Announce(self, Applied::default());
+        let result = sync::run_into(&self.db, &self.me, self.fetch.as_ref(), &mut applied.1).await;
         self.state.send_modify(|s| {
             s.offline = matches!(result, Err(SyncError::Net(_)));
             if result.is_ok() {
                 s.last_synced = Some(SystemTime::now());
             }
         });
-        // Pages committed before a failure are reported too.
-        self.notify(applied);
+        drop(applied); // announced now, before the outcome's own events
         match result {
             Ok(Synced::Done(_)) => Ok(()),
             Ok(Synced::Reset) => {
@@ -323,10 +330,21 @@ impl Cache {
                     Some(r) => {
                         // Nothing above the range's top: a live message there may follow one
                         // not delivered yet (the next sync, or `load_head`, settles it).
-                        let top_ok = messages.first().and_then(id_of).is_none_or(|first| {
+                        // Measured at the page's upper edge: `before` when paging, else the
+                        // first message that isn't a tombstone (the head fetch, which omits
+                        // deleted messages, proved nothing live sits above the range).
+                        let deleted = |m: &&Value| {
+                            m.get("deleted").and_then(Value::as_bool) == Some(true)
+                                || m.get("deleted_at").is_some_and(|d| !d.is_null())
+                        };
+                        let edge = match &before {
+                            Some(b) => Some(b.clone()),
+                            None => messages.iter().find(|m| !deleted(m)).and_then(id_of),
+                        };
+                        let top_ok = edge.is_none_or(|edge| {
                             r.newest_id
                                 .as_deref()
-                                .is_some_and(|top| first.as_str() <= top)
+                                .is_some_and(|top| edge.as_str() <= top)
                         });
                         // Down to the start, or a full page that ends inside the range.
                         let bottom_ok = r.complete_to_start
@@ -414,7 +432,16 @@ impl Cache {
                 let unchanged_floor = floor_at(&tx, &id)? == floor
                     && tx
                         .query_row("SELECT 1 FROM channels WHERE id = ?1", [&id], |_| Ok(()))
-                        .is_ok();
+                        .is_ok()
+                    // An active removal fence rejects the page's rows (the caller isn't back
+                    // yet, whatever a channel row says).
+                    && tx
+                        .query_row(
+                            "SELECT 1 FROM removed WHERE channel_id = ?1 AND active = 1",
+                            [&id],
+                            |_| Ok(()),
+                        )
+                        .is_err();
                 let applied = apply(
                     &tx,
                     &me,

@@ -633,3 +633,119 @@ async fn a_range_that_grows_is_announced() {
             .needs_network
     );
 }
+
+// ---- Review round 2 ----
+
+/// Paging from a live message above the range: the gap below it is unverified.
+#[tokio::test]
+async fn paging_from_above_the_range_needs_the_network() {
+    let s = setup(
+        vec![page(9, None, vec![], vec![])],
+        Hist {
+            ids: vec!["m5", "m4"],
+            gate: None,
+        },
+        None,
+    );
+    s.cache.sync_now().await.unwrap();
+    s.cache.load_head("c", 50).await.unwrap();
+    s.cache
+        .live_event("message.new", &msg("m7", "c", 12, "bob", "live"))
+        .await;
+    let p = s.cache.cached_messages("c", Some("m7"), 2).await.unwrap();
+    assert_eq!(ids(&p.messages), vec!["m5", "m4"]);
+    assert!(
+        p.needs_network,
+        "m6 may be missing between m7 and the range"
+    );
+}
+
+/// A tombstone above the newest surviving message: history never lists it, and it hides
+/// nothing, so the head page is complete after one load.
+#[tokio::test]
+async fn a_tombstone_above_the_head_does_not_keep_it_incomplete() {
+    let mut tomb = msg("m2", "c", 8, "bob", "");
+    tomb["deleted_at"] = json!("2026-09-25T11:00:00Z");
+    let s = setup(
+        vec![page(9, None, vec![tomb], vec![])],
+        Hist {
+            ids: vec!["m1"],
+            gate: None,
+        },
+        None,
+    );
+    s.cache.sync_now().await.unwrap();
+    s.cache.load_head("c", 50).await.unwrap();
+    let p = s.cache.cached_messages("c", None, 50).await.unwrap();
+    assert_eq!(ids(&p.messages), vec!["m2", "m1"]);
+    assert!(!p.needs_network);
+}
+
+/// Removed, then a channel row (not the caller's membership) brings the channel back: the
+/// fence still rejects history, so no coverage is recorded from it.
+#[tokio::test]
+async fn history_under_an_active_fence_leaves_no_coverage() {
+    let s = setup(
+        vec![page(9, None, vec![], vec![])],
+        Hist {
+            ids: vec!["m2", "m1"],
+            gate: None,
+        },
+        None,
+    );
+    s.cache.sync_now().await.unwrap();
+    s.cache
+        .live_event("channel.delete", &json!({ "id": "c", "seq": 20 }))
+        .await;
+    s.cache
+        .live_event(
+            "channel.update",
+            &json!({ "id": "c", "name": "general", "seq": 21 }),
+        )
+        .await;
+    s.cache.load_head("c", 50).await.unwrap();
+    let p = s.cache.cached_messages("c", None, 50).await.unwrap();
+    assert!(p.messages.is_empty());
+    assert!(p.needs_network, "coverage from rejected rows");
+}
+
+/// Cancelled while page two is out: page one's committed changes are still announced.
+#[tokio::test]
+async fn a_cancelled_run_still_announces_what_it_committed() {
+    struct OneThenHang(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Fetch for OneThenHang {
+        async fn page(&self, _since: &str) -> Result<Page, crate::Error> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                let mut p = page(5, None, vec![msg("m1", "c", 4, "bob", "a")], vec![]);
+                p["more"] = json!(true);
+                return Ok(Page::Rows(p));
+            }
+            std::future::pending().await
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let slot: Arc<dyn KeySlot> = Arc::new(InMemoryKeySlot::default());
+    let db = match store::open(dir.path(), Kind::Cache, "s", &KeyStore::new(slot)).unwrap() {
+        Opened::Ready { db, .. } => db,
+        other => panic!("{other:?}"),
+    };
+    let fetch = Arc::new(OneThenHang(AtomicUsize::new(0)));
+    let cache = Cache::new(db, ME.into(), fetch.clone(), Arc::new(no_history()));
+    let mut events = cache.events();
+    let run = tokio::spawn({
+        let c = cache.clone();
+        async move { c.sync_now().await }
+    });
+    let f = fetch.clone();
+    eventually("page two requested", move || {
+        f.0.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    run.abort();
+    let _ = run.await;
+    assert_eq!(
+        events.try_recv().ok(),
+        Some(CacheEvent::Channels(vec!["c".into()]))
+    );
+}
