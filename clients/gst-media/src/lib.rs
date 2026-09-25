@@ -25,7 +25,7 @@ use std::time::Duration;
 use gst::prelude::*;
 use tokio::sync::{mpsc, oneshot};
 
-pub use brook_core::{IceCandidate, IceServer, PcKind, SubStream};
+pub use brook_core::{IceCandidate, IceServer, MediaKind, MediaSource, PcKind, SubStream};
 
 /// Result alias for engine operations.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -177,6 +177,14 @@ pub enum EngineEvent {
         /// The new state.
         state: gst_webrtc::WebRTCPeerConnectionState,
     },
+    /// The screen share stopped on its own (the user ended it from the
+    /// desktop's sharing indicator, or the shared window closed). Only the
+    /// share is affected: stop it ([`GstEngine::stop_screen_share`]) and
+    /// renegotiate; the call goes on.
+    ScreenShareEnded {
+        /// What the capture reported, for logs.
+        message: String,
+    },
     /// A pipeline error (device gone, encoder failure, ...).
     Error {
         /// Which PC's pipeline failed.
@@ -199,6 +207,141 @@ pub struct GstEngine {
     /// The user's mic/camera state, applied to the publish pipeline when it
     /// exists (a toggle before the first offer must not be lost).
     media: Mutex<(bool, bool)>,
+    /// The screen-share m-line, once a share was started (kept, inactive,
+    /// after a stop so the next share reuses it).
+    screen: Mutex<Option<ScreenShare>>,
+}
+
+/// Where a screen share comes from.
+#[derive(Debug)]
+pub enum ScreenSource {
+    /// A stream from the xdg-desktop-portal ScreenCast portal: the PipeWire
+    /// remote fd and the stream's node id (see [`request_screen_cast`]).
+    Portal {
+        /// `OpenPipeWireRemote` fd; kept open for as long as the share runs.
+        fd: std::os::fd::OwnedFd,
+        /// The PipeWire node of the chosen screen/window.
+        node: u32,
+        /// The portal session; closing it ends the desktop's "sharing" state.
+        session: PortalSession,
+    },
+    /// A synthetic pattern (tests).
+    Test,
+}
+
+/// An open ScreenCast portal session. Close it when sharing stops, so the
+/// desktop drops its "screen is being shared" indicator
+/// ([`GstEngine::stop_screen_share`] hands it back for that).
+pub struct PortalSession(ashpd::desktop::Session<ashpd::desktop::screencast::Screencast>);
+
+impl std::fmt::Debug for PortalSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PortalSession")
+    }
+}
+
+impl PortalSession {
+    /// End the session (async: call it on the app's Tokio runtime).
+    pub async fn close(self) {
+        if let Err(err) = self.0.close().await {
+            tracing::debug!(%err, "closing the screen-cast session");
+        }
+    }
+}
+
+/// One labelled m-line of the publish offer: core's [`brook_core::TrackLabel`]
+/// (`call.publish` `tracks`).
+pub type PublishTrack = brook_core::TrackLabel;
+
+/// Ask the desktop for a screen or window to share through the
+/// xdg-desktop-portal ScreenCast portal: the desktop shows its own picker and
+/// asks for consent (works on Plasma, GNOME and wlroots). Returns a source for
+/// [`GstEngine::start_screen_share`], or an error if the user cancelled.
+pub async fn request_screen_cast() -> Result<ScreenSource> {
+    use ashpd::desktop::screencast::{
+        CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType,
+        StartCastOptions,
+    };
+    use ashpd::desktop::{CreateSessionOptions, PersistMode};
+
+    let portal = |e: ashpd::Error| Error::Setup(format!("screen-cast portal: {e}"));
+    let proxy = Screencast::new().await.map_err(portal)?;
+    let session = proxy
+        .create_session(CreateSessionOptions::default())
+        .await
+        .map_err(portal)?;
+    proxy
+        .select_sources(
+            &session,
+            SelectSourcesOptions::default()
+                .set_cursor_mode(CursorMode::Embedded)
+                .set_sources(SourceType::Monitor | SourceType::Window)
+                .set_multiple(false)
+                .set_persist_mode(PersistMode::DoNot),
+        )
+        .await
+        .map_err(portal)?
+        .response()
+        .map_err(portal)?;
+    let streams = proxy
+        .start(&session, None, StartCastOptions::default())
+        .await
+        .map_err(portal)?
+        .response()
+        .map_err(portal)?;
+    let node = streams
+        .streams()
+        .first()
+        .ok_or(Error::State("no screen or window was chosen"))?
+        .pipe_wire_node_id();
+    let fd = proxy
+        .open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default())
+        .await
+        .map_err(portal)?;
+    Ok(ScreenSource::Portal {
+        fd,
+        node,
+        session: PortalSession(session),
+    })
+}
+
+/// A transceiver's media kind from the caps on the webrtcbin sink pad
+/// feeding it (`application/x-rtp, media=audio|video`).
+fn kind_from_pad_caps(
+    webrtc: &gst::Element,
+    transceiver: &gst_webrtc::WebRTCRTPTransceiver,
+) -> MediaKind {
+    webrtc
+        .sink_pads()
+        .into_iter()
+        .find(|pad| {
+            pad.property::<Option<gst_webrtc::WebRTCRTPTransceiver>>("transceiver")
+                .as_ref()
+                == Some(transceiver)
+        })
+        .and_then(|pad| pad.current_caps())
+        .and_then(|caps| {
+            caps.structure(0)
+                .and_then(|s| s.get::<String>("media").ok())
+        })
+        .map_or(MediaKind::Unknown, |media| match media.as_str() {
+            "audio" => MediaKind::Audio,
+            "video" => MediaKind::Video,
+            _ => MediaKind::Unknown,
+        })
+}
+
+/// The screen-share branch of the publish pipeline.
+struct ScreenShare {
+    /// The webrtcbin sink pad (and so the transceiver/m-line) it feeds.
+    pad: gst::Pad,
+    transceiver: gst_webrtc::WebRTCRTPTransceiver,
+    /// The capture + encode branch while sharing; `None` once stopped.
+    branch: Option<gst::Bin>,
+    /// The portal's PipeWire fd, held while sharing.
+    _fd: Option<std::os::fd::OwnedFd>,
+    /// The portal session, handed back on stop.
+    session: Option<PortalSession>,
 }
 
 /// One PeerConnection: a pipeline with a `webrtcbin` named `webrtc`.
@@ -214,6 +357,9 @@ impl Drop for Pc {
         }
     }
 }
+
+/// Element name of the screen-share branch in the publish pipeline.
+const SCREEN_BRANCH: &str = "screen_share";
 
 /// How long to wait for capture/encoder caps before offering anyway.
 const CAPS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -242,6 +388,7 @@ impl GstEngine {
                 subscribe: Mutex::new(None),
                 closed: AtomicBool::new(false),
                 media: Mutex::new(media),
+                screen: Mutex::new(None),
             }),
             rx,
         ))
@@ -279,12 +426,17 @@ impl GstEngine {
             let media = self.media.lock().unwrap();
             self.apply_media(media.0, media.1)?;
         }
-        // The publish PC only sends (PROTOCOL.md §3.1).
+        // The publish PC only sends (PROTOCOL.md §3.1): new transceivers
+        // (webrtcbin makes them sendrecv) become sendonly; an inactive one (a
+        // stopped screen share) stays inactive.
         for t in transceivers(&webrtc) {
-            t.set_property(
-                "direction",
-                gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
-            );
+            let direction = t.property::<gst_webrtc::WebRTCRTPTransceiverDirection>("direction");
+            if direction != gst_webrtc::WebRTCRTPTransceiverDirection::Inactive {
+                t.set_property(
+                    "direction",
+                    gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
+                );
+            }
         }
 
         let offer = create_description(&webrtc, "create-offer", "offer").await?;
@@ -454,11 +606,184 @@ impl GstEngine {
         *self.ice_servers.lock().unwrap() = servers;
     }
 
+    /// Start sharing: add (or re-activate) a sendonly video m-line fed by
+    /// `source` on the publish PC. The caller then renegotiates (core:
+    /// `republish`). Screens go at 10 fps: they are mostly static and the
+    /// per-publisher bitrate cap is shared with the camera (MEDIA.md §6).
+    pub fn start_screen_share(&self, source: ScreenSource) -> Result<()> {
+        self.ensure_open()?;
+        let (pipeline, webrtc) = self
+            .publish
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|pc| (pc.pipeline.clone(), pc.webrtc.clone()))
+            .ok_or(Error::State("start publishing before sharing the screen"))?;
+        let mut screen = self.screen.lock().unwrap();
+        if screen.as_ref().is_some_and(|s| s.branch.is_some()) {
+            return Err(Error::State("already sharing the screen"));
+        }
+        let (src, fd, session) = match source {
+            ScreenSource::Portal { fd, node, session } => (
+                format!(
+                    "pipewiresrc name=scr_src fd={} path={node} do-timestamp=true keepalive-time=1000",
+                    std::os::fd::AsRawFd::as_raw_fd(&fd)
+                ),
+                Some(fd),
+                Some(session),
+            ),
+            ScreenSource::Test => (
+                "videotestsrc name=scr_src is-live=true pattern=smpte".to_string(),
+                None,
+                None,
+            ),
+        };
+        let encoder = video_encoder(&self.config, "senc", self.config.video_kbps.min(1000))?;
+        let desc = format!(
+            "{src} ! videoconvert ! videoscale ! videorate ! \
+             video/x-raw,width=[16,1920],height=[16,1080],framerate=10/1 ! \
+             queue leaky=downstream max-size-buffers=2 ! videoconvert ! {encoder} ! identity"
+        );
+        // (`identity`: a bin description can't end in a caps filter shorthand.)
+        let branch = gst::parse::bin_from_description(&desc, true)
+            .map_err(|e| Error::Setup(format!("screen branch: {e}")))?;
+        // Named so bus errors from inside it are told apart from the call's.
+        branch.set_property("name", SCREEN_BRANCH);
+        pipeline
+            .add(&branch)
+            .map_err(|e| Error::Setup(e.to_string()))?;
+        // Reuse the m-line of an earlier share, else request a new one.
+        let pad = match screen.as_ref() {
+            Some(s) => s.pad.clone(),
+            None => webrtc
+                .request_pad_simple("sink_%u")
+                .ok_or(Error::Setup("webrtcbin refused a new sink pad".into()))?,
+        };
+        let linked = branch
+            .static_pad("src")
+            .ok_or(Error::Setup("screen branch has no src pad".into()))
+            .and_then(|src| {
+                src.link(&pad)
+                    .map_err(|e| Error::Setup(format!("link screen: {e:?}")))
+            });
+        if let Err(err) = linked {
+            let _ = pipeline.remove(&branch);
+            return Err(err);
+        }
+        let transceiver = pad
+            .property::<Option<gst_webrtc::WebRTCRTPTransceiver>>("transceiver")
+            .ok_or(Error::Setup("screen pad has no transceiver".into()))?;
+        transceiver.set_property(
+            "direction",
+            gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
+        );
+        if let Err(e) = branch.sync_state_with_parent() {
+            let _ = branch.set_state(gst::State::Null);
+            if let Some(src) = branch.static_pad("src") {
+                let _ = src.unlink(&pad);
+            }
+            let _ = pipeline.remove(&branch);
+            return Err(Error::Setup(format!("start screen: {e}")));
+        }
+        *screen = Some(ScreenShare {
+            pad,
+            transceiver,
+            branch: Some(branch),
+            _fd: fd,
+            session,
+        });
+        Ok(())
+    }
+
+    /// Stop sharing: the capture branch stops and its m-line becomes
+    /// inactive at the next renegotiation (kept for the next share). Returns
+    /// the portal session, if any: close it ([`PortalSession::close`]).
+    pub fn stop_screen_share(&self) -> Result<Option<PortalSession>> {
+        let mut screen = self.screen.lock().unwrap();
+        let Some(share) = screen.as_mut().filter(|s| s.branch.is_some()) else {
+            return Err(Error::State("not sharing the screen"));
+        };
+        let branch = share.branch.take().expect("checked above");
+        share.transceiver.set_property(
+            "direction",
+            gst_webrtc::WebRTCRTPTransceiverDirection::Inactive,
+        );
+        // Stop streaming first, so unlinking never races a buffer push.
+        let _ = branch.set_state(gst::State::Null);
+        if let Some(src) = branch.static_pad("src") {
+            let _ = src.unlink(&share.pad);
+        }
+        if let Some(pipeline) = branch.parent().and_downcast::<gst::Pipeline>() {
+            let _ = pipeline.remove(&branch);
+        }
+        share._fd = None;
+        Ok(share.session.take())
+    }
+
+    /// Test hook: make the screen capture fail as if the desktop ended it.
+    #[doc(hidden)]
+    pub fn fail_screen_capture_for_test(&self) {
+        let source = self
+            .screen
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|s| s.branch.as_ref())
+            .and_then(|b| b.by_name("scr_src"));
+        if let Some(src) = source {
+            gst::element_error!(
+                src,
+                gst::ResourceError::Read,
+                ["stream ended by the desktop (test)"]
+            );
+        }
+    }
+
+    /// Labels for every m-line of the publish PC, as of the last offer:
+    /// audio -> mic, video -> camera, the share's m-line -> screen, including
+    /// a stopped (inactive) share: `call.publish` `tracks` must label every
+    /// m-line, and the server counts only active ones as published.
+    pub fn publish_tracks(&self) -> Vec<PublishTrack> {
+        let Some(webrtc) = self.webrtc(PcKind::Publish) else {
+            return Vec::new();
+        };
+        let screen = self
+            .screen
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.transceiver.clone());
+        transceivers(&webrtc)
+            .filter_map(|t| {
+                let mid = t.property::<Option<String>>("mid")?;
+                let is_screen = screen.as_ref() == Some(&t);
+                // webrtcbin fills in `kind` from caps only later, so a freshly
+                // added transceiver can still say unknown: the screen is video
+                // by definition, others fall back to their sink pad's caps.
+                let kind = match t.property::<gst_webrtc::WebRTCKind>("kind") {
+                    gst_webrtc::WebRTCKind::Audio => MediaKind::Audio,
+                    gst_webrtc::WebRTCKind::Video => MediaKind::Video,
+                    _ if is_screen => MediaKind::Video,
+                    _ => kind_from_pad_caps(&webrtc, &t),
+                };
+                let source = if is_screen {
+                    MediaSource::Screen
+                } else if kind == MediaKind::Audio {
+                    MediaSource::Mic
+                } else {
+                    MediaSource::Camera
+                };
+                Some(PublishTrack { mid, kind, source })
+            })
+            .collect()
+    }
+
     /// Tear both PCs down (leave / call ended) and fence the engine: any
     /// operation still in flight, or started later, fails with
     /// [`Error::State`] and builds nothing.
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        self.screen.lock().unwrap().take();
         self.publish.lock().unwrap().take();
         self.subscribe.lock().unwrap().take();
     }
@@ -636,8 +961,17 @@ impl GstEngine {
                         err.error(),
                         err.debug().unwrap_or_default()
                     );
-                    tracing::warn!(?kind, %message, "media pipeline error");
-                    let _ = events.send(EngineEvent::Error { pc: kind, message });
+                    // A failing screen capture ends the share, not the call.
+                    let from_screen = err
+                        .src()
+                        .is_some_and(|s| s.path_string().contains(&format!(":{SCREEN_BRANCH}/")));
+                    if from_screen {
+                        tracing::info!(%message, "screen share ended");
+                        let _ = events.send(EngineEvent::ScreenShareEnded { message });
+                    } else {
+                        tracing::warn!(?kind, %message, "media pipeline error");
+                        let _ = events.send(EngineEvent::Error { pc: kind, message });
+                    }
                 }
                 gst::MessageView::Warning(w) => {
                     tracing::debug!(?kind, warning = %w.error(), "media pipeline warning");
@@ -697,7 +1031,7 @@ fn publish_description(config: &EngineConfig) -> Result<String> {
         CameraSource::None => None,
     };
     if let Some(src) = video_src {
-        let encoder = video_encoder(config)?;
+        let encoder = video_encoder(config, "venc", config.video_kbps)?;
         desc.push_str(&format!(
             "{src} ! videoconvert ! videoscale ! videorate ! \
              video/x-raw,width=1280,height=720,framerate=30/1 ! tee name=vt \
@@ -710,8 +1044,7 @@ fn publish_description(config: &EngineConfig) -> Result<String> {
 }
 
 /// The encoder + payloader chain for the configured codec, with fallbacks.
-fn video_encoder(config: &EngineConfig) -> Result<String> {
-    let kbps = config.video_kbps;
+fn video_encoder(config: &EngineConfig, name: &str, kbps: u32) -> Result<String> {
     // rtph264pay derives profile-level-id from the SPS (x264's constrained
     // baseline is 42c01f); the SFU matches the SDP string 42e01f exactly, so
     // advertise that. Same profile, only the constraint_set2 flag differs.
@@ -721,7 +1054,7 @@ fn video_encoder(config: &EngineConfig) -> Result<String> {
          application/x-rtp,media=video,encoding-name=H264,payload=102";
     let vp8 = || {
         format!(
-            "vp8enc name=venc deadline=1 cpu-used=8 target-bitrate={} keyframe-max-dist=60 \
+            "vp8enc name={name} deadline=1 cpu-used=8 target-bitrate={} keyframe-max-dist=60 \
              error-resilient=partitions ! rtpvp8pay pt=96 picture-id-mode=15-bit ! \
              application/x-rtp,media=video,encoding-name=VP8,payload=96",
             kbps * 1000
@@ -739,7 +1072,7 @@ fn video_encoder(config: &EngineConfig) -> Result<String> {
         for hw in ["vah264lpenc", "vah264enc"] {
             if has(hw) {
                 return Ok(format!(
-                    "{hw} name=venc bitrate={kbps} key-int-max=60 ! \
+                    "{hw} name={name} bitrate={kbps} key-int-max=60 ! \
                      video/x-h264,profile=constrained-baseline ! {h264_pay}"
                 ));
             }
@@ -747,13 +1080,13 @@ fn video_encoder(config: &EngineConfig) -> Result<String> {
     }
     if has("x264enc") {
         return Ok(format!(
-            "x264enc name=venc tune=zerolatency speed-preset=ultrafast bitrate={kbps} \
+            "x264enc name={name} tune=zerolatency speed-preset=ultrafast bitrate={kbps} \
              key-int-max=60 bframes=0 ! video/x-h264,profile=constrained-baseline ! {h264_pay}"
         ));
     }
     if has("openh264enc") {
         return Ok(format!(
-            "openh264enc name=venc bitrate={} gop-size=60 ! {h264_pay}",
+            "openh264enc name={name} bitrate={} gop-size=60 ! {h264_pay}",
             kbps * 1000
         ));
     }
@@ -1101,6 +1434,19 @@ fn promise_error(s: &gst::StructureRef, context: &str) -> String {
 impl brook_core::MediaEngine for GstEngine {
     async fn create_publish_offer(&self) -> std::result::Result<String, brook_core::EngineError> {
         Ok(GstEngine::create_publish_offer(self).await?)
+    }
+
+    /// The offer with this engine's own labels (the shared screen's m-line is
+    /// `screen`; a stopped share stays labelled), from the same call so a
+    /// toggle can't slip between the SDP and its labels.
+    async fn create_labelled_offer(
+        &self,
+    ) -> std::result::Result<brook_core::PublishOffer, brook_core::EngineError> {
+        let sdp = GstEngine::create_publish_offer(self).await?;
+        Ok(brook_core::PublishOffer {
+            sdp,
+            tracks: self.publish_tracks(),
+        })
     }
 
     async fn apply_publish_answer(

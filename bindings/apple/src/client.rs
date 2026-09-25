@@ -4,9 +4,17 @@ use std::sync::Arc;
 
 use brook_core::{BrookClient, CoreConfig};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use brook_core::ServerEvent;
+use tokio::sync::broadcast::error::RecvError;
+
+use crate::call::{
+    run, EngineAdapter, FfiCallHandle, FfiMediaEngine, FfiServerEvent, ServerEventListener,
+};
 use crate::listener::{subscribe_receiver, AuthStateListener, Subscription};
 use crate::runtime::runtime;
-use crate::types::{LoginError, LoginResult};
+use crate::types::{FfiChannel, LoginError, LoginResult};
 
 /// Swift-facing wrapper around [`BrookClient`].
 #[derive(uniffi::Object)]
@@ -29,6 +37,69 @@ impl FfiBrookClient {
     /// Observe authentication state (latest state wins; see [`AuthStateListener`]).
     pub fn subscribe(&self, listener: Arc<dyn AuthStateListener>) -> Arc<Subscription> {
         subscribe_receiver(self.inner.state(), listener)
+    }
+
+    /// Open the realtime socket (idempotent). Subscribe to events first so `Ready` and the
+    /// `channel.call` snapshot sent right after it are not missed.
+    pub async fn start_realtime(&self) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.start_realtime().await }).await
+    }
+
+    /// Channels and DMs the signed-in user belongs to.
+    pub async fn list_channels(&self) -> Result<Vec<FfiChannel>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let channels = run(async move { inner.list_channels().await }).await?;
+        Ok(channels.into_iter().map(Into::into).collect())
+    }
+
+    /// Realtime events the Apple UI uses (`Ready`, `ChannelCall`); others are skipped.
+    /// Cancel (or drop) the subscription to stop.
+    pub fn subscribe_events(&self, listener: Arc<dyn ServerEventListener>) -> Arc<Subscription> {
+        let mut rx = self.inner.events();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let task = runtime().spawn(async move {
+            loop {
+                let event = match rx.recv().await {
+                    Ok(event) => event,
+                    Err(RecvError::Lagged(_)) => continue, // UI state is re-derivable
+                    Err(RecvError::Closed) => break,
+                };
+                let mapped = match event {
+                    ServerEvent::Ready => FfiServerEvent::Ready,
+                    ServerEvent::ChannelCall {
+                        channel_id,
+                        call_id,
+                        participant_count,
+                    } => FfiServerEvent::ChannelCall {
+                        channel_id,
+                        call_id,
+                        participant_count,
+                    },
+                    _ => continue,
+                };
+                if flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                listener.on_event(mapped);
+            }
+        });
+        Subscription::from_task(cancelled, task)
+    }
+
+    /// Join `channel_id`'s call, driving the Swift `engine`. Requires a ready socket.
+    pub async fn join_call(
+        &self,
+        channel_id: String,
+        engine: Arc<dyn FfiMediaEngine>,
+        publish: bool,
+    ) -> Result<Arc<FfiCallHandle>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let engine: Arc<dyn brook_core::MediaEngine> = Arc::new(EngineAdapter(engine));
+        let handle =
+            run(async move { inner.join_call(&channel_id, engine, publish).await }).await?;
+        Ok(FfiCallHandle::new(handle))
     }
 
     /// Log in with a local handle + password.
