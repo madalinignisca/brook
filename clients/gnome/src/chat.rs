@@ -1207,12 +1207,29 @@ fn main_menu_popover(chat: &Rc<Chat>) -> gtk::Popover {
         .margin_start(4)
         .margin_end(4)
         .build();
+    let two_factor = gtk::Button::builder()
+        .label("Two-Factor Sign-In…")
+        .has_frame(false)
+        .build();
     let sign_out = gtk::Button::builder()
         .label("Sign Out")
         .has_frame(false)
         .build();
     menu.append(&change_password);
+    menu.append(&two_factor);
     menu.append(&sign_out);
+    two_factor.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        move |_| {
+            popover.popdown();
+            crate::totp_ui::settings_dialog(
+                &chat.message_list,
+                chat.client.clone(),
+                chat.runtime.clone(),
+            );
+        }
+    });
     popover.set_child(Some(&menu));
     sign_out.connect_clicked({
         let chat = chat.clone();
