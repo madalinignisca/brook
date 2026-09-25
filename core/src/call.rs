@@ -136,6 +136,7 @@ pub(crate) async fn join(
         epoch,
         publish_wanted: publish,
         publish: Publish::Idle,
+        republish_pending: false,
         pub_seq: 0,
         unsent_offer: None,
         pub_candidates: Vec::new(),
@@ -273,6 +274,8 @@ struct Task {
     epoch: u64,
     publish_wanted: bool,
     publish: Publish,
+    /// A renegotiation asked for while one was in flight: one more offer once it settles.
+    republish_pending: bool,
     pub_seq: u64,
     /// An offer that completed while the socket was down; sent after resume.
     unsent_offer: Option<(u64, PublishOffer)>,
@@ -406,6 +409,8 @@ impl Task {
     // ---- publish ----
 
     fn start_publish_offer(&mut self) {
+        // An offer started now sees the engine's latest state: nothing is left pending.
+        self.republish_pending = false;
         self.pub_seq += 1;
         let seq = self.pub_seq;
         self.publish = Publish::Offering(seq);
@@ -592,11 +597,18 @@ impl Task {
                 reply,
             } => self.set_media(audio, video, reply),
             Input::Republish(reply) => {
-                if self.publish == Publish::Stable && self.connected {
+                if !self.publish_wanted {
+                    // Listen-only: there is no publish connection to renegotiate.
+                    let _ = reply.send(Err(Error::Busy));
+                } else if self.publish == Publish::Stable && self.connected {
                     self.start_publish_offer();
                     let _ = reply.send(Ok(()));
                 } else {
-                    let _ = reply.send(Err(Error::Busy));
+                    // An offer may already be in flight from before the engine changed (a
+                    // share stopped just after it started): refusing would lose this change.
+                    // One more offer follows once the current publish settles.
+                    self.republish_pending = true;
+                    let _ = reply.send(Ok(()));
                 }
             }
             Input::Leave(reply) => {
@@ -746,6 +758,9 @@ impl Task {
                         self.publish = Publish::Stable;
                         self.flush_remote(PcKind::Publish);
                         self.reannounce_media();
+                        if self.republish_pending && self.connected && !self.ended {
+                            self.start_publish_offer();
+                        }
                     }
                     Err(err) => self.finish(EndReason::EngineFailed(err.0), true),
                 }
@@ -902,6 +917,7 @@ impl Task {
     fn after_resume(&mut self) {
         match self.publish {
             Publish::NeedsRestart | Publish::AwaitingAnswer(_) => self.start_publish_offer(),
+            Publish::Stable if self.republish_pending => self.start_publish_offer(),
             _ => {}
         }
         if let Some((seq, offer)) = self.unsent_offer.take() {

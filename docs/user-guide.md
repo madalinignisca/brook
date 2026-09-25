@@ -10,8 +10,8 @@ Using the Brook desktop client. To run a server, see the
 ## What is Brook?
 
 A team-communication app that aims to feel **native to your desktop** rather than
-a web page in a wrapper. The first client is for **GNOME** (Linux); clients for
-KDE Plasma, macOS, Windows, Android, and iOS are planned, all sharing one core.
+a web page in a wrapper. Clients exist for **GNOME** (Linux) and **macOS**; clients
+for KDE Plasma, Windows, Android, and iOS are planned, all sharing one core.
 
 ## What you need
 
@@ -41,6 +41,34 @@ BROOK_SERVER=https://chat.example.com cargo run -p brook-gnome
   use it only on a trusted network:
   ```bash
   BROOK_SERVER=http://chat.example.lan:8080 BROOK_ALLOW_INSECURE_HTTP=1 cargo run -p brook-gnome
+  ```
+
+## Getting the macOS client
+
+Signed, notarized builds are **planned**. For now, build from source on an Apple
+Silicon Mac with **macOS 26** or later:
+
+**Prerequisites:** Xcode, the Rust toolchain (`rustup` plus
+`rustup target add aarch64-apple-darwin`), and XcodeGen (`brew install xcodegen`).
+
+```bash
+git clone https://github.com/madalinignisca/brook.git
+cd brook
+clients/macos/build.sh
+open clients/macos/build/Build/Products/Debug/Brook.app
+```
+
+- Type your **server address** on the sign-in screen. Brook remembers it (once a
+  sign-in succeeds) and fills it in next time.
+- On a **LAN server**, macOS may ask to allow Brook to find devices on your local
+  network. Allow it; if the first attempt failed while the prompt was showing, just
+  sign in again.
+- **Plain-HTTP servers** (e.g. a test server without TLS yet) are refused by default.
+  To allow them for testing, run the command below. The sign-in screen then shows a
+  warning, because your password is sent unencrypted. Turn it off again with
+  `defaults delete dev.brook.Brook AllowInsecureHTTP`.
+  ```bash
+  defaults write dev.brook.Brook AllowInsecureHTTP -bool YES
   ```
 
 ## Signing in
