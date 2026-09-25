@@ -340,6 +340,16 @@ impl BrookClient {
             .map_err(outbox_error)
     }
 
+    /// Retry a failed reply without its quote (after `message.reply_target_gone`), keeping
+    /// its place in the queue.
+    pub async fn retry_without_reply(&self, client_id: &str) -> Result<()> {
+        self.active_outbox()
+            .await?
+            .retry_without_reply(client_id)
+            .await
+            .map_err(outbox_error)
+    }
+
     /// Remove a message that hasn't gone out (`AlreadySent` if the server has it).
     pub async fn delete_pending(&self, client_id: &str) -> Result<Deleted> {
         self.active_outbox()
