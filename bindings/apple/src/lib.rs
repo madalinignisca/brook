@@ -8,6 +8,7 @@ mod call;
 mod client;
 mod keyslot;
 mod listener;
+mod offline;
 mod runtime;
 mod types;
 
@@ -18,6 +19,11 @@ pub use call::{
 };
 pub use client::FfiBrookClient;
 pub use listener::{AuthStateListener, Subscription};
+pub use offline::{
+    CacheEventListener, CacheStateListener, FfiCacheEvent, FfiCacheState, FfiCachedChannel,
+    FfiCachedMessages, FfiDeleted, FfiLocalUser, FfiMember, FfiMessage, FfiPendingMessage,
+    FfiPendingState,
+};
 pub use types::{FfiAuthState, FfiChannel, FfiSession, FfiUser, LoginError, LoginResult};
 
 uniffi::setup_scaffolding!();
