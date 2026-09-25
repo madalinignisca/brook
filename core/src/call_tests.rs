@@ -12,8 +12,8 @@ use tokio::sync::Semaphore;
 
 use crate::test_support::{TestServer, WsPeer};
 use crate::{
-    BrookClient, CallHandle, CallStatus, EndReason, EngineError, IceCandidate, MediaEngine, PcKind,
-    SubStream,
+    default_labels, BrookClient, CallHandle, CallStatus, EndReason, EngineError, IceCandidate,
+    MediaEngine, MediaKind, MediaSource, PcKind, PublishOffer, SubStream,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -30,6 +30,8 @@ struct FakeEngine {
     subscribe_applies: AtomicUsize,
     fail_media: AtomicBool,
     fail_candidates: AtomicBool,
+    /// When set, offers are this SDP instead of "offer-N".
+    offer_sdp: Mutex<Option<String>>,
 }
 
 impl FakeEngine {
@@ -63,6 +65,9 @@ impl MediaEngine for FakeEngine {
             return Err(EngineError("closed".into()));
         }
         let n = self.offers.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(sdp) = self.offer_sdp.lock().unwrap().clone() {
+            return Ok(sdp);
+        }
         Ok(format!("offer-{n}"))
     }
     async fn apply_publish_answer(&self, sdp: String) -> Result<(), EngineError> {
@@ -264,7 +269,7 @@ async fn join_then_publish_offer_answer() {
     let publish = call.recv_type("call.publish").await;
     assert_eq!(
         publish["data"],
-        json!({ "call_id": "k1", "sdp": "offer-1" })
+        json!({ "call_id": "k1", "sdp": "offer-1", "tracks": [] })
     );
     call.peer
         .send(json!({ "type": "call.publish.answer", "re": publish["id"],
@@ -797,4 +802,127 @@ async fn leave_without_confirmation_resolves_after_the_bounded_wait() {
         .expect("leave() hung")
         .unwrap()
         .unwrap();
+}
+
+// ---- labelled offers (screen share, PROTOCOL.md §3.3) ----
+
+const AV_SDP: &str = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendonly\r\n\
+                      m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\na=sendonly\r\n";
+
+fn label(mid: &str, kind: &str, source: &str) -> Value {
+    json!({ "mid": mid, "kind": kind, "source": source })
+}
+
+/// An engine without its own labelling: call.publish carries the default labels.
+#[tokio::test]
+async fn publish_carries_default_labels() {
+    let mut call = join(true, |e| *e.offer_sdp.lock().unwrap() = Some(AV_SDP.into())).await;
+    let publish = call.recv_type("call.publish").await;
+    assert_eq!(publish["data"]["sdp"], AV_SDP);
+    assert_eq!(
+        publish["data"]["tracks"],
+        json!([label("0", "audio", "mic"), label("1", "video", "camera")])
+    );
+}
+
+/// An engine that labels a screen: its labels go out untouched.
+struct Sharing(Arc<FakeEngine>);
+
+#[async_trait]
+impl MediaEngine for Sharing {
+    async fn create_publish_offer(&self) -> Result<String, EngineError> {
+        self.0.create_publish_offer().await
+    }
+    async fn create_labelled_offer(&self) -> Result<PublishOffer, EngineError> {
+        let sdp = self.0.create_publish_offer().await?;
+        let mut tracks = default_labels(&sdp);
+        if let Some(t) = tracks.iter_mut().find(|t| t.mid == "1") {
+            t.source = MediaSource::Screen;
+        }
+        Ok(PublishOffer { sdp, tracks })
+    }
+    async fn apply_publish_answer(&self, sdp: String) -> Result<(), EngineError> {
+        self.0.apply_publish_answer(sdp).await
+    }
+    async fn apply_subscribe_offer(
+        &self,
+        sdp: String,
+        streams: Vec<SubStream>,
+    ) -> Result<String, EngineError> {
+        self.0.apply_subscribe_offer(sdp, streams).await
+    }
+    fn add_remote_candidate(&self, pc: PcKind, c: Option<IceCandidate>) -> Result<(), EngineError> {
+        self.0.add_remote_candidate(pc, c)
+    }
+    fn set_local_media(&self, audio: bool, video: bool) -> Result<(), EngineError> {
+        self.0.set_local_media(audio, video)
+    }
+    async fn close(&self) {
+        self.0.close().await
+    }
+}
+
+#[tokio::test]
+async fn engine_labels_go_out_as_given() {
+    let mut server = TestServer::start().await;
+    let (client, mut peer) = connected(&mut server).await;
+    let fake = Arc::new(FakeEngine::default());
+    *fake.offer_sdp.lock().unwrap() = Some(AV_SDP.into());
+    let engine = Arc::new(Sharing(fake));
+    let c = client.clone();
+    let joining = tokio::spawn(async move { c.join_call("ch", engine, true).await });
+    let f = peer.recv().await;
+    peer.send(joined(&f["id"], "t1")).await;
+    let _handle = joining.await.unwrap().unwrap();
+    let publish = loop {
+        let f = peer.recv().await;
+        if f["type"] == "call.publish" {
+            break f;
+        }
+    };
+    assert_eq!(
+        publish["data"]["tracks"],
+        json!([label("0", "audio", "mic"), label("1", "video", "screen")])
+    );
+}
+
+/// An offer made while the socket is down goes out after resume with its labels.
+#[tokio::test]
+async fn resent_offer_keeps_its_labels() {
+    let mut call = join(true, |e| {
+        *e.offer_sdp.lock().unwrap() = Some(AV_SDP.into());
+        e.gate("create_publish_offer");
+    })
+    .await;
+    let resume = call.reconnect().await;
+    // The offer completes while the call is resuming: it is kept and sent after resume.
+    call.engine.gates.lock().unwrap()["create_publish_offer"].add_permits(1);
+    tokio::time::sleep(QUIET).await;
+    call.peer.send(joined(&resume["id"], "t2")).await;
+    let publish = call.recv_type("call.publish").await;
+    assert_eq!(
+        publish["data"]["tracks"],
+        json!([label("0", "audio", "mic"), label("1", "video", "camera")])
+    );
+}
+
+#[test]
+fn default_labels_cover_every_media_mline() {
+    let sdp = "v=0\r\n\
+               m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:a\r\n\
+               m=video 0 UDP/TLS/RTP/SAVPF 96\r\na=mid:v\r\na=inactive\r\n\
+               m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:d\r\n\
+               m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendonly\r\n";
+    let got: Vec<(String, MediaKind, MediaSource)> = default_labels(sdp)
+        .into_iter()
+        .map(|t| (t.mid, t.kind, t.source))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("a".into(), MediaKind::Audio, MediaSource::Mic),
+            ("v".into(), MediaKind::Video, MediaSource::Camera), // inactive: still labelled
+            ("3".into(), MediaKind::Video, MediaSource::Camera), // no a=mid: its position
+        ]
+    );
 }

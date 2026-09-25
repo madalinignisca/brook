@@ -66,7 +66,7 @@ pub enum MediaSource {
     Mic,
     /// Camera.
     Camera,
-    /// Screen share (later).
+    /// Screen share.
     Screen,
     /// A source this client does not know yet.
     #[serde(other)]
@@ -119,6 +119,67 @@ pub struct Participant {
 #[error("media engine: {0}")]
 pub struct EngineError(pub String);
 
+/// What one publish m-line carries, sent as `tracks` on `call.publish` (PROTOCOL.md §3.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrackLabel {
+    /// The m-line's mid.
+    pub mid: String,
+    /// Audio or video.
+    pub kind: MediaKind,
+    /// Mic, camera or screen.
+    pub source: MediaSource,
+}
+
+/// A publish offer with a label for its m-lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishOffer {
+    /// The offer SDP (already the publish PC's local description).
+    pub sdp: String,
+    /// One label per audio/video m-line, inactive ones included.
+    pub tracks: Vec<TrackLabel>,
+}
+
+/// The labels an engine without screen share means: every audio m-line is the mic, every
+/// video m-line the camera. Inactive m-lines are labelled too: the contract requires active
+/// ones and allows the rest, and labelling all of them never needs to know which is which.
+/// An m-line without `a=mid` gets its position, as the server does.
+pub fn default_labels(sdp: &str) -> Vec<TrackLabel> {
+    let mut out: Vec<TrackLabel> = Vec::new();
+    let mut current: Option<(usize, MediaKind)> = None;
+    let mut mid: Option<String> = None;
+    let mut position = 0usize;
+    let mut flush = |current: &mut Option<(usize, MediaKind)>, mid: &mut Option<String>| {
+        if let Some((pos, kind)) = current.take() {
+            let source = if kind == MediaKind::Audio {
+                MediaSource::Mic
+            } else {
+                MediaSource::Camera
+            };
+            let mid = mid.take().unwrap_or_else(|| pos.to_string());
+            out.push(TrackLabel { mid, kind, source });
+        }
+        *mid = None;
+    };
+    for line in sdp.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("m=") {
+            flush(&mut current, &mut mid);
+            let kind = match rest.split_whitespace().next() {
+                Some("audio") => Some(MediaKind::Audio),
+                Some("video") => Some(MediaKind::Video),
+                _ => None,
+            };
+            current = kind.map(|k| (position, k));
+            position += 1;
+        } else if let Some(m) = line.strip_prefix("a=mid:") {
+            if current.is_some() {
+                mid = Some(m.to_string());
+            }
+        }
+    }
+    flush(&mut current, &mut mid);
+    out
+}
+
 /// The platform's WebRTC stack (GStreamer on Linux, libwebrtc on Apple), driven by core's
 /// call task. Core owns signaling; the engine owns capture, codecs, PeerConnections and
 /// rendering.
@@ -132,6 +193,15 @@ pub trait MediaEngine: Send + Sync {
     /// Create a sendonly offer for the publish PC and set it as its local description.
     /// Called again to renegotiate (e.g. camera added later).
     async fn create_publish_offer(&self) -> Result<String, EngineError>;
+    /// The publish offer with its m-line labels; what core sends. The default labels every
+    /// audio m-line `mic` and every video m-line `camera`: an engine that shares its screen
+    /// overrides this and labels that m-line `screen`, from the same call that made the
+    /// offer (a separate query could race a share starting or stopping in between).
+    async fn create_labelled_offer(&self) -> Result<PublishOffer, EngineError> {
+        let sdp = self.create_publish_offer().await?;
+        let tracks = default_labels(&sdp);
+        Ok(PublishOffer { sdp, tracks })
+    }
     /// Set the publish PC's remote description.
     async fn apply_publish_answer(&self, sdp: String) -> Result<(), EngineError>;
     /// Set the subscribe PC's remote description to `sdp`, create the answer and set it as

@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::call_types::{
     CallState, CallStatus, EndReason, EngineError, IceCandidate, IceServer, MediaEngine,
-    Participant, PcKind, SubStream,
+    Participant, PcKind, PublishOffer, SubStream,
 };
 use crate::session_store::Revision;
 use crate::ws::{CallFrame, CallRoute, CommandError, Commands, Conn, Reply, Routes};
@@ -181,7 +181,7 @@ enum Input {
 enum Done {
     PublishOffer {
         seq: u64,
-        res: std::result::Result<String, EngineError>,
+        res: std::result::Result<PublishOffer, EngineError>,
     },
     PublishAnswer {
         seq: u64,
@@ -275,7 +275,7 @@ struct Task {
     publish: Publish,
     pub_seq: u64,
     /// An offer that completed while the socket was down; sent after resume.
-    unsent_offer: Option<(u64, String)>,
+    unsent_offer: Option<(u64, PublishOffer)>,
     /// Local publish candidates held until `call.publish` for the current offer is written.
     pub_candidates: Vec<Option<IceCandidate>>,
     sub: Subscribe,
@@ -413,18 +413,20 @@ impl Task {
         let engine = self.engine.clone();
         let done = self.done_tx.clone();
         tokio::spawn(async move {
-            let res = engine.create_publish_offer().await;
+            let res = engine.create_labelled_offer().await;
             let _ = done.send(Input::Done(Done::PublishOffer { seq, res }));
         });
     }
 
-    fn send_publish(&mut self, seq: u64, sdp: String) {
+    fn send_publish(&mut self, seq: u64, offer: PublishOffer) {
         if !self.connected {
-            self.unsent_offer = Some((seq, sdp));
+            self.unsent_offer = Some((seq, offer));
             return;
         }
-        let frame =
-            json!({ "type": "call.publish", "data": { "call_id": self.call_id, "sdp": sdp } });
+        // Always labelled: the server pins each live mid's source, and an unlabelled
+        // re-publish would otherwise fall back to the defaults (PROTOCOL.md §3.3).
+        let frame = json!({ "type": "call.publish", "data": {
+            "call_id": self.call_id, "sdp": offer.sdp, "tracks": offer.tracks } });
         match self
             .commands
             .start(self.generation, frame, "call.publish.answer", None)
@@ -438,7 +440,7 @@ impl Task {
                 self.await_reply(rx, move |res| Done::PublishAnswer { seq, res });
             }
             Err(_) => {
-                self.unsent_offer = Some((seq, sdp));
+                self.unsent_offer = Some((seq, offer));
             }
         }
     }
@@ -709,7 +711,7 @@ impl Task {
                     return;
                 }
                 match res {
-                    Ok(sdp) => self.send_publish(seq, sdp),
+                    Ok(offer) => self.send_publish(seq, offer),
                     Err(err) => self.finish(EndReason::EngineFailed(err.0), true),
                 }
             }
@@ -902,9 +904,9 @@ impl Task {
             Publish::NeedsRestart | Publish::AwaitingAnswer(_) => self.start_publish_offer(),
             _ => {}
         }
-        if let Some((seq, sdp)) = self.unsent_offer.take() {
+        if let Some((seq, offer)) = self.unsent_offer.take() {
             if self.publish == Publish::Offering(seq) {
-                self.send_publish(seq, sdp);
+                self.send_publish(seq, offer);
             }
         }
         self.send_retained_answer();
