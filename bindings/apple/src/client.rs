@@ -42,6 +42,29 @@ impl FfiBrookClient {
         subscribe_receiver(self.inner.state(), listener)
     }
 
+    /// Keep the session across launches in `slot` (the Keychain), with sign-out fences under
+    /// `data_dir`. Call once, before signing in or restoring.
+    pub fn enable_persistence(&self, slot: Arc<dyn crate::keyslot::FfiKeySlot>, data_dir: String) {
+        self.inner.enable_persistence(
+            Arc::new(crate::keyslot::SlotAdapter(slot)),
+            std::path::PathBuf::from(data_dir),
+        );
+    }
+
+    /// At launch: sign in with the stored session, if there's a usable one.
+    pub async fn restore(&self) -> crate::types::FfiRestoreOutcome {
+        let inner = Arc::clone(&self.inner);
+        match runtime().spawn(async move { inner.restore().await }).await {
+            Ok(outcome) => outcome.into(),
+            Err(_) => crate::types::FfiRestoreOutcome::Offline,
+        }
+    }
+
+    /// False only when the last sign-out couldn't make the stored session unusable.
+    pub fn sign_out_complete(&self) -> bool {
+        self.inner.sign_out_complete()
+    }
+
     /// Core's authentication state right now. The subscription keeps only the latest value
     /// (a quick `LoggedIn` then `LoggedOut` can arrive as just `LoggedOut`), so the app reads
     /// the truth here when its own login completes.

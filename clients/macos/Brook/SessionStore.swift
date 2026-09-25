@@ -18,6 +18,8 @@ import Synchronization
 final class SessionStore {
     enum Phase: Equatable {
         case signedOut(error: String?)
+        /// At launch: signing in with the stored session ("Signing in…", no form).
+        case restoring
         case signingIn
         case signedIn(FfiUser)
         /// The password was right; the account's TOTP code (or a recovery code) comes next.
@@ -39,6 +41,10 @@ final class SessionStore {
         static let codeStepExpired = "That took too long. Enter your password again."
         static let codeFormat = "Enter the 6-digit code from your authenticator app."
         static let recoveryFormat = "Enter one of your recovery codes."
+        static let keychainUnavailable = "Your saved sign-in couldn't be read (the keychain may be locked). Sign in again."
+        static let restoreOffline = "Couldn't reach the server to resume your session. It's kept for next time; you can also sign in again."
+        static let signOutIncomplete = "This Mac couldn't forget your saved sign-in, so Brook may sign you in again at the next launch. Sign in and out again to retry."
+        static let secondInstance = "Brook is already open. This window won't remember your sign-in."
     }
 
     typealias ClientFactory = (_ server: String, _ allowInsecureHttp: Bool) throws -> FfiBrookClient
@@ -56,9 +62,55 @@ final class SessionStore {
     @ObservationIgnored private var settled = Int.max
     @ObservationIgnored private var delivered: DeliveryCount?
 
-    init(settings: Settings = Settings(), makeClient: @escaping ClientFactory = SessionStore.liveClient) {
+    private let persistence: SessionPersistence
+    /// The launch restore runs at most once per process.
+    @ObservationIgnored private var restoreStarted = false
+
+    init(
+        settings: Settings = Settings(), persistence: SessionPersistence = .off,
+        makeClient: @escaping ClientFactory = SessionStore.liveClient
+    ) {
         self.settings = settings
+        self.persistence = persistence
         self.makeClient = makeClient
+        switch persistence {
+        // Start on "Signing in…" rather than flash the form the restore may replace.
+        case .on where settings.lastGoodServer != nil: phase = .restoring
+        case .secondInstance: phase = .signedOut(error: Message.secondInstance)
+        case .on, .off: break
+        }
+    }
+
+    /// Every client this store makes keeps its session only when persistence is on.
+    private func client(for address: String) throws -> FfiBrookClient {
+        let client = try makeClient(address, settings.allowInsecureHTTP)
+        if case let .on(slot, dataDir) = persistence { client.enablePersistence(slot: slot, dataDir: dataDir) }
+        return client
+    }
+
+    /// At launch, with the last server: sign in with the stored session. It is an attempt
+    /// like a sign-in, so a sign-out meanwhile wins and its late result is ignored.
+    func restoreAtLaunch() async {
+        guard phase == .restoring, !restoreStarted, let address = settings.lastGoodServer else { return }
+        restoreStarted = true
+        attempt += 1
+        let mine = attempt
+        let client: FfiBrookClient
+        do { client = try self.client(for: address) } catch {
+            end()
+            phase = .signedOut(error: nil)
+            return
+        }
+        follow(client, attempt: mine)
+        let outcome = await client.restore()
+        guard mine == attempt else { return }
+        switch outcome {
+        case let .loggedIn(user): finishSignIn(client, user: user, address: address)
+        case .notSignedIn: end(); phase = .signedOut(error: nil)
+        case .unavailable: end(); phase = .signedOut(error: Message.keychainUnavailable)
+        case .offline: end(); phase = .signedOut(error: Message.restoreOffline)
+        case .superseded: end(); phase = .signedOut(error: nil) // core's newer attempt isn't ours
+        }
     }
 
     nonisolated static func liveClient(server: String, allowInsecureHttp: Bool) throws -> FfiBrookClient {
@@ -70,6 +122,7 @@ final class SessionStore {
     @discardableResult
     func signIn(server: String, handle: String, password: String) async -> Bool {
         if case .signingIn = phase { return false }
+        if case .restoring = phase { return false }
         let handle = handle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !handle.isEmpty, !password.isEmpty else {
             phase = .signedOut(error: Message.missingFields)
@@ -86,7 +139,7 @@ final class SessionStore {
         attempt += 1
         let mine = attempt
         do {
-            let client = try makeClient(address, settings.allowInsecureHTTP)
+            let client = try client(for: address)
             follow(client, attempt: mine)
             let result = try await client.login(handle: handle, password: password)
             guard mine == attempt else { return true } // ended meanwhile (a sign-out won)
@@ -109,6 +162,11 @@ final class SessionStore {
         }
         return true
     }
+
+    /// Set when a sign-out couldn't make the stored session unusable; shown until a sign-in.
+    private(set) var signOutWarning: String?
+    /// Completed sign-ins, counted: a sign-out's late result applies only if none came after.
+    @ObservationIgnored private var signIns = 0
 
     /// After a sign-in with a recovery code: how many are left (the app warns when few).
     private(set) var recoveryCodesLeft: UInt32?
@@ -134,6 +192,8 @@ final class SessionStore {
             return
         }
         self.client = client
+        signIns += 1
+        signOutWarning = nil // the new sign-in replaced the stored copy
         settings.saveLastGoodServer(address)
         phase = .signedIn(user)
     }
@@ -207,7 +267,14 @@ final class SessionStore {
         guard case .signedIn = phase, let client else { return }
         end()
         phase = .signedOut(error: nil)
-        Task { await client.logout() } // core revokes the token; the client goes after
+        let before = signIns
+        Task {
+            await client.logout() // core forgets the stored copy, then revokes (best effort)
+            // Both the keychain delete and the fence failed: the next launch could sign in
+            // again. Its own value, not the form's error: typing into the form meanwhile must
+            // not hide it. A sign-in completed since replaced the stored copy: then it's moot.
+            if !client.signOutComplete(), before == signIns { signOutWarning = Message.signOutIncomplete }
+        }
     }
 
     /// Core's auth events for `attempt`, in order, on the main actor.

@@ -38,6 +38,9 @@ struct Cell {
     /// The current attempt is waiting for its TOTP step (its challenge is open). Closed by a
     /// success, `cancel_totp`, an expired challenge, and anything that moves `login_gen`.
     challenge_open: bool,
+    /// The stored copy mirrors this store's session: set by an install, cleared by a sign-out
+    /// or a rejection (not by a close: quitting keeps it).
+    persisted: bool,
 }
 
 /// Revoking refresh tokens core stops holding, from anywhere, including a `Drop` on a thread
@@ -55,6 +58,9 @@ pub(crate) enum RefreshApplied {
     Committed,
     /// A login/logout replaced the session meanwhile; the result was dropped.
     Discarded,
+    /// The client is gone, but the stored copy followed the rotation (quit keeps the session):
+    /// the new token must not be revoked.
+    Stored,
 }
 
 #[derive(Clone)]
@@ -74,6 +80,10 @@ pub(crate) struct SessionStore {
     closed: Arc<AtomicBool>,
     /// Unique per store (per client): what binds a TOTP challenge to the client it came from.
     id: u64,
+    /// Staying signed in: the stored copy, written through inside the write sections below.
+    persistence: Arc<OnceLock<crate::persist::Persistence>>,
+    /// Whether the last sign-out made the stored copy unusable (deleted or fenced).
+    sign_out_complete: Arc<AtomicBool>,
 }
 
 static NEXT_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -90,6 +100,42 @@ impl SessionStore {
             detached: Arc::default(),
             closed: Arc::default(),
             id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
+            persistence: Arc::default(),
+            sign_out_complete: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Enable persistence; this store's client becomes the slot's owner (see `persist`).
+    pub(crate) fn set_persistence(&self, p: crate::persist::Persistence) {
+        p.claim(self.id);
+        let _ = self.persistence.set(p);
+    }
+
+    /// Run `op` on the stored copy if persistence is on and this client owns the slot.
+    pub(crate) fn with_slot<T>(
+        &self,
+        op: impl FnOnce(&crate::persist::Persistence) -> T,
+    ) -> Option<T> {
+        self.persistence.get()?.guarded(self.id, op)
+    }
+
+    pub(crate) fn persistence(&self) -> Option<&crate::persist::Persistence> {
+        self.persistence.get()
+    }
+
+    pub(crate) fn sign_out_complete(&self) -> bool {
+        self.sign_out_complete.load(Ordering::SeqCst)
+    }
+
+    /// A restore's stored token was refused: delete the stored copy only if it still holds that
+    /// token, checked inside the write section (a newer sign-in may have replaced it).
+    pub(crate) async fn clear_persisted_if_holds(&self, gen: u64, refresh_token: &str) {
+        let cell = self.cell.write().await;
+        if cell.login_gen != gen {
+            return; // this restore is stale: whatever replaced it decides
+        }
+        if let Some(p) = self.persistence.get() {
+            p.guarded(self.id, |p| p.clear_if_holds(refresh_token));
         }
     }
 
@@ -172,6 +218,11 @@ impl SessionStore {
                 return Err(());
             }
             let old = cell.session.take();
+            if old.is_some() {
+                // The displaced sign-in must not be restorable, whatever this login's outcome.
+                self.with_slot(crate::persist::Persistence::clear);
+                cell.persisted = false;
+            }
             cell.rev.epoch += 1;
             cell.rev.credential_rev = 0;
             (cell.rev, old)
@@ -203,9 +254,15 @@ impl SessionStore {
         let mut installed = false;
         let rev = {
             let mut cell = self.cell.write().await;
-            if !self.is_closed() && cell.login_gen == gen && cell.challenge_open {
+            // Refused when a newer client owns the slot: it can't bring back a replaced sign-in.
+            let owns = || match self.persistence.get() {
+                Some(_) => self.with_slot(|p| p.write(&session)).is_some(),
+                None => true,
+            };
+            if !self.is_closed() && cell.login_gen == gen && cell.challenge_open && owns() {
                 let user = session.user.clone();
                 cell.challenge_open = false;
+                cell.persisted = self.persistence.get().is_some();
                 cell.session = Some(session);
                 cell.rev.epoch += 1;
                 cell.rev.credential_rev = 0;
@@ -241,6 +298,14 @@ impl SessionStore {
             if self.is_closed() || cell.login_gen != gen {
                 return false;
             }
+            if self.persistence.get().is_some() {
+                // Refused when a newer client owns the slot, so a late restore or login can't
+                // bring back a sign-in that was replaced or signed out.
+                if self.with_slot(|p| p.write(&session)).is_none() {
+                    return false;
+                }
+                cell.persisted = true;
+            }
             let user = session.user.clone();
             cell.session = Some(session);
             cell.rev.epoch += 1;
@@ -265,6 +330,14 @@ impl SessionStore {
                 self.closed.store(true, Ordering::SeqCst);
             }
             let old = cell.session.take();
+            // A sign-out clears the stored copy before it returns; a close (quit) keeps it.
+            if !close && self.persistence.get().is_some() {
+                // A newer client owns the slot: nothing of ours is stored.
+                let done = self.with_slot(crate::persist::Persistence::clear);
+                self.sign_out_complete
+                    .store(done.unwrap_or(true), Ordering::SeqCst);
+                cell.persisted = false;
+            }
             cell.rev.epoch += 1;
             cell.rev.credential_rev = 0;
             let _ = self.state_tx.send(AuthState::LoggedOut); // under the lock (see install)
@@ -286,7 +359,11 @@ impl SessionStore {
         let store = self.clone();
         runtime.spawn(async move {
             if let Some(old) = store.sign_out(true).await {
-                store.revoke_detached(old.refresh_token);
+                // Quit isn't sign-out: with a stored session, the token stays valid for the
+                // next launch. Without one, a dropped client is a signed-out one.
+                if store.persistence.get().is_none() {
+                    store.revoke_detached(old.refresh_token);
+                }
             }
         });
     }
@@ -341,12 +418,30 @@ impl SessionStore {
         let rev = {
             let mut cell = self.cell.write().await;
             if self.is_closed() {
-                return RefreshApplied::Discarded;
+                // Quitting mid-refresh: the server already rotated, so the stored token is
+                // dead. Store the new one (if ours is still the stored copy) rather than
+                // revoke it, or the next launch finds a dead session. Not after a sign-out
+                // or rejection (`persisted` is false then): those tokens must go.
+                let stored = if cell.persisted {
+                    self.with_slot(|p| p.follow_rotation(rotated_from, &refresh_token))
+                } else {
+                    None
+                };
+                return if stored == Some(true) {
+                    RefreshApplied::Stored
+                } else {
+                    RefreshApplied::Discarded
+                };
             }
             match cell.session.as_mut() {
                 Some(s) if s.refresh_token == rotated_from => {
                     s.access_token = access_token;
                     s.refresh_token = refresh_token;
+                    // Rotation made the stored token dead: follow it (unless a newer client
+                    // owns the slot now). Not `with_slot`: `s` borrows the cell.
+                    if let Some(p) = self.persistence.get() {
+                        p.guarded(self.id, |p| p.write(s));
+                    }
                     cell.rev.credential_rev += 1;
                     cell.rev
                 }
@@ -366,6 +461,9 @@ impl SessionStore {
             let mut cell = self.cell.write().await;
             match cell.session.as_ref() {
                 Some(s) if s.refresh_token == rejected => {
+                    // A remote sign-out: not restorable either (only if still ours).
+                    self.with_slot(crate::persist::Persistence::clear);
+                    cell.persisted = false;
                     cell.session = None;
                     cell.rev.epoch += 1;
                     cell.rev.credential_rev = 0;
@@ -424,6 +522,35 @@ mod tests {
         out.await.unwrap();
         assert!(store.snapshot().await.1.is_none());
         assert_eq!(*state.borrow(), AuthState::LoggedOut);
+    }
+
+    /// Persistence follows store order: an install and a sign-out queued back to back leave the
+    /// stored copy cleared, not rewritten by a late install.
+    #[tokio::test]
+    async fn the_stored_copy_follows_store_order() {
+        let (store, _state) = store();
+        let slot = Arc::new(crate::InMemoryKeySlot::default());
+        let dir = tempfile::tempdir().unwrap();
+        store.set_persistence(crate::persist::Persistence::new(
+            slot.clone(),
+            "https://h",
+            dir.path().to_path_buf(),
+        ));
+        let gen = store.reserve_login().await;
+        let held = store.cell.write().await;
+        let s = store.clone();
+        let install = tokio::spawn(async move { s.install_for_login(gen, session(1)).await });
+        tokio::task::yield_now().await;
+        let s = store.clone();
+        let out = tokio::spawn(async move { s.sign_out(false).await });
+        tokio::task::yield_now().await;
+        drop(held);
+        assert!(install.await.unwrap());
+        out.await.unwrap();
+        assert!(
+            !slot.contains("session:https://h"),
+            "the install's write landed after the sign-out's clear"
+        );
     }
 
     /// The drop fence is synchronous: even with no runtime to run the cleanup on (and before

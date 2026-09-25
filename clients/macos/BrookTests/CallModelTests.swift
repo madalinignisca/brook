@@ -44,6 +44,9 @@ final class FakeRealtime: FfiBrookClientProtocol, @unchecked Sendable {
     func subscribe(listener: AuthStateListener) -> Subscription { FakeSubscription() }
     func changePassword(current: String, new: String, signOutOtherDevices: Bool) async throws -> Bool? { nil }
     func logout() async {}
+    func enablePersistence(slot: FfiKeySlot, dataDir: String) {}
+    func restore() async -> FfiRestoreOutcome { .notSignedIn }
+    func signOutComplete() -> Bool { true }
     func authState() -> FfiAuthState { .loggedOut }
     func completeTotp(challenge: FfiTotpChallenge, code: String) async throws -> UInt32? { nil }
     func completeRecovery(challenge: FfiTotpChallenge, recoveryCode: String) async throws -> UInt32? { nil }

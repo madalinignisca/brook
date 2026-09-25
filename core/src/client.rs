@@ -65,6 +65,21 @@ impl std::fmt::Debug for TotpChallenge {
     }
 }
 
+/// What a restore at launch found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// Signed in with the stored session (its refresh token rotated and stored again).
+    LoggedIn(User),
+    /// Nothing to restore (never stored, signed out, fenced, or the server refused it).
+    NotSignedIn,
+    /// The secure store is locked or failing: nothing was deleted; sign in by hand for now.
+    Unavailable,
+    /// The server couldn't be reached: the stored session is kept for next time.
+    Offline,
+    /// A sign-in or sign-out happened meanwhile and won; nothing was changed.
+    Superseded,
+}
+
 /// A password login's answer: a pair (not yet a session), or a TOTP step.
 enum Issued {
     Pair(TokenPair),
@@ -244,6 +259,89 @@ impl BrookClient {
             }
         });
         task.await.map_err(|_| Error::UnexpectedResponse)?
+    }
+
+    /// Keep the session across launches in `slot` (a platform secure store), with sign-out
+    /// fences in `data_dir`. Off unless called; set once, before signing in or restoring.
+    pub fn enable_persistence(&self, slot: Arc<dyn crate::KeySlot>, data_dir: std::path::PathBuf) {
+        let origin = self.base.as_str().trim_end_matches('/').to_string();
+        self.session
+            .set_persistence(crate::persist::Persistence::new(slot, &origin, data_dir));
+    }
+
+    /// Whether the last sign-out made the stored session unusable (deleted, or fenced). False
+    /// only when the secure store *and* the fence both failed: tell the user.
+    pub fn sign_out_complete(&self) -> bool {
+        self.session.sign_out_complete()
+    }
+
+    /// At launch: sign in with the stored session, if there is a usable one. Runs as a login
+    /// attempt (a sign-in or sign-out meanwhile wins), refreshes the stored token, and installs
+    /// and re-stores the new pair in one step.
+    pub async fn restore(&self) -> RestoreOutcome {
+        self.session.note_runtime();
+        let gen = self.session.reserve_login().await;
+        let (session, http, base) = (self.session.clone(), self.http.clone(), self.base.clone());
+        let task = tokio::spawn(async move {
+            let _flight = session.refresh_lock.clone().lock_owned().await;
+            if session.persistence().is_none() {
+                return RestoreOutcome::NotSignedIn;
+            }
+            // Read (and a fence's cleanup) only as the slot's owner: a newer client's stored
+            // session is never read, refreshed or deleted by an older one.
+            let read = session.with_slot(|p| {
+                if p.fenced() {
+                    let _ = p.clear(); // best effort; the fence keeps it unusable either way
+                    return Ok(None);
+                }
+                p.load()
+            });
+            let stored = match read {
+                None => return RestoreOutcome::Superseded, // a newer client owns the slot
+                Some(Ok(Some(stored))) => stored,
+                Some(Ok(None)) => return RestoreOutcome::NotSignedIn,
+                Some(Err(_)) => return RestoreOutcome::Unavailable, // locked or failing: delete nothing
+            };
+            let Ok(url) = base.join("api/v1/auth/refresh") else {
+                return RestoreOutcome::Offline;
+            };
+            let resp = match http
+                .post(url)
+                .json(&json!({ "refresh_token": stored.refresh_token }))
+                .send()
+                .await
+            {
+                Ok(resp) => resp,
+                Err(_) => return RestoreOutcome::Offline,
+            };
+            if refused(resp.status()) {
+                // Refused: forget it, but only if it's still the stored one.
+                session
+                    .clear_persisted_if_holds(gen, &stored.refresh_token)
+                    .await;
+                return RestoreOutcome::NotSignedIn;
+            }
+            if !resp.status().is_success() {
+                return RestoreOutcome::Offline; // 429, 5xx, or not the api answering: kept
+            }
+            let Ok(pair) = resp.json::<TokenPair>().await else {
+                return RestoreOutcome::Offline;
+            };
+            let restored = Session {
+                access_token: pair.access_token,
+                refresh_token: pair.refresh_token,
+                user: stored.user,
+            };
+            let user = restored.user.clone();
+            // Install and re-store in one write section, only if still current.
+            if session.install_for_login(gen, restored.clone()).await {
+                RestoreOutcome::LoggedIn(user)
+            } else {
+                session.revoke_detached(restored.refresh_token);
+                RestoreOutcome::Superseded
+            }
+        });
+        task.await.unwrap_or(RestoreOutcome::Offline)
     }
 
     /// The background loops' handles (tests: to see them end).
@@ -824,6 +922,15 @@ async fn fetch_me(http: &reqwest::Client, base: &Url, access_token: &str) -> Res
     resp.json().await.map_err(|_| Error::UnexpectedResponse)
 }
 
+/// Whether `/auth/refresh` refused the token itself. The api answers only 200, 401
+/// (`auth.invalid_token`), 422 (a malformed body) or 429; any other 4xx comes from something in
+/// front of it (a misrouted proxy, a captive portal, a maintenance page) and says nothing about
+/// the token, so treating it as a refusal would sign the user out over a proxy hiccup.
+fn refused(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+}
+
 /// Periodically rotate the access token so a long-lived session keeps REST calls
 /// and the socket authorized. While there is no session it idles and polls.
 async fn refresh_loop(refresher: Refresher) {
@@ -960,12 +1067,17 @@ pub(crate) async fn refresh_once(
         }
         return Ok(RefreshOutcome::RateLimited(wait));
     }
-    if resp.status().is_client_error() {
+    if refused(resp.status()) {
         session.clear_if_holds(&refresh_token).await;
         return Ok(RefreshOutcome::Rejected);
     }
     if !resp.status().is_success() {
-        return Err(api_error(resp).await); // 5xx → transient
+        // 5xx, or a 4xx not from the api: transient. Body-free: the body of a failed refresh can echo the submitted
+        // token, and this error is logged by the refresh loop.
+        return Err(Error::Api {
+            code: format!("http_{}", resp.status().as_u16()),
+            message: format!("request failed with status {}", resp.status().as_u16()),
+        });
     }
     let tokens: TokenPair = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
     let fresh = tokens.refresh_token.clone();
@@ -975,6 +1087,7 @@ pub(crate) async fn refresh_once(
             .await
         {
             RefreshApplied::Committed => RefreshOutcome::Committed,
+            RefreshApplied::Stored => RefreshOutcome::Discarded, // kept for the next launch
             RefreshApplied::Discarded => {
                 session.revoke_detached(fresh); // rotated for a session no longer held
                 RefreshOutcome::Discarded
