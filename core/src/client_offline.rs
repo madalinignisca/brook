@@ -90,11 +90,14 @@ impl BrookClient {
         let Ok(Some(local)) = LocalData::open(&data_dir.join("stores"), slot).await else {
             return false;
         };
-        if local.reconcile().await.is_err() {
-            return false;
-        }
+        // A loss is recorded even if reconciling then fails part-way: the outbox that held
+        // it may already be gone.
+        let reconciled = local.reconcile().await;
         if local.take_lost_unsent() {
             crate::offline::record_loss(&self.losses, &self.cache_events);
+        }
+        if reconciled.is_err() {
+            return false;
         }
         *self.offline.lock().await = Some(Offline::with_events(
             local,

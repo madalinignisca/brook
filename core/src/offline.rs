@@ -318,6 +318,12 @@ impl Offline {
         epoch: u64,
     ) -> Result<(), StoreError> {
         self.forgotten = Some((origin.to_string(), user_id.to_string(), epoch));
+        // Whoever's stores are open, the feed stops showing them now: the session has moved
+        // on (a switch the watcher hasn't reached yet leaves another user's cache open).
+        if let Some(a) = &mut self.active {
+            a.state_feed = None;
+        }
+        self.state.reset();
         if self.active_for(origin, user_id).is_some() {
             self.close_active().await;
         }

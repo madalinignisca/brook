@@ -313,6 +313,26 @@ async fn a_new_epoch_for_the_same_user_resets_the_feed() {
     );
 }
 
+/// Forgetting the session's user while another user's stores are still open (a switch
+/// the watcher hasn't reached) stops the feed showing that other user at once.
+#[tokio::test]
+async fn forgetting_resets_the_feed_whoever_is_open() {
+    let mut s = setup().await;
+    let mut feed = s.offline.state_feed();
+    sign_in(&mut s, "u1", 1).await;
+    synced(&mut feed).await;
+    s.offline.forget("https://a", "u2", 2).await.unwrap();
+    assert_eq!(
+        *feed.borrow(),
+        crate::cache::CacheState::default(),
+        "u1's state still showed after u2 was forgotten"
+    );
+    let cache = s.offline.active().unwrap().cache.clone();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    cache.sync_now().await.unwrap();
+    assert_eq!(*feed.borrow(), crate::cache::CacheState::default());
+}
+
 /// A forwarder whose generation has passed writes nothing, even while its cache still
 /// changes (the window between a switch and the old forwarder stopping).
 #[tokio::test]
