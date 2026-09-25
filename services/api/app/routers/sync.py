@@ -99,7 +99,7 @@ async def sync(
     since: Annotated[str, Query(max_length=32)] = "0",
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = MAX_PAGE,
 ) -> SyncOut:
-    if not since.isdigit():
+    if not (since.isascii() and since.isdigit()):  # "²".isdigit() is True, int() isn't
         raise _reset()  # not a cursor we issued
     cursor = int(since)
     counter = await session.get(SyncCounter, 1)

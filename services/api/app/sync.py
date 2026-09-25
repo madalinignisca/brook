@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import event, insert, select, update
+from sqlalchemy import event, insert, inspect, select, update
 from sqlalchemy.orm import Session
 
 from .models import Channel, File, Membership, Message, Reaction, SyncCounter, SyncTombstone, User
@@ -45,12 +45,24 @@ def _take_seq(session: Session) -> int:
     return int(seq)
 
 
+_PROFILE = ("handle", "display_name", "status")
+
+
+def _profile_changed(user: User) -> bool:
+    """Only what other members can see. A password or session change (password_hash,
+    sessions_valid_after, ...) must not move users.seq, or co-members could infer it."""
+    state = inspect(user)
+    return any(state.attrs[name].history.has_changes() for name in _PROFILE)
+
+
 @event.listens_for(Session, "before_flush")
 def _stamp(session: Session, _ctx: Any, _instances: Any) -> None:
     changed = [
         obj
         for obj in (*session.new, *session.dirty)
-        if isinstance(obj, _STAMPED) and (obj in session.new or session.is_modified(obj))
+        if isinstance(obj, _STAMPED)
+        and (obj in session.new or session.is_modified(obj))
+        and (not isinstance(obj, User) or obj in session.new or _profile_changed(obj))
     ]
     reactions = [o for o in (*session.new, *session.deleted) if isinstance(o, Reaction)]
     dead_files = [o for o in session.deleted if isinstance(o, File) and o.message_id is not None]
@@ -63,6 +75,11 @@ def _stamp(session: Session, _ctx: Any, _instances: Any) -> None:
         obj.seq = seq
         if isinstance(obj, Membership) and obj in session.new:
             obj.joined_seq = seq
+    # The member list is part of a channel's state: joining or leaving re-stamps it, so
+    # channel.update events (and /sync) carry a seq that orders them.
+    member_changes = {m.channel_id for m in (*session.new, *ended) if isinstance(m, Membership)}
+    if member_changes:
+        session.execute(update(Channel).where(Channel.id.in_(member_changes)).values(seq=seq))
     touched = {r.message_id for r in reactions} | {f.message_id for f in dead_files}
     if touched:
         session.execute(update(Message).where(Message.id.in_(touched)).values(seq=seq))

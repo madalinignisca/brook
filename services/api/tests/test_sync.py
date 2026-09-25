@@ -7,7 +7,7 @@ import uuid
 
 import httpx
 from fastapi.testclient import TestClient
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from app import db
 from app.models import Channel, Membership
@@ -257,3 +257,108 @@ async def test_a_rolled_back_savepoint_forgets_its_seq(client: httpx.AsyncClient
         await s.flush()  # takes (and locks) a fresh one
         assert transaction_seq(s.sync_session) > 0
         await s.rollback()
+
+
+# ---------------------------------------------------------------- auth review of #91
+
+
+async def test_strangers_are_never_in_users(client: httpx.AsyncClient) -> None:
+    from app.models import User
+
+    ha, hb, _ch = await _setup(client)
+    await _user(client, "carol", ha)  # shares no channel with bob
+    first = await _sync(client, hb)
+    assert "carol" not in {u["handle"] for u in first["users"]}
+    async with db.get_sessionmaker()() as s:  # carol's profile changes (stamped)
+        carol = (await s.scalars(select(User).where(User.handle == "carol"))).one()
+        carol.display_name = "Carol Renamed"
+        await s.commit()
+    later = await _sync(client, hb, first["next"])
+    assert later["users"] == []
+
+
+async def test_other_peoples_removals_elsewhere_never_leak(client: httpx.AsyncClient) -> None:
+    ha, hb, _ch = await _setup(client)
+    await _user(client, "carol", ha)
+    other = (
+        await client.post("/api/v1/channels", json={"kind": "channel", "name": "x"}, headers=ha)
+    ).json()
+    await client.post(
+        f"/api/v1/channels/{other['id']}/members", json={"handle": "carol"}, headers=ha
+    )
+    cursor = (await _sync(client, hb))["next"]
+    carol_id = (await client.get(f"{AUTH}/me", headers=await _user(client, "carol"))).json()["id"]
+    async with db.get_sessionmaker()() as s:
+        m = await s.get(Membership, (uuid.UUID(other["id"]), uuid.UUID(carol_id)))
+        assert m is not None
+        await s.delete(m)
+        await s.commit()
+    page = await _sync(client, hb, cursor)
+    assert page["left_members"] == [] and page["removed_channels"] == []
+
+
+async def test_removed_then_readded_is_not_reported_removed(client: httpx.AsyncClient) -> None:
+    ha, hb, ch = await _setup(client)
+    cursor = (await _sync(client, hb))["next"]
+    bob_id = (await client.get(f"{AUTH}/me", headers=hb)).json()["id"]
+    async with db.get_sessionmaker()() as s:
+        m = await s.get(Membership, (uuid.UUID(ch), uuid.UUID(bob_id)))
+        assert m is not None
+        await s.delete(m)
+        await s.commit()
+    await client.post(f"/api/v1/channels/{ch}/members", json={"handle": "bob"}, headers=ha)
+    page = await _sync(client, hb, cursor)
+    assert page["removed_channels"] == []
+    assert [c["id"] for c in page["channels"]] == [ch]
+
+
+async def test_a_password_change_is_invisible_to_co_members(client: httpx.AsyncClient) -> None:
+    ha, hb, _ch = await _setup(client)
+    cursor = (await _sync(client, hb))["next"]
+    r = await client.post(
+        f"{AUTH}/password",
+        json={
+            "current_password": PW,
+            "new_password": "brand-new-pass",
+            "sign_out_other_devices": False,
+        },
+        headers=ha,
+    )
+    assert r.status_code == 200
+    page = await _sync(client, hb, cursor)
+    assert page["users"] == []  # nothing visible changed, so nothing to infer
+
+
+async def test_non_ascii_digit_cursor_is_a_reset(client: httpx.AsyncClient) -> None:
+    ha, _hb, _ch = await _setup(client)
+    r = await client.get("/api/v1/sync", params={"since": "²"}, headers=ha)
+    assert r.status_code == 410
+
+
+def test_reaction_and_channel_events_carry_a_fresh_seq(sync_client: TestClient) -> None:
+    http = sync_client
+    http.post(f"{AUTH}/register", json={"handle": "alice", "display_name": "A", "password": PW})
+    a = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
+    ha = _h(a["access_token"])
+    http.post(
+        f"{AUTH}/register", json={"handle": "bob", "display_name": "B", "password": PW}, headers=ha
+    )
+    ch = http.post("/api/v1/channels", json={"kind": "channel", "name": "g"}, headers=ha).json()
+    with http.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "auth", "data": {"access_token": a["access_token"]}})
+        assert ws.receive_json()["type"] == "ready"
+        sent = http.post(
+            f"/api/v1/channels/{ch['id']}/messages", json={"body": "hi"}, headers=ha
+        ).json()
+        http.post(
+            f"/api/v1/channels/{ch['id']}/messages/{sent['id']}/reactions",
+            json={"emoji": "👍"},
+            headers=ha,
+        )
+        http.post(f"/api/v1/channels/{ch['id']}/members", json={"handle": "bob"}, headers=ha)
+        seen: dict[str, dict] = {}
+        while "channel.update" not in seen:
+            ev = ws.receive_json()
+            seen[ev["type"]] = ev["data"]
+        assert seen["reaction.update"]["seq"] > sent["seq"]
+        assert seen["channel.update"]["seq"] > seen["reaction.update"]["seq"]

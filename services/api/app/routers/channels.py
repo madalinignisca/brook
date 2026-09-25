@@ -441,6 +441,7 @@ async def join_channel(
 
 async def _emit_channel_update(hub: Hub, session: AsyncSession, channel: Channel) -> None:
     """Broadcast a `channel.update` to a channel's members (membership/metadata changed)."""
+    await session.refresh(channel)  # the seq a membership change just stamped on it
     members = await _members(session, channel.id)
     out = _channel_out(channel, members)
     member_ids = [m.id for m in members]
@@ -793,6 +794,8 @@ async def toggle_reaction(
     else:
         await session.delete(existing)
         added = False
+    await session.flush()  # stamps the message's seq (app/sync.py)
+    seq = transaction_seq(session.sync_session)
     await session.commit()
 
     count = (
@@ -817,6 +820,7 @@ async def toggle_reaction(
                 "user_id": str(user.id),
                 "added": added,
                 "count": count,
+                "seq": seq,
             },
         ),
     )
