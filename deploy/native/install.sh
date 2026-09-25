@@ -79,7 +79,12 @@ if [ "$(cat /opt/janus/.brook-commit 2>/dev/null)" != "$JANUS_COMMIT" ]; then
             --disable-all-transports --enable-websockets \
             --disable-all-handlers --disable-all-loggers
         as_janus make -s -j"$(nproc)"
-        make -s install
+        # `make install` regenerates version.c from git as root, and git refuses a
+        # checkout owned by another user ("dubious ownership"), which breaks the
+        # link. Trust this one directory for this one command only, via git's env
+        # config, so root's global git config is never touched.
+        GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$build/src" \
+            make -s install
     )
     echo "$JANUS_COMMIT" > /opt/janus/.brook-commit
     rm -rf "$build"
