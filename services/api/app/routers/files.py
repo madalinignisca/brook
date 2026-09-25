@@ -60,11 +60,18 @@ MAX_UPLOADS_PER_USER = 3
 FREE_CHECK_EVERY = 8 * 1024 * 1024  # re-check the disk floor while streaming
 
 
-def _error(code: int, err: str, message: str, details: object = None) -> HTTPException:
+def _error(
+    code: int,
+    err: str,
+    message: str,
+    details: object = None,
+    retry_after: int | None = None,
+) -> HTTPException:
     detail: dict[str, object] = {"code": err, "message": message}
     if details is not None:
         detail["details"] = details
-    return HTTPException(status_code=code, detail=detail)
+    headers = {"Retry-After": str(retry_after)} if retry_after is not None else None
+    return HTTPException(status_code=code, detail=detail, headers=headers)
 
 
 def _not_found() -> HTTPException:
@@ -182,9 +189,17 @@ async def upload_content(
     await session.rollback()  # don't hold a transaction open while the body streams
 
     if file_id in _in_flight:
-        raise _error(status.HTTP_409_CONFLICT, "file.upload_in_progress", "Already uploading")
+        # Transient: the client's outbox backs off and retries (it isn't a failure).
+        raise _error(
+            status.HTTP_409_CONFLICT, "file.upload_in_progress", "Already uploading", retry_after=5
+        )
     if _in_flight_per_user.get(user_id, 0) >= MAX_UPLOADS_PER_USER:
-        raise _error(status.HTTP_429_TOO_MANY_REQUESTS, "rate_limited", "Too many uploads at once")
+        raise _error(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "rate_limited",
+            "Too many uploads at once",
+            retry_after=10,
+        )
     _in_flight.add(file_id)
     _in_flight_per_user[user_id] = _in_flight_per_user.get(user_id, 0) + 1
     try:

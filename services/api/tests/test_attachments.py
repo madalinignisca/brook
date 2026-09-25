@@ -350,6 +350,7 @@ async def test_parallel_puts_to_one_file_are_refused_while_one_streams(
     finally:
         files_router._in_flight.discard(fid)
     assert r.status_code == 409 and r.json()["error"]["code"] == "file.upload_in_progress"
+    assert int(r.headers["retry-after"]) > 0  # transient: the outbox backs off
     assert _dir_files() == []  # it never opened a part file
     ok = await client.put(created["upload_url"], content=b"x" * 10, headers=ha)
     assert ok.status_code == 200 and not files_router._in_flight
