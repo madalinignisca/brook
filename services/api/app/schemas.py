@@ -228,6 +228,9 @@ class MessageCreate(BaseModel):
 
     body: str = Field(min_length=1, max_length=4000)
     reply_to_id: uuid.UUID | None = None
+    # Outbox idempotency: a UUID the client generates once per message. Resending
+    # with the same one returns the stored message (200), never a duplicate.
+    client_id: uuid.UUID | None = None
 
 
 class MessageEdit(BaseModel):
@@ -273,6 +276,8 @@ class MessageOut(BaseModel):
     reply_to_id: uuid.UUID | None = None
     reply_to: ReplyExcerpt | None = None
     reactions: list[ReactionSummary] = Field(default_factory=list)
+    # Echoed so the sender's cache matches its pending outbox entry to this message.
+    client_id: uuid.UUID | None = None
     # Specific @handle mentions resolved to member ids (set only on the live send).
     mentions: list[uuid.UUID] = Field(default_factory=list)
     # True when @channel / @here mentioned everyone (avoids listing all member ids).
