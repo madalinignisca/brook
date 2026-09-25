@@ -45,6 +45,9 @@ pub(crate) struct SessionStore {
     /// Serializes refreshes (the periodic loop and the socket's 1008 recovery), so a
     /// token is rotated once, not once per caller.
     pub(crate) refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    /// After a 429 on /auth/refresh: no refresh is sent before this (every caller, not only the
+    /// one that got the 429, so queued refreshes do not each try again at once).
+    pub(crate) refresh_not_before: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
     rev_tx: Arc<watch::Sender<Revision>>,
     state_tx: Arc<watch::Sender<AuthState>>,
 }
@@ -55,6 +58,7 @@ impl SessionStore {
         Self {
             cell: Arc::new(RwLock::new(Cell::default())),
             refresh_lock: Arc::default(),
+            refresh_not_before: Arc::default(),
             rev_tx: Arc::new(rev_tx),
             state_tx,
         }
@@ -93,6 +97,8 @@ impl SessionStore {
             cell.session = session;
             cell.rev
         };
+        // A new sign-in (or sign-out) does not inherit the previous session's 429 wait.
+        *self.refresh_not_before.lock().unwrap() = None;
         self.rev_tx.send_replace(rev);
     }
 
@@ -115,6 +121,7 @@ impl SessionStore {
                 _ => return RefreshApplied::Discarded,
             }
         };
+        *self.refresh_not_before.lock().unwrap() = None; // the wait is over: it worked
         self.rev_tx.send_replace(rev);
         RefreshApplied::Committed
     }

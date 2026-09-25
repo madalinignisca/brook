@@ -24,6 +24,8 @@ pub enum RefreshMode {
     Rotate,
     /// Answer with this status and an error envelope.
     Fail(u16),
+    /// 429 `auth.rate_limited` with `Retry-After: <seconds>`.
+    RateLimited(u32),
 }
 
 struct ServerState {
@@ -125,6 +127,12 @@ async fn refresh(State(state): State<Shared>) -> Response {
     state.refresh_calls += 1;
     match state.refresh_mode {
         RefreshMode::Rotate => Json(issue(&mut state, "alice")).into_response(),
+        RefreshMode::RateLimited(secs) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", secs.to_string())],
+            Json(json!({ "error": { "code": "auth.rate_limited", "message": "slow down" } })),
+        )
+            .into_response(),
         RefreshMode::Fail(code) => (
             StatusCode::from_u16(code).unwrap(),
             Json(
@@ -211,6 +219,7 @@ impl WsPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::RefreshOutcome;
     use crate::{AuthState, ServerEvent};
 
     /// P0 smoke: through the public client — login, realtime start, auth frame carries
@@ -700,6 +709,180 @@ mod tests {
         let mut next = server.accept().await;
         assert_eq!(server.refresh_calls(), 1, "reconnected before refreshing");
         assert_eq!(next.accept_auth().await["data"]["access_token"], "access-2");
+    }
+
+    /// A rate-limited refresh is not a rejected token: the session and the user stay.
+    #[tokio::test]
+    async fn rate_limited_refresh_keeps_the_session() {
+        let server = TestServer::start().await;
+        let client = server.client();
+        client.login("alice", "pw").await.unwrap();
+        let before = client.session.snapshot().await.1.unwrap().refresh_token;
+        server.set_refresh_mode(RefreshMode::RateLimited(60));
+        let outcome = client.refresh_now().await.unwrap();
+        assert_eq!(
+            outcome,
+            RefreshOutcome::RateLimited(Duration::from_secs(60))
+        );
+        assert!(
+            matches!(*client.state().borrow(), AuthState::LoggedIn(_)),
+            "signed out"
+        );
+        assert_eq!(
+            client.session.snapshot().await.1.unwrap().refresh_token,
+            before
+        );
+    }
+
+    /// 1008 `rate_limited`: the IP must wait. No refresh (it would not help and only adds
+    /// load), no reconnect before 5 s, and after a healthy session the wait starts over.
+    #[tokio::test]
+    async fn rate_limited_close_backs_off_without_refreshing() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, _generation) = connected(&mut server, |_| {}).await;
+        peer.close(1008, "rate_limited").await;
+        // The ordinary backoff would reconnect after 1 s; rate_limited waits at least 5 s.
+        let early = tokio::time::timeout(Duration::from_millis(4500), server.accept()).await;
+        assert!(
+            early.is_err(),
+            "reconnected sooner than the rate-limit minimum"
+        );
+        let mut next = tokio::time::timeout(Duration::from_secs(10), server.accept())
+            .await
+            .expect("never reconnected");
+        next.accept_auth().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // After a healthy session, a new rate_limited close waits 5 s again, not 10.
+        next.close(1008, "rate_limited").await;
+        let early = tokio::time::timeout(Duration::from_millis(4500), server.accept()).await;
+        assert!(
+            early.is_err(),
+            "reconnected sooner than the rate-limit minimum (2nd)"
+        );
+        tokio::time::timeout(Duration::from_millis(2500), server.accept())
+            .await
+            .expect("the wait did not start over after a healthy session");
+        assert_eq!(
+            server.refresh_calls(),
+            0,
+            "refreshed on a rate_limited close"
+        );
+        assert!(matches!(*client.state().borrow(), AuthState::LoggedIn(_)));
+    }
+
+    /// An auth close whose refresh is rate limited: wait `Retry-After` (not a hot loop), then
+    /// reconnect, having asked for a refresh exactly once, and still signed in.
+    #[tokio::test]
+    async fn auth_close_with_a_rate_limited_refresh_waits() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, _generation) = connected(&mut server, |_| {}).await;
+        server.set_refresh_mode(RefreshMode::RateLimited(2));
+        peer.close(1008, "token_expired").await;
+        let early = tokio::time::timeout(Duration::from_millis(1800), server.accept()).await;
+        assert!(early.is_err(), "reconnected before Retry-After");
+        tokio::time::timeout(Duration::from_secs(6), server.accept())
+            .await
+            .expect("never reconnected after Retry-After");
+        assert_eq!(server.refresh_calls(), 1, "refresh hammered");
+        assert!(
+            matches!(*client.state().borrow(), AuthState::LoggedIn(_)),
+            "signed out"
+        );
+    }
+
+    /// After a 429, another refresh (any caller) does not ask again inside the wait.
+    #[tokio::test]
+    async fn a_429_cooldown_is_shared_by_every_refresher() {
+        let server = TestServer::start().await;
+        let client = server.client();
+        client.login("alice", "pw").await.unwrap();
+        server.set_refresh_mode(RefreshMode::RateLimited(60));
+        client.refresh_now().await.unwrap();
+        let second = client.refresh_now().await.unwrap();
+        assert!(
+            matches!(second, RefreshOutcome::RateLimited(w) if w > Duration::from_secs(50)),
+            "{second:?}"
+        );
+        assert_eq!(server.refresh_calls(), 1, "asked again inside the wait");
+    }
+
+    /// A new sign-in does not inherit the previous session's 429 wait.
+    #[tokio::test]
+    async fn a_new_login_clears_the_429_wait() {
+        let server = TestServer::start().await;
+        let client = server.client();
+        client.login("alice", "pw").await.unwrap();
+        server.set_refresh_mode(RefreshMode::RateLimited(60));
+        client.refresh_now().await.unwrap();
+        client.login("bob", "pw").await.unwrap();
+        server.set_refresh_mode(RefreshMode::Rotate);
+        assert_eq!(
+            client.refresh_now().await.unwrap(),
+            RefreshOutcome::Committed
+        );
+    }
+
+    /// A sign-in during a long `Retry-After` wait on the socket ends the wait: the new session
+    /// gets its realtime connection at once.
+    #[tokio::test]
+    async fn a_new_login_ends_the_sockets_retry_after_wait() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, _generation) = connected(&mut server, |_| {}).await;
+        server.set_refresh_mode(RefreshMode::RateLimited(3600));
+        peer.close(1008, "token_expired").await;
+        tokio::time::sleep(Duration::from_millis(300)).await; // the socket task is waiting
+        server.set_refresh_mode(RefreshMode::Rotate);
+        client.login("bob", "pw").await.unwrap();
+        let mut next = tokio::time::timeout(Duration::from_secs(3), server.accept())
+            .await
+            .expect("the new session waited out the old one's Retry-After");
+        next.accept_auth().await;
+    }
+
+    /// Auth rejected on a socket that never became ready, refresh fine: back off, not a loop.
+    #[tokio::test]
+    async fn repeated_auth_rejection_before_ready_backs_off() {
+        let mut server = TestServer::start().await;
+        let client = server.client();
+        client.login("alice", "pw").await.unwrap();
+        client.start_realtime().await.unwrap();
+        let mut peer = server.accept().await;
+        let _auth = peer.recv().await; // never answered with ready
+        peer.close(1008, "auth_failed").await;
+        let early = tokio::time::timeout(Duration::from_millis(700), server.accept()).await;
+        assert!(
+            early.is_err(),
+            "reconnected at once after a rejection before ready"
+        );
+    }
+
+    #[test]
+    fn retry_after_is_clamped() {
+        use crate::client::{parse_retry_after, REFRESH_RETRY_INTERVAL};
+        assert_eq!(parse_retry_after(Some("0")), Duration::from_secs(1));
+        assert_eq!(parse_retry_after(Some(" 30 ")), Duration::from_secs(30));
+        assert_eq!(parse_retry_after(Some("999999")), Duration::from_secs(3600));
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            REFRESH_RETRY_INTERVAL
+        );
+        assert_eq!(parse_retry_after(None), REFRESH_RETRY_INTERVAL);
+    }
+
+    #[test]
+    fn refresh_loop_delay_honours_retry_after() {
+        use crate::client::{next_refresh_delay, REFRESH_RETRY_INTERVAL};
+        let long = Duration::from_secs(120);
+        assert_eq!(
+            next_refresh_delay(&Ok(RefreshOutcome::RateLimited(long))),
+            long
+        );
+        // Never sooner than the usual retry.
+        let short = Duration::from_secs(1);
+        assert_eq!(
+            next_refresh_delay(&Ok(RefreshOutcome::RateLimited(short))),
+            REFRESH_RETRY_INTERVAL
+        );
     }
 
     /// A refused re-auth (different user / invalid) closes the socket and reconnects.
