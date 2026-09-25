@@ -149,12 +149,40 @@ Every frame in both directions is the §2 envelope `{type, id, ts, data}`.
 | type | data | reply |
 |---|---|---|
 | `call.join` | `{channel_id}` | `call.joined` |
-| `call.publish` | `{call_id, sdp}` (publish-PC **offer**) | `call.publish.answer` |
+| `call.publish` | `{call_id, sdp, tracks?}` (publish-PC **offer**; `tracks` labels its m-lines, see below) | `call.publish.answer` |
 | `call.subscribe.answer` | `{call_id, version, sdp}` (subscribe-PC **answer** to the offer with that `version`) | `call.ok` or `error: stale` |
 | `call.ice` | `{call_id, pc: "publish"\|"subscribe", candidate}` | none (fire-and-forget) |
-| `call.media` | `{call_id, audio: bool, video: bool}` (mute state as the user sees it) | `call.ok` |
+| `call.media` | `{call_id, audio: bool, video: bool}` (mute state the user wants; the server announces each as *wanted AND published*, so an unpublished kind stays `false`, and a mute sent before the publish completes is kept when it does) | `call.ok` |
 | `call.leave` | `{call_id}` | `call.ok` |
 | `call.resume` | `{call_id, participant_id, resume_token}` (after a WS reconnect, §3.5) | `call.joined` |
+
+**Track labels and screen share.** `tracks` is an optional list of
+`{mid, kind: "audio"|"video", source}` labelling the offer's m-lines:
+
+- Absent: every audio m-line is `mic` and every video m-line is `camera` (clients
+  predating screen share keep working).
+- Present: every **active** audio/video m-line must be labelled; inactive or
+  rejected ones *may* be. Each label names an audio/video m-line of this offer,
+  once, with a `source` valid for its kind (`audio`: `mic`; `video`: `camera` or
+  `screen`). At most one **active** `screen`. A mid that stays active keeps its
+  source: relabelling a live m-line is refused (stop it and share again).
+  Anything else is `invalid`.
+- An m-line is **active** unless its direction is `inactive`/`recvonly`, or its
+  port is 0 **without** `a=bundle-only` (port 0 **with** `a=bundle-only` is live,
+  per RFC 8843, and is how max-bundle clients such as webrtcbin write it).
+- **Start sharing:** add a `sendonly` video m-line to the **same** publish PC,
+  label it `screen`, and send `call.publish` again. **Stop sharing:** set that
+  m-line's direction to `inactive` and publish again. To share again, re-enable
+  that m-line or add a new one.
+- **Never `stop()` a publish transceiver.** That rejects its m-line, and the
+  browser may later **recycle** the slot under a new mid, which the SFU (Janus
+  1.4.2) answers with the stale mid, breaking the PC. The server refuses any
+  offer that changes the mid of an existing m-line position with `invalid`.
+- Peers get a new stream through a normal `call.subscribe.offer` whose
+  `SubStream.source` is `"screen"`, and see it in the sharer's
+  `Participant.publishing`.
+- `call.media` stays mic/camera only: its `video` flag is the camera. Sharing is
+  on/off by publishing, never by `call.media`.
 
 `candidate` is `{candidate, sdpMid, sdpMLineIndex}` (exactly these keys, as WebRTC's
 `RTCIceCandidate.toJSON()` produces), or `null` for end-of-candidates; `pc` is the
@@ -184,8 +212,8 @@ its candidates in the SDP, so server → client trickle is rare but allowed.)
 
 ```text
 Participant = { participant_id, user_id, display_name,
-                audio: bool, video: bool,             // false until published; then from
-                                                      // the publish offer; then call.media
+                audio: bool, video: bool,             // mic / camera: wanted (last call.media,
+                                                      // default on) AND published
                 publishing: [ { kind: "audio"|"video", source: "mic"|"camera"|"screen" } ] }
 SubStream   = { mid, participant_id, kind: "audio"|"video", source }
 ```
@@ -244,8 +272,8 @@ token, participant or user is always the same `not_in_call`.
 - **8 participants** per call (`call_full` beyond).
 - Per-publisher cap **1.5 Mbps video / 720p** set in the SFU room config, until
   simulcast lands ([MEDIA.md](MEDIA.md) §5).
-- One camera + one mic per participant. Screen share is a later additive change
-  (a third `source`), not in v1.
+- One mic, one camera and at most one screen per participant. The per-publisher
+  bitrate cap applies; send the screen at a low frame rate (MEDIA.md).
 - ICE: host candidates suffice on the shared LAN test server; STUN/TURN delivery
   (`ice_servers` in `call.joined`) is added with coturn, as an **additive** field.
 

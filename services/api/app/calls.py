@@ -69,14 +69,29 @@ class Participant:
     feed_id: int = 0  # Janus publisher id
     private_id: int = 0
     publishing: list[dict[str, str]] = field(default_factory=list)
+    # mid -> source ("mic" | "camera" | "screen") of this participant's ACTIVE publish
+    # m-lines. Subscriptions and the SubStream.source mapping are per stream, from
+    # this table (not from Janus's description round-trip).
+    stream_sources: dict[str, str] = field(default_factory=dict)
+    # mid of each publish m-line by position, from the last accepted offer. Janus
+    # 1.4.2 does not support m-line RECYCLING (a rejected slot reused under a new
+    # mid): it answers with the stale mid and the client's PC rejects the answer
+    # ("order of m-lines doesn't match"). Verified with Chrome. Refused up front.
+    pub_mids: list[str] = field(default_factory=list)
     # True once Janus reports this publish PC up ("webrtcup"). Janus refuses to
     # subscribe anyone to a feed before that ("No such feed"), so a participant only
     # counts as a subscribable publisher from then on; "hangup" clears it.
     media_up: bool = False
-    # Contract §3.4: false until published; then set from what the publish offer
-    # sends, and changed only by call.media afterwards.
+    # Announced mute state (contract §3.4), derived by refresh_media(): never set directly.
     audio: bool = False
     video: bool = False
+    # What the user last asked for with call.media (on until they say otherwise).
+    # The announced audio/video are always intent AND "that kind is published",
+    # recomputed on call.media and on every publish, so a mute sent before the
+    # publish lands survives it, and an unpublished kind can never show as on.
+    audio_intent: bool = True
+    video_intent: bool = True
+
     # Proves "this device is that participant" on call.resume (contract §3.5). A
     # user may be in one call from several devices, so user_id alone would let one
     # device take over another's participant. Rotated on every resume.
@@ -86,12 +101,23 @@ class Participant:
     # client still holds only the old one and must not lose the call over it.
     prev_resume_token: str | None = None
     sub_hid: int | None = None
-    sub_feeds: set[int] = field(default_factory=set)
+    # (feed, mid) this participant's subscribe PC carries. Per STREAM, not per feed:
+    # Janus does not add a stream a publisher adds mid-call (e.g. a screen share) to
+    # an existing feed-level subscription (verified against Janus 1.4.2), so every
+    # stream is subscribed explicitly.
+    sub_streams: set[tuple[int, str]] = field(default_factory=set)
     sub_version: int = 0
     sub_pending: dict[str, Any] | None = None  # the unanswered offer frame, if any
     sub_dirty: bool = False
     grace: asyncio.Task[None] | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def refresh_media(self) -> None:
+        """audio/video = what the user wants AND what is actually published."""
+        # call.media covers mic and camera only; a screen share is on/off by publish.
+        sources = set(self.stream_sources.values())
+        self.audio = self.audio_intent and "mic" in sources
+        self.video = self.video_intent and "camera" in sources
 
     def view(self) -> dict[str, Any]:
         return {
@@ -333,21 +359,42 @@ class CallManager:
 
     # ---- publish --------------------------------------------------------------
 
-    async def publish(self, p: Participant, sdp: str) -> str:
+    async def publish(self, p: Participant, sdp: str, tracks: Any = None) -> str:
+        mlines = _parse_mlines(sdp)
+        for i, (old, new) in enumerate(zip(p.pub_mids, (m.mid for m in mlines), strict=False)):
+            if old != new:
+                raise CallError(
+                    "invalid",
+                    f"m-line {i} changed mid {old!r} -> {new!r}: m-line recycling is not "
+                    "supported; stop sharing with direction inactive, never stop() a "
+                    "publish transceiver",
+                )
+        # CallError on bad labels; p.stream_sources pins the source of live mids.
+        sources = _label_streams(mlines, tracks, p.stream_sources)
         try:
             msg = await self.janus().message(
                 p.sid,
                 p.pub_hid,
-                {"request": "configure", "audio": True, "video": True},
+                {
+                    "request": "configure",
+                    "audio": True,
+                    "video": True,
+                    # Janus-side labels (for logs/tools); our mapping uses stream_sources.
+                    "descriptions": [{"mid": m, "description": s} for m, s in sources.items()],
+                },
                 jsep={"type": "offer", "sdp": sdp},
             )
             answer = msg["jsep"]["sdp"]
         except (JanusError, KeyError) as exc:
             log.warning("SFU rejected a publish offer from %s: %s", p.participant_id, exc)
             raise CallError("invalid", "the SFU rejected the offer") from exc
-        p.publishing = _publishing_from_sdp(sdp)
-        p.audio = any(x["kind"] == "audio" for x in p.publishing)
-        p.video = any(x["kind"] == "video" for x in p.publishing)
+        p.stream_sources = sources
+        p.pub_mids = [m.mid for m in mlines]
+        p.publishing = [
+            {"kind": "audio" if src == "mic" else "video", "source": src}
+            for src in sources.values()
+        ]
+        p.refresh_media()  # keeps a mute sent before this publish landed
         await self._broadcast(
             p.call,
             envelope(
@@ -374,11 +421,12 @@ class CallManager:
                 p.sub_dirty = True  # replayed after the client answers
                 return
             desired = {
-                o.feed_id
+                (o.feed_id, mid)
                 for o in p.call.participants.values()
-                if o is not p and o.publishing and o.media_up
+                if o is not p and o.media_up
+                for mid in o.stream_sources
             }
-            if desired == p.sub_feeds:
+            if desired == p.sub_streams:
                 return
             janus = self.janus()
             if p.sub_hid is None:
@@ -392,7 +440,7 @@ class CallManager:
                             "ptype": "subscriber",
                             "room": p.call.room,
                             "private_id": p.private_id,
-                            "streams": [{"feed": f} for f in sorted(desired)],
+                            "streams": [{"feed": f, "mid": m} for f, m in sorted(desired)],
                         },
                     )
                 except JanusError:
@@ -403,17 +451,27 @@ class CallManager:
                     return
                 p.sub_hid = hid
             else:
+                add = desired - p.sub_streams
+                drop = p.sub_streams - desired
                 body: dict[str, Any] = {"request": "update"}
-                if add := desired - p.sub_feeds:
-                    body["subscribe"] = [{"feed": f} for f in sorted(add)]
-                if drop := p.sub_feeds - desired:
-                    body["unsubscribe"] = [{"feed": f} for f in sorted(drop)]
+                if add:
+                    body["subscribe"] = [{"feed": f, "mid": m} for f, m in sorted(add)]
+                if drop:
+                    body["unsubscribe"] = [{"feed": f, "mid": m} for f, m in sorted(drop)]
                 try:
                     msg = await janus.message(p.sid, p.sub_hid, body)
                 except JanusError:
-                    log.exception("subscriber update failed for %s", p.participant_id)
+                    # Our record of the subscription can no longer be trusted (e.g. a
+                    # stream its publisher dropped is already gone from Janus, or Janus
+                    # renamed a recycled mid in place). Don't guess which part applied:
+                    # drop the subscribe PC and rebuild it from scratch, the same
+                    # recovery a rejected answer uses. The client gets a fresh offer.
+                    log.warning("subscriber update failed for %s; resubscribing", p.participant_id)
+                    await janus.detach(p.sid, p.sub_hid)
+                    p.sub_hid, p.sub_streams = None, set()
+                    self._spawn(self.reconcile(p))
                     return
-            p.sub_feeds = desired
+            p.sub_streams = desired
             if "jsep" in msg:
                 await self._offer(p, msg)
 
@@ -430,12 +488,13 @@ class CallManager:
                 or s.get("type") not in ("audio", "video")
             ):
                 continue
+            default = "mic" if s["type"] == "audio" else "camera"
             streams.append(
                 {
                     "mid": str(s["mid"]),
                     "participant_id": owner.participant_id,
                     "kind": s["type"],
-                    "source": "mic" if s["type"] == "audio" else "camera",
+                    "source": owner.stream_sources.get(str(s.get("feed_mid")), default),
                 }
             )
         frame = envelope(
@@ -472,7 +531,7 @@ class CallManager:
                 # Start over with a fresh subscriber handle and a fresh offer.
                 if p.sub_hid is not None:
                     await self.janus().detach(p.sid, p.sub_hid)
-                p.sub_hid, p.sub_feeds, p.sub_pending, p.sub_dirty = None, set(), None, False
+                p.sub_hid, p.sub_streams, p.sub_pending, p.sub_dirty = None, set(), None, False
                 self._spawn(self.reconcile(p))
                 log.warning("SFU rejected a subscribe answer from %s: %s", p.participant_id, exc)
                 raise CallError("invalid", "the SFU rejected the answer") from exc
@@ -642,23 +701,98 @@ def _token_ok(given: str, current: str, previous: str | None) -> bool:
     return ok_current or ok_previous
 
 
-def _publishing_from_sdp(sdp: str) -> list[dict[str, str]]:
-    """What a publish offer sends: one entry per non-inactive audio/video m-line."""
-    out: list[dict[str, str]] = []
-    kind: str | None = None
-    direction_ok = True
+@dataclass(frozen=True)
+class _MLine:
+    mid: str
+    kind: str  # "audio" | "video" | other (e.g. "application")
+    active: bool  # sends media (see _parse_mlines for the rule)
+
+
+def _parse_mlines(sdp: str) -> list[_MLine]:
+    """The offer's m-lines with their mid, kind and whether they are active.
+
+    Active = not `inactive`/`recvonly`, and not port 0 UNLESS `a=bundle-only`.
+    Port 0 with bundle-only (RFC 8843) is a live m-line riding the bundle: it is
+    how GStreamer's webrtcbin (max-bundle) writes every m-line after the first.
+    Treating plain "port 0" as inactive dropped native clients' cameras (Chrome
+    uses port 9, so browser tests never saw it).
+    """
+    out: list[_MLine] = []
+    cur: dict[str, Any] | None = None
 
     def flush() -> None:
-        if kind in ("audio", "video") and direction_ok:
-            out.append({"kind": kind, "source": "mic" if kind == "audio" else "camera"})
+        if cur is not None:
+            parked = cur["port_zero"] and not cur["bundle_only"]
+            out.append(_MLine(cur["mid"], cur["kind"], cur["sending"] and not parked))
 
-    for line in sdp.splitlines():
+    for raw in sdp.splitlines():
+        line = raw.strip()
         if line.startswith("m="):
             flush()
-            kind, direction_ok = line[2:].split(" ", 1)[0], True
-        elif line.strip() in ("a=inactive", "a=recvonly"):
-            direction_ok = False
+            parts = line[2:].split()
+            kind = parts[0] if parts else ""
+            port_zero = len(parts) > 1 and parts[1] == "0"
+            cur = {
+                "mid": str(len(out)),
+                "kind": kind,
+                "port_zero": port_zero,
+                "bundle_only": False,
+                "sending": True,
+            }
+        elif cur is not None and line.startswith("a=mid:"):
+            cur["mid"] = line[len("a=mid:") :]
+        elif cur is not None and line == "a=bundle-only":
+            cur["bundle_only"] = True
+        elif cur is not None and line in ("a=inactive", "a=recvonly"):
+            cur["sending"] = False
     flush()
+    return out
+
+
+_SOURCES = {"audio": {"mic"}, "video": {"camera", "screen"}}
+
+
+def _label_streams(
+    mlines: list[_MLine], tracks: Any, current: dict[str, str] | None = None
+) -> dict[str, str]:
+    """mid -> source for the ACTIVE audio/video m-lines (contract §3.3).
+
+    Without ``tracks``: audio is "mic", video "camera" (clients predating screen
+    share). With ``tracks``:
+    - every ACTIVE audio/video m-line must be labelled; inactive or rejected ones
+      MAY be (browsers drop stopped transceivers from their lists, so demanding a
+      label for a rejected m-line would make re-sharing impossible);
+    - each label names an audio/video m-line of this offer, once, with a source
+      valid for its kind;
+    - at most one ACTIVE "screen" (a stopped screen may stay labelled);
+    - a mid that stays active keeps its source (``current``): relabelling a live
+      camera as a screen, or back, is ``invalid``; stop and restart instead.
+    Anything else is ``invalid``: a mislabelled screen would show as a camera
+    tile, or vice versa.
+    """
+    media = {m.mid: m for m in mlines if m.kind in _SOURCES}
+    if tracks is None:
+        return {
+            m.mid: ("mic" if m.kind == "audio" else "camera") for m in media.values() if m.active
+        }
+    if not isinstance(tracks, list) or not all(isinstance(t, dict) for t in tracks):
+        raise CallError("invalid", "tracks must be a list of {mid, kind, source}")
+    labels = {str(t.get("mid")): t for t in tracks}
+    if len(labels) != len(tracks) or not set(labels) <= set(media):
+        raise CallError("invalid", "tracks must name this offer's audio/video m-lines, once each")
+    if missing := {mid for mid, m in media.items() if m.active} - set(labels):
+        raise CallError(
+            "invalid", f"tracks must label every active m-line (missing {sorted(missing)})"
+        )
+    for mid, t in labels.items():
+        if t.get("kind") != media[mid].kind or t.get("source") not in _SOURCES[media[mid].kind]:
+            raise CallError("invalid", f"track {mid}: kind/source do not match its m-line")
+    out = {mid: str(labels[mid]["source"]) for mid, m in media.items() if m.active}
+    if sum(src == "screen" for src in out.values()) > 1:
+        raise CallError("invalid", "at most one active screen per participant")
+    for mid, src in out.items():
+        if current and mid in current and current[mid] != src:
+            raise CallError("invalid", f"track {mid}: source cannot change while it is active")
     return out
 
 
@@ -730,7 +864,7 @@ async def _join(conn: Connection, frame: dict[str, Any], re: str | None) -> None
 async def _publish(conn: Connection, frame: dict[str, Any], re: str | None) -> None:
     data = _require(frame, "call_id", "sdp")
     p = manager._participant_of(conn, data["call_id"])
-    answer = await manager.publish(p, str(data["sdp"]))
+    answer = await manager.publish(p, str(data["sdp"]), data.get("tracks"))
     await conn.send(
         envelope("call.publish.answer", {"call_id": p.call.call_id, "sdp": answer}, re=re)
     )
@@ -763,8 +897,14 @@ async def _ice(conn: Connection, frame: dict[str, Any], re: str | None) -> None:
 async def _media(conn: Connection, frame: dict[str, Any], re: str | None) -> None:
     data = _require(frame, "call_id", "audio", "video")
     p = manager._participant_of(conn, data["call_id"])
-    p.audio, p.video = bool(data["audio"]), bool(data["video"])
+    before = (p.audio, p.video)
+    p.audio_intent, p.video_intent = bool(data["audio"]), bool(data["video"])
+    p.refresh_media()  # announced = intent AND published (see Participant)
     await conn.send(envelope("call.ok", {}, re=re))
+    if (p.audio, p.video) == before:
+        # Nothing peers can see changed (e.g. a client re-announcing its intent
+        # after a publish landed): no redundant call.participant event.
+        return
     updated = envelope(
         "call.participant",
         {"call_id": p.call.call_id, "event": "updated", "participant": p.view()},
