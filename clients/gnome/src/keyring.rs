@@ -106,7 +106,11 @@ fn worker(rx: mpsc::Receiver<(Op, mpsc::Sender<Reply>)>) {
             }
             outcome
         });
-        let _ = reply.send(result); // the caller may have given up (deadline)
+        // The caller may have given up (deadline). The operation still ran, and later
+        // ones run after it in the order issued: core has already fenced a timed-out
+        // write or delete, and a sign-out's delete then a new sign-in's replace land in
+        // that order. Don't "fix" this by dropping late operations.
+        let _ = reply.send(result);
     }
 }
 
