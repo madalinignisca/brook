@@ -168,8 +168,10 @@ connection**, and catches up exactly on what it missed. Done means, observably:
 ### 6.2 Downloads
 - Written **already encrypted**: each received MiB is sealed and appended. A partial is
   ciphertext, recorded in `files.state = partial` with its last complete chunk.
-- Resume uses `Range` from that chunk's end, with `If-Range: <sha256>`. If the server's file
-  changed, the partial is discarded and a new key is used.
+- Resume uses `Range` from that chunk's end, with `If-Range: "<sha256>"` (quoted, exactly as
+  the server's `ETag: "<sha256>"`). A `200` instead of a `206` means the file changed or the
+  validator didn't match: the partial is discarded, a new key is used, and the download starts
+  from 0.
 ### 6.3 Uploads
 - Uploads stream from the outbox snapshot (decrypted in memory, chunk by chunk), with a
   per-transfer timeout. The client-wide 30 s doesn't apply.
