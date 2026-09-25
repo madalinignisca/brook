@@ -21,6 +21,17 @@ use url::Url;
 
 use crate::{AuthState, Session};
 
+/// What `install_for_login` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Install {
+    Installed,
+    /// A sign-out, a newer login or a close won meanwhile: the pair is nobody's (revoke it).
+    Stale,
+    /// A newer client owns the persistence slot. A pair refreshed from the stored token is in
+    /// the same login (token family) as that client's: revoking it would sign that client out.
+    SlotTaken,
+}
+
 /// Counters observed by the socket (and later, calls).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Revision {
@@ -292,17 +303,17 @@ impl SessionStore {
     /// Install login attempt `gen`'s session and publish `LoggedIn`, in the same write that
     /// checks the attempt is still current (a sign-out can't slip between install and publish).
     /// False: stale; the caller revokes the pair.
-    pub(crate) async fn install_for_login(&self, gen: u64, session: Session) -> bool {
+    pub(crate) async fn install_for_login(&self, gen: u64, session: Session) -> Install {
         let rev = {
             let mut cell = self.cell.write().await;
             if self.is_closed() || cell.login_gen != gen {
-                return false;
+                return Install::Stale;
             }
             if self.persistence.get().is_some() {
                 // Refused when a newer client owns the slot, so a late restore or login can't
                 // bring back a sign-in that was replaced or signed out.
                 if self.with_slot(|p| p.write(&session)).is_none() {
-                    return false;
+                    return Install::SlotTaken;
                 }
                 cell.persisted = true;
             }
@@ -315,7 +326,7 @@ impl SessionStore {
         };
         *self.refresh_not_before.lock().unwrap() = None;
         self.rev_tx.send_replace(rev);
-        true
+        Install::Installed
     }
 
     /// Sign out (or, with `close`, the client is gone): end any login attempt, take the
@@ -518,7 +529,7 @@ mod tests {
         let out = tokio::spawn(async move { s.sign_out(false).await });
         tokio::task::yield_now().await; // the sign-out waits behind it
         drop(held);
-        assert!(install.await.unwrap());
+        assert_eq!(install.await.unwrap(), Install::Installed);
         out.await.unwrap();
         assert!(store.snapshot().await.1.is_none());
         assert_eq!(*state.borrow(), AuthState::LoggedOut);
@@ -545,7 +556,7 @@ mod tests {
         let out = tokio::spawn(async move { s.sign_out(false).await });
         tokio::task::yield_now().await;
         drop(held);
-        assert!(install.await.unwrap());
+        assert_eq!(install.await.unwrap(), Install::Installed);
         out.await.unwrap();
         assert!(
             !slot.contains("session:https://h"),

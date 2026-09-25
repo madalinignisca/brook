@@ -10,7 +10,7 @@ use serde_json::json;
 use tokio::sync::{broadcast, watch};
 use url::Url;
 
-use crate::session_store::{RefreshApplied, Revision, SessionStore};
+use crate::session_store::{Install, RefreshApplied, Revision, SessionStore};
 use crate::ws::{self, Commands, ServerEvent, Transport};
 use crate::{
     AuthState, Channel, CoreConfig, Error, Message, ReactionSummary, Result, Session, User,
@@ -352,11 +352,16 @@ impl BrookClient {
             };
             let user = restored.user.clone();
             // Install and re-store in one write section, only if still current.
-            if session.install_for_login(gen, restored.clone()).await {
-                RestoreOutcome::LoggedIn(user)
-            } else {
-                session.revoke_detached(restored.refresh_token);
-                RestoreOutcome::Superseded
+            match session.install_for_login(gen, restored.clone()).await {
+                Install::Installed => RestoreOutcome::LoggedIn(user),
+                Install::Stale => {
+                    session.revoke_detached(restored.refresh_token);
+                    RestoreOutcome::Superseded
+                }
+                // Refreshed from the stored token, so it's the same login as the newer
+                // client that took the slot: the server ends a whole login on logout, and
+                // revoking this would sign that client out. It's left to expire.
+                Install::SlotTaken => RestoreOutcome::Superseded,
             }
         });
         task.await.unwrap_or(RestoreOutcome::Offline)
@@ -444,7 +449,9 @@ impl BrookClient {
                             return Err(err);
                         }
                     };
-                    if session.install_for_login(gen, new.clone()).await {
+                    // A fresh login is a login of its own: whatever refused it, revoking it
+                    // touches nobody else.
+                    if session.install_for_login(gen, new.clone()).await == Install::Installed {
                         Ok(LoginOutcome::LoggedIn(new)) // LoggedIn published by the install
                     } else {
                         session.revoke_detached(new.refresh_token); // superseded meanwhile
