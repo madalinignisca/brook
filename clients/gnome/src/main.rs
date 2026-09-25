@@ -127,6 +127,7 @@ fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
         error_label: error_label.downgrade(),
         login_button: login_button.downgrade(),
         window: window.downgrade(),
+        signed_out_by_user: Rc::default(),
     };
     // The client for the server currently in use; replaced when the user logs
     // in to a different server. Dropping the old client ends its state watcher.
@@ -222,6 +223,8 @@ struct LoginUi {
     error_label: glib::WeakRef<gtk::Label>,
     login_button: glib::WeakRef<gtk::Button>,
     window: glib::WeakRef<adw::ApplicationWindow>,
+    /// Set by Sign Out, so the login view doesn't call it "You were signed out".
+    signed_out_by_user: Rc<std::cell::Cell<bool>>,
 }
 
 /// Reactive UI: apply a client's observable auth state on the GTK main loop.
@@ -265,7 +268,14 @@ fn watch_auth_state(
                     if let Some(chat) = stack.child_by_name("chat") {
                         stack.set_visible_child_name("login");
                         stack.remove(&chat);
-                        error_label.set_text("You were signed out. Please log in again.");
+                        // Sign Out needs no explanation; anything else (a refresh
+                        // rejected, a password changed elsewhere) does.
+                        let asked = ui.signed_out_by_user.replace(false);
+                        error_label.set_text(if asked {
+                            ""
+                        } else {
+                            "You were signed out. Please log in again."
+                        });
                     }
                     login_button.set_sensitive(true);
                 }
@@ -283,7 +293,18 @@ fn watch_auth_state(
                     // grows to a comfortable chat size on first sign-in.
                     if stack.child_by_name("chat").is_none() {
                         let is_admin = user.global_role == "admin";
-                        let view = chat::build(client, ui.runtime.clone(), is_admin);
+                        let sign_out: Rc<dyn Fn()> = Rc::new({
+                            let (client, runtime) = (client.clone(), ui.runtime.clone());
+                            let asked = ui.signed_out_by_user.clone();
+                            move || {
+                                asked.set(true);
+                                let client = client.clone();
+                                // Core ends the session at once and publishes
+                                // LoggedOut; the watcher above goes back to login.
+                                runtime.spawn(async move { client.logout().await });
+                            }
+                        });
+                        let view = chat::build(client, ui.runtime.clone(), is_admin, sign_out);
                         stack.add_named(&view, Some("chat"));
                         if let Some(window) = ui.window.upgrade() {
                             window.set_default_size(900, 640);
