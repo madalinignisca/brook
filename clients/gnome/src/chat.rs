@@ -438,6 +438,9 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     let widgets = chat.message_rows.borrow().get(&message.id).cloned();
                     if let Some(widgets) = widgets {
                         widgets.body.set_markup(&markdown_to_pango(&message.body));
+                        // An edit can add or clear a file message's caption (the server refuses
+                        // a blank edit on a message without files), so follow the new text.
+                        widgets.body.set_visible(!message.body.trim().is_empty());
                         widgets.edited.set_visible(true);
                     }
                 }
@@ -748,21 +751,20 @@ fn send_current(chat: &Rc<Chat>) {
 
     let chat = chat.clone();
     glib::spawn_future_local(async move {
-        // Through the outbox when offline storage is on: saved before this returns,
-        // sent in order, shown as a "sending" bubble until it arrives. A reply (the
-        // outbox has no quote field yet) or no local storage sends directly, online.
-        let queued = reply_to.is_none();
+        // Through the outbox when offline storage is on (replies too): saved before
+        // this returns, sent in order, shown as a "sending" bubble until it arrives.
+        // Without local storage it sends directly, online.
         let handle = chat.runtime.spawn({
             let client = chat.client.clone();
             let (body, reply_to) = (body.clone(), reply_to.clone());
             async move {
-                if queued {
-                    match client.send_queued(&channel_id, &body, None, None).await {
-                        Ok(_) => return Ok(true),
-                        Err(brook_core::Error::Api { code, .. }) if code == "local.unavailable" => {
-                        }
-                        Err(err) => return Err(err),
-                    }
+                match client
+                    .send_queued(&channel_id, &body, reply_to.clone(), None)
+                    .await
+                {
+                    Ok(_) => return Ok(true),
+                    Err(brook_core::Error::Api { code, .. }) if code == "local.unavailable" => {}
+                    Err(err) => return Err(err),
                 }
                 client
                     .send_message(&channel_id, &body, reply_to.as_deref())
@@ -960,6 +962,9 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
             .build();
         row.append(&quote);
     }
+    // A file sent without a caption has no text line (the server allows an empty body
+    // when files are attached).
+    body_label.set_visible(!(message.body.trim().is_empty() && !message.attachments.is_empty()));
     row.append(&body_label);
     // Attached files (a tombstone has none): shown, and saved only on request.
     for file in &message.attachments {
@@ -2061,6 +2066,7 @@ fn pending_text(state: &PendingState) -> String {
             "not_found" | "authz.forbidden" | "http_403" | "http_404" => {
                 "Not sent: you can't post here any more".into()
             }
+            "message.reply_target_gone" => "Not sent: the quoted message was deleted".into(),
             _ => "Not sent".into(),
         },
     }
@@ -2109,6 +2115,23 @@ fn pending_row(chat: &Rc<Chat>, item: &PendingMessage) -> gtk::ListBoxRow {
         .margin_end(12)
         .opacity(0.6)
         .build();
+    if let Some(target) = &item.reply_to_id {
+        // The quoted message as shown in this channel, if it's on screen.
+        let quoted = chat
+            .message_rows
+            .borrow()
+            .get(target)
+            .map(|w| w.body.text().to_string());
+        let excerpt = reply_excerpt(quoted.as_deref());
+        column.append(
+            &gtk::Label::builder()
+                .label(format!("\u{21b3} Replying to {excerpt}"))
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+    }
     column.append(
         &gtk::Label::builder()
             .label(&item.body)
@@ -2130,8 +2153,18 @@ fn pending_row(chat: &Rc<Chat>, item: &PendingMessage) -> gtk::ListBoxRow {
     );
     if failed {
         column.set_opacity(1.0);
+        // A reply whose quote is gone can't succeed as is: offer it as a plain message,
+        // in place (same position in the queue), instead of a Retry that fails again.
+        let quote_gone = matches!(
+            &item.state,
+            PendingState::Failed { code } if code == "message.reply_target_gone"
+        );
         let retry = gtk::Button::builder()
-            .label("Retry")
+            .label(if quote_gone {
+                "Send without the quote"
+            } else {
+                "Retry"
+            })
             .css_classes(["flat"])
             .build();
         let delete = gtk::Button::builder()
@@ -2145,8 +2178,13 @@ fn pending_row(chat: &Rc<Chat>, item: &PendingMessage) -> gtk::ListBoxRow {
             let (chat, cid) = (chat.clone(), cid.clone());
             move |_| {
                 let (client, cid) = (chat.client.clone(), cid.clone());
-                chat.runtime
-                    .spawn(async move { client.retry_send(&cid).await });
+                chat.runtime.spawn(async move {
+                    if quote_gone {
+                        client.retry_without_reply(&cid).await
+                    } else {
+                        client.retry_send(&cid).await
+                    }
+                });
             }
         });
         delete.connect_clicked({
@@ -2466,6 +2504,10 @@ mod offline_tests {
             }),
             "Not sent"
         );
+        assert!(pending_text(&PendingState::Failed {
+            code: "message.reply_target_gone".into()
+        })
+        .contains("quoted message was deleted"));
     }
 }
 
@@ -2546,5 +2588,36 @@ mod order_tests {
             insert_position(shown.iter(), "0190a000-0000-7000-8000-000000000009"),
             2
         );
+    }
+}
+
+/// The quoted message on a queued reply's bubble: one line, at most 80 characters.
+fn reply_excerpt(quoted: Option<&str>) -> String {
+    match quoted {
+        None => "an earlier message".into(),
+        Some(text) => {
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if flat.is_empty() {
+                "a deleted message".into() // a tombstone shows no body
+            } else {
+                flat.chars().take(80).collect()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod reply_excerpt_tests {
+    use super::reply_excerpt;
+
+    #[test]
+    fn a_quote_is_one_line_and_a_tombstone_says_so() {
+        assert_eq!(
+            reply_excerpt(Some("first line\nsecond  line")),
+            "first line second line"
+        );
+        assert_eq!(reply_excerpt(Some("")), "a deleted message");
+        assert_eq!(reply_excerpt(None), "an earlier message");
+        assert_eq!(reply_excerpt(Some(&"x".repeat(200))).chars().count(), 80);
     }
 }
