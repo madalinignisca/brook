@@ -686,9 +686,11 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
             let client = chat.client.clone();
             let channel_id = channel_id.clone();
             async move {
-                let page = client.cached_messages(&channel_id, None, 50).await?;
-                if page.needs_network {
-                    let _ = client.load_head(&channel_id, 50).await;
+                let mut page = client.cached_messages(&channel_id, None, 50).await?;
+                if page.needs_network && client.load_head(&channel_id, 50).await.is_ok() {
+                    // Re-read: the head fetch filled the cache (drawing the stale page
+                    // first would leave older rows arriving after newer ones).
+                    page = client.cached_messages(&channel_id, None, 50).await?;
                 }
                 Ok::<_, brook_core::Error>(page.messages)
             }
@@ -991,7 +993,10 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
     if let Some(old) = chat.message_rows.borrow_mut().remove(&message.id) {
         chat.message_list.remove(&old.row);
     }
-    chat.message_list.append(&list_row);
+    // In time order whatever the source (cache, history page, live event): ids are
+    // UUIDv7, lowercase, so string order is time order. Queued bubbles stay after them.
+    let position = insert_position(chat.message_rows.borrow().keys(), &message.id);
+    chat.message_list.insert(&list_row, position as i32);
     if let Some(cid) = &message.client_id {
         chat.shown_client_ids.borrow_mut().insert(cid.clone());
         drop_pending_bubble(chat, cid);
@@ -2466,5 +2471,40 @@ mod send_error_tests {
             message: String::new(),
         };
         assert!(send_error_text(&overtake).contains("earlier messages"));
+    }
+}
+
+/// Where a message goes among those shown: after every older one. Message ids are
+/// UUIDv7 in lowercase hex, so their string order is their time order.
+fn insert_position<'a>(shown: impl Iterator<Item = &'a String>, id: &str) -> usize {
+    shown.filter(|other| other.as_str() < id).count()
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::insert_position;
+
+    #[test]
+    fn an_older_message_goes_before_newer_ones() {
+        let shown: Vec<String> = [
+            "0190a000-0000-7000-8000-000000000003",
+            "0190a000-0000-7000-8000-000000000005",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // A page from load_head arriving after the newest is already on screen.
+        assert_eq!(
+            insert_position(shown.iter(), "0190a000-0000-7000-8000-000000000001"),
+            0
+        );
+        assert_eq!(
+            insert_position(shown.iter(), "0190a000-0000-7000-8000-000000000004"),
+            1
+        );
+        assert_eq!(
+            insert_position(shown.iter(), "0190a000-0000-7000-8000-000000000009"),
+            2
+        );
     }
 }
