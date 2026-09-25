@@ -209,3 +209,8 @@ one reviewer.
   checks that under one process-wide lock. The app makes a new client per attempt, so the owner
   is always the current attempt. A rotation is followed after a quit only while the session is
   still persisted, never after a sign-out. No round 3 by rule.
+
+**Server review.** `/auth/refresh` answers only 200, 401, 422 or 429. So only 401 and 422
+mean the token was refused (deleted if it's still the stored one). Any other 4xx comes from
+something in front of the api and is transient, like a 5xx: Offline at restore, a retry in the
+refresh loop.
