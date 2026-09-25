@@ -1,6 +1,6 @@
 # TOTP two-factor sign-in, client side — implementation plan
 
-> Status: **draft for review** · 2026-09-25 · Implements the approved spec
+> Status: **approved** (Heavy, two rounds) · 2026-09-25 · Implements the approved spec
 > [2026-09-25-totp-clients-design.md](2026-09-25-totp-clients-design.md) (Heavy). Starts after the
 > server spec #48 is merged; P4 needs its implementation on the test server. Tests first, each seen
 > failing under a named mutation.
@@ -24,12 +24,20 @@
    so an in-flight completion, which rechecks ownership under the lock before applying, can never
    install after them. `cancel_totp(&challenge)` clears the id only if it is that challenge's
    (a stale Back never cancels a newer one); it is idempotent and returns nothing.
+   **Publishing is atomic:** the final ownership check and the install-and-consume are one
+   session-store write (`install_if_current(challenge_id, pair)`), so a Back between a check and
+   an install cannot exist. **Login has an attempt generation:** `login` bumps it before sending
+   the password; its response publishes either outcome (a pair, or a new challenge) only if the
+   generation is still its own, checked in the same store write, so a password response arriving
+   after a logout or a newer login publishes nothing.
 2. `complete_totp` / `complete_recovery`: lock → ownership check → request → ownership check →
    apply (install + consume, or end on `totp_expired`, or keep on `invalid_code`); superseded →
    `ChallengeSuperseded`, and a pair issued for it is revoked best-effort.
 3. `totp_activate` on the change-password machinery (lock across the request, CAS commit, own
    bounded task); `totp_enroll`, `totp_disable`, `totp_regenerate_recovery_codes`,
-   `admin_reset_totp` on `Ctx::send` (own id refused locally, nothing sent). Body-free errors
+   `admin_reset_totp` on `Ctx::send` (own id refused locally, nothing sent; the id is read
+   from the same snapshot whose epoch `Ctx::send` is bound to, as `admin_reset_password` does,
+   so an account switch in between makes the call fail rather than target the new identity). Body-free errors
    throughout. The public me type gains `totp_enabled` and `recovery_codes_left`.
 - **Check:** every core test of spec §6, each seen red under its named mutation: pair installed
   after the password step; ownership check skipped before or after the request; invalidation
@@ -63,10 +71,12 @@
      the replay guard, not expiry or a consumed token).
   3. Recovery-code sign-in → `recovery_codes_left` = 9; the same recovery code on a fresh
      challenge → 403.
-  4. Next step: regenerate (password + code) → 10 new codes; an old unused one is refused.
+  4. Next step: regenerate (password + code) → 10 new codes; an old unused one is refused, and
+     **a new one signs in** (fresh challenge).
   5. Admin reset **while TOTP is enabled**, with a second device's session open: its access token,
      refresh token and socket are refused/closed (raw probes); the password alone now signs in.
-  6. A separate throwaway account: enrol, activate, and **disable** with the next step's code.
+  6. A separate throwaway account: enrol, activate, and **disable** with the next step's code;
+     then `/me` says `totp_enabled: false` and a **password-only login returns a working pair**.
   Waits: one per code-bearing call after the first, ≤ 30 s each (about 5 per run, ≤ 2.5 min).
   Required by name in `itest.sh`.
 - Rate limits: the suite spends about 15 credential checks and waits out any 429, as the password
@@ -99,3 +109,8 @@ for the kept-after-expiry challenge and for URI/recovery-code leaks; the own-id 
 `admin_reset_totp`; a P4 that proves replay on a fresh challenge, never reuses a step, probes
 both devices' old tokens after activation, and resets an *enabled* target with its sessions
 probed; the challenge's expiry, an idempotent `cancel_totp` and the me fields (Linux asks).
+**Round 2 — Codex + Vibe.** Vibe: none. Codex raised four new points, all accepted (no round 3,
+nothing disputed): the final ownership check and install are one atomic store write; login
+gets an attempt generation checked when publishing either outcome; the own-id refusal is bound
+to the epoch `Ctx::send` uses; P4 proves disable (state and a password-only login) and that a
+regenerated recovery code works. The gate closes.
