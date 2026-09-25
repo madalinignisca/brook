@@ -163,6 +163,60 @@ async def test_attach_and_see_it_in_history(client: httpx.AsyncClient) -> None:
     assert history[0]["attachments"][0]["filename"] == "report.pdf"
 
 
+async def test_attachments_keep_the_senders_order_on_every_read(
+    client: httpx.AsyncClient,
+) -> None:
+    # Uploaded first → attached last: history, /sync and a resend must all show the
+    # sender's order, the same as the send's own answer (not upload order).
+    ha, hb, ch = await _setup(client)
+    first = await _upload(client, ha, ch, b"one", name="one.txt")
+    second = await _upload(client, ha, ch, b"two", name="two.txt")
+    third = await _upload(client, ha, ch, b"three", name="three.txt")
+    order = [third["id"], first["id"], second["id"]]
+    cid = str(uuid.uuid4())
+    body = {"body": "files", "attachments": order, "client_id": cid}
+    url = f"/api/v1/channels/{ch}/messages"
+    sent = await client.post(url, json=body, headers=ha)
+    assert sent.status_code == 201
+    assert [a["id"] for a in sent.json()["attachments"]] == order
+
+    history = (await client.get(url, headers=hb)).json()
+    assert [a["id"] for a in history[-1]["attachments"]] == order
+    resend = await client.post(url, json=body, headers=ha)
+    assert [a["id"] for a in resend.json()["attachments"]] == order
+    synced = (await client.get("/api/v1/sync", params={"since": "1"}, headers=hb)).json()
+    (msg,) = [m for m in synced["messages"] if m["id"] == sent.json()["id"]]
+    assert [a["id"] for a in msg["attachments"]] == order
+
+
+async def test_a_message_may_be_files_only_but_not_empty(client: httpx.AsyncClient) -> None:
+    ha, _hb, ch = await _setup(client)
+    url = f"/api/v1/channels/{ch}/messages"
+    f = await _upload(client, ha, ch, b"photo", name="photo.jpg")
+    only_files = await client.post(url, json={"attachments": [f["id"]]}, headers=ha)
+    assert only_files.status_code == 201
+    assert only_files.json()["body"] == "" and only_files.json()["deleted_at"] is None
+    assert [a["id"] for a in only_files.json()["attachments"]] == [f["id"]]
+    nothing = await client.post(url, json={"body": ""}, headers=ha)
+    assert nothing.status_code == 422
+    blank = await client.post(url, json={"body": "  \n "}, headers=ha)  # no files: junk
+    assert blank.status_code == 422
+    captioned = await client.post(url, json={"body": "hi"}, headers=ha)
+    assert captioned.status_code == 201
+
+    # Edits follow the same rule: a caption can be added to, and removed from, a file
+    # message; a text-only message can't be edited down to nothing.
+    fid = only_files.json()["id"]
+    added = await client.patch(f"{url}/{fid}", json={"body": "a caption"}, headers=ha)
+    assert added.status_code == 200 and added.json()["body"] == "a caption"
+    removed = await client.patch(f"{url}/{fid}", json={"body": ""}, headers=ha)
+    assert removed.status_code == 200 and removed.json()["body"] == ""
+    blanked = await client.patch(
+        f"{url}/{captioned.json()['id']}", json={"body": "   "}, headers=ha
+    )
+    assert blanked.status_code == 422
+
+
 async def test_attach_rules(client: httpx.AsyncClient) -> None:
     ha, hb, ch = await _setup(client)
     other = (
@@ -248,6 +302,8 @@ async def test_limits(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
     # 1000 free - 8 pending - 3 new = 989 < 995: the shared disk's floor holds.
     floor = await _create(client, ha, ch, b"x" * 3)
     assert floor.status_code == 507 and floor.json()["error"]["code"] == "file.no_space"
+    # "Try later": clients keep the upload and retry after this long.
+    assert floor.headers["Retry-After"] == "600"
 
 
 # ---------------------------------------------------------------- lifecycle

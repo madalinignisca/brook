@@ -357,7 +357,8 @@ async def test_reply_to_foreign_message_rejected(client: httpx.AsyncClient) -> N
         json={"body": "bad reply", "reply_to_id": foreign},
         headers=_auth(alice),
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "message.reply_target_gone"
 
 
 async def test_reactions_toggle_and_aggregate(client: httpx.AsyncClient) -> None:

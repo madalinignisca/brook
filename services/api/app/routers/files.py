@@ -67,6 +67,13 @@ FREE_CHECK_EVERY = 8 * 1024 * 1024  # re-check the disk floor while streaming
 IDLE_TIMEOUT_S = 60.0
 
 
+def _no_space() -> HTTPException:
+    # "Try later", not "never": an admin freeing space fixes it with no change on the
+    # client, so clients keep the upload and retry after this long (their outbox row
+    # stays pending, shown as waiting for the server's storage).
+    return _error(507, "file.no_space", "The server is low on disk space", retry_after=600)
+
+
 def _error(
     code: int,
     err: str,
@@ -143,7 +150,7 @@ async def create_file(
     )
     free = await run_in_threadpool(storage.free_bytes)
     if free - int(pending or 0) - body.size < settings.files_min_free_bytes:
-        raise _error(507, "file.no_space", "The server is low on disk space")
+        raise _no_space()
     row = File(
         channel_id=channel_id,
         uploader_id=user.id,
@@ -241,7 +248,7 @@ async def _stream_and_commit(
 ) -> FileOut:
     settings = get_settings()
     if await run_in_threadpool(storage.free_bytes) < settings.files_min_free_bytes:
-        raise _error(507, "file.no_space", "The server is low on disk space")
+        raise _no_space()
     part = await run_in_threadpool(storage.PartWriter, file_id)
     next_check = FREE_CHECK_EVERY
     try:
@@ -254,7 +261,7 @@ async def _stream_and_commit(
             if part.size >= next_check:
                 next_check += FREE_CHECK_EVERY
                 if await run_in_threadpool(storage.free_bytes) < settings.files_min_free_bytes:
-                    raise _error(507, "file.no_space", "The server is low on disk space")
+                    raise _no_space()
         if part.size != declared:
             raise _error(422, "file.size_mismatch", "Fewer bytes than declared")
         await run_in_threadpool(part.finish)
