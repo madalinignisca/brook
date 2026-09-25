@@ -735,6 +735,13 @@ fn send_current(chat: &Rc<Chat>) {
     }
     chat.composer.set_text("");
     let reply_to = chat.replying_to.borrow().clone();
+    // "Replying to …", kept to restore the reply if the send fails.
+    let reply_label = chat
+        .reply_label
+        .label()
+        .strip_prefix("Replying to ")
+        .map(str::to_string)
+        .unwrap_or_default();
     set_reply(chat, None);
 
     let chat = chat.clone();
@@ -745,6 +752,7 @@ fn send_current(chat: &Rc<Chat>) {
         let queued = reply_to.is_none();
         let handle = chat.runtime.spawn({
             let client = chat.client.clone();
+            let (body, reply_to) = (body.clone(), reply_to.clone());
             async move {
                 if queued {
                     match client.send_queued(&channel_id, &body, None).await {
@@ -763,7 +771,19 @@ fn send_current(chat: &Rc<Chat>) {
         match handle.await {
             Ok(Ok(true)) => render_pending(&chat),
             Ok(Ok(false)) => {}
-            Ok(Err(err)) => tracing::warn!(%err, "failed to send message"),
+            Ok(Err(err)) => {
+                tracing::warn!(%err, "failed to send message");
+                // Nothing was sent: give the text (and the reply) back, unless the
+                // user already started typing something new, and say why.
+                if chat.composer.text().is_empty() {
+                    chat.composer.set_text(&body);
+                    chat.composer.set_position(-1);
+                    if let Some(id) = reply_to {
+                        set_reply(&chat, Some((id, reply_label)));
+                    }
+                }
+                show_send_error(&chat, &send_error_text(&err));
+            }
             Err(_) => {}
         }
     });
@@ -2398,5 +2418,50 @@ mod offline_tests {
             }),
             "Not sent"
         );
+    }
+}
+
+/// Why a send failed, briefly (shown above the message box).
+fn send_error_text(err: &brook_core::Error) -> String {
+    match err {
+        brook_core::Error::Http(_)
+        | brook_core::Error::Timeout
+        | brook_core::Error::Disconnected => {
+            "Couldn't send: you're offline. Your message is back in the box.".into()
+        }
+        brook_core::Error::NotAuthenticated => "Couldn't send: you were signed out.".into(),
+        brook_core::Error::Api { code, .. } if code == "outbox.would_overtake" => {
+            "Wait for your earlier messages to send, then try again.".into()
+        }
+        _ => "Couldn't send. Your message is back in the box.".into(),
+    }
+}
+
+/// Show a send error in the typing line for a few seconds.
+fn show_send_error(chat: &Rc<Chat>, text: &str) {
+    chat.typing_label.set_text(text);
+    chat.typing_label.add_css_class("error");
+    chat.typing_label.set_visible(true);
+    let label = chat.typing_label.downgrade();
+    glib::timeout_add_seconds_local_once(6, move || {
+        if let Some(label) = label.upgrade() {
+            label.remove_css_class("error");
+            label.set_visible(false);
+        }
+    });
+}
+
+#[cfg(test)]
+mod send_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_send_says_the_text_is_back() {
+        assert!(send_error_text(&brook_core::Error::Timeout).contains("back in the box"));
+        let overtake = brook_core::Error::Api {
+            code: "outbox.would_overtake".into(),
+            message: String::new(),
+        };
+        assert!(send_error_text(&overtake).contains("earlier messages"));
     }
 }
