@@ -107,4 +107,5 @@ deletes local data (snapshots), and changes the outbox format.
   concern: nothing is queued until Send), per-file progress bars.
 - Downloads into the cache, pinning, eviction and Open copies (#67, design §6.2, §6.4).
 - Image thumbnails or previews.
-- A per-user storage quota for snapshots (the server has none yet, #88).
+- A local cap on snapshot storage (10 × 100 MiB per queued message is bounded; the server's
+  5 GiB per-user quota only bites at upload).
