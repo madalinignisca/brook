@@ -20,6 +20,8 @@ final class SessionStore {
         case signedOut(error: String?)
         case signingIn
         case signedIn(FfiUser)
+        /// The password was right; the account's TOTP code (or a recovery code) comes next.
+        case needsCode(error: String?)
     }
 
     enum Message {
@@ -32,6 +34,11 @@ final class SessionStore {
         static let insecure = "The server address must start with https://"
         static let unexpected = "The server sent an unexpected response."
         static let signedOut = "You're signed out. Sign in again."
+        static let wrongCode = "Wrong or already-used code. Wait for the next one."
+        static let wrongRecoveryCode = "That recovery code is wrong or already used. Try another one."
+        static let codeStepExpired = "That took too long. Enter your password again."
+        static let codeFormat = "Enter the 6-digit code from your authenticator app."
+        static let recoveryFormat = "Enter one of your recovery codes."
     }
 
     typealias ClientFactory = (_ server: String, _ allowInsecureHttp: Bool) throws -> FfiBrookClient
@@ -85,16 +92,11 @@ final class SessionStore {
             guard mine == attempt else { return true } // ended meanwhile (a sign-out won)
             switch result {
             case let .loggedIn(session):
-                // Whatever the (lossy) stream delivered so far, core's state now is the truth.
-                settled = delivered?.value ?? 0
-                if case .loggedOut = client.authState() {
-                    end()
-                    phase = .signedOut(error: Message.signedOut)
-                    return true
-                }
-                self.client = client
-                settings.saveLastGoodServer(address)
-                phase = .signedIn(session.user)
+                finishSignIn(client, user: session.user, address: address)
+            case let .totpRequired(challenge):
+                // The password was right; nothing is signed in until the code step succeeds.
+                pending = PendingCode(client: client, challenge: challenge, address: address, attempt: mine)
+                phase = .needsCode(error: nil)
             }
         } catch let error as LoginError {
             guard mine == attempt else { return true }
@@ -106,6 +108,97 @@ final class SessionStore {
             phase = .signedOut(error: Message.unexpected)
         }
         return true
+    }
+
+    /// After a sign-in with a recovery code: how many are left (the app warns when few).
+    private(set) var recoveryCodesLeft: UInt32?
+    /// A code is being checked (the button stays disabled).
+    private(set) var codeBusy = false
+
+    /// The code step: the client that proved the password, and its challenge.
+    private struct PendingCode {
+        let client: FfiBrookClient
+        let challenge: FfiTotpChallenge
+        let address: String
+        let attempt: Int
+    }
+
+    @ObservationIgnored private var pending: PendingCode?
+
+    /// Signed in: from here on core's state is the truth (the stream may skip states).
+    private func finishSignIn(_ client: FfiBrookClient, user: FfiUser, address: String) {
+        settled = delivered?.value ?? 0
+        if case .loggedOut = client.authState() {
+            end()
+            phase = .signedOut(error: Message.signedOut)
+            return
+        }
+        self.client = client
+        settings.saveLastGoodServer(address)
+        phase = .signedIn(user)
+    }
+
+    /// The 6-digit code (spaces allowed, as pasted from "123 456").
+    func submitCode(_ code: String) async {
+        let digits = code.filter { !$0.isWhitespace }
+        guard digits.count == 6, digits.allSatisfy({ $0.isASCII && $0.isNumber }) else {
+            if case .needsCode = phase { phase = .needsCode(error: Message.codeFormat) }
+            return
+        }
+        await complete(recovery: false) { try await $0.completeTotp(challenge: $1, code: digits) }
+    }
+
+    /// A recovery code instead of the 6-digit code.
+    func submitRecovery(_ code: String) async {
+        let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            if case .needsCode = phase { phase = .needsCode(error: Message.recoveryFormat) }
+            return
+        }
+        await complete(recovery: true) { try await $0.completeRecovery(challenge: $1, recoveryCode: trimmed) }
+    }
+
+    /// Back to the password: this challenge ends (core refuses it from now on).
+    func back() {
+        guard case .needsCode = phase, let pending else { return }
+        end()
+        phase = .signedOut(error: nil)
+        Task { await pending.client.cancelTotp(challenge: pending.challenge) }
+    }
+
+    private func complete(
+        recovery: Bool, _ call: (FfiBrookClient, FfiTotpChallenge) async throws -> UInt32?
+    ) async {
+        guard case .needsCode = phase, let pending, !codeBusy else { return }
+        codeBusy = true
+        defer { codeBusy = false }
+        do {
+            let left = try await call(pending.client, pending.challenge)
+            guard pending.attempt == attempt else { return }
+            self.pending = nil
+            recoveryCodesLeft = left
+            guard case let .loggedIn(user) = pending.client.authState() else {
+                end()
+                phase = .signedOut(error: Message.signedOut)
+                return
+            }
+            finishSignIn(pending.client, user: user, address: pending.address)
+        } catch LoginError.ChallengeSuperseded {
+            return // Back, a newer attempt or a sign-out already decided what shows
+        } catch let LoginError.Api(code, _) where code == "auth.invalid_code" {
+            guard pending.attempt == attempt else { return }
+            phase = .needsCode(error: recovery ? Message.wrongRecoveryCode : Message.wrongCode)
+        } catch let LoginError.Api(code, _) where code == "auth.totp_expired" {
+            guard pending.attempt == attempt else { return }
+            end()
+            phase = .signedOut(error: Message.codeStepExpired)
+        } catch let error as LoginError {
+            guard pending.attempt == attempt else { return }
+            phase = .needsCode(error: Self.message(for: error, address: pending.address))
+        } catch {
+            guard pending.attempt == attempt else { return }
+            phase = .needsCode(error: Message.unexpected)
+        }
     }
 
     /// Account → Sign Out. The attempt ends first, so a remote `LoggedOut` arriving after it
@@ -150,6 +243,8 @@ final class SessionStore {
         events = nil
         delivered = nil
         settled = Int.max
+        pending = nil
+        recoveryCodesLeft = nil
         client = nil
     }
 
@@ -163,6 +258,7 @@ final class SessionStore {
         case .InvalidServerUrl: Message.invalidAddress
         case .UnexpectedResponse: Message.unexpected
         case .NotAuthenticated: Message.signedOut
+        case .ChallengeSuperseded: Message.unexpected
         case .Disconnected, .Timeout: Message.unreachable
         case .CallEnded, .Busy, .TooLarge: Message.unexpected
         }

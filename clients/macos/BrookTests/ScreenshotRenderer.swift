@@ -66,7 +66,7 @@ final class ScreenshotRenderer: XCTestCase {
 
             let realtime = FakeRealtime(channels: [channel("c1", "general"), channel("c2", "calltest")])
             try render(
-                SignedInView(user: alice, client: realtime, calls: CallCenter()) {}, "4-signed-in", dark: dark,
+                SignedInView(user: alice, client: realtime, calls: CallCenter(), signOut: {}), "4-signed-in", dark: dark,
                 to: dir, size: CGSize(width: 720, height: 560))
 
             let wide = CGSize(width: 800, height: 560)

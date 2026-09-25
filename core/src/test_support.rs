@@ -2,7 +2,7 @@
 //! upgrade (the client derives both from a single base URL), with each accepted socket
 //! handed to the test to drive imperatively — so tests choose frame order exactly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -74,8 +74,22 @@ struct ServerState {
     login_gate: Option<Arc<Semaphore>>,
     /// Held before a scripted 401 on the user list is sent (a response still in flight).
     expired_gate: Option<Arc<Semaphore>>,
-    /// Every password/users request: (path, bearer token, JSON body).
+    /// Every password/users/totp/logout request: (path, bearer token, JSON body).
     requests: Vec<(String, String, Value)>,
+    /// Handles with TOTP active: their login needs a second step.
+    totp_users: HashSet<String>,
+    /// Live pending tokens (`totp_token`) → handle.
+    pending: HashMap<String, String>,
+    /// The code `/auth/totp` accepts, and the unused recovery codes.
+    totp_code: String,
+    recovery_codes: HashSet<String>,
+    /// Held after `/auth/totp` issued its pair, before the response is sent.
+    totp_gate: Option<Arc<Semaphore>>,
+    /// Held before `/auth/totp` sends a refusal (a wrong code).
+    totp_error_gate: Option<Arc<Semaphore>>,
+    /// Handles with an enrolment waiting for activation, and whether it has expired.
+    enrolling: HashSet<String>,
+    enrollment_expired: bool,
     sockets: mpsc::UnboundedSender<WsPeer>,
 }
 
@@ -106,6 +120,14 @@ impl TestServer {
             refresh_gate: None,
             login_gate: None,
             requests: Vec::new(),
+            totp_users: HashSet::new(),
+            pending: HashMap::new(),
+            totp_code: "123456".into(),
+            recovery_codes: HashSet::new(),
+            totp_gate: None,
+            totp_error_gate: None,
+            enrolling: HashSet::new(),
+            enrollment_expired: false,
             sockets: tx,
         }));
         let app = Router::new()
@@ -113,6 +135,15 @@ impl TestServer {
             .route("/api/v1/auth/me", get(me))
             .route("/api/v1/auth/refresh", post(refresh))
             .route("/api/v1/auth/password", post(change_password))
+            .route("/api/v1/auth/totp", post(complete_totp))
+            .route("/api/v1/auth/totp/enroll", post(totp_enroll))
+            .route("/api/v1/auth/totp/activate", post(totp_activate))
+            .route("/api/v1/auth/totp/disable", post(totp_disable))
+            .route(
+                "/api/v1/auth/totp/recovery-codes",
+                post(totp_recovery_codes),
+            )
+            .route("/api/v1/users/{id}/totp/reset", post(totp_admin_reset))
             .route("/api/v1/auth/logout", post(logout))
             .route("/api/v1/users", get(list_users))
             .route("/api/v1/users/{id}/password", post(reset_password))
@@ -184,6 +215,42 @@ impl TestServer {
 
     pub fn set_login_fails(&self, fails: bool) {
         self.state.lock().unwrap().login_fails = fails;
+    }
+
+    /// Turn TOTP on for `handle`, with these unused recovery codes (the code is `123456`).
+    pub fn enable_totp(&self, handle: &str, recovery_codes: &[&str]) {
+        let mut state = self.state.lock().unwrap();
+        state.totp_users.insert(handle.to_string());
+        state.recovery_codes = recovery_codes.iter().map(|c| c.to_string()).collect();
+    }
+
+    /// The pending enrolment expires (the next activate answers `auth.totp_enrollment_expired`).
+    pub fn expire_enrollment(&self) {
+        self.state.lock().unwrap().enrollment_expired = true;
+    }
+
+    /// Whether `handle` has TOTP on.
+    pub fn totp_enabled(&self, handle: &str) -> bool {
+        self.state.lock().unwrap().totp_users.contains(handle)
+    }
+
+    /// Expire every pending token (the next `/auth/totp` answers `auth.totp_expired`).
+    pub fn expire_pending(&self) {
+        self.state.lock().unwrap().pending.clear();
+    }
+
+    /// Hold `/auth/totp` refusals until the gate gets a permit.
+    pub fn gate_totp_errors(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        self.state.lock().unwrap().totp_error_gate = Some(gate.clone());
+        gate
+    }
+
+    /// Hold `/auth/totp` responses after the pair is issued until the gate gets a permit.
+    pub fn gate_totp(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        self.state.lock().unwrap().totp_gate = Some(gate.clone());
+        gate
     }
 
     pub fn set_stall_login(&self, stall: bool) {
@@ -319,13 +386,98 @@ async fn login(State(state): State<Shared>, Json(body): Json<Value>) -> Response
     }
     let (pair, gate) = {
         let mut state = state.lock().unwrap();
+        state
+            .requests
+            .push(("/auth/login".into(), String::new(), body.clone()));
         if state.login_fails {
             return error(401, "auth.invalid_credentials", "wrong password");
+        }
+        if state.totp_users.contains(&handle) {
+            if body["supports_totp"] != true {
+                return error(403, "auth.totp_client_required", "update the app");
+            }
+            state.next += 1;
+            let token = format!("totp-{}", state.next);
+            state.pending.insert(token.clone(), handle);
+            return Json(json!({ "totp_required": true, "totp_token": token, "expires_in": 300 }))
+                .into_response();
         }
         (issue(&mut state, &handle), state.login_gate.clone())
     };
     after_commit(gate).await;
     Json(pair).into_response()
+}
+
+/// The second login step. A wrong code keeps the pending token (a typo never sends the user
+/// back to the password); success consumes it.
+async fn complete_totp(State(state): State<Shared>, Json(body): Json<Value>) -> Response {
+    enum Outcome {
+        Pair(Value, Option<Arc<Semaphore>>),
+        Refused(Response, Option<Arc<Semaphore>>),
+        Now(Response),
+    }
+    let outcome = {
+        let mut state = state.lock().unwrap();
+        state
+            .requests
+            .push(("/auth/totp".into(), String::new(), body.clone()));
+        if body["recovery_code"].as_str().is_some_and(|c| c.len() > 64) {
+            // The server's schema bound: FastAPI answers 422 (and echoes the input).
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "detail": [{ "input": body["recovery_code"] }] })),
+            )
+                .into_response();
+        }
+        let token = body["totp_token"].as_str().unwrap_or_default().to_string();
+        match state.pending.get(&token).cloned() {
+            None => Outcome::Now(error(403, "auth.totp_expired", "sign in again")),
+            Some(handle) => {
+                let accepted = if let Some(code) = body["code"].as_str() {
+                    // A refusal echoes the submitted code, as a careless server might: core
+                    // must not repeat it.
+                    (code == state.totp_code)
+                        .then_some(None)
+                        .ok_or(code.to_string())
+                } else {
+                    let rc = body["recovery_code"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    if state.recovery_codes.remove(&rc) {
+                        Ok(Some(state.recovery_codes.len()))
+                    } else {
+                        Err(rc)
+                    }
+                };
+                match accepted {
+                    Err(sent) => Outcome::Refused(
+                        error(403, "auth.invalid_code", &format!("wrong code {sent}")),
+                        state.totp_error_gate.clone(),
+                    ),
+                    Ok(left) => {
+                        let mut pair = issue(&mut state, &handle);
+                        if let Some(left) = left {
+                            pair["recovery_codes_left"] = json!(left);
+                        }
+                        state.pending.remove(&token);
+                        Outcome::Pair(pair, state.totp_gate.clone())
+                    }
+                }
+            }
+        }
+    };
+    match outcome {
+        Outcome::Now(r) => r,
+        Outcome::Refused(r, gate) => {
+            after_commit(gate).await;
+            r
+        }
+        Outcome::Pair(pair, gate) => {
+            after_commit(gate).await;
+            Json(pair).into_response()
+        }
+    }
 }
 
 /// Revoke one refresh token (idempotent), as the server does.
@@ -449,17 +601,19 @@ async fn list_users(State(state): State<Shared>, headers: HeaderMap, uri: Uri) -
 }
 
 async fn me(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or_default();
-    match state.lock().unwrap().tokens.get(token) {
-        Some(handle) => Json(json!({
-            "id": format!("id-{handle}"), "handle": handle,
-            "display_name": handle, "global_role": "member"
-        }))
-        .into_response(),
+    let token = bearer(&headers);
+    let state = state.lock().unwrap();
+    match state.tokens.get(&token) {
+        Some(handle) => {
+            let on = state.totp_users.contains(handle);
+            Json(json!({
+                "id": format!("id-{handle}"), "handle": handle,
+                "display_name": handle, "global_role": "member",
+                "totp_enabled": on,
+                "recovery_codes_left": if on { json!(state.recovery_codes.len()) } else { Value::Null },
+            }))
+            .into_response()
+        }
         None => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
@@ -588,11 +742,264 @@ impl WsPeer {
     }
 }
 
+fn second_factor_ok(state: &mut ServerState, body: &Value) -> bool {
+    if let Some(code) = body["code"].as_str() {
+        return code == state.totp_code;
+    }
+    let rc = body["recovery_code"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    state.recovery_codes.remove(&rc)
+}
+
+fn ten_codes() -> Vec<String> {
+    (1..=10).map(|n| format!("new-{n:02}")).collect()
+}
+
+async fn totp_enroll(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let token = bearer(&headers);
+    let mut state = state.lock().unwrap();
+    let handle = match authed(&mut state, "/auth/totp/enroll", &token, body.clone()) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    if body["password"] != "pw" {
+        return error(403, "auth.invalid_credentials", "wrong password");
+    }
+    if state.totp_users.contains(&handle) {
+        return error(409, "conflict", "TOTP is already active");
+    }
+    state.enrolling.insert(handle.clone());
+    state.enrollment_expired = false;
+    Json(json!({
+        "otpauth_uri": format!("otpauth://totp/Brook:{handle}?secret=JBSWY3DPEHPK3PXP&issuer=Brook"),
+        "expires_in": 600
+    }))
+    .into_response()
+}
+
+/// Activation applies the cutoff (every token of the user issued before it is revoked, this
+/// device's included) and returns a new pair with the recovery codes.
+async fn totp_activate(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let token = bearer(&headers);
+    let (out, gate) = {
+        let mut state = state.lock().unwrap();
+        let handle = match authed(&mut state, "/auth/totp/activate", &token, body.clone()) {
+            Ok(h) => h,
+            Err(r) => return r,
+        };
+        if !state.enrolling.contains(&handle) {
+            return error(409, "conflict", "no enrolment in progress");
+        }
+        if state.enrollment_expired {
+            return error(409, "auth.totp_enrollment_expired", "scan a new code");
+        }
+        if body["code"].as_str() != Some(state.totp_code.as_str()) {
+            return error(403, "auth.invalid_code", "wrong code");
+        }
+        state.enrolling.remove(&handle);
+        state.totp_users.insert(handle.clone());
+        let codes = ten_codes();
+        state.recovery_codes = codes.iter().cloned().collect();
+        revoke_refresh_tokens(&mut state, &handle);
+        state.tokens.retain(|_, h| *h != handle);
+        let mut out = issue(&mut state, &handle);
+        out["recovery_codes"] = json!(codes);
+        (out, state.password_gate.clone())
+    };
+    after_commit(gate).await;
+    Json(out).into_response()
+}
+
+async fn totp_disable(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let token = bearer(&headers);
+    let mut state = state.lock().unwrap();
+    let handle = match authed(&mut state, "/auth/totp/disable", &token, body.clone()) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    if body["password"] != "pw" {
+        return error(403, "auth.invalid_credentials", "wrong password");
+    }
+    if !second_factor_ok(&mut state, &body) {
+        return error(403, "auth.invalid_code", "wrong code");
+    }
+    state.totp_users.remove(&handle);
+    state.recovery_codes.clear();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn totp_recovery_codes(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let token = bearer(&headers);
+    let mut state = state.lock().unwrap();
+    if let Err(r) = authed(
+        &mut state,
+        "/auth/totp/recovery-codes",
+        &token,
+        body.clone(),
+    ) {
+        return r;
+    }
+    if body["password"] != "pw" {
+        return error(403, "auth.invalid_credentials", "wrong password");
+    }
+    if !second_factor_ok(&mut state, &body) {
+        return error(403, "auth.invalid_code", "wrong code");
+    }
+    let codes = ten_codes();
+    state.recovery_codes = codes.iter().cloned().collect();
+    Json(json!({ "recovery_codes": codes })).into_response()
+}
+
+async fn totp_admin_reset(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let token = bearer(&headers);
+    let mut state = state.lock().unwrap();
+    let path = format!("/users/{id}/totp/reset");
+    if let Err(r) = authed(&mut state, &path, &token, body.clone()) {
+        return r;
+    }
+    if body["admin_password"] != "pw" {
+        return error(403, "auth.invalid_credentials", "wrong admin password");
+    }
+    let handle = id.strip_prefix("id-").unwrap_or(&id).to_string();
+    state.totp_users.remove(&handle);
+    revoke_refresh_tokens(&mut state, &handle);
+    state.tokens.retain(|_, h| *h != handle);
+    StatusCode::NO_CONTENT.into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::RefreshOutcome;
     use crate::{AuthState, ServerEvent};
+
+    async fn post(
+        server: &TestServer,
+        path: &str,
+        bearer: Option<&str>,
+        body: Value,
+    ) -> (u16, Value) {
+        let mut req = reqwest::Client::new().post(format!("{}/api/v1/{path}", server.base));
+        if let Some(b) = bearer {
+            req = req.bearer_auth(b);
+        }
+        let resp = req.json(&body).send().await.unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.json().await.unwrap_or(Value::Null))
+    }
+
+    /// The fake's TOTP sign-in behaves as the server spec says (#48 §2.1-2.2).
+    #[tokio::test]
+    async fn fake_totp_sign_in_follows_the_wire() {
+        let server = TestServer::start().await;
+        server.enable_totp("alice", &["rc-1"]);
+        let (status, body) = post(
+            &server,
+            "auth/login",
+            None,
+            json!({"handle": "alice", "password": "pw"}),
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"]["code"].clone()),
+            (403, json!("auth.totp_client_required"))
+        );
+
+        let login = json!({"handle": "alice", "password": "pw", "supports_totp": true});
+        let (status, body) = post(&server, "auth/login", None, login.clone()).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["totp_required"], true);
+        let token = body["totp_token"].as_str().unwrap().to_string();
+        assert!(
+            body.get("access_token").is_none(),
+            "tokens after the password alone"
+        );
+
+        // The pending token is no bearer.
+        let (status, _) = post(&server, "auth/password", Some(&token), json!({})).await;
+        assert_eq!(status, 401);
+
+        // A wrong code keeps the token; the right one consumes it.
+        let (status, body) = post(
+            &server,
+            "auth/totp",
+            None,
+            json!({"totp_token": token, "code": "000000"}),
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"]["code"].clone()),
+            (403, json!("auth.invalid_code"))
+        );
+        let (status, body) = post(
+            &server,
+            "auth/totp",
+            None,
+            json!({"totp_token": token, "code": "123456"}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(body["access_token"].is_string());
+        let (status, body) = post(
+            &server,
+            "auth/totp",
+            None,
+            json!({"totp_token": token, "code": "123456"}),
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"]["code"].clone()),
+            (403, json!("auth.totp_expired"))
+        );
+
+        // A recovery code works once and reports what is left.
+        let (_, body) = post(&server, "auth/login", None, login.clone()).await;
+        let token = body["totp_token"].as_str().unwrap().to_string();
+        let (status, body) = post(
+            &server,
+            "auth/totp",
+            None,
+            json!({"totp_token": token, "recovery_code": "rc-1"}),
+        )
+        .await;
+        assert_eq!(
+            (status, body["recovery_codes_left"].clone()),
+            (200, json!(0))
+        );
+        let (_, body) = post(&server, "auth/login", None, login).await;
+        let token = body["totp_token"].as_str().unwrap().to_string();
+        let (status, _) = post(
+            &server,
+            "auth/totp",
+            None,
+            json!({"totp_token": token, "recovery_code": "rc-1"}),
+        )
+        .await;
+        assert_eq!(status, 403, "a recovery code worked twice");
+    }
 
     /// P0 smoke: through the public client — login, realtime start, auth frame carries
     /// the issued token, `ready` becomes `ServerEvent::Ready`, server close is survived.

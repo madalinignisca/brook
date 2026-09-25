@@ -6,12 +6,22 @@ struct SignedInView: View {
     let client: any FfiBrookClientProtocol
     let calls: CallCenter
     let signOut: () -> Void
+    /// Set after a sign-in with a recovery code: warn when few are left.
+    let recoveryCodesLeft: UInt32?
     @State private var channels: ChannelsModel
+    @State private var totpEnabled: Bool?
+    @State private var settingUpTotp = false
+    @State private var secondFactorAction: SecondFactorModel.Action?
+    @State private var resettingTotp = false
     @State private var selection: String?
     @State private var changingPassword = false
     @State private var resettingPassword = false
 
-    init(user: FfiUser, client: any FfiBrookClientProtocol, calls: CallCenter, signOut: @escaping () -> Void) {
+    init(
+        user: FfiUser, client: any FfiBrookClientProtocol, calls: CallCenter,
+        signOut: @escaping () -> Void, recoveryCodesLeft: UInt32? = nil
+    ) {
+        self.recoveryCodesLeft = recoveryCodesLeft
         self.user = user
         self.client = client
         self.calls = calls
@@ -64,6 +74,16 @@ struct SignedInView: View {
                         Button("Reset a User's Password…") { resettingPassword = true }
                     }
                     Divider()
+                    if totpEnabled == true {
+                        Button("New Recovery Codes…") { secondFactorAction = .newCodes }
+                        Button("Turn Off Two-Factor Sign-In…") { secondFactorAction = .turnOff }
+                    } else if totpEnabled == false {
+                        Button("Turn On Two-Factor Sign-In…") { settingUpTotp = true }
+                    }
+                    if user.globalRole == "admin" {
+                        Button("Reset a User's Two-Factor Sign-In…") { resettingTotp = true }
+                    }
+                    Divider()
                     Button("Sign Out", action: signOut)
                 } label: {
                     Label("Account", systemImage: "person.crop.circle")
@@ -75,10 +95,46 @@ struct SignedInView: View {
                 ChangePasswordSheet(client: account)
             }
         }
+        .sheet(isPresented: $settingUpTotp, onDismiss: refreshTotp) {
+            if let account = client as? any AccountClient { TwoFactorSetupSheet(client: account) }
+        }
+        .sheet(item: $secondFactorAction, onDismiss: refreshTotp) { action in
+            if let account = client as? any AccountClient { SecondFactorSheet(client: account, action: action) }
+        }
+        .sheet(isPresented: $resettingTotp) {
+            if let account = client as? any AccountClient {
+                AdminTotpResetSheet(client: account, selfId: user.id)
+            }
+        }
+        .task { refreshTotp() }
+        .safeAreaInset(edge: .top) {
+            if let left = recoveryCodesLeft, left <= 2, totpEnabled == true {
+                HStack {
+                    Label("You have \(left) recovery code\(left == 1 ? "" : "s") left.",
+                          systemImage: "exclamationmark.triangle")
+                    Spacer()
+                    Button("New Recovery Codes…") { secondFactorAction = .newCodes }
+                }
+                .padding(8)
+                .background(.orange.opacity(0.15))
+            }
+        }
         .sheet(isPresented: $resettingPassword) {
             if let account = client as? any AccountClient {
                 AdminResetSheet(client: account, selfId: user.id)
             }
         }
     }
+}
+
+extension SignedInView {
+    /// Whether two-factor sign-in is on decides which menu items show.
+    fileprivate func refreshTotp() {
+        guard let account = client as? any AccountClient else { return }
+        Task { totpEnabled = (try? await account.me())?.totpEnabled }
+    }
+}
+
+extension SecondFactorModel.Action: Identifiable {
+    var id: Self { self }
 }
