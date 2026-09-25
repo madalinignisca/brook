@@ -15,6 +15,9 @@
 | `POST /auth/ldap` | LDAP bind credentials → tokens |
 | `POST /auth/refresh` | refresh → new access token (rotates refresh token) |
 | `POST /auth/logout` | revoke refresh token |
+| `POST /auth/password` | change own password `{current_password, new_password}` → fresh `{access_token, refresh_token}`; see §1.1 |
+| `GET  /users` · `?handle=` | **admin**: all users by handle · exact handle (404 `not_found` if none) |
+| `POST /users/{id}/password` | **admin**: set another user's password `{new_password}` → 204; see §1.1 |
 | `GET  /health` | liveness/readiness (also on `sfu`; unauthenticated) |
 | `GET  /me` · `PATCH /me` | current user · update profile/avatar |
 | `GET  /channels` | channels/DMs the user belongs to |
@@ -33,6 +36,27 @@
 | `GET /bots/{id}` · `PATCH /bots/{id}` · `DELETE /bots/{id}` | get / update (url, regen secret) / delete |
 | `POST /channels/{id}/bots` · `DELETE /channels/{id}/bots/{bot}` | add / remove bot from channel |
 | `POST /bots/{id}/webhook` | **inbound** webhook: external posts as bot (HMAC-signed) |
+
+### 1.1 Password changes and sessions
+
+- `POST /auth/password` needs a full access token and the current password.
+  On success **every** refresh token of the user is revoked (all devices signed
+  out), and the response carries a new pair for the calling client.
+- **The old refresh token is dead the moment the server commits.** A client that
+  loses the response (timeout, dropped connection) still holds revoked tokens: its
+  next `/auth/refresh` gets 401 `auth.invalid_token`, it looks signed out, and
+  signing in with the **new** password works. There is no idempotent retry.
+- Access tokens already issued are stateless JWTs and stay valid until they expire
+  (≤ `access_ttl_seconds`, 15 min), on every device. Revoking refresh tokens is
+  what ends the sessions; open WebSockets end at their next re-auth.
+- Wrong current password: **403** `auth.invalid_credentials`, deliberately not 401,
+  so clients do not mistake it for an expired access token and refresh-and-retry.
+  New password outside 8–256 characters: 422 (same policy as `/auth/register`).
+- `POST /users/{id}/password` (admin) revokes the target's refresh tokens the same
+  way. An admin cannot use it on their own account (400 `invalid`): changing your
+  own password always re-checks the current one, so a stolen admin access token
+  cannot quietly take over the admin account. Non-admin: 403 `authz.forbidden`;
+  unknown id: 404 `not_found`.
 
 ## 2. WebSocket (realtime plane) — `wss://<host>/ws`
 

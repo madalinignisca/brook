@@ -16,6 +16,21 @@ class RegisterIn(BaseModel):
     password: str = Field(min_length=8, max_length=256)
 
 
+class PasswordChangeIn(BaseModel):
+    """Change the caller's own password (re-authenticates with the current one)."""
+
+    # No min length on the current password: it is checked against the hash, and
+    # accounts may predate the policy. The cap bounds argon2 work per request.
+    current_password: str = Field(max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
+
+class AdminPasswordIn(BaseModel):
+    """An admin sets another user's password."""
+
+    new_password: str = Field(min_length=8, max_length=256)
+
+
 class LoginIn(BaseModel):
     """Login payload."""
 

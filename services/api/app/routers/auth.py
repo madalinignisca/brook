@@ -20,7 +20,7 @@ from ..config import Settings, get_settings
 from ..db import get_session
 from ..deps import get_current_user
 from ..models import RefreshToken, User, ensure_utc, utcnow
-from ..schemas import LoginIn, RefreshIn, RegisterIn, TokenPair, UserOut
+from ..schemas import LoginIn, PasswordChangeIn, RefreshIn, RegisterIn, TokenPair, UserOut
 from ..security import (
     create_access_token,
     decode_access_token,
@@ -161,6 +161,52 @@ async def refresh(
         # Already rotated/revoked, or token reuse.
         # TODO(Phase 0b): treat reuse of a revoked token as theft → revoke the family.
         raise bad
+    return await _issue_tokens(session, settings, user)
+
+
+async def revoke_all_refresh_tokens(session: AsyncSession, user_id: uuid.UUID) -> None:
+    """Revoke every live refresh token of ``user_id`` (signs out all devices).
+
+    Access tokens already issued stay valid until they expire (access_ttl_seconds,
+    15 min): they are stateless JWTs. Revoking refresh tokens is what stops a
+    device from staying signed in beyond that.
+    """
+    await session.execute(
+        update(RefreshToken)
+        .where(RefreshToken.user_id == user_id, RefreshToken.revoked.is_(False))
+        .values(revoked=True)
+    )
+
+
+@router.post("/password", response_model=TokenPair)
+async def change_password(
+    body: PasswordChangeIn,
+    user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> TokenPair:
+    """Change the caller's password; sign out every device; return a fresh pair.
+
+    Every refresh token of the user is revoked, including the caller's own, and
+    the response carries a new pair so this client stays signed in. The old
+    refresh token is dead from the moment this commits: a client that loses the
+    response is signed out on its next refresh and signs in with the new password.
+
+    A wrong current password is 403, deliberately not 401: clients treat 401 as
+    "access token expired" and would refresh-and-retry instead of reporting it.
+    """
+    if user.password_hash is None:
+        dummy_verify(body.current_password)  # same timing as a real check
+        ok = False
+    else:
+        ok = verify_password(user.password_hash, body.current_password)
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "auth.invalid_credentials", "message": "Current password is wrong"},
+        )
+    user.password_hash = hash_password(body.new_password)
+    await revoke_all_refresh_tokens(session, user.id)
     return await _issue_tokens(session, settings, user)
 
 
