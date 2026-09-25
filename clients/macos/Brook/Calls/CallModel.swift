@@ -8,6 +8,9 @@ import Synchronization
 /// The engine side the call UI needs (WebRTCEngine; a fake in tests).
 protocol CallMedia: AnyObject, Sendable {
     func closed() async
+    func startScreenShare(_ capture: VideoCapture) async throws
+    func stopScreenShare() async
+    func onScreenShareEnded(_ callback: @escaping @Sendable () -> Void)
     func onLocalVideoTrack(_ callback: @escaping @Sendable (RTCVideoTrack) -> Void)
     func onRemoteTracks(_ callback: @escaping @Sendable ([RemoteTrack]) -> Void)
 }
@@ -27,6 +30,7 @@ final class CallModel {
         let id: String
         let name: String
         let isSelf: Bool
+        var isScreen = false
         let audio: Bool
         let video: Bool
         let track: RTCVideoTrack?
@@ -45,6 +49,12 @@ final class CallModel {
     private var confirmed: (audio: Bool, video: Bool)
     private var mediaChain: Task<Void, Never>?
     private var remote: [String: RTCVideoTrack] = [:]  // participant id → camera track
+    private var remoteScreens: [String: RTCVideoTrack] = [:]  // participant id → screen track
+    private(set) var sharing = false
+    private(set) var sharingBusy = false
+    private(set) var shareError: String?
+    /// The system ended the share while it was still starting (before `sharing` was set).
+    private var endedWhileStarting = false
 
     private let handle: any FfiCallHandleProtocol
     private let media: CallMedia
@@ -68,13 +78,26 @@ final class CallModel {
     func start() async {
         stateSubscription = handle.subscribeState(listener: StateBridge(self))
         media.onRemoteTracks { [weak self] tracks in
-            let video = tracks.filter { $0.kind == .video && $0.source == .camera }
-            let byParticipant = Dictionary(
-                video.compactMap { t in (t.track as? RTCVideoTrack).map { (t.participantId, $0) } },
-                uniquingKeysWith: { first, _ in first })
-            nonisolated(unsafe) let owned = byParticipant
+            func byParticipant(_ source: FfiMediaSource) -> [String: RTCVideoTrack] {
+                Dictionary(
+                    tracks.filter { $0.kind == .video && $0.source == source }
+                        .compactMap { t in (t.track as? RTCVideoTrack).map { (t.participantId, $0) } },
+                    uniquingKeysWith: { first, _ in first })
+            }
+            nonisolated(unsafe) let cameras = byParticipant(.camera)
+            nonisolated(unsafe) let screens = byParticipant(.screen)
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.remote = owned }
+                MainActor.assumeIsolated {
+                    self?.remote = cameras
+                    self?.remoteScreens = screens
+                }
+            }
+        }
+        // The system ended the share (menu bar, display gone): the engine already set the
+        // m-line inactive; tell the others.
+        media.onScreenShareEnded { [weak self] in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.screenShareEnded() }
             }
         }
         // The camera track appears when the publish offer is built, which can be after this.
@@ -86,7 +109,10 @@ final class CallModel {
         }
     }
 
-    func apply(_ state: FfiCallState) { self.state = state }
+    func apply(_ state: FfiCallState) {
+        self.state = state
+        if isEnded { sharing = false }  // the engine closed with the call
+    }
 
     /// Self first (from local state: core's roster excludes self), then everyone else.
     var tiles: [Tile] {
@@ -94,11 +120,67 @@ final class CallModel {
         let me = Tile(
             id: state.selfParticipant ?? "self", name: "You", isSelf: true, audio: micOn,
             video: cameraOn, track: cameraOn ? localVideo : nil)
-        return [me] + state.participants.filter { $0.participantId != state.selfParticipant }.map { p in
+        let others = state.participants.filter { $0.participantId != state.selfParticipant }
+        // Shared screens first: they are what everyone is looking at.
+        let screens = others.compactMap { p -> Tile? in
+            guard let track = remoteScreens[p.participantId] else { return nil }
+            return Tile(
+                id: p.participantId + ".screen", name: "\(p.displayName)'s screen", isSelf: false,
+                isScreen: true, audio: true, video: true, track: track)
+        }
+        return screens + [me] + others.map { p in
             Tile(
                 id: p.participantId, name: p.displayName, isSelf: false, audio: p.audio,
                 video: p.video, track: remote[p.participantId])
         }
+    }
+
+    /// Share `capture` (the screen the user picked): a new or re-enabled m-line, then a
+    /// renegotiation. Only listen-only calls cannot share (there is no publish connection).
+    func shareScreen(_ capture: VideoCapture) async {
+        guard plan.publishes, !sharing, !sharingBusy, !isEnded else { return }
+        sharingBusy = true
+        defer { sharingBusy = false }
+        shareError = nil
+        endedWhileStarting = false
+        do {
+            try await media.startScreenShare(capture)
+        } catch {
+            shareError = "Couldn't share the screen."
+            return
+        }
+        do {
+            try await handle.republish()
+            // Ended meanwhile (by the system, or the call): it isn't sharing. The engine has
+            // already set the m-line inactive; renegotiate once more if the call goes on.
+            if endedWhileStarting || isEnded {
+                if !isEnded { try? await handle.republish() }
+                return
+            }
+            sharing = true
+        } catch {
+            await media.stopScreenShare()
+            shareError = "Couldn't share the screen."
+        }
+    }
+
+    func screenShareEnded() {
+        if sharingBusy, !sharing {
+            endedWhileStarting = true
+            return
+        }
+        guard sharing else { return }
+        sharing = false
+        Task { [handle] in try? await handle.republish() }
+    }
+
+    func stopSharing() async {
+        guard sharing, !sharingBusy else { return }
+        sharingBusy = true
+        defer { sharingBusy = false }
+        await media.stopScreenShare()
+        sharing = false
+        try? await handle.republish()
     }
 
     /// Reconnecting / Ended banner text; nil while connected or joining.
