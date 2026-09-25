@@ -705,6 +705,16 @@ async def edit_message(
     message = await _get_message(session, channel_id, message_id)
     if message.author_id != user.id:
         raise _forbidden("Only the author can edit a message")
+    if not body.body.strip():
+        # The send's rule, "text or files": a caption may be removed from a message
+        # with files, but a text-only message can't be edited down to nothing.
+        has_files = await session.scalar(
+            select(File.id)
+            .where(File.message_id == message_id, File.status == "committed")
+            .limit(1)
+        )
+        if has_files is None:
+            raise _validation("A message needs text or at least one attachment")
 
     message.body = body.body
     message.edited_at = utcnow()
