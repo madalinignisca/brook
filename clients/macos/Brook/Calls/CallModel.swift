@@ -11,6 +11,7 @@ protocol CallMedia: AnyObject, Sendable {
     func startScreenShare(_ capture: VideoCapture) async throws
     func stopScreenShare() async
     func onScreenShareEnded(_ callback: @escaping @Sendable () -> Void)
+    func onCameraProblem(_ callback: @escaping @Sendable (String) -> Void)
     func onLocalVideoTrack(_ callback: @escaping @Sendable (RTCVideoTrack) -> Void)
     func onRemoteTracks(_ callback: @escaping @Sendable ([RemoteTrack]) -> Void)
 }
@@ -53,6 +54,10 @@ final class CallModel {
     private(set) var sharing = false
     private(set) var sharingBusy = false
     private(set) var shareError: String?
+    /// Set when the camera could not be used; the call goes on without it.
+    private(set) var cameraProblem: String?
+    static let cameraUnavailable =
+        "Your camera isn't available (it may be in use by another app). You're still in the call."
     /// The system ended the share while it was still starting (before `sharing` was set).
     private var endedWhileStarting = false
 
@@ -98,6 +103,12 @@ final class CallModel {
         media.onScreenShareEnded { [weak self] in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated { self?.screenShareEnded() }
+            }
+        }
+        // The camera failed (missing, busy, too slow): show it off and tell the others.
+        media.onCameraProblem { [weak self] _ in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.cameraFailed() }
             }
         }
         // The camera track appears when the publish offer is built, which can be after this.
@@ -164,6 +175,12 @@ final class CallModel {
         }
     }
 
+    func cameraFailed() {
+        cameraProblem = Self.cameraUnavailable
+        guard cameraOn else { return }
+        Task { await setMedia(audio: micOn, video: false) }
+    }
+
     func screenShareEnded() {
         if sharingBusy, !sharing {
             endedWhileStarting = true
@@ -217,6 +234,9 @@ final class CallModel {
 
     func toggleCamera() async {
         guard plan.camera else { return }
+        // Turning it back on is a retry: clear the warning (the engine reports again if the
+        // camera still fails).
+        if !cameraOn { cameraProblem = nil }
         await setMedia(audio: micOn, video: !cameraOn)
     }
 

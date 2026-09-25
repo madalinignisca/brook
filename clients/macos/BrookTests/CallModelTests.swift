@@ -129,6 +129,8 @@ final class FakeMedia: CallEngine, @unchecked Sendable {
         if refuseShare { throw FfiEngineError.Failed(message: "no") }
     }
     func stopScreenShare() async { screen.withLock { $0.append("stop") } }
+    let cameraProblem = Mutex<(@Sendable (String) -> Void)?>(nil)
+    func onCameraProblem(_ callback: @escaping @Sendable (String) -> Void) { cameraProblem.withLock { $0 = callback } }
     let shareEnded = Mutex<(@Sendable () -> Void)?>(nil)
     func onScreenShareEnded(_ callback: @escaping @Sendable () -> Void) { shareEnded.withLock { $0 = callback } }
     func createLabelledOffer() async throws -> FfiPublishOffer { FfiPublishOffer(sdp: "", tracks: []) }
@@ -423,6 +425,22 @@ final class ScreenShareModelTests: XCTestCase {
         await sharing.value
         XCTAssertFalse(call.sharing, "an ended share shown as sharing")
         XCTAssertEqual(handle.republishes.withLock { $0 }, 2, "no renegotiation for the end")
+    }
+
+    /// The camera failed: the UI shows it off, says why, and tells the others (camera off).
+    func testCameraProblemTurnsTheCameraOffAndKeepsTheCall() async throws {
+        let handle = FakeHandle(), media = FakeMedia()
+        let call = CallModel(channelName: "c", plan: full, handle: handle, media: media)
+        await call.start()
+        media.cameraProblem.withLock { $0 }?("busy")
+        await drainMain()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(call.cameraOn)
+        XCTAssertEqual(call.cameraProblem, CallModel.cameraUnavailable)
+        XCTAssertEqual(handle.media.withLock { $0 }, ["true:false"])
+        XCTAssertFalse(call.isEnded)
+        await call.toggleCamera()  // the user tries again
+        XCTAssertNil(call.cameraProblem, "stale warning after a retry")
     }
 
     func testEndedCallIsNotSharing() async {

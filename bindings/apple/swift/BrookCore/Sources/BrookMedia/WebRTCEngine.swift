@@ -170,6 +170,12 @@ public final class WebRTCEngine: FfiMediaEngine, @unchecked Sendable {
         await core.stopScreenShare()
     }
 
+    /// Called (on the engine queue) when the camera cannot be used (missing, busy, too slow to
+    /// start). The call goes on without it; the UI shows the camera off and says why.
+    public func onCameraProblem(_ callback: @escaping @Sendable (String) -> Void) {
+        core.enqueue { $0.setCameraProblemCallback(callback) }
+    }
+
     /// Called (on the engine queue) when the system ended the share on its own; the engine
     /// has already set the m-line inactive, and the caller renegotiates.
     public func onScreenShareEnded(_ callback: @escaping @Sendable () -> Void) {
@@ -251,6 +257,10 @@ actor EngineCore {
     private var screenSource: RTCVideoSource?
     private var screenCapture: VideoCapture?
     var screenEndedCallback: (@Sendable () -> Void)?
+    private var cameraProblemCallback: (@Sendable (String) -> Void)?
+    /// The latest camera problem, replayed to a callback registered later: the first offer
+    /// (and its capture start) can run before the UI registers.
+    private var lastCameraProblem: String?
     private var screenBusy = false
     private var screenWaiters: [CheckedContinuation<Void, Never>] = []
     /// The user's intent; applied to tracks and capture as they come to exist.
@@ -309,7 +319,16 @@ actor EngineCore {
     func createLabelledOffer() async throws -> FfiPublishOffer {
         try check()
         let pc = try publish ?? makePublish()
-        if capture != nil, media.video { try await syncCapture() }
+        if capture != nil, media.video {
+            // A camera problem is not a call problem: the offer goes out without frames (the
+            // track stays, so the camera can come back without renegotiating).
+            do {
+                try await syncCapture()
+            } catch {
+                try check()  // but the close fence still aborts the offer
+                cameraProblem(error)
+            }
+        }
         try check()
         let offer = try await pc.offer(for: Self.noConstraints)
         try check()
@@ -334,6 +353,20 @@ actor EngineCore {
             default: return nil
             }
         }
+    }
+
+    /// The camera can't be used: tell the UI (which shows it off and says why). Never an
+    /// engine failure, which core answers by ending the call.
+    func cameraProblem(_ error: any Error) {
+        guard !closing, !fence.isSet else { return }
+        let message = String(describing: error)
+        lastCameraProblem = message
+        cameraProblemCallback?(message)
+    }
+
+    func setCameraProblemCallback(_ callback: @escaping @Sendable (String) -> Void) {
+        cameraProblemCallback = callback
+        if let lastCameraProblem { callback(lastCameraProblem) }
     }
 
     // MARK: screen share
@@ -580,7 +613,7 @@ actor EngineCore {
             do {
                 try await self?.syncCapture()
             } catch {
-                await self?.fail("camera: \(error)")
+                await self?.cameraProblem(error)
             }
         }
     }

@@ -84,6 +84,9 @@ struct CallView: View {
                 Label("You're sharing your screen", systemImage: "rectangle.on.rectangle")
                     .font(.callout).foregroundStyle(.green)
             }
+            if let problem = call.cameraProblem {
+                Text(problem).font(.callout).foregroundStyle(.secondary)
+            }
             if let error = call.shareError {
                 Text(error).font(.callout).foregroundStyle(.red)
             }
