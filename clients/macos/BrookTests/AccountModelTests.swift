@@ -22,6 +22,55 @@ final class FakeAccount: AccountClient, @unchecked Sendable {
         if let failure { throw failure }
     }
     func listUsers() async throws -> [FfiUserSummary] { users }
+
+    // TOTP management: each call recorded; `failure` (when set) is thrown by all of them.
+    var codes = (1 ... 10).map { String(format: "abcd-%04d", $0) }
+    func me() async throws -> FfiMe {
+        FfiMe(user: FfiUser(id: "me", handle: "me", displayName: "Me", globalRole: "member"),
+              totpEnabled: false, recoveryCodesLeft: nil)
+    }
+    /// Tests only: the factor as sent (the type itself never renders its code).
+    static func plain(_ factor: FfiSecondFactor) -> String {
+        switch factor {
+        case let .code(code): "code:\(code)"
+        case let .recovery(code): "recovery:\(code)"
+        }
+    }
+    var gate: Gate?
+    func totpEnroll(password: String) async throws -> FfiTotpEnrollment {
+        calls.withLock { $0.append("enroll:\(password)") }
+        await gate?.wait()
+        if let failure { throw failure }
+        return FakeEnrollment()
+    }
+    func totpActivate(code: String) async throws -> [String] {
+        calls.withLock { $0.append("activate:\(code)") }
+        if let failure { throw failure }
+        return codes
+    }
+    func totpDisable(password: String, factor: FfiSecondFactor) async throws {
+        calls.withLock { $0.append("disable:\(password):\(Self.plain(factor))") }
+        if let failure { throw failure }
+    }
+    func totpRegenerateRecoveryCodes(password: String, factor: FfiSecondFactor) async throws -> [String] {
+        calls.withLock { $0.append("regenerate:\(password):\(Self.plain(factor))") }
+        await gate?.wait()
+        if let failure { throw failure }
+        return codes
+    }
+    func adminResetTotp(userId: String, adminPassword: String) async throws {
+        calls.withLock { $0.append("totp-reset:\(userId):\(adminPassword)") }
+        if let failure { throw failure }
+    }
+}
+
+final class FakeEnrollment: FfiTotpEnrollment, @unchecked Sendable {
+    init() { super.init(noHandle: NoHandle()) }
+    required init(unsafeFromHandle _: UInt64) { fatalError("never lifted from Rust") }
+    override func otpauthUri() -> String {
+        "otpauth://totp/Brook:me?secret=JBSWY3DPEHPK3PXPJBSWY3DP&issuer=Brook&algorithm=SHA1&digits=6&period=30"
+    }
+    override func expiresIn() -> UInt64 { 600 }
 }
 
 func user(_ id: String, _ role: String = "member") -> FfiUserSummary {
@@ -223,5 +272,160 @@ final class AdminResetModelTests: XCTestCase {
         model.confirm = "bobs-new-pass"
         await model.submit()
         XCTAssertEqual(model.error, AdminResetModel.noAnswer)
+    }
+}
+
+@MainActor
+final class TwoFactorModelTests: XCTestCase {
+    func testTheManualKeyIsTheSecretInGroupsOfFour() {
+        XCTAssertEqual(
+            TwoFactorSetupModel.key(from: FakeEnrollment().otpauthUri()),
+            "JBSW Y3DP EHPK 3PXP JBSW Y3DP")
+        XCTAssertNil(TwoFactorSetupModel.key(from: "https://example.com"))
+    }
+
+    func testTheQRCodeRendersLocally() {
+        XCTAssertNotNil(QRCode.image(for: FakeEnrollment().otpauthUri(), size: 200))
+    }
+
+    /// Password → scan → code → recovery codes → done; the password and the secret are gone
+    /// as soon as their step is over.
+    func testSetupWalksTheStepsAndDropsSecretsAsItGoes() async {
+        let account = FakeAccount()
+        let model = TwoFactorSetupModel(client: account)
+        model.password = "pw"
+        await model.start()
+        XCTAssertEqual(model.step, .scan)
+        XCTAssertEqual(model.password, "", "password kept after enrolment")
+        XCTAssertNotNil(model.uri)
+        model.code = "123 456"
+        await model.activate()
+        XCTAssertEqual(account.calls.withLock { $0 }, ["enroll:pw", "activate:123456"])
+        XCTAssertEqual(model.step, .codes(account.codes))
+        XCTAssertNil(model.uri, "the secret kept after activation")
+        model.finish()
+        XCTAssertEqual(model.step, .codes(account.codes), "finished without confirming the codes were saved")
+        model.savedCodes = true
+        model.finish()
+        XCTAssertEqual(model.step, .done)
+        XCTAssertEqual(model.note, TwoFactorSetupModel.othersSignedOut)
+    }
+
+    func testSetupErrorsAreSaidPlainly() async {
+        let account = FakeAccount()
+        let model = TwoFactorSetupModel(client: account)
+        account.failure = .Api(code: "auth.invalid_credentials", message: "x")
+        model.password = "wrong"
+        await model.start()
+        XCTAssertEqual(model.error, TwoFactorSetupModel.wrongPassword)
+        XCTAssertEqual(model.step, .password)
+
+        account.failure = nil
+        model.password = "pw"
+        await model.start()
+        account.failure = .Api(code: "auth.invalid_code", message: "x")
+        model.code = "000000"
+        await model.activate()
+        XCTAssertEqual(model.error, SessionStore.Message.wrongCode)
+        XCTAssertEqual(model.step, .scan)
+
+        account.failure = .Api(code: "auth.totp_enrollment_expired", message: "x")
+        model.code = "123456"
+        await model.activate()
+        XCTAssertEqual(model.error, TwoFactorSetupModel.enrollmentExpired)
+        XCTAssertEqual(model.step, .password, "an expired enrolment must start over with a new QR code")
+        XCTAssertNil(model.uri)
+    }
+
+    func testClosingTheSheetDropsEverything() async {
+        let model = TwoFactorSetupModel(client: FakeAccount())
+        model.password = "pw"
+        await model.start()
+        model.code = "12"
+        model.clear()
+        XCTAssertNil(model.uri)
+        XCTAssertEqual([model.password, model.code], ["", ""])
+        XCTAssertEqual(model.step, .password)
+    }
+
+    func testTurnOffAndNewCodesSendTheRightSecondFactor() async {
+        let account = FakeAccount()
+        let off = SecondFactorModel(client: account, action: .turnOff)
+        off.password = "pw"
+        off.code = "123 456"
+        await off.submit()
+        off.useRecovery = true
+        off.password = "pw"
+        off.code = " abcd-0001 "
+        let fresh = SecondFactorModel(client: account, action: .newCodes)
+        fresh.password = "pw"
+        fresh.useRecovery = true
+        fresh.code = "abcd-0002"
+        await fresh.submit()
+        XCTAssertEqual(account.calls.withLock { $0 }, [
+            "disable:pw:code:123456",
+            "regenerate:pw:recovery:abcd-0002",
+        ])
+        XCTAssertTrue(off.done)
+        XCTAssertEqual(fresh.newCodes, account.codes)
+        XCTAssertEqual([fresh.password, fresh.code], ["", ""], "secrets kept after success")
+    }
+
+    func testAdminTwoFactorResetSendsTheAdminPassword() async {
+        let account = FakeAccount()
+        account.users = [user("bob")]
+        let model = AdminTotpResetModel(client: account, selfId: "me")
+        await model.load()
+        model.selectedId = "bob"
+        model.adminPassword = "admin-pw"
+        await model.submit()
+        XCTAssertEqual(account.calls.withLock { $0 }, ["totp-reset:bob:admin-pw"])
+        XCTAssertNotNil(model.done)
+        XCTAssertEqual(model.adminPassword, "")
+    }
+
+    // MARK: review round 1
+
+    func testClosingAfterNewCodesDropsThem() async {
+        let model = SecondFactorModel(client: FakeAccount(), action: .newCodes)
+        model.password = "pw"
+        model.code = "123456"
+        await model.submit()
+        XCTAssertNotNil(model.newCodes)
+        model.dismissed()
+        XCTAssertNil(model.newCodes, "recovery codes kept after the sheet closed")
+    }
+
+    /// Closing the setup sheet while enrolment is in flight: the late answer doesn't bring the
+    /// secret (or a step) back into the closed model.
+    func testALateEnrolmentAfterClosingIsIgnored() async {
+        let account = FakeAccount()
+        account.gate = Gate()
+        let model = TwoFactorSetupModel(client: account)
+        model.password = "pw"
+        let started = Task { await model.start() }
+        try? await Task.sleep(for: .milliseconds(50))
+        model.clear()
+        account.gate?.open()
+        await started.value
+        XCTAssertNil(model.uri, "the secret came back after closing")
+        XCTAssertEqual(model.step, .password)
+    }
+
+    /// The wording follows what was sent, not the toggle as it is when the answer arrives.
+    func testTheRefusalIsWordedForWhatWasSent() async {
+        let account = FakeAccount()
+        account.gate = Gate()
+        account.failure = .Api(code: "auth.invalid_code", message: "x")
+        let model = SecondFactorModel(client: account, action: .newCodes)
+        model.password = "pw"
+        model.useRecovery = true
+        model.code = "abcd-0001"
+        let sent = Task { await model.submit() }
+        try? await Task.sleep(for: .milliseconds(50))
+        model.useRecovery = false // switched while the recovery code is being checked
+        account.gate?.open()
+        await sent.value
+        XCTAssertEqual(model.error, SessionStore.Message.wrongRecoveryCode)
     }
 }

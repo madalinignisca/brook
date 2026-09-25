@@ -7,6 +7,12 @@ protocol AccountClient: AnyObject, Sendable {
     func changePassword(current: String, new: String, signOutOtherDevices: Bool) async throws -> Bool?
     func adminResetPassword(userId: String, adminPassword: String, new: String) async throws
     func listUsers() async throws -> [FfiUserSummary]
+    func me() async throws -> FfiMe
+    func totpEnroll(password: String) async throws -> FfiTotpEnrollment
+    func totpActivate(code: String) async throws -> [String]
+    func totpDisable(password: String, factor: FfiSecondFactor) async throws
+    func totpRegenerateRecoveryCodes(password: String, factor: FfiSecondFactor) async throws -> [String]
+    func adminResetTotp(userId: String, adminPassword: String) async throws
 }
 
 extension FfiBrookClient: AccountClient {}
