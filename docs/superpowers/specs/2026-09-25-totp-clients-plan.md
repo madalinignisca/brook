@@ -18,18 +18,27 @@
 
 ### P2 — Core
 1. `LoginOutcome` and the challenge: `login` sends `supports_totp`, returns `TotpRequired` with
-   an opaque challenge (id, token, expiry; `Debug` redacted). The session store gains the current
-   challenge id, cleared by `login`, `logout`, `cancel_totp` and a success.
+   an opaque challenge (id, token, `expires_at`; `Debug` redacted). The session store gains the
+   current challenge id. **Invalidation never waits for the refresh lock:** `login`, `logout` and
+   `cancel_totp` clear the id first (a plain store write), then do anything that needs the lock;
+   so an in-flight completion, which rechecks ownership under the lock before applying, can never
+   install after them. `cancel_totp(&challenge)` clears the id only if it is that challenge's
+   (a stale Back never cancels a newer one); it is idempotent and returns nothing.
 2. `complete_totp` / `complete_recovery`: lock → ownership check → request → ownership check →
    apply (install + consume, or end on `totp_expired`, or keep on `invalid_code`); superseded →
    `ChallengeSuperseded`, and a pair issued for it is revoked best-effort.
 3. `totp_activate` on the change-password machinery (lock across the request, CAS commit, own
    bounded task); `totp_enroll`, `totp_disable`, `totp_regenerate_recovery_codes`,
-   `admin_reset_totp` on `Ctx::send`. Body-free errors throughout.
-- **Check:** every core test of spec §6; mutations: pair installed after the password step;
-  ownership check skipped (before or after the request); a wrong code ending the challenge;
-  activation without the lock; the pending token in `Debug`, a log line, `Authorization` or the WS
-  auth frame; a 401 on a wrong code triggering a refresh.
+   `admin_reset_totp` on `Ctx::send` (own id refused locally, nothing sent). Body-free errors
+   throughout. The public me type gains `totp_enabled` and `recovery_codes_left`.
+- **Check:** every core test of spec §6, each seen red under its named mutation: pair installed
+  after the password step; ownership check skipped before or after the request; invalidation
+  waiting for the lock (logout during a gated completion → late sign-in); `cancel_totp` of a stale
+  challenge clearing a newer one; a wrong code ending the challenge; the challenge kept after
+  `auth.totp_expired`; activation without the lock; the pending token in `Debug`, a log line,
+  `Authorization` or the WS auth frame; **the otpauth URI or a recovery code in a log line or an
+  error's `Display`/`Debug`**; a 401 on a wrong code triggering a refresh; no local refusal of the
+  own id in `admin_reset_totp`.
 
 ### P3 — Bindings and macOS
 - FFI: `LoginResult` gains `TotpRequired { challenge: Arc<FfiTotpChallenge> }` (an object, so the
@@ -42,10 +51,24 @@
 - **Check:** view-model tests from spec §6; off-screen renders; the existing suite green.
 
 ### P4 — Live (after #48's implementation is on the test server)
-- itest on throwaway accounts: the test computes codes from the URI's secret (RFC 6238, SHA-1,
-  30 s): enrol → activate (another device's refresh dies; this device keeps working) → wait for
-  the next step → sign in with password + code → the same code refused → recovery-code sign-in →
-  regenerate → disable; admin reset signs the target out. Required by name in `itest.sh`.
+- itest on throwaway accounts; the test computes codes from the URI's secret (RFC 6238, SHA-1,
+  30 s) and never reuses a step (every code-accepting endpoint shares the replay guard), waiting
+  for the next step before each code-bearing call:
+  1. Two devices signed in (A via the bindings, B raw). A enrols and activates: **both devices'
+     old access and refresh tokens** are refused (raw probes), and the returned pair works (raw
+     `/auth/me` with it).
+  2. Next step: sign in with password + code → a pair. **Replay:** a *fresh* challenge (new
+     password step) with that same code, still inside its ±1-step window → 403
+     `auth.invalid_code`; then the next step's code on that challenge succeeds (so the refusal was
+     the replay guard, not expiry or a consumed token).
+  3. Recovery-code sign-in → `recovery_codes_left` = 9; the same recovery code on a fresh
+     challenge → 403.
+  4. Next step: regenerate (password + code) → 10 new codes; an old unused one is refused.
+  5. Admin reset **while TOTP is enabled**, with a second device's session open: its access token,
+     refresh token and socket are refused/closed (raw probes); the password alone now signs in.
+  6. A separate throwaway account: enrol, activate, and **disable** with the next step's code.
+  Waits: one per code-bearing call after the first, ≤ 30 s each (about 5 per run, ≤ 2.5 min).
+  Required by name in `itest.sh`.
 - Rate limits: the suite spends about 15 credential checks and waits out any 429, as the password
   suite does.
 
@@ -54,10 +77,25 @@
 |---|---|---|
 | P2 | ownership check only before the request | the check runs again after it, under the lock; tested with a gated server |
 | P3 | a UniFFI object for the challenge outlives the client | it holds the id and token only; a stale one returns `ChallengeSuperseded` |
-| P4 | the next-code wait makes the live run slow | ≤ 30 s per wait, twice per run |
+| P4 | the next-code wait makes the live run slow | ≤ 30 s per wait, about five per run |
 
 ## If it stops halfway
-P1 is test-only. P2 changes login (the `supports_totp` flag is ignored by older servers, and a
-non-TOTP login is unchanged), so it can land alone behind its tests. P3 exposes UI for endpoints
-that must exist: **the implementation PR merges only after #48's implementation is deployed and
-P4 passes.**
+P1 is test-only. **P2 cannot land alone:** it changes `login`'s return type, and with
+`supports_totp` always sent a TOTP account would leave any client that ignores `TotpRequired`
+stuck (GTK drives its UI from `AuthState` and would sit in Authenticating; KDE's
+`client.login(..).await?` would stop compiling, and KDE is not in CI). So the core PR opens as a
+**draft** and merges in one landing with the macOS step (P3), the GTK second step and a KDE
+"not supported yet" shim, built by the Linux client on a branch from it. Older servers: a
+server without TOTP ignores `supports_totp` (its `LoginIn` has no `extra="forbid"`; pydantic
+ignores unknown fields), and a non-TOTP account's login is unchanged, as today's tests show.
+**The landing waits for #48's implementation on the test server and a passing P4.**
+
+## Review log
+**Round 1 — Codex + Vibe (Heavy), plus the Linux client's review.** All accepted: invalidation
+before the lock and ownership rechecked under it, a stale `cancel_totp` never clearing a newer
+challenge; P2 cannot land alone (both reviewers and the Linux client), so a draft core PR and
+one landing with every client; the server-compat claim backed by the schema; named mutations
+for the kept-after-expiry challenge and for URI/recovery-code leaks; the own-id refusal of
+`admin_reset_totp`; a P4 that proves replay on a fresh challenge, never reuses a step, probes
+both devices' old tokens after activation, and resets an *enabled* target with its sessions
+probed; the challenge's expiry, an idempotent `cancel_totp` and the me fields (Linux asks).
