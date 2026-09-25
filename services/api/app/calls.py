@@ -772,8 +772,13 @@ def _label_streams(
     """
     media = {m.mid: m for m in mlines if m.kind in _SOURCES}
     if tracks is None:
+        # A live mid keeps its pinned source; only NEW mids get the defaults (else a
+        # live screen republished without labels would silently become a camera).
+        pinned = current or {}
         return {
-            m.mid: ("mic" if m.kind == "audio" else "camera") for m in media.values() if m.active
+            m.mid: pinned.get(m.mid) or ("mic" if m.kind == "audio" else "camera")
+            for m in media.values()
+            if m.active
         }
     if not isinstance(tracks, list) or not all(isinstance(t, dict) for t in tracks):
         raise CallError("invalid", "tracks must be a list of {mid, kind, source}")
