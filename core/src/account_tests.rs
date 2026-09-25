@@ -79,7 +79,7 @@ async fn change_commits_the_fresh_pair_and_revokes_the_old_one() {
     let rev_before = client.session.snapshot().await.0;
 
     client
-        .change_password("old-pass-1", "new-pass-2")
+        .change_password("old-pass-1", "new-pass-2", true)
         .await
         .unwrap();
 
@@ -104,7 +104,8 @@ async fn change_commits_the_fresh_pair_and_revokes_the_old_one() {
     assert_eq!(sent.len(), 1);
     assert_eq!(
         sent[0].1,
-        json!({ "current_password": "old-pass-1", "new_password": "new-pass-2" })
+        json!({ "current_password": "old-pass-1", "new_password": "new-pass-2",
+                "sign_out_other_devices": true })
     );
     // And the session keeps working: a refresh with the new token succeeds.
     let refresher = Refresher {
@@ -115,6 +116,23 @@ async fn change_commits_the_fresh_pair_and_revokes_the_old_one() {
     let rev = client.session.snapshot().await.0;
     refresher.refresh(rev).await.unwrap();
     assert!(matches!(*client.state().borrow(), AuthState::LoggedIn(_)));
+}
+
+/// Unchecked, the flag is sent as false: never left out for a server default to decide.
+#[tokio::test]
+async fn keeping_other_devices_signed_in_is_sent_explicitly() {
+    let server = strict().await;
+    let client = signed_in(&server, "alice").await;
+    client
+        .change_password("old-pass-1", "new-pass-2", false)
+        .await
+        .unwrap();
+    let sent = password_requests(&server, "/auth/password");
+    assert_eq!(
+        sent[0].1,
+        json!({ "current_password": "old-pass-1", "new_password": "new-pass-2",
+                "sign_out_other_devices": false })
+    );
 }
 
 /// The race: a background refresh (the production single-flight path) arrives while the change
@@ -128,7 +146,8 @@ async fn a_refresh_racing_the_change_never_signs_the_user_out() {
     let seen = client.session.snapshot().await.0;
 
     let c = client.clone();
-    let change = tokio::spawn(async move { c.change_password("old-pass-1", "new-pass-2").await });
+    let change =
+        tokio::spawn(async move { c.change_password("old-pass-1", "new-pass-2", true).await });
     eventually("server committed the change", || {
         !password_requests(&server, "/auth/password").is_empty()
     })
@@ -182,7 +201,7 @@ async fn a_refresh_just_before_the_change_is_harmless() {
     refresher.refresh(rev).await.unwrap();
     let rotated = client.session.snapshot().await.1.unwrap().access_token;
     client
-        .change_password("old-pass-1", "new-pass-2")
+        .change_password("old-pass-1", "new-pass-2", true)
         .await
         .unwrap();
     assert_eq!(password_requests(&server, "/auth/password")[0].0, rotated);
@@ -195,7 +214,7 @@ async fn expired_access_refreshes_once_and_retries_once() {
     let client = signed_in(&server, "alice").await;
     server.expire_next(1);
     client
-        .change_password("old-pass-1", "new-pass-2")
+        .change_password("old-pass-1", "new-pass-2", true)
         .await
         .unwrap();
     assert_eq!(server.refresh_calls(), 1);
@@ -216,7 +235,7 @@ async fn repeated_401_does_not_loop() {
     let client = signed_in(&server, "alice").await;
     server.expire_next(10);
     let err = client
-        .change_password("old-pass-1", "new-pass-2")
+        .change_password("old-pass-1", "new-pass-2", true)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NotAuthenticated), "{err:?}");
@@ -231,7 +250,7 @@ async fn wrong_current_password_never_refreshes() {
     let old = refresh_token(&client).await;
     server.set_password_mode(PasswordMode::WrongCurrent);
     let err = client
-        .change_password("wrong-pass", "new-pass-2")
+        .change_password("wrong-pass", "new-pass-2", true)
         .await
         .unwrap_err();
     assert!(
@@ -249,7 +268,7 @@ async fn a_refused_new_password_never_reaches_the_error_text() {
     let client = signed_in(&server, "alice").await;
     server.set_password_mode(PasswordMode::Echo422);
     let err = client
-        .change_password("Sekret-Old-1", "Sekret-New-2")
+        .change_password("Sekret-Old-1", "Sekret-New-2", true)
         .await
         .unwrap_err();
     secret_free(&err, &["Sekret-Old-1", "Sekret-New-2"]);
@@ -260,7 +279,7 @@ async fn signed_out_sends_nothing() {
     let server = strict().await;
     let client = server.client();
     let err = client
-        .change_password("old-pass-1", "new-pass-2")
+        .change_password("old-pass-1", "new-pass-2", true)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NotAuthenticated));
@@ -274,7 +293,8 @@ async fn a_login_during_the_change_waits_for_it() {
     let client = signed_in(&server, "alice").await;
     let gate = server.gate_password();
     let c = client.clone();
-    let change = tokio::spawn(async move { c.change_password("old-pass-1", "new-pass-2").await });
+    let change =
+        tokio::spawn(async move { c.change_password("old-pass-1", "new-pass-2", true).await });
     eventually("server committed the change", || {
         !password_requests(&server, "/auth/password").is_empty()
     })
@@ -307,7 +327,8 @@ async fn cancelling_after_the_server_committed_still_installs_the_pair() {
     let client = signed_in(&server, "alice").await;
     let gate = server.gate_password();
     let c = client.clone();
-    let caller = tokio::spawn(async move { c.change_password("old-pass-1", "new-pass-2").await });
+    let caller =
+        tokio::spawn(async move { c.change_password("old-pass-1", "new-pass-2", true).await });
     eventually("server committed the change", || {
         !password_requests(&server, "/auth/password").is_empty()
     })
@@ -336,10 +357,13 @@ async fn the_bound_releases_the_lock_and_nothing_commits_late() {
     let client = Arc::new(shortened);
     let gate = server.gate_password();
 
-    let err = tokio::time::timeout(WAIT, client.change_password("old-pass-1", "new-pass-2"))
-        .await
-        .expect("change not bounded")
-        .unwrap_err();
+    let err = tokio::time::timeout(
+        WAIT,
+        client.change_password("old-pass-1", "new-pass-2", true),
+    )
+    .await
+    .expect("change not bounded")
+    .unwrap_err();
     assert!(matches!(err, Error::Timeout), "{err:?}");
     tokio::time::timeout(WAIT, client.login("alice", "new-pass-2"))
         .await
@@ -529,7 +553,8 @@ async fn a_change_is_bound_to_the_session_it_started_in() {
     let client = signed_in(&server, "alice").await;
     let held = client.session.refresh_lock.clone().lock_owned().await;
     let c = client.clone();
-    let change = tokio::spawn(async move { c.change_password("old-pass-1", "new-pass-2").await });
+    let change =
+        tokio::spawn(async move { c.change_password("old-pass-1", "new-pass-2", true).await });
     tokio::time::sleep(Duration::from_millis(100)).await; // it read the epoch and waits
     let bob = signed_in(&server, "bob").await;
     let bobs = bob.session.snapshot().await.1.unwrap();
@@ -583,7 +608,7 @@ async fn a_rate_limited_refresh_during_a_change_keeps_the_session() {
     server.expire_next(1);
     server.set_refresh_mode(RefreshMode::RateLimited(30));
     let err = client
-        .change_password("old-pass-1", "new-pass-2")
+        .change_password("old-pass-1", "new-pass-2", true)
         .await
         .unwrap_err();
     assert!(
@@ -654,4 +679,123 @@ async fn a_401_answered_after_a_new_login_refreshes_nothing() {
         .unwrap_err();
     assert!(matches!(err, Error::NotAuthenticated), "{err:?}");
     assert_eq!(server.refresh_calls(), 0, "refreshed another session");
+}
+
+/// With "sign out other devices", the server closes this device's own socket (1008
+/// `session_revoked`) before the password response goes out. The socket's refresh must wait for
+/// the change, see the new pair and reconnect with it: sending the revoked refresh token would be
+/// rejected, and a rejection signs the user out by their own password change.
+#[tokio::test]
+async fn own_socket_revoked_before_the_response_stays_signed_in() {
+    let mut server = strict().await;
+    let client = signed_in(&server, "alice").await;
+    client.start_realtime().await.unwrap();
+    let mut peer = server.accept().await;
+    peer.accept_auth().await;
+    let gate = server.gate_password();
+
+    let c = client.clone();
+    let change =
+        tokio::spawn(async move { c.change_password("old-pass-1", "new-pass-2", true).await });
+    eventually("server committed the change", || {
+        !password_requests(&server, "/auth/password").is_empty()
+    })
+    .await;
+    peer.close(1008, "session_revoked").await;
+    tokio::time::sleep(Duration::from_millis(200)).await; // the socket's refresh is waiting
+    assert_eq!(
+        server.refresh_calls(),
+        0,
+        "refreshed while the change was in flight"
+    );
+    gate.add_permits(1);
+    tokio::time::timeout(WAIT, change)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    let mut again = server.accept().await;
+    let auth = again.accept_auth().await;
+    let session = client.session.snapshot().await.1.unwrap();
+    assert_eq!(
+        auth["data"]["access_token"], session.access_token,
+        "reconnected without the new pair"
+    );
+    assert!(
+        matches!(*client.state().borrow(), AuthState::LoggedIn(_)),
+        "signed out by its own password change"
+    );
+    assert_eq!(server.refresh_calls(), 0, "the revoked token was sent");
+}
+
+/// The other ordering: the socket is closed after the new pair is committed. Its refresh sees the
+/// new revision and reconnects with the new pair, sending nothing.
+#[tokio::test]
+async fn own_socket_revoked_after_the_commit_reconnects_with_the_new_pair() {
+    let mut server = strict().await;
+    let client = signed_in(&server, "alice").await;
+    client.start_realtime().await.unwrap();
+    let mut peer = server.accept().await;
+    peer.accept_auth().await;
+    client
+        .change_password("old-pass-1", "new-pass-2", true)
+        .await
+        .unwrap();
+    peer.close(1008, "session_revoked").await;
+
+    let mut again = server.accept().await;
+    let auth = again.accept_auth().await;
+    let session = client.session.snapshot().await.1.unwrap();
+    assert_eq!(auth["data"]["access_token"], session.access_token);
+    assert!(matches!(*client.state().borrow(), AuthState::LoggedIn(_)));
+    assert_eq!(server.refresh_calls(), 0, "the revoked token was sent");
+}
+
+/// A REST call of this device with the old access token, answered 401 while the change is in
+/// flight: its refresh waits for the change and retries with the new pair.
+#[tokio::test]
+async fn own_rest_call_with_the_revoked_access_token_retries_with_the_new_pair() {
+    let server = strict().await;
+    let client = signed_in(&server, "alice").await;
+    let gate = server.gate_password();
+    let c = client.clone();
+    let change =
+        tokio::spawn(async move { c.change_password("old-pass-1", "new-pass-2", true).await });
+    eventually("server committed the change", || {
+        !password_requests(&server, "/auth/password").is_empty()
+    })
+    .await;
+    let c = client.clone();
+    let list = tokio::spawn(async move { c.list_users().await });
+    eventually("the list got its 401", || {
+        !password_requests(&server, "/users").is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        server.refresh_calls(),
+        0,
+        "refreshed while the change was in flight"
+    );
+    gate.add_permits(1);
+    tokio::time::timeout(WAIT, change)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(WAIT, list)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let sent = password_requests(&server, "/users");
+    assert_eq!(sent.len(), 2);
+    let session = client.session.snapshot().await.1.unwrap();
+    assert_eq!(
+        sent[1].0, session.access_token,
+        "retried without the new pair"
+    );
+    assert!(matches!(*client.state().borrow(), AuthState::LoggedIn(_)));
+    assert_eq!(server.refresh_calls(), 0);
 }

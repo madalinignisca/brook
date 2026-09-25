@@ -4,7 +4,7 @@ import Observation
 
 /// The account calls the password sheets need (the Rust client; a fake in tests).
 protocol AccountClient: AnyObject, Sendable {
-    func changePassword(current: String, new: String) async throws
+    func changePassword(current: String, new: String, signOutOtherDevices: Bool) async throws
     func adminResetPassword(userId: String, adminPassword: String, new: String) async throws
     func listUsers() async throws -> [FfiUserSummary]
 }
@@ -69,11 +69,15 @@ final class ChangePasswordModel {
     var current = ""
     var new = ""
     var confirm = ""
+    /// "Sign out of other devices": on by default, and again each time the sheet opens.
+    var signOutOtherDevices = true
     private(set) var busy = false
     private(set) var error: String?
-    private(set) var done = false
+    /// What happened, once it has (the text follows what was sent, not the box now).
+    private(set) var done: String?
 
-    static let success = "Password changed. Your other devices will be signed out within 15 minutes."
+    static let signedOthersOut = "Password changed. Your other devices are signed out."
+    static let keptOthersSignedIn = "Password changed. Your other devices stay signed in."
     static let wrongCurrent = "The current password is wrong."
     static let sameAsCurrent = "The new password is the same as the current one."
 
@@ -96,9 +100,10 @@ final class ChangePasswordModel {
         error = nil
         defer { busy = false }
         do {
-            try await client.changePassword(current: current, new: new)
+            let signOut = signOutOtherDevices
+            try await client.changePassword(current: current, new: new, signOutOtherDevices: signOut)
             clear()
-            done = true
+            done = signOut ? Self.signedOthersOut : Self.keptOthersSignedIn
         } catch {
             // Fields stay: a typo can be fixed without retyping everything.
             self.error = AccountMessage.text(for: error, wrongPassword: Self.wrongCurrent)
@@ -110,6 +115,8 @@ final class ChangePasswordModel {
         current = ""
         new = ""
         confirm = ""
+        signOutOtherDevices = true
+        done = nil
     }
 }
 
@@ -161,7 +168,7 @@ final class AdminResetModel {
             try await client.adminResetPassword(userId: id, adminPassword: adminPassword, new: new)
             let who = users.first { $0.id == id }?.displayName ?? "The user"
             clear()
-            done = "\(who)'s password is set. They're signed out everywhere within 15 minutes."
+            done = "\(who)'s password is set. They're signed out everywhere."
         } catch {
             self.error = AccountMessage.text(
                 for: error, wrongPassword: Self.wrongAdmin, forbidden: Self.adminTarget)

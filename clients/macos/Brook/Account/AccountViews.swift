@@ -12,14 +12,15 @@ struct ChangePasswordSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Change Password").font(.title2)
-            if model.done {
-                Text(ChangePasswordModel.success)
+            if let done = model.done {
+                Text(done)
                 HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
             } else {
                 Form {
                     SecureField("Current password", text: $model.current)
                     SecureField("New password", text: $model.new)
                     SecureField("Confirm new password", text: $model.confirm)
+                    Toggle("Sign out of other devices", isOn: $model.signOutOtherDevices)
                 }
                 if let error = model.error {
                     Text(error).foregroundStyle(.red)

@@ -10,8 +10,8 @@ final class FakeAccount: AccountClient, @unchecked Sendable {
     var failure: LoginError?
     var users: [FfiUserSummary] = []
 
-    func changePassword(current: String, new: String) async throws {
-        calls.withLock { $0.append("change:\(current)>\(new)") }
+    func changePassword(current: String, new: String, signOutOtherDevices: Bool) async throws {
+        calls.withLock { $0.append("change:\(current)>\(new):\(signOutOtherDevices ? "out" : "keep")") }
         if let failure { throw failure }
     }
     func adminResetPassword(userId: String, adminPassword: String, new: String) async throws {
@@ -77,9 +77,27 @@ final class ChangePasswordModelTests: XCTestCase {
         model.new = "new-pass-2"
         model.confirm = "new-pass-2"
         await model.submit()
-        XCTAssertEqual(account.calls.withLock { $0 }, ["change:old-pass-1>new-pass-2"])
-        XCTAssertTrue(model.done)
+        XCTAssertEqual(account.calls.withLock { $0 }, ["change:old-pass-1>new-pass-2:out"])
+        XCTAssertEqual(model.done, ChangePasswordModel.signedOthersOut)
         XCTAssertEqual([model.current, model.new, model.confirm], ["", "", ""], "passwords kept")
+    }
+
+    /// "Sign out of other devices" starts checked, is sent as set, says what happened, and is
+    /// checked again when the sheet is next opened.
+    func testSignOutOtherDevicesIsOnByDefaultAndSentAsSet() async {
+        let account = FakeAccount()
+        let model = ChangePasswordModel(client: account)
+        XCTAssertTrue(model.signOutOtherDevices, "not checked by default")
+        model.current = "old-pass-1"
+        model.new = "new-pass-2"
+        model.confirm = "new-pass-2"
+        model.signOutOtherDevices = false
+        await model.submit()
+        XCTAssertEqual(account.calls.withLock { $0 }, ["change:old-pass-1>new-pass-2:keep"])
+        XCTAssertEqual(model.done, ChangePasswordModel.keptOthersSignedIn)
+        model.clear()
+        XCTAssertTrue(model.signOutOtherDevices, "left unchecked for the next change")
+        XCTAssertNil(model.done)
     }
 
     func testRefusalKeepsTheFieldsAndSaysWhy() async {
@@ -99,7 +117,7 @@ final class ChangePasswordModelTests: XCTestCase {
             model.confirm = "new-pass-2"
             await model.submit()
             XCTAssertEqual(model.error, message, "\(failure)")
-            XCTAssertFalse(model.done)
+            XCTAssertNil(model.done)
             XCTAssertEqual(model.current, "old-pass-1", "fields cleared after a refusal")
         }
     }

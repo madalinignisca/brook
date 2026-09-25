@@ -1,6 +1,6 @@
 # Password change: core and macOS (auth hardening, PR B, client side)
 
-> Status: **approved** (Heavy, two rounds) · 2026-09-25 · Dial: **Heavy** (auth; owner confirmed)
+> Status: **approved** (Heavy, two rounds; §9 amendment approved, two rounds) · 2026-09-25 · Dial: **Heavy** (auth; owner confirmed)
 > Server side (`services/api` endpoints) is the server session's, by the owner's routing; this
 > spec covers core and the macOS app, and states what they need from the server.
 
@@ -135,3 +135,42 @@ also refuses admin targets. Recorded in §3 and §5.
 **Round 2 — Codex + Vibe.** Vibe: none. Codex: bound the locked section (a stalled response
 would hold the refresh lock and block login) and the success message still overstated the
 sign-out; both accepted. Nothing disputed; the gate closes.
+
+## 9. Amendment: sign out other devices at once (server PR #45)
+The owner asked for a **"Sign out of other devices"** checkbox, checked by default. The server
+adds `sign_out_other_devices` (default `true`) to `POST /auth/password`. When true, every access
+token issued before the change is refused at once (REST 401, WebSocket `1008 session_revoked`) and
+open sockets are closed; when false, other devices stay signed in. An admin reset always signs
+the target out this way, so its sheet gets no checkbox.
+- Core: `change_password(current, new, sign_out_other_devices)`, always sent explicitly (never
+  left to the server default). Nothing else changes. This device's own socket is closed too; core
+  maps it to AuthRejected, and its refresh waits on the lock the change holds, sees the new
+  revision and reconnects with the new pair (a call resumes, `call.resume`).
+- macOS: the checkbox under the password fields, back to checked whenever the sheet opens. Success
+  text follows the choice: checked → "Password changed. Your other devices are signed out."; not
+  checked → "Password changed. Your other devices stay signed in." The admin success text becomes
+  "…is signed out everywhere." (no 15 minutes).
+- Tests: the exact body carries the flag both ways; the model sends what the box says, starts
+  checked, is re-checked on clear, and shows the matching text; FFI passes it through. Core, with
+  a fake that refuses the old access tokens when the flag is set: this device's socket closed with
+  `session_revoked` **before** the response (the change still in flight) and **after** the commit,
+  and a REST call of this device with the old access token answered 401 during the change. Each
+  asserts no sign-out, no refresh sent, and reconnect/retry with the new pair. (A call resumes over
+  the new socket with the rotated token: `call_tests::resume_uses_the_rotated_token`.)
+- Live (P4), both settings, on throwaway accounts: **checked** (and admin reset): the other
+  device's old access token is refused on REST at once, and its already-open socket is closed with
+  `session_revoked`, well inside the 15-minute access lifetime; this device keeps working.
+  **Unchecked:** the other device's access token, open socket and refresh all keep working.
+- Limit: an older server ignores the field, so it signs others out within 15 minutes whichever
+  way the box is set, and the success text would be wrong both ways. There is no released server
+  and no capability mechanism in the protocol yet; **this PR merges only after #45 is deployed to
+  the test and production servers**. A capability or version check is a protocol-wide decision
+  (it concerns every addition, not this one), raised with the server side.
+
+**Amendment review, round 1 — Codex + Vibe (Heavy).** Accepted: tests for the socket closed
+before and after the commit and for an old-token REST call (all three seen red with the
+single-flight revision check or the change's lock removed); P4 asserts immediate revocation, and
+that unchecked keeps the other device working (also Vibe's point). Rejected with reasons: a
+capability check before showing the box (no released server; merge gated on #45's deployment;
+versioning is a protocol-wide decision, not this checkbox's).
+**Amendment review, round 2 — Codex + Vibe.** Both: none. Nothing disputed; the gate closes.

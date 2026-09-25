@@ -283,6 +283,10 @@ async fn change_password(
             _ => {}
         }
         revoke_refresh_tokens(&mut state, &handle);
+        if body["sign_out_other_devices"] == true {
+            // Server PR #45: every access token issued before the change is refused at once.
+            state.tokens.retain(|_, h| *h != handle);
+        }
         (issue(&mut state, &handle), state.password_gate.clone())
     };
     after_commit(gate).await;

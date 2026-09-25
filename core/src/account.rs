@@ -106,9 +106,20 @@ impl Ctx {
     }
 
     /// The locked section of a password change, run in its own task.
-    async fn change_password(&self, epoch: u64, current: String, new: String) -> Result<()> {
+    async fn change_password(
+        &self,
+        epoch: u64,
+        current: String,
+        new: String,
+        sign_out_other_devices: bool,
+    ) -> Result<()> {
         let url = self.base.join("api/v1/auth/password")?;
-        let body = json!({ "current_password": current, "new_password": new });
+        // Always explicit: the server's default must not decide what the checkbox said.
+        let body = json!({
+            "current_password": current,
+            "new_password": new,
+            "sign_out_other_devices": sign_out_other_devices,
+        });
         let (resp, used_refresh) = self
             .send(epoch, OnExpired::LockHeld, |access| {
                 self.http.post(url.clone()).bearer_auth(access).json(&body)
@@ -142,8 +153,14 @@ impl BrookClient {
 
     /// Change the signed-in user's password. On success this device keeps a fresh token pair
     /// (the realtime socket re-authenticates with it); every other session of the user loses its
-    /// refresh token. A wrong current password is `Api { code: "auth.invalid_credentials" }`.
-    pub async fn change_password(&self, current: &str, new: &str) -> Result<()> {
+    /// refresh token, and with `sign_out_other_devices` also its access token and open socket at
+    /// once (this device's socket is closed too and reconnects with the new pair). A wrong current password is `Api { code: "auth.invalid_credentials" }`.
+    pub async fn change_password(
+        &self,
+        current: &str,
+        new: &str,
+        sign_out_other_devices: bool,
+    ) -> Result<()> {
         let epoch = self.session.snapshot().await.0.epoch;
         let lock: OwnedMutexGuard<()> = self.session.refresh_lock.clone().lock_owned().await;
         let ctx = self.ctx();
@@ -154,9 +171,12 @@ impl BrookClient {
         // the task and releases the lock; a response arriving later commits nothing.
         let task = tokio::spawn(async move {
             let _lock = lock;
-            tokio::time::timeout(bound, ctx.change_password(epoch, current, new))
-                .await
-                .unwrap_or(Err(Error::Timeout))
+            tokio::time::timeout(
+                bound,
+                ctx.change_password(epoch, current, new, sign_out_other_devices),
+            )
+            .await
+            .unwrap_or(Err(Error::Timeout))
         });
         task.await.map_err(|_| Error::UnexpectedResponse)?
     }
