@@ -461,3 +461,34 @@ def test_a_message_hints_only_the_senders_other_devices(
         alice_saw = drain(alice_ws)
         assert "message.new" in alice_saw and "sync.hint" not in alice_saw
         assert "sync.hint" in drain(bob_phone)
+
+
+async def test_a_join_is_found_even_after_my_row_moved_on(client: httpx.AsyncClient) -> None:
+    """Joined at J, then my read marker moved my row to a later seq. A page ending
+    between the two must still deliver the channel and all its members (found by
+    joined_seq, not by the row's current seq), and nothing is lost on the next page."""
+    ha = await _user(client, "alice")
+    hb = await _user(client, "bob", ha)
+    await _user(client, "carol", ha)
+    ch = (
+        await client.post("/api/v1/channels", json={"kind": "channel", "name": "old"}, headers=ha)
+    ).json()
+    await client.post(f"/api/v1/channels/{ch['id']}/members", json={"handle": "carol"}, headers=ha)
+    cursor = (await _sync(client, hb))["next"]  # bob isn't in it yet
+    await client.post(
+        f"/api/v1/channels/{ch['id']}/members", json={"handle": "bob"}, headers=ha
+    )  # J
+    sent = (
+        await client.post(f"/api/v1/channels/{ch['id']}/messages", json={"body": "x"}, headers=ha)
+    ).json()
+    await client.post(
+        f"/api/v1/channels/{ch['id']}/read", json={"message_id": sent["id"]}, headers=hb
+    )
+    first = await _sync(client, hb, cursor, limit=1)  # ends at J: bob's row is already past it
+    assert first["more"] is True
+    assert [c["id"] for c in first["channels"]] == [ch["id"]]
+    members = {m["user_id"] for m in first["memberships"] if m["channel_id"] == ch["id"]}
+    assert len(members) == 3
+    assert {u["handle"] for u in first["users"]} >= {"alice", "bob", "carol"}
+    rest = await _sync(client, hb, first["next"])
+    assert [m["body"] for m in rest["messages"]] == ["x"]
