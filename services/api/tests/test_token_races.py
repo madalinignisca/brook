@@ -287,3 +287,47 @@ async def test_sync_cannot_lose_a_change_committed_late(client: httpx.AsyncClien
     after = (await client.get("/api/v1/sync", params={"since": cursor}, headers=h)).json()
     bodies = [m["body"] for m in after["messages"]]
     assert bodies == ["T1", "T2"]  # commit order is seq order; T1 not lost
+
+
+async def test_logout_catches_the_token_of_an_inflight_refresh(client: httpx.AsyncClient) -> None:
+    """Sign-out while a refresh is mid-flight: the refresh has rotated T into S, not yet
+    committed, and the client logs out with T. Logout must wait for it (the user lock)
+    and end S too; without the lock its UPDATE's snapshot predates S and misses it."""
+    user_id, pair = await _alice(client)
+    async with db.get_sessionmaker()() as a:
+        await lock_user(a, user_id)
+        old = await a.scalar(
+            select(RefreshToken).where(RefreshToken.token_hash == hash_token(pair["refresh_token"]))
+        )
+        assert old is not None
+        successor = uuid.uuid4()
+        await a.execute(
+            update(RefreshToken)
+            .where(RefreshToken.id == old.id)
+            .values(revoked=True, rotated_at=utcnow(), replaced_by_id=successor)
+        )
+        raw_new, new_hash = new_refresh_token()
+        a.add(
+            RefreshToken(
+                id=successor,
+                family_id=old.family_id,
+                user_id=user_id,
+                token_hash=new_hash,
+                expires_at=utcnow() + timedelta(days=1),
+            )
+        )
+        await a.flush()
+        out = asyncio.create_task(
+            client.post(f"{AUTH}/logout", json={"refresh_token": pair["refresh_token"]})
+        )
+        await asyncio.sleep(SETTLE)
+        assert not out.done()  # waits for the in-flight refresh
+        await a.commit()
+
+    assert (await out).status_code == 204
+    async with db.get_sessionmaker()() as check:
+        new = await check.scalar(select(RefreshToken).where(RefreshToken.token_hash == new_hash))
+        assert new is not None and new.revoked is True
+    assert (
+        await client.post(f"{AUTH}/refresh", json={"refresh_token": raw_new})
+    ).status_code == 401

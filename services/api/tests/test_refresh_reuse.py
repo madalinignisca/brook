@@ -194,3 +194,44 @@ async def test_an_expired_live_token_is_just_refused(client: httpx.AsyncClient) 
         await session.commit()
     assert (await _refresh(client, t)).status_code == 401
     assert await _reuse_events() == 0
+
+
+async def test_logout_ends_the_successor_of_a_refresh_in_flight(
+    client: httpx.AsyncClient,
+) -> None:
+    # Sign-out raced a refresh: the server rotated T into S, the client (signing out)
+    # never kept S and logs out with T. S must not stay live for its whole TTL.
+    await _alice(client)
+    other_device = await _login(client)
+    t = await _login(client)
+    s = (await _refresh(client, t)).json()["refresh_token"]
+    assert (await client.post(f"{AUTH}/logout", json={"refresh_token": t})).status_code == 204
+    assert (await _refresh(client, s)).status_code == 401
+    assert (await _refresh(client, other_device)).status_code == 200  # another family
+    assert await _reuse_events() == 0  # a logged-out token is refused, not theft
+    assert await _events("logout") == 1  # on record, whoever held the token
+
+
+async def test_logout_with_an_unknown_token_is_a_quiet_204(client: httpx.AsyncClient) -> None:
+    await _alice(client)
+    live = await _login(client)
+    r = await client.post(f"{AUTH}/logout", json={"refresh_token": "not-a-token"})
+    assert r.status_code == 204
+    assert (await _refresh(client, live)).status_code == 200
+
+
+async def test_logout_works_from_a_throttled_address(client: httpx.AsyncClient) -> None:
+    # A household behind one address, throttled after mistyped passwords, can still
+    # sign out: a 429 there would leave the device's tokens live.
+    from app import ratelimit
+
+    await _alice(client)
+    t = await _login(client)
+    lim = ratelimit.get_limiter()
+    for _ in range(lim.config.backoff_after + 2):
+        await client.post(f"{AUTH}/login", json={"handle": "alice", "password": "nope-x"})
+    assert (
+        await client.post(f"{AUTH}/login", json={"handle": "alice", "password": PW})
+    ).status_code == 429
+    assert (await client.post(f"{AUTH}/logout", json={"refresh_token": t})).status_code == 204
+    assert await _events("logout") == 1
