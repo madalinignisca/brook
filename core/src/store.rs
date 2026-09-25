@@ -194,7 +194,7 @@ fn registry() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
 }
 
 /// A store's registry entry, held for as long as anything opens, rebuilds or erases it.
-/// Dropped unarmed once the store's thread owns the entry (`hand_over`).
+/// Moved into the store's thread when it opens, and released when that thread ends.
 struct Reservation {
     key: PathBuf,
     armed: bool,
@@ -209,17 +209,16 @@ impl Reservation {
         }
     }
 
-    fn hand_over(mut self) -> PathBuf {
-        self.armed = false;
-        self.key.clone()
+    fn release(&mut self) {
+        if std::mem::take(&mut self.armed) {
+            registry().remove(&self.key);
+        }
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        if self.armed {
-            registry().remove(&self.key);
-        }
+        self.release();
     }
 }
 
@@ -227,6 +226,12 @@ impl Drop for Reservation {
 /// path, so a symlink or `..` can't be a second way into an open store.
 fn paths_in(dir: &Path, kind: Kind) -> Result<Paths, StoreError> {
     fs::create_dir_all(dir).map_err(|_| StoreError::Io)?;
+    // Owner only: `create_dir_all` follows the umask (usually 0755).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|_| StoreError::Io)?;
+    }
     let dir = fs::canonicalize(dir).map_err(|_| StoreError::Io)?;
     Ok(Paths::new(&dir, kind))
 }
@@ -277,7 +282,7 @@ fn open_reserved(
     }
     match inner {
         Inner::Ready(conn, rebuilt) => Ok(Opened::Ready {
-            db: Db::spawn(conn, reservation.hand_over()),
+            db: Db::spawn(conn, reservation)?,
             rebuilt,
         }),
         Inner::Other(opened) => Ok(opened),
@@ -294,36 +299,48 @@ fn open_inner(
     keys: &KeyStore<dyn KeySlot>,
     paths: &Paths,
 ) -> Result<Inner, StoreError> {
-    let key = match keys.get_or_create(&kind.slot(store_id)) {
-        Ok(key) => key,
+    let (key, made_now) = match keys.get_or_create_reporting(&kind.slot(store_id)) {
+        Ok(found) => found,
         Err(KeySlotError::Exists | KeySlotError::Unavailable | KeySlotError::Fatal(_)) => {
             return Ok(Inner::Other(Opened::Locked));
         }
     };
     let check = key_check(key.bytes());
     if paths.db.exists() {
-        let matches = match fs::read(&paths.check) {
-            Ok(stored) => stored == check,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        #[derive(PartialEq)]
+        enum Check {
+            Matches,
+            /// Present, for another key: durable proof the database was made with another.
+            Other,
+            Absent,
+        }
+        let found = match fs::read(&paths.check) {
+            Ok(stored) if stored == check => Check::Matches,
+            Ok(_) => Check::Other,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Check::Absent,
             // Unreadable is not absent: nothing is decided, nothing is deleted.
             Err(_) => return Err(StoreError::Io),
         };
-        return Ok(match (matches, connect(&paths.db, key.bytes())) {
-            (true, Ok(conn)) => Inner::Ready(conn, None),
-            // The key is right but the file won't open: damage, kept.
-            (true, Err(_)) => Inner::Other(Opened::Damaged),
-            // The check was lost (a crash before it was written, or it was removed), but
-            // the key opens the database: it is this key's. Keep it, restore the check.
-            (false, Ok(conn)) => {
+        // Only **proof** deletes: a check written for another key, or a key made during this
+        // very open (a fresh random key can't be the key of a file already on disk; one
+        // opener per store rules out a racing creator). A failed open alone proves nothing:
+        // damage, I/O and locking fail the same way. (The probe itself may checkpoint a
+        // committed WAL into the file; that moves pages, it loses nothing.)
+        let keyless = found == Check::Other || (found == Check::Absent && made_now);
+        return Ok(match (found, connect(&paths.db, key.bytes())) {
+            (Check::Matches, Ok(conn)) => Inner::Ready(conn, None),
+            // The key opens it: it's this key's, whatever the check said. Restore the check.
+            (_, Ok(conn)) => {
                 write_atomically(&paths.check, &check)?;
                 Inner::Ready(conn, None)
             }
-            // Neither the check nor the database answers to this key: its key is gone.
-            (false, Err(_)) => {
+            (_, Err(_)) if keyless => {
                 remove_all(paths)?;
                 let conn = create(kind, paths, key.bytes(), &check)?;
                 Inner::Ready(conn, Some(Rebuilt::KeyMissing))
             }
+            // The key should open it and doesn't, or it's unclear whose it is: kept.
+            (_, Err(_)) => Inner::Other(Opened::Damaged),
         });
     }
     Ok(Inner::Ready(
@@ -415,7 +432,11 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let tmp = path.with_extension("check.tmp");
     let io = |_| StoreError::Io;
     {
-        let mut f = fs::File::create(&tmp).map_err(io)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut f = options.open(&tmp).map_err(io)?;
         f.write_all(bytes).map_err(io)?;
         f.sync_all().map_err(io)?;
     }
@@ -446,28 +467,31 @@ pub(crate) struct Db {
 }
 
 impl Db {
-    fn spawn(mut conn: Connection, path: PathBuf) -> Self {
+    /// The reservation moves into the thread: if the thread can't start, the closure is
+    /// dropped and the reservation with it, so the store isn't left marked open.
+    fn spawn(conn: Connection, reservation: Reservation) -> Result<Self, StoreError> {
         let (jobs, rx) = mpsc::channel::<Job>();
         let (done, stopped) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("brook-store".into())
             .spawn(move || {
-                // Runs on every exit, a panicking job's unwind included: the store is
-                // released and `close` hears it, or the store could never reopen.
+                // Declared before `conn`, so dropped after it on every exit (a panicking
+                // job's unwind included): the database is closed before the store is
+                // released and `close` returns.
                 let _release = Release {
-                    path,
+                    reservation,
                     done: Some(done),
                 };
+                let mut conn = conn;
                 for job in rx {
                     job(&mut conn);
                 }
-                drop(conn); // closes the database before `_release` runs
             })
-            .expect("spawn the store thread");
-        Self {
+            .map_err(|_| StoreError::Io)?;
+        Ok(Self {
             jobs: Some(jobs),
             stopped: Some(stopped),
-        }
+        })
     }
 
     /// Run `f` on the store's thread.
@@ -497,15 +521,16 @@ impl Db {
     }
 }
 
-/// Releases a store's registry entry and reports it stopped, when its thread ends.
+/// Releases a store's registry entry (its reservation) and reports it stopped, when its
+/// thread ends.
 struct Release {
-    path: PathBuf,
+    reservation: Reservation,
     done: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Drop for Release {
     fn drop(&mut self) {
-        registry().remove(&self.path);
+        self.reservation.release();
         if let Some(done) = self.done.take() {
             let _ = done.send(());
         }

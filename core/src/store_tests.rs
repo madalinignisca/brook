@@ -79,13 +79,8 @@ async fn nothing_under_the_store_is_plaintext() {
         Vec::<String>::new(),
         "mid-transaction"
     );
-    // A crash: the connection is never closed (its thread is leaked with the open tx).
-    std::mem::forget(db);
-    assert_eq!(
-        plaintext_anywhere(dir.path(), SENTINEL),
-        Vec::<String>::new(),
-        "after a crash"
-    );
+    // A real crash is `a_crash_mid_transaction_leaves_only_ciphertext_and_committed_rows`.
+    db.close().await;
 }
 
 #[tokio::test]
@@ -358,7 +353,8 @@ async fn an_alias_is_the_same_store() {
 
 const CRASH_DIR: &str = "BROOK_STORE_CRASH_DIR";
 
-/// The child half of the crash test: commit some rows, start a transaction, and die.
+/// The child half of the crash test: commit some rows, then die **inside** a live
+/// transaction, with a one-page cache so its uncommitted pages have spilled to the WAL.
 #[test]
 fn crash_child() {
     let Ok(dir) = std::env::var(CRASH_DIR) else {
@@ -377,20 +373,19 @@ fn crash_child() {
             &keys(&slot),
         ));
         write_sentinel(&db, 5).await;
-        db.call(|c| {
-            c.execute_batch("BEGIN;")?;
-            for i in 0..500 {
-                c.execute(
-                    "INSERT INTO users(id, seq, json) VALUES (?1, 1, ?2)",
-                    [format!("t{i}"), format!("{SENTINEL}-tx")],
-                )?;
-            }
-            Ok(())
-        })
-        .await
-        .unwrap();
+        let _: Result<(), StoreError> = db
+            .call(|c| {
+                c.execute_batch("PRAGMA cache_size = 1; BEGIN;")?;
+                for i in 0..2000 {
+                    c.execute(
+                        "INSERT INTO users(id, seq, json) VALUES (?1, 1, ?2)",
+                        [format!("t{i}"), format!("{SENTINEL}-tx-{i:04}")],
+                    )?;
+                }
+                std::process::abort(); // a kill, mid-transaction: no rollback, no close
+            })
+            .await;
     });
-    std::process::abort(); // a kill: no destructors, no close
 }
 
 /// A real crash mid-transaction: no plaintext anywhere, the committed rows survive and the
@@ -404,7 +399,19 @@ async fn a_crash_mid_transaction_leaves_only_ciphertext_and_committed_rows() {
         .output()
         .unwrap()
         .status;
-    assert!(!status.success(), "the child didn't crash");
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        status.signal(),
+        Some(6),
+        "the child didn't abort: {status:?}"
+    );
+    let wal = std::fs::metadata(dir.path().join("cache.db-wal"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    assert!(
+        wal > 64 * 1024,
+        "the uncommitted pages never reached the WAL ({wal} bytes)"
+    );
     assert!(dir.path().join("cache.db").exists());
     assert_eq!(
         plaintext_anywhere(dir.path(), SENTINEL),
@@ -419,4 +426,49 @@ async fn a_crash_mid_transaction_leaves_only_ciphertext_and_committed_rows() {
         .await
         .unwrap();
     assert_eq!(users, 5, "committed rows lost or uncommitted ones kept");
+}
+
+/// No check and a database the key can't open: damage and a lost key look the same, so
+/// nothing is deleted (only an explicit reset clears it).
+#[tokio::test]
+async fn a_damaged_store_without_its_check_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let (db, _) = ready(store::open(dir.path(), Kind::Outbox, "s1", &keys(&slot)));
+    db.close().await;
+    std::fs::remove_file(dir.path().join("outbox.check")).unwrap();
+    let path = dir.path().join("outbox.db");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[100] ^= 0xff;
+    std::fs::write(&path, &bytes).unwrap();
+    let o = store::open(dir.path(), Kind::Outbox, "s1", &keys(&slot)).unwrap();
+    assert!(matches!(o, Opened::Damaged), "{o:?}");
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+/// No check, and the slot was gone so a key was made just now: a fresh random key can't be
+/// the database's, so it is keyless and remade.
+#[tokio::test]
+async fn a_lost_slot_and_a_lost_check_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let (db, _) = ready(store::open(dir.path(), Kind::Cache, "s1", &keys(&slot)));
+    write_sentinel(&db, 2).await;
+    db.close().await;
+    std::fs::remove_file(dir.path().join("cache.check")).unwrap();
+    keys(&slot).destroy("cache:s1").unwrap();
+    let (_db, rebuilt) = ready(store::open(dir.path(), Kind::Cache, "s1", &keys(&slot)));
+    assert_eq!(rebuilt, Some(Rebuilt::KeyMissing));
+}
+
+#[tokio::test]
+async fn only_the_owner_can_enter_the_store_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let stores = dir.path().join("stores");
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let (_db, _) = ready(store::open(&stores, Kind::Cache, "s1", &keys(&slot)));
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&stores), 0o700);
+    assert_eq!(mode(&stores.join("cache.check")), 0o600);
 }
