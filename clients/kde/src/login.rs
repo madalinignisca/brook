@@ -7,7 +7,7 @@
 use core::pin::Pin;
 use std::sync::Arc;
 
-use brook_core::{AuthState, BrookClient, CoreConfig};
+use brook_core::{AuthState, BrookClient, CoreConfig, LoginOutcome};
 use cxx_qt::Threading;
 use cxx_qt_lib::QString;
 
@@ -77,7 +77,20 @@ impl qobject::LoginController {
             let outcome = async {
                 let config = CoreConfig::with_options(&server, allow_insecure_http)?;
                 let client = Arc::new(BrookClient::new(config)?);
-                let session = client.login(&handle, &password).await?;
+                let session = match client.login(&handle, &password).await? {
+                    LoginOutcome::LoggedIn(session) => session,
+                    // Two-factor sign-in isn't in the KDE app yet: end the attempt and
+                    // say so, instead of waiting on a step this app can't show.
+                    LoginOutcome::TotpRequired(challenge) => {
+                        client.cancel_totp(&challenge).await;
+                        return Err(brook_core::Error::Api {
+                            code: "totp.unsupported".into(),
+                            message: "This account uses two-factor sign-in, which the KDE app \
+                                      doesn't support yet. Use the GNOME or macOS app."
+                                .into(),
+                        });
+                    }
+                };
                 // Share the authenticated client with the chat controller.
                 app::set_client(client.clone()).await;
                 Ok::<_, brook_core::Error>((session, client))
@@ -94,6 +107,12 @@ impl qobject::LoginController {
                             ));
                             this.as_mut().set_logged_in(true);
                             watch_sign_out(this.qt_thread(), client);
+                        }
+                        Err(brook_core::Error::Api { code, message })
+                            if code == "totp.unsupported" =>
+                        {
+                            this.as_mut()
+                                .set_error_text(QString::from(message.as_str()));
                         }
                         Err(err) => {
                             this.as_mut()
