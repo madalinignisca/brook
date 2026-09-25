@@ -123,7 +123,7 @@ async def test_member_cannot_use_admin_routes(client: httpx.AsyncClient) -> None
     assert (await client.get(USERS, headers=_bearer(bob))).status_code == 403
     reset = await client.post(
         f"{USERS}/{alice_id}/password",
-        json={"new_password": "taken-over-now"},
+        json={"admin_password": PW, "new_password": "taken-over-now"},
         headers=_bearer(bob),
     )
     assert reset.status_code == 403
@@ -137,7 +137,7 @@ async def test_admin_reset_signs_target_out_and_sets_password(client: httpx.Asyn
 
     resp = await client.post(
         f"{USERS}/{bob_id}/password",
-        json={"new_password": "temporary-pass"},
+        json={"admin_password": PW, "new_password": "temporary-pass"},
         headers=_bearer(alice),
     )
     assert resp.status_code == 204
@@ -159,7 +159,7 @@ async def test_admin_reset_refuses_self_and_unknown(client: httpx.AsyncClient) -
 
     self_reset = await client.post(
         f"{USERS}/{alice_id}/password",
-        json={"new_password": "no-shortcut-here"},
+        json={"admin_password": PW, "new_password": "no-shortcut-here"},
         headers=_bearer(alice),
     )
     assert self_reset.status_code == 400
@@ -168,7 +168,58 @@ async def test_admin_reset_refuses_self_and_unknown(client: httpx.AsyncClient) -
 
     unknown = await client.post(
         f"{USERS}/00000000-0000-4000-8000-000000000000/password",
-        json={"new_password": "whatever-long"},
+        json={"admin_password": PW, "new_password": "whatever-long"},
         headers=_bearer(alice),
     )
     assert unknown.status_code == 404
+
+
+async def test_change_password_to_same_is_refused(client: httpx.AsyncClient) -> None:
+    await _register(client, "alice")
+    pair = await _login(client, "alice")
+    same = await client.post(
+        f"{AUTH}/password",
+        json={"current_password": PW, "new_password": PW},
+        headers=_bearer(pair),
+    )
+    assert same.status_code == 422
+    # Nothing was revoked by the refused no-op.
+    assert (
+        await client.post(f"{AUTH}/refresh", json={"refresh_token": pair.json()["refresh_token"]})
+    ).status_code == 200
+
+
+async def test_admin_reset_requires_admin_password(client: httpx.AsyncClient) -> None:
+    alice, bob = await _admin_and_member(client)
+    bob_id = (await client.get(f"{AUTH}/me", headers=_bearer(bob))).json()["id"]
+    resp = await client.post(
+        f"{USERS}/{bob_id}/password",
+        json={"admin_password": "stolen-token-only", "new_password": "temporary-pass"},
+        headers=_bearer(alice),
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "auth.invalid_credentials"
+    assert (await _login(client, "bob")).status_code == 200
+
+
+async def test_admin_cannot_reset_another_admin(client: httpx.AsyncClient) -> None:
+    from sqlalchemy import update
+
+    from app import db
+    from app.models import User
+
+    alice, bob = await _admin_and_member(client)
+    # No API creates a second admin yet; seed one so the rule is enforced where
+    # it is claimed rather than by the accident of there being one admin.
+    async with db.get_sessionmaker()() as s:
+        await s.execute(update(User).where(User.handle == "bob").values(global_role="admin"))
+        await s.commit()
+    bob_id = (await client.get(f"{AUTH}/me", headers=_bearer(bob))).json()["id"]
+    resp = await client.post(
+        f"{USERS}/{bob_id}/password",
+        json={"admin_password": PW, "new_password": "taken-over-now"},
+        headers=_bearer(alice),
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "authz.forbidden"
+    assert (await _login(client, "bob")).status_code == 200

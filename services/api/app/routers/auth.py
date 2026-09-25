@@ -53,6 +53,27 @@ async def _optional_user(
     return user if user and user.status == "active" else None
 
 
+async def lock_user(session: AsyncSession, user_id: uuid.UUID) -> User | None:
+    """Load ``user_id`` with ``SELECT ... FOR UPDATE``, refreshing any cached copy.
+
+    Every path that issues or revokes a user's refresh tokens takes this lock
+    first (login, refresh, password change, admin reset), so those transactions
+    run one at a time per user. Without it, on Postgres (READ COMMITTED) a
+    refresh that commits its new token while a "revoke all" UPDATE is running is
+    missed by that UPDATE: the new token was not in its snapshot. That token
+    would survive a password change, i.e. an attacker rotating a stolen refresh
+    token would stay signed in. SQLite ignores FOR UPDATE; it serialises writers
+    anyway. tests/test_token_races.py proves the ordering on Postgres.
+    """
+    user: User | None = await session.scalar(
+        select(User)
+        .where(User.id == user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return user
+
+
 async def _issue_tokens(session: AsyncSession, settings: Settings, user: User) -> TokenPair:
     """Create an access token and a persisted refresh token for ``user``."""
     access = create_access_token(settings, user.id, user.global_role)
@@ -113,7 +134,9 @@ async def login(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> TokenPair:
     """Authenticate with handle + password, returning a token pair."""
-    user = await session.scalar(select(User).where(User.handle == body.handle))
+    # FOR UPDATE: see lock_user. Also means the hash verified here is the one
+    # committed last, so a login racing a password change cannot use the old one.
+    user = await session.scalar(select(User).where(User.handle == body.handle).with_for_update())
     bad = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail={"code": "auth.invalid_credentials", "message": "Invalid handle or password"},
@@ -144,7 +167,8 @@ async def refresh(
     )
     if token is None or ensure_utc(token.expires_at) <= utcnow():
         raise bad
-    user = await session.get(User, token.user_id)
+    # Lock the user BEFORE the compare-and-set below (see lock_user).
+    user = await lock_user(session, token.user_id)
     if user is None or user.status != "active":
         raise bad
     # Compare-and-set: only the first concurrent rotation flips revoked→true, so
@@ -195,6 +219,15 @@ async def change_password(
     A wrong current password is 403, deliberately not 401: clients treat 401 as
     "access token expired" and would refresh-and-retry instead of reporting it.
     """
+    # Re-read under the lock (see lock_user): the copy from get_current_user was
+    # loaded without it, and a concurrent change may have replaced the hash.
+    locked = await lock_user(session, user.id)
+    if locked is None or locked.status != "active":  # deleted/disabled since auth
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "auth.invalid_token", "message": "Invalid or expired token"},
+        )
+    user = locked
     if user.password_hash is None:
         dummy_verify(body.current_password)  # same timing as a real check
         ok = False
@@ -204,6 +237,12 @@ async def change_password(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "auth.invalid_credentials", "message": "Current password is wrong"},
+        )
+    if body.new_password == body.current_password:
+        # Would sign out every device for no change; almost always a UI slip.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "invalid", "message": "New password must differ from the current one"},
         )
     user.password_hash = hash_password(body.new_password)
     await revoke_all_refresh_tokens(session, user.id)

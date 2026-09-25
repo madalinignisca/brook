@@ -26,8 +26,9 @@ class PasswordChangeIn(BaseModel):
 
 
 class AdminPasswordIn(BaseModel):
-    """An admin sets another user's password."""
+    """An admin sets another user's password, re-authenticating with their own."""
 
+    admin_password: str = Field(max_length=256)
     new_password: str = Field(min_length=8, max_length=256)
 
 

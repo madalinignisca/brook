@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,8 +17,8 @@ from ..db import get_session
 from ..deps import require_admin
 from ..models import User
 from ..schemas import AdminPasswordIn, UserOut
-from ..security import hash_password
-from .auth import revoke_all_refresh_tokens
+from ..security import hash_password, verify_password
+from .auth import lock_user, revoke_all_refresh_tokens
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -27,7 +27,7 @@ router = APIRouter(prefix="/users", tags=["users"])
 async def list_users(
     _admin: Annotated[User, Depends(require_admin)],
     session: Annotated[AsyncSession, Depends(get_session)],
-    handle: str | None = None,
+    handle: Annotated[str | None, Query(max_length=64)] = None,
 ) -> list[User]:
     """All users ordered by handle, or the exact ``handle`` match (404 if none).
 
@@ -54,20 +54,37 @@ async def reset_password(
 ) -> None:
     """Set another user's password and sign them out of every device.
 
-    Refused for the admin's own account: changing your own password must go
-    through ``POST /auth/password``, which re-checks the current password, so a
-    stolen admin access token cannot silently take over the admin account.
+    Refused for the admin's own account (400) and for any other admin (403):
+    admin passwords only change through ``POST /auth/password``, which re-checks
+    the current password, so a stolen admin access token cannot take over an
+    admin account.
     """
+    # Re-authentication: a stolen admin access token alone must not be able to
+    # reset member passwords (that would give the thief persistent logins that
+    # outlive the token). Same rule as the TOTP reset (encryption spec §7.6).
+    if admin.password_hash is None or not verify_password(admin.password_hash, body.admin_password):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "auth.invalid_credentials", "message": "Admin password is wrong"},
+        )
     if user_id == admin.id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid", "message": "Use POST /api/v1/auth/password for your own"},
         )
-    target = await session.get(User, user_id)
+    target = await lock_user(session, user_id)  # serialise with the target's refreshes
     if target is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "not_found", "message": "No such user"},
+        )
+    if target.global_role == "admin":
+        # Otherwise one stolen admin token resets a second admin, logs in as them
+        # and resets the first: persistent takeover of every admin. Admins change
+        # their own password (which re-checks the current one), nothing else.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "authz.forbidden", "message": "Admins change their own password"},
         )
     target.password_hash = hash_password(body.new_password)
     await revoke_all_refresh_tokens(session, target.id)

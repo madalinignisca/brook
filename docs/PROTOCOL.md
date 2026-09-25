@@ -17,7 +17,7 @@
 | `POST /auth/logout` | revoke refresh token |
 | `POST /auth/password` | change own password `{current_password, new_password}` → fresh `{access_token, refresh_token}`; see §1.1 |
 | `GET  /users` · `?handle=` | **admin**: all users by handle · exact handle (404 `not_found` if none) |
-| `POST /users/{id}/password` | **admin**: set another user's password `{new_password}` → 204; see §1.1 |
+| `POST /users/{id}/password` | **admin**: set a member's password `{admin_password, new_password}` → 204; see §1.1 |
 | `GET  /health` | liveness/readiness (also on `sfu`; unauthenticated) |
 | `GET  /me` · `PATCH /me` | current user · update profile/avatar |
 | `GET  /channels` | channels/DMs the user belongs to |
@@ -51,12 +51,17 @@
   what ends the sessions; open WebSockets end at their next re-auth.
 - Wrong current password: **403** `auth.invalid_credentials`, deliberately not 401,
   so clients do not mistake it for an expired access token and refresh-and-retry.
-  New password outside 8–256 characters: 422 (same policy as `/auth/register`).
+  New password outside 8–256 characters, or equal to the current one: 422.
 - `POST /users/{id}/password` (admin) revokes the target's refresh tokens the same
-  way. An admin cannot use it on their own account (400 `invalid`): changing your
-  own password always re-checks the current one, so a stolen admin access token
-  cannot quietly take over the admin account. Non-admin: 403 `authz.forbidden`;
-  unknown id: 404 `not_found`.
+  way. The admin re-authenticates with `admin_password` (wrong: 403
+  `auth.invalid_credentials`), so a stolen admin access token alone cannot hand
+  the thief lasting logins. It only works on **members**: the admin's own account
+  is 400 `invalid`, another admin is 403 `authz.forbidden`. An admin password only
+  ever changes through `POST /auth/password`. Non-admin caller: 403
+  `authz.forbidden`; unknown id: 404 `not_found`.
+- Token issue and revocation are serialised per user (the server locks the user
+  row in login, refresh, password change and admin reset), so a refresh racing a
+  password change cannot mint a token that outlives it.
 
 ## 2. WebSocket (realtime plane) — `wss://<host>/ws`
 
