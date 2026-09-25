@@ -2114,9 +2114,8 @@ fn pending_row(chat: &Rc<Chat>, item: &PendingMessage) -> gtk::ListBoxRow {
             .message_rows
             .borrow()
             .get(target)
-            .map(|w| w.body.text().to_string())
-            .unwrap_or_else(|| "an earlier message".into());
-        let excerpt: String = quoted.chars().take(80).collect();
+            .map(|w| w.body.text().to_string());
+        let excerpt = reply_excerpt(quoted.as_deref());
         column.append(
             &gtk::Label::builder()
                 .label(format!("\u{21b3} Replying to {excerpt}"))
@@ -2563,5 +2562,36 @@ mod order_tests {
             insert_position(shown.iter(), "0190a000-0000-7000-8000-000000000009"),
             2
         );
+    }
+}
+
+/// The quoted message on a queued reply's bubble: one line, at most 80 characters.
+fn reply_excerpt(quoted: Option<&str>) -> String {
+    match quoted {
+        None => "an earlier message".into(),
+        Some(text) => {
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if flat.is_empty() {
+                "a deleted message".into() // a tombstone shows no body
+            } else {
+                flat.chars().take(80).collect()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod reply_excerpt_tests {
+    use super::reply_excerpt;
+
+    #[test]
+    fn a_quote_is_one_line_and_a_tombstone_says_so() {
+        assert_eq!(
+            reply_excerpt(Some("first line\nsecond  line")),
+            "first line second line"
+        );
+        assert_eq!(reply_excerpt(Some("")), "a deleted message");
+        assert_eq!(reply_excerpt(None), "an earlier message");
+        assert_eq!(reply_excerpt(Some(&"x".repeat(200))).chars().count(), 80);
     }
 }
