@@ -52,6 +52,7 @@ fn outbox_error(e: OutboxError) -> Error {
                 OutboxError::SignedOut => "outbox.signed_out",
                 OutboxError::Closed => "outbox.closed",
                 OutboxError::IdInUse => "outbox.id_in_use",
+                OutboxError::BadId => "outbox.bad_id",
                 _ => "outbox.store",
             }
             .into(),
@@ -305,7 +306,9 @@ impl BrookClient {
     }
 
     /// Queue a message: saved before this returns, sent in order when possible. Pass the
-    /// `client_id` of an earlier attempt to retry it. Returns its `client_id`.
+    /// `client_id` of an earlier attempt to retry it (a UUID, any case; anything else is
+    /// `outbox.bad_id`). Returns its `client_id` in canonical lowercase form, which is how
+    /// `pending_messages` and the sent message's `client_id` will show it.
     pub async fn send_queued(
         &self,
         channel_id: &str,

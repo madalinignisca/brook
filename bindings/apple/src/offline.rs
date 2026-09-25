@@ -347,7 +347,9 @@ impl FfiBrookClient {
 
     /// Queue a message: saved before this returns, sent in order when possible.
     /// `client_id` is required: make it (a UUID) and keep it **before** calling, so a
-    /// call whose answer was lost can be retried with the same id.
+    /// call whose answer was lost can be retried with the same id. Any case is accepted;
+    /// the returned id is the canonical lowercase form that `pending_messages` and the sent
+    /// message's `client_id` use, so match bubbles on that. Not a UUID: `outbox.bad_id`.
     pub async fn send_queued(
         &self,
         channel_id: String,

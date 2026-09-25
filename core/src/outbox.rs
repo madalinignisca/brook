@@ -112,6 +112,9 @@ pub enum OutboxError {
     /// This `client_id` is already queued for another channel.
     #[error("that message id is already used")]
     IdInUse,
+    /// This `client_id` isn't a UUID (the server would refuse it).
+    #[error("the message id isn't a UUID")]
+    BadId,
 }
 
 /// Transient failures back off up to this.
@@ -137,6 +140,38 @@ pub(crate) struct Outbox {
 struct ChannelSender {
     lock: Mutex<()>,
     wake: Notify,
+}
+
+/// A `client_id` in the form the server echoes it: the server parses it as a UUID and
+/// answers with the canonical lowercase hyphenated text, and the echo is compared exactly,
+/// so anything else (an uppercase Swift `UUID().uuidString`) would never match. Accepts the
+/// hyphenated 8-4-4-4-12 form or 32 hex digits, any case; `None` for anything else.
+pub(crate) fn canonical_client_id(id: &str) -> Option<String> {
+    let hex: String = match id.len() {
+        36 => {
+            let dashes_ok = id
+                .char_indices()
+                .all(|(i, c)| matches!(i, 8 | 13 | 18 | 23) == (c == '-'));
+            if !dashes_ok {
+                return None;
+            }
+            id.chars().filter(|&c| c != '-').collect()
+        }
+        32 => id.to_string(),
+        _ => return None,
+    };
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let h = hex.to_ascii_lowercase();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    ))
 }
 
 pub(crate) fn new_client_id() -> String {
@@ -280,8 +315,11 @@ impl Outbox {
         body: &str,
         client_id: Option<String>,
     ) -> Result<String, OutboxError> {
+        let client_id = match client_id {
+            Some(id) => canonical_client_id(&id).ok_or(OutboxError::BadId)?,
+            None => new_client_id(),
+        };
         let sender = self.sender(channel_id)?;
-        let client_id = client_id.unwrap_or_else(new_client_id);
         // Woken before the insert, not after: a caller cancelled mid-insert leaves a
         // committed row, and the sender must still look (a spare wake-up is harmless).
         sender.wake.notify_one();
@@ -439,6 +477,9 @@ impl Outbox {
     /// Put a failed message back in line.
     pub(crate) async fn retry(self: &Arc<Self>, client_id: &str) -> Result<(), OutboxError> {
         self.check_open()?;
+        // Stored canonical: the caller may still hold the form it passed to `enqueue`.
+        let canonical = canonical_client_id(client_id);
+        let client_id = canonical.as_deref().unwrap_or(client_id);
         let Some(channel) = self.row_channel(client_id).await? else {
             return Ok(());
         };
@@ -467,6 +508,8 @@ impl Outbox {
         client_id: &str,
     ) -> Result<Deleted, OutboxError> {
         self.check_open()?;
+        let canonical = canonical_client_id(client_id);
+        let client_id = canonical.as_deref().unwrap_or(client_id);
         let Some(channel) = self.row_channel(client_id).await? else {
             return Ok(Deleted::NotFound);
         };
