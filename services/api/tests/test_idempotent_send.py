@@ -167,3 +167,34 @@ async def test_removed_member_resend_is_refused_like_a_fresh_send(
     # non-member never learns the channel exists (403 means archived; clients rely on it).
     assert fresh.status_code == 404
     assert again.status_code == fresh.status_code
+
+
+async def test_a_reply_to_a_deleted_message_is_refused_until_accepted(
+    client: httpx.AsyncClient,
+) -> None:
+    """A reply whose target was deleted gets its own code (the client can offer to send
+    it without the quote), unless it was already accepted: then the resend is the
+    stored reply, as for any resend."""
+    ha, hb, ch = await _setup(client)
+    url = f"/api/v1/channels/{ch}/messages"
+    target = (await client.post(url, json={"body": "quote me"}, headers=ha)).json()["id"]
+    accepted = str(uuid.uuid4())
+    first = await client.post(
+        url, json={"body": "yes", "reply_to_id": target, "client_id": accepted}, headers=hb
+    )
+    assert first.status_code == 201
+    assert (await client.delete(f"{url}/{target}", headers=ha)).status_code == 204
+
+    resend = await client.post(
+        url, json={"body": "yes", "reply_to_id": target, "client_id": accepted}, headers=hb
+    )
+    assert resend.status_code == 200
+    assert resend.json()["id"] == first.json()["id"]
+
+    late = await client.post(
+        url,
+        json={"body": "too late", "reply_to_id": target, "client_id": str(uuid.uuid4())},
+        headers=hb,
+    )
+    assert late.status_code == 422
+    assert late.json()["error"]["code"] == "message.reply_target_gone"
