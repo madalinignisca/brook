@@ -115,7 +115,10 @@ async fn main() {
                     EngineEvent::SubscribeStreams(s) => println!(
                         "subscribe offer applied: {:?}",
                         s.iter()
-                            .map(|s| format!("{}={:?}/{}", s.mid, s.kind, s.participant_id))
+                            .map(|s| format!(
+                                "{}={:?}:{:?}/{}",
+                                s.mid, s.kind, s.source, s.participant_id
+                            ))
                             .collect::<Vec<_>>()
                     ),
                     EngineEvent::Error { pc, message } => {
@@ -128,12 +131,25 @@ async fn main() {
         });
     }
 
+    let share_engine = engine.clone();
     let engine_dyn: Arc<dyn MediaEngine> = engine;
     let call = client
         .join_call(&channel, engine_dyn, true)
         .await
         .expect("join_call");
     let _ = handle_tx.send(call.clone());
+    // BROOK_SHARE=test: also share a synthetic screen (SMPTE bars) once
+    // publishing is up, labelled `screen` through core's labelled offer.
+    if std::env::var("BROOK_SHARE").as_deref() == Ok("test") {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        match share_engine.start_screen_share(brook_media_gst::ScreenSource::Test) {
+            Ok(()) => match call.republish().await {
+                Ok(()) => println!("sharing a test-pattern screen"),
+                Err(err) => println!("republish for the share failed: {err}"),
+            },
+            Err(err) => println!("screen share failed: {err}"),
+        }
+    }
     let mut state = call.state();
 
     let deadline = seconds.map(|s| tokio::time::Instant::now() + Duration::from_secs(s));

@@ -198,3 +198,34 @@ async fn share_start_stop_restart() {
     publisher.close();
     subscriber.close();
 }
+
+/// A screen capture that fails (the user ended it from the desktop's sharing
+/// indicator) ends the share only: ScreenShareEnded, never a call-level Error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_capture_ends_only_the_share() {
+    let frames: Frames = Arc::default();
+    let (engine, mut events) = GstEngine::new(config(sink(frames))).unwrap();
+    // One offer builds the publish pipeline; no answer is needed for this
+    // check (and offering again without one would leave webrtcbin stuck in
+    // have-local-offer, which core never does).
+    engine.create_publish_offer().await.unwrap();
+    engine.start_screen_share(ScreenSource::Test).unwrap();
+    engine.fail_screen_capture_for_test();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let ev = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("ScreenShareEnded within 5 s")
+            .unwrap();
+        match ev {
+            EngineEvent::ScreenShareEnded { .. } => break,
+            EngineEvent::Error { message, .. } => panic!("call-level error: {message}"),
+            _ => {}
+        }
+    }
+    // The share can be stopped cleanly and the engine keeps working.
+    engine.stop_screen_share().unwrap();
+    assert!(engine.set_local_media(true, true).is_ok());
+    engine.close();
+}

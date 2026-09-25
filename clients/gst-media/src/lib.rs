@@ -175,6 +175,14 @@ pub enum EngineEvent {
         /// The new state.
         state: gst_webrtc::WebRTCPeerConnectionState,
     },
+    /// The screen share stopped on its own (the user ended it from the
+    /// desktop's sharing indicator, or the shared window closed). Only the
+    /// share is affected: stop it ([`GstEngine::stop_screen_share`]) and
+    /// renegotiate; the call goes on.
+    ScreenShareEnded {
+        /// What the capture reported, for logs.
+        message: String,
+    },
     /// A pipeline error (device gone, encoder failure, ...).
     Error {
         /// Which PC's pipeline failed.
@@ -239,17 +247,9 @@ impl PortalSession {
     }
 }
 
-/// One labelled m-line of the publish offer (core sends these as
-/// `call.publish` `tracks`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublishTrack {
-    /// The m-line's mid.
-    pub mid: String,
-    /// Audio or video.
-    pub kind: MediaKind,
-    /// Mic, camera or screen.
-    pub source: MediaSource,
-}
+/// One labelled m-line of the publish offer: core's [`brook_core::TrackLabel`]
+/// (`call.publish` `tracks`).
+pub type PublishTrack = brook_core::TrackLabel;
 
 /// Ask the desktop for a screen or window to share through the
 /// xdg-desktop-portal ScreenCast portal: the desktop shows its own picker and
@@ -355,6 +355,9 @@ impl Drop for Pc {
         }
     }
 }
+
+/// Element name of the screen-share branch in the publish pipeline.
+const SCREEN_BRANCH: &str = "screen_share";
 
 /// How long to wait for capture/encoder caps before offering anyway.
 const CAPS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -630,6 +633,8 @@ impl GstEngine {
         // (`identity`: a bin description can't end in a caps filter shorthand.)
         let branch = gst::parse::bin_from_description(&desc, true)
             .map_err(|e| Error::Setup(format!("screen branch: {e}")))?;
+        // Named so bus errors from inside it are told apart from the call's.
+        branch.set_property("name", SCREEN_BRANCH);
         pipeline
             .add(&branch)
             .map_err(|e| Error::Setup(e.to_string()))?;
@@ -699,6 +704,25 @@ impl GstEngine {
         }
         share._fd = None;
         Ok(share.session.take())
+    }
+
+    /// Test hook: make the screen capture fail as if the desktop ended it.
+    #[doc(hidden)]
+    pub fn fail_screen_capture_for_test(&self) {
+        let source = self
+            .screen
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|s| s.branch.as_ref())
+            .and_then(|b| b.by_name("scr_src"));
+        if let Some(src) = source {
+            gst::element_error!(
+                src,
+                gst::ResourceError::Read,
+                ["stream ended by the desktop (test)"]
+            );
+        }
     }
 
     /// Labels for every m-line of the publish PC, as of the last offer:
@@ -923,8 +947,17 @@ impl GstEngine {
                         err.error(),
                         err.debug().unwrap_or_default()
                     );
-                    tracing::warn!(?kind, %message, "media pipeline error");
-                    let _ = events.send(EngineEvent::Error { pc: kind, message });
+                    // A failing screen capture ends the share, not the call.
+                    let from_screen = err
+                        .src()
+                        .is_some_and(|s| s.path_string().contains(&format!(":{SCREEN_BRANCH}/")));
+                    if from_screen {
+                        tracing::info!(%message, "screen share ended");
+                        let _ = events.send(EngineEvent::ScreenShareEnded { message });
+                    } else {
+                        tracing::warn!(?kind, %message, "media pipeline error");
+                        let _ = events.send(EngineEvent::Error { pc: kind, message });
+                    }
                 }
                 gst::MessageView::Warning(w) => {
                     tracing::debug!(?kind, warning = %w.error(), "media pipeline warning");
@@ -1382,6 +1415,19 @@ fn promise_error(s: &gst::StructureRef, context: &str) -> String {
 impl brook_core::MediaEngine for GstEngine {
     async fn create_publish_offer(&self) -> std::result::Result<String, brook_core::EngineError> {
         Ok(GstEngine::create_publish_offer(self).await?)
+    }
+
+    /// The offer with this engine's own labels (the shared screen's m-line is
+    /// `screen`; a stopped share stays labelled), from the same call so a
+    /// toggle can't slip between the SDP and its labels.
+    async fn create_labelled_offer(
+        &self,
+    ) -> std::result::Result<brook_core::PublishOffer, brook_core::EngineError> {
+        let sdp = GstEngine::create_publish_offer(self).await?;
+        Ok(brook_core::PublishOffer {
+            sdp,
+            tracks: self.publish_tracks(),
+        })
     }
 
     async fn apply_publish_answer(
