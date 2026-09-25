@@ -59,6 +59,8 @@ def _stamp(session: Session, _ctx: Any, _instances: Any) -> None:
     seq = _take_seq(session)
     for obj in changed:
         obj.seq = seq
+        if isinstance(obj, Membership) and obj in session.new:
+            obj.joined_seq = seq
     touched = {r.message_id for r in reactions} | {f.message_id for f in dead_files}
     if touched:
         session.execute(update(Message).where(Message.id.in_(touched)).values(seq=seq))

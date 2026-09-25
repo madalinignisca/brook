@@ -224,3 +224,15 @@ def test_live_events_carry_seq(sync_client: TestClient) -> None:
             ev = ws.receive_json()
             seen[ev["type"]] = ev["data"]
         assert seen["message.delete"]["seq"] > sent["seq"]
+
+
+async def test_a_send_does_not_resend_the_member_list(client: httpx.AsyncClient) -> None:
+    """My membership row moves with every read-marker update (a send is one); that
+    must not look like joining, which pulls in the whole member list and profiles."""
+    ha, _hb, ch = await _setup(client)
+    cursor = (await _sync(client, ha))["next"]
+    await client.post(f"/api/v1/channels/{ch}/messages", json={"body": "hi"}, headers=ha)
+    page = await _sync(client, ha, cursor)
+    me = (await client.get(f"{AUTH}/me", headers=ha)).json()["id"]
+    assert [m["user_id"] for m in page["memberships"]] == [me]  # only my read marker
+    assert page["users"] == [] and page["channels"] == []

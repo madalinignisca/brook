@@ -155,7 +155,11 @@ async def sync(
         ).all()
     )
     # A channel new to me: all of its members and the channel itself, whatever their seq.
-    new_to_me = {m.channel_id for m in memberships if m.user_id == user.id}
+    # joined_seq, not seq: my own row's seq moves with every read-marker update (every
+    # send), and re-sending the whole member list each time would be pointless.
+    new_to_me = {
+        m.channel_id for m in memberships if m.user_id == user.id and cursor < m.joined_seq <= upper
+    }
     if new_to_me:
         extra = (
             await session.scalars(select(Membership).where(Membership.channel_id.in_(new_to_me)))

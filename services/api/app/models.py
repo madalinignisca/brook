@@ -159,6 +159,9 @@ class Membership(Base):
     role: Mapped[str] = mapped_column(String(16), default="member")  # 'owner' | 'member'
     # Sync change sequence (sync spec §2), stamped automatically by app/sync.py.
     seq: Mapped[int] = mapped_column(BigInteger, default=0, index=True)
+    # The seq of the insert only (seq above moves with every read-marker update, so it
+    # can't tell /sync that a channel is new to this member).
+    joined_seq: Mapped[int] = mapped_column(BigInteger, default=0)
     joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     # Highest message id the user has read in this channel (UUIDv7 is sortable, so
     # unread = messages with a greater id). No FK: messages may be soft-deleted.

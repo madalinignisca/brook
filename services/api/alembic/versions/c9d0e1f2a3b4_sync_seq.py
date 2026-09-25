@@ -30,6 +30,10 @@ def upgrade() -> None:
                 sa.Column("seq", sa.BigInteger(), nullable=False, server_default="1")
             )
         op.create_index(f"ix_{table}_seq", table, ["seq"])
+    with op.batch_alter_table("memberships", schema=None) as batch_op:
+        batch_op.add_column(
+            sa.Column("joined_seq", sa.BigInteger(), nullable=False, server_default="1")
+        )
     op.create_table(
         "sync_counter",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -55,6 +59,8 @@ def downgrade() -> None:
     """Downgrade schema."""
     op.drop_table("sync_tombstones")
     op.drop_table("sync_counter")
+    with op.batch_alter_table("memberships", schema=None) as batch_op:
+        batch_op.drop_column("joined_seq")
     for table in _TABLES:
         op.drop_index(f"ix_{table}_seq", table_name=table)
         with op.batch_alter_table(table, schema=None) as batch_op:
