@@ -81,7 +81,10 @@ pub use client_offline::CachedMessages;
 pub use config::CoreConfig;
 pub use error::{Error, Result};
 pub use keyslot::{InMemoryKeySlot, KeySlot, KeySlotError, KeyStore};
-pub use outbox::{Deleted, PendingMessage, PendingState};
+pub use outbox::{
+    Deleted, OutgoingFile, PendingFile, PendingMessage, PendingState, QueuedFile, SendReceipt,
+    MAX_FILES_PER_MESSAGE, MAX_FILE_BYTES,
+};
 pub use session::{Session, User};
 pub use state::AuthState;
 pub use transfer::{

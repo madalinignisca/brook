@@ -158,6 +158,47 @@ struct Setup {
     _cache_dir: tempfile::TempDir,
 }
 
+/// Open an outbox over `db` with `post` (whose sends it makes) and the test server's uploads,
+/// its snapshots under `dir`.
+async fn open_outbox(
+    db: Db,
+    cache: Arc<Cache>,
+    post: Arc<dyn Post>,
+    rx: watch::Receiver<Option<u64>>,
+    dir: &std::path::Path,
+) -> Result<Arc<Outbox>, crate::store::StoreError> {
+    let outbox = Outbox::open(
+        db,
+        cache,
+        post,
+        Arc::new(NoUploads),
+        Arc::new(crate::transfer::Transfers::new()),
+        rx,
+        dir,
+    )
+    .await?;
+    outbox.set_chunk_for_tests(8);
+    Ok(outbox)
+}
+
+/// For the text-only tests: an upload is never asked for.
+struct NoUploads;
+
+#[async_trait::async_trait]
+impl crate::outbox::Upload for NoUploads {
+    async fn upload(
+        &self,
+        _: crate::transfer::TransferId,
+        _: &Arc<crate::transfer::Flags>,
+        _: &str,
+        _: &crate::outbox::FileRow,
+        _: &crate::snapshot::SnapshotSource,
+        _: u64,
+    ) -> Result<crate::transfer::FileInfo, crate::Error> {
+        panic!("a text message uploaded a file")
+    }
+}
+
 fn open_db(dir: &std::path::Path, kind: Kind, slot: &Arc<InMemoryKeySlot>) -> Db {
     let keys = KeyStore::new(slot.clone() as Arc<dyn KeySlot>);
     match store::open(dir, kind, "s", &keys).unwrap() {
@@ -184,11 +225,12 @@ async fn setup() -> Setup {
     }
     let server = Arc::new(Server::default());
     let (session, rx) = watch::channel(Some(1));
-    let outbox = Outbox::open(
+    let outbox = open_outbox(
         open_db(outbox_dir.path(), Kind::Outbox, &slot),
         cache.clone(),
         server.clone(),
         rx,
+        outbox_dir.path(),
     )
     .await
     .unwrap();
@@ -307,9 +349,15 @@ async fn a_row_left_sending_by_a_crash_is_resent_with_its_id() {
         .await
         .unwrap();
     let (session, rx) = watch::channel(None);
-    let outbox = Outbox::open(db, s.cache.clone(), s.server.clone(), rx)
-        .await
-        .unwrap();
+    let outbox = open_outbox(
+        db,
+        s.cache.clone(),
+        s.server.clone(),
+        rx,
+        s.outbox_dir.path(),
+    )
+    .await
+    .unwrap();
     // Before anything is sent again, it reads as waiting, not as mid-send.
     assert_eq!(
         outbox.pending("c1").await.unwrap()[0].state,
@@ -543,11 +591,12 @@ async fn a_failed_ack_keeps_the_row() {
     let slot = Arc::new(InMemoryKeySlot::default());
     let dir = tempfile::tempdir().unwrap();
     let (session, rx) = watch::channel(Some(1));
-    let outbox = Outbox::open(
+    let outbox = open_outbox(
         open_db(dir.path(), Kind::Outbox, &slot),
         s.cache.clone(),
         Arc::new(Garbled(s.server.clone())),
         rx,
+        dir.path(),
     )
     .await
     .unwrap();
@@ -695,11 +744,12 @@ async fn an_accepted_message_is_never_deleted_as_unsent() {
     let slot = Arc::new(InMemoryKeySlot::default());
     let dir = tempfile::tempdir().unwrap();
     let (_session, rx) = watch::channel(Some(1));
-    let outbox = Outbox::open(
+    let outbox = open_outbox(
         open_db(dir.path(), Kind::Outbox, &slot),
         s.cache.clone(),
         Arc::new(Garbled(s.server.clone())),
         rx,
+        dir.path(),
     )
     .await
     .unwrap();
@@ -811,11 +861,12 @@ async fn an_accepted_row_is_never_resent_forever_nor_failed() {
         let dir = tempfile::tempdir().unwrap();
         let (_session, rx) = watch::channel(Some(1));
         s.server.script([Answer::Ok, then]);
-        let outbox = Outbox::open(
+        let outbox = open_outbox(
             open_db(dir.path(), Kind::Outbox, &slot),
             s.cache.clone(),
             Arc::new(Garbled(s.server.clone())),
             rx,
+            dir.path(),
         )
         .await
         .unwrap();
@@ -1135,4 +1186,690 @@ async fn retry_without_reply_only_acts_on_a_gone_quote() {
         p[0].state
     );
     assert_eq!(p[0].reply_to_id.as_deref(), Some(Q));
+}
+
+// ---- Queued files (attachments spec) ----
+
+mod files {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use serde_json::{json, Value};
+    use tokio::sync::{watch, Notify};
+
+    use super::{eventually, open_db, NoSync, ME};
+    use crate::cache::Cache;
+    use crate::outbox::{
+        FileRow, Outbox, OutboxError, Outgoing, PendingState, Post, SendFailure, Upload,
+    };
+    use crate::snapshot::SnapshotSource;
+    use crate::store::Kind;
+    use crate::transfer::{FileInfo, Flags, TransferId, Transfers, UploadSource};
+    use crate::{InMemoryKeySlot, OutgoingFile};
+
+    /// What the fake does with the next upload.
+    enum Up {
+        Ok,
+        Fail(crate::Error),
+        /// Wait for `gate`, stopping on the row's flags like a real transfer.
+        Held,
+    }
+
+    #[derive(Default)]
+    struct Files {
+        ups: Mutex<VecDeque<Up>>,
+        /// Every upload: (file_client_id, the bytes read).
+        uploaded: Mutex<Vec<(String, Vec<u8>)>>,
+        posts: Mutex<Vec<Outgoing>>,
+        post_fail: Mutex<VecDeque<SendFailure>>,
+        gate: Notify,
+        same_id: AtomicBool,
+    }
+
+    fn info(id: &str) -> FileInfo {
+        FileInfo {
+            id: id.into(),
+            channel_id: "c1".into(),
+            uploader_id: ME.into(),
+            filename: "f".into(),
+            original_name: "f".into(),
+            size: 1,
+            content_type: "x".into(),
+            status: "committed".into(),
+            sha256: None,
+        }
+    }
+
+    fn api(code: &str) -> crate::Error {
+        crate::Error::Api {
+            code: code.into(),
+            message: String::new(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Upload for Files {
+        async fn upload(
+            &self,
+            _: TransferId,
+            flags: &Arc<Flags>,
+            _: &str,
+            file: &FileRow,
+            source: &SnapshotSource,
+            _: u64,
+        ) -> Result<FileInfo, crate::Error> {
+            use tokio::io::AsyncReadExt;
+            let mut bytes = vec![];
+            source
+                .reader()
+                .await
+                .map_err(|_| api("transfer.io"))?
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|_| api("transfer.io"))?;
+            let next = self.ups.lock().unwrap().pop_front().unwrap_or(Up::Ok);
+            if let Up::Held = next {
+                loop {
+                    if flags.cancel.load(Ordering::SeqCst) {
+                        return Err(api("transfer.cancelled"));
+                    }
+                    if flags.pause.load(Ordering::SeqCst) {
+                        return Err(api("transfer.paused"));
+                    }
+                    if tokio::time::timeout(Duration::from_millis(20), self.gate.notified())
+                        .await
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            }
+            if let Up::Fail(e) = next {
+                return Err(e);
+            }
+            self.uploaded
+                .lock()
+                .unwrap()
+                .push((file.file_client_id.clone(), bytes));
+            Ok(info(&if self.same_id.load(Ordering::SeqCst) {
+                "dup".to_string()
+            } else {
+                format!("id-{}", file.file_client_id)
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Post for Files {
+        async fn send(
+            &self,
+            ch: &str,
+            msg: &Outgoing,
+            cid: &str,
+            _: u64,
+        ) -> Result<Value, SendFailure> {
+            self.posts.lock().unwrap().push(msg.clone());
+            if let Some(f) = self.post_fail.lock().unwrap().pop_front() {
+                return Err(f);
+            }
+            Ok(
+                json!({ "id": format!("m-{cid}"), "channel_id": ch, "author_id": ME,
+                       "body": msg.body, "created_at": "2026-09-26T10:00:00Z", "seq": 50,
+                       "client_id": cid }),
+            )
+        }
+    }
+
+    struct S {
+        outbox: Arc<Outbox>,
+        files: Arc<Files>,
+        transfers: Arc<Transfers>,
+        cache: Arc<Cache>,
+        session: watch::Sender<Option<u64>>,
+        slot: Arc<InMemoryKeySlot>,
+        dir: tempfile::TempDir,
+        src: tempfile::TempDir,
+        _cache_dir: tempfile::TempDir,
+    }
+
+    async fn open(
+        s_dir: &std::path::Path,
+        slot: &Arc<InMemoryKeySlot>,
+        cache: &Arc<Cache>,
+        files: &Arc<Files>,
+        transfers: &Arc<Transfers>,
+        rx: watch::Receiver<Option<u64>>,
+    ) -> Arc<Outbox> {
+        let outbox = Outbox::open(
+            open_db(s_dir, Kind::Outbox, slot),
+            cache.clone(),
+            files.clone(),
+            files.clone(),
+            transfers.clone(),
+            rx,
+            s_dir,
+        )
+        .await
+        .unwrap();
+        outbox.set_chunk_for_tests(8);
+        outbox
+    }
+
+    async fn setup() -> S {
+        let slot = Arc::new(InMemoryKeySlot::default());
+        let cache_dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(
+            open_db(cache_dir.path(), Kind::Cache, &slot),
+            ME.into(),
+            Arc::new(NoSync),
+            Arc::new(NoSync),
+        );
+        cache
+            .live_event(
+                "channel.update",
+                &json!({ "id": "c1", "name": "c1", "seq": 1 }),
+            )
+            .await;
+        let files = Arc::new(Files::default());
+        let transfers = Arc::new(Transfers::new());
+        let (session, rx) = watch::channel(Some(1));
+        let outbox = open(dir.path(), &slot, &cache, &files, &transfers, rx).await;
+        S {
+            outbox,
+            files,
+            transfers,
+            cache,
+            session,
+            slot,
+            dir,
+            src: tempfile::tempdir().unwrap(),
+            _cache_dir: cache_dir,
+        }
+    }
+
+    fn file(s: &S, name: &str, bytes: &[u8]) -> OutgoingFile {
+        let path = s.src.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        OutgoingFile {
+            path,
+            filename: name.into(),
+            content_type: "application/octet-stream".into(),
+        }
+    }
+
+    fn snaps(s: &S) -> usize {
+        std::fs::read_dir(s.outbox.snap_dir_for_tests())
+            .unwrap()
+            .count()
+    }
+
+    async fn drained(s: &S) {
+        for _ in 0..500 {
+            if s.outbox.unsent_count().await.unwrap() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("never drained: {:?}", s.outbox.pending("c1").await.unwrap());
+    }
+
+    async fn state(s: &S) -> PendingState {
+        s.outbox.pending("c1").await.unwrap()[0].state.clone()
+    }
+
+    async fn until_state(s: &S, want: fn(&PendingState) -> bool) {
+        for _ in 0..500 {
+            if s.outbox
+                .pending("c1")
+                .await
+                .unwrap()
+                .first()
+                .is_some_and(|m| want(&m.state))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "never reached the state: {:?}",
+            s.outbox.pending("c1").await.unwrap()
+        );
+    }
+
+    fn failed(p: &PendingState) -> bool {
+        matches!(p, PendingState::Failed { .. })
+    }
+
+    /// Files go up in order, from the snapshots (a source edited after queueing changes
+    /// nothing), then one POST names their ids in order with the body and reply target;
+    /// after the ack no snapshot is left.
+    #[tokio::test]
+    async fn files_go_up_then_the_post_names_them_in_order() {
+        let s = setup().await;
+        s.session.send_replace(None);
+        let (a, b) = (file(&s, "a", b"first file here"), file(&s, "b", b"second"));
+        let r = s
+            .outbox
+            .enqueue_with_files("c1", "", Some("q".into()), None, vec![a.clone(), b])
+            .await
+            .unwrap();
+        assert_eq!(r.files.len(), 2);
+        assert_eq!(snaps(&s), 2);
+        std::fs::write(&a.path, b"EDITED AFTERWARDS").unwrap();
+        s.session.send_replace(Some(1));
+        drained(&s).await;
+        let up = s.files.uploaded.lock().unwrap().clone();
+        assert_eq!(
+            up.iter().map(|(_, b)| b.clone()).collect::<Vec<_>>(),
+            vec![b"first file here".to_vec(), b"second".to_vec()]
+        );
+        let post = s.files.posts.lock().unwrap().last().cloned().unwrap();
+        let want: Vec<String> = r
+            .files
+            .iter()
+            .map(|f| format!("id-{}", f.file_client_id))
+            .collect();
+        assert_eq!(post.attachments, want);
+        assert_eq!(post.reply_to_id.as_deref(), Some("q"));
+        assert_eq!(post.body, "");
+        for _ in 0..100 {
+            if snaps(&s) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(snaps(&s), 0, "a snapshot survived the ack");
+    }
+
+    /// Refused before anything is copied: too many, too large, empty, or nothing at all.
+    #[tokio::test]
+    async fn limits_are_checked_before_anything_is_written() {
+        let s = setup().await;
+        s.session.send_replace(None);
+        let eleven: Vec<_> = (0..11).map(|i| file(&s, &format!("f{i}"), b"x")).collect();
+        assert_eq!(
+            s.outbox
+                .enqueue_with_files("c1", "", None, None, eleven)
+                .await,
+            Err(OutboxError::TooManyFiles)
+        );
+        let big = s.src.path().join("big");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(crate::MAX_FILE_BYTES + 1)
+            .unwrap();
+        let big = OutgoingFile {
+            path: big,
+            filename: "big".into(),
+            content_type: "x".into(),
+        };
+        assert_eq!(
+            s.outbox
+                .enqueue_with_files("c1", "", None, None, vec![big])
+                .await,
+            Err(OutboxError::FileTooLarge)
+        );
+        assert_eq!(
+            s.outbox
+                .enqueue_with_files("c1", "", None, None, vec![file(&s, "e", b"")])
+                .await,
+            Err(OutboxError::EmptyFile)
+        );
+        assert_eq!(
+            s.outbox
+                .enqueue_with_files("c1", "  ", None, None, vec![])
+                .await,
+            Err(OutboxError::EmptyMessage)
+        );
+        assert_eq!(snaps(&s), 0);
+        assert!(s.outbox.pending("c1").await.unwrap().is_empty());
+        let ten: Vec<_> = (0..10).map(|i| file(&s, &format!("t{i}"), b"x")).collect();
+        assert!(s
+            .outbox
+            .enqueue_with_files("c1", "", None, None, ten)
+            .await
+            .is_ok());
+    }
+
+    /// Two of three uploads done, then the process goes: the next one uploads the third only.
+    #[tokio::test]
+    async fn a_restart_resumes_after_the_last_upload() {
+        let s = setup().await;
+        s.files
+            .ups
+            .lock()
+            .unwrap()
+            .extend([Up::Ok, Up::Ok, Up::Held]);
+        let fs: Vec<_> = (0..3).map(|i| file(&s, &format!("r{i}"), b"abc")).collect();
+        let r = s
+            .outbox
+            .enqueue_with_files("c1", "x", None, None, fs)
+            .await
+            .unwrap();
+        let files = s.files.clone();
+        eventually("two uploads", move || {
+            files.uploaded.lock().unwrap().len() == 2
+        })
+        .await;
+        let outbox = s.outbox.clone();
+        outbox.close().await;
+        let (session, rx) = watch::channel(Some(2));
+        let outbox = open(s.dir.path(), &s.slot, &s.cache, &s.files, &s.transfers, rx).await;
+        outbox.resume().await.unwrap();
+        for _ in 0..500 {
+            if outbox.unsent_count().await.unwrap() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let up: Vec<String> = s
+            .files
+            .uploaded
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(f, _)| f.clone())
+            .collect();
+        assert_eq!(up.len(), 3, "{up:?}");
+        assert_eq!(
+            up[2], r.files[2].file_client_id,
+            "the restart uploaded another file again"
+        );
+        drop(session);
+    }
+
+    /// Files swept meanwhile: the first `not_attachable` uploads them again, the second fails.
+    #[tokio::test]
+    async fn not_attachable_reuploads_once_then_fails() {
+        let s = setup().await;
+        s.files
+            .post_fail
+            .lock()
+            .unwrap()
+            .extend([SendFailure::Refused {
+                code: "file.not_attachable".into(),
+            }]);
+        s.outbox
+            .enqueue_with_files("c1", "x", None, None, vec![file(&s, "a", b"aa")])
+            .await
+            .unwrap();
+        drained(&s).await;
+        assert_eq!(
+            s.files.uploaded.lock().unwrap().len(),
+            2,
+            "not uploaded again"
+        );
+        s.files.post_fail.lock().unwrap().extend([
+            SendFailure::Refused {
+                code: "file.not_attachable".into(),
+            },
+            SendFailure::Refused {
+                code: "file.not_attachable".into(),
+            },
+        ]);
+        s.outbox
+            .enqueue_with_files("c1", "y", None, None, vec![file(&s, "b", b"bb")])
+            .await
+            .unwrap();
+        until_state(&s, failed).await;
+        assert_eq!(
+            state(&s).await,
+            PendingState::Failed {
+                code: "file.not_attachable".into()
+            }
+        );
+    }
+
+    /// Two files the server gave one id: never POSTed, the row fails.
+    #[tokio::test]
+    async fn duplicate_ids_never_reach_the_post() {
+        let s = setup().await;
+        s.files.same_id.store(true, Ordering::SeqCst);
+        s.outbox
+            .enqueue_with_files(
+                "c1",
+                "x",
+                None,
+                None,
+                vec![file(&s, "a", b"1"), file(&s, "b", b"2")],
+            )
+            .await
+            .unwrap();
+        until_state(&s, failed).await;
+        assert_eq!(
+            state(&s).await,
+            PendingState::Failed {
+                code: "outbox.duplicate_file".into()
+            }
+        );
+        assert!(s.files.posts.lock().unwrap().is_empty());
+    }
+
+    /// Cancel through a file's transfer id fails the row; Retry sends it.
+    #[tokio::test]
+    async fn cancel_fails_the_row_and_retry_sends_it() {
+        let s = setup().await;
+        s.files.ups.lock().unwrap().push_back(Up::Held);
+        let r = s
+            .outbox
+            .enqueue_with_files(
+                "c1",
+                "x",
+                None,
+                None,
+                vec![file(&s, "a", b"1"), file(&s, "b", b"2")],
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Through the file that hasn't started: it still stops the row.
+        s.transfers
+            .flag(r.files[1].transfer_id)
+            .cancel
+            .store(true, Ordering::SeqCst);
+        until_state(&s, failed).await;
+        assert_eq!(
+            state(&s).await,
+            PendingState::Failed {
+                code: "transfer.cancelled".into()
+            }
+        );
+        assert!(s.files.posts.lock().unwrap().is_empty());
+        s.outbox.retry(&r.client_id).await.unwrap();
+        drained(&s).await;
+        assert_eq!(s.files.posts.lock().unwrap().len(), 1);
+    }
+
+    /// Delete of an uploading row doesn't wait for the upload; its snapshots go.
+    #[tokio::test]
+    async fn delete_while_uploading_returns_at_once() {
+        let s = setup().await;
+        s.files.ups.lock().unwrap().push_back(Up::Held);
+        let r = s
+            .outbox
+            .enqueue_with_files("c1", "x", None, None, vec![file(&s, "a", b"1")])
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            s.outbox.delete_pending(&r.client_id),
+        )
+        .await
+        .expect("Delete waited for the upload")
+        .unwrap();
+        assert!(s.outbox.pending("c1").await.unwrap().is_empty());
+        assert_eq!(snaps(&s), 0);
+    }
+
+    /// The same id again returns the stored receipt and copies nothing.
+    #[tokio::test]
+    async fn a_repeat_call_returns_the_stored_receipt() {
+        let s = setup().await;
+        s.session.send_replace(None);
+        let first = s
+            .outbox
+            .enqueue_with_files("c1", "x", None, None, vec![file(&s, "a", b"1")])
+            .await
+            .unwrap();
+        let mut events = s.transfers.events_for_tests();
+        let again = s
+            .outbox
+            .enqueue_with_files(
+                "c1",
+                "x",
+                None,
+                Some(first.client_id.clone()),
+                vec![file(&s, "a2", b"22"), file(&s, "b2", b"33")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(again, first);
+        assert_eq!(snaps(&s), 1);
+        while let Ok(e) = events.try_recv() {
+            assert_ne!(
+                e.state,
+                crate::transfer::TransferState::Preparing,
+                "the repeat copied"
+            );
+        }
+    }
+
+    /// Snapshots no row names (a crash between the copy and the commit) go at the next open.
+    #[tokio::test]
+    async fn orphan_snapshots_go_at_open() {
+        let s = setup().await;
+        s.session.send_replace(None);
+        let kept = s
+            .outbox
+            .enqueue_with_files("c1", "x", None, None, vec![file(&s, "a", b"1")])
+            .await
+            .unwrap();
+        std::fs::write(
+            s.outbox
+                .snap_dir_for_tests()
+                .join("0190a000-0000-7000-8000-00000000dead"),
+            b"x",
+        )
+        .unwrap();
+        let outbox = s.outbox.clone();
+        outbox.close().await;
+        let (_session, rx) = watch::channel(None);
+        let outbox = open(s.dir.path(), &s.slot, &s.cache, &s.files, &s.transfers, rx).await;
+        let names: Vec<String> = std::fs::read_dir(outbox.snap_dir_for_tests())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec![kept.files[0].file_client_id.clone()]);
+    }
+
+    /// A damaged snapshot fails the row before any byte is uploaded.
+    #[tokio::test]
+    async fn a_damaged_snapshot_fails_before_any_upload() {
+        let s = setup().await;
+        s.session.send_replace(None);
+        let r = s
+            .outbox
+            .enqueue_with_files(
+                "c1",
+                "x",
+                None,
+                None,
+                vec![file(&s, "a", b"some bytes here!")],
+            )
+            .await
+            .unwrap();
+        let path = s
+            .outbox
+            .snap_dir_for_tests()
+            .join(&r.files[0].file_client_id);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[3] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        s.session.send_replace(Some(1));
+        until_state(&s, failed).await;
+        assert_eq!(
+            state(&s).await,
+            PendingState::Failed {
+                code: "outbox.snapshot_damaged".into()
+            }
+        );
+        assert!(s.files.uploaded.lock().unwrap().is_empty());
+        let p = s.outbox.pending("c1").await.unwrap();
+        assert_eq!(
+            p[0].files[0].error.as_deref(),
+            Some("outbox.snapshot_damaged")
+        );
+    }
+
+    /// A 401 on an upload waits (the token is renewed), it doesn't fail the row.
+    #[tokio::test]
+    async fn a_401_on_an_upload_leaves_the_row_pending() {
+        let s = setup().await;
+        s.files
+            .ups
+            .lock()
+            .unwrap()
+            .push_back(Up::Fail(crate::Error::NotAuthenticated));
+        s.outbox
+            .enqueue_with_files("c1", "x", None, None, vec![file(&s, "a", b"1")])
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!failed(&state(&s).await), "{:?}", state(&s).await);
+        drained(&s).await;
+    }
+
+    /// Signing out pauses an upload: the row stays pending, and the next sign-in sends it.
+    #[tokio::test]
+    async fn sign_out_pauses_and_the_next_sign_in_resumes() {
+        let s = setup().await;
+        s.files.ups.lock().unwrap().push_back(Up::Held);
+        s.outbox
+            .enqueue_with_files("c1", "x", None, None, vec![file(&s, "a", b"1")])
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        s.session.send_replace(None);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(state(&s).await, PendingState::Pending);
+        s.session.send_replace(Some(2));
+        drained(&s).await;
+    }
+
+    /// Per-file error on a permanent refusal, and it's cleared by Retry.
+    #[tokio::test]
+    async fn a_refused_file_is_named_and_retry_clears_it() {
+        let s = setup().await;
+        s.files
+            .ups
+            .lock()
+            .unwrap()
+            .push_back(Up::Fail(api("file.quota_exceeded")));
+        let r = s
+            .outbox
+            .enqueue_with_files(
+                "c1",
+                "x",
+                None,
+                None,
+                vec![file(&s, "a", b"1"), file(&s, "b", b"2")],
+            )
+            .await
+            .unwrap();
+        until_state(&s, failed).await;
+        let p = s.outbox.pending("c1").await.unwrap();
+        assert_eq!(p[0].files[0].error.as_deref(), Some("file.quota_exceeded"));
+        assert_eq!(p[0].files[1].error, None);
+        s.session.send_replace(None); // hold the resend, to see the row as Retry left it
+        s.outbox.retry(&r.client_id).await.unwrap();
+        let p = s.outbox.pending("c1").await.unwrap();
+        assert_eq!(p[0].files[0].error, None, "Retry kept the old refusal");
+        s.session.send_replace(Some(2));
+        drained(&s).await;
+    }
 }

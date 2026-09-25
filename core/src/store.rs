@@ -61,14 +61,14 @@ impl Kind {
         match self {
             Kind::Cache => 2,  // 2: `removed.active` (the removal floor)
             Kind::Index => 2,  // 2: `stores.doomed` (a wipe whose keys aren't gone yet)
-            Kind::Outbox => 2, // 2: `outbox.reply_to_id` (queued replies)
+            Kind::Outbox => 3, // 2: `outbox.reply_to_id`; 3: queued files, `deletions`
         }
     }
 
     fn schema(self) -> &'static str {
         match self {
             Kind::Cache => CACHE_V1,
-            Kind::Outbox => OUTBOX_V2,
+            Kind::Outbox => OUTBOX_V3,
             Kind::Index => INDEX_V1,
         }
     }
@@ -95,17 +95,21 @@ CREATE TABLE files(file_id TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER 
 CREATE TABLE deletions(path TEXT PRIMARY KEY);
 ";
 
-const OUTBOX_V2: &str = "
+const OUTBOX_V3: &str = "
 CREATE TABLE meta(id INTEGER PRIMARY KEY CHECK (id = 1), format INTEGER NOT NULL,
                   generation INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE outbox(ordinal INTEGER PRIMARY KEY AUTOINCREMENT, client_id TEXT NOT NULL UNIQUE,
                     channel_id TEXT NOT NULL, body TEXT NOT NULL, reply_to_id TEXT,
                     state TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL);
-CREATE TABLE outbox_files(client_id TEXT NOT NULL, file_client_id TEXT NOT NULL UNIQUE,
-                          snapshot_path TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
-                          content_type TEXT NOT NULL, filename TEXT NOT NULL, file_id TEXT,
-                          key BLOB NOT NULL);
+CREATE TABLE outbox_files(client_id TEXT NOT NULL
+                              REFERENCES outbox(client_id) ON DELETE CASCADE,
+                          ordinal INTEGER NOT NULL, file_client_id TEXT NOT NULL UNIQUE,
+                          filename TEXT NOT NULL, content_type TEXT NOT NULL,
+                          size INTEGER NOT NULL, sha256 TEXT NOT NULL, key BLOB NOT NULL,
+                          file_id TEXT, error TEXT);
+CREATE INDEX outbox_files_by_row ON outbox_files(client_id, ordinal);
+CREATE TABLE deletions(path TEXT PRIMARY KEY);
 ";
 
 const INDEX_V1: &str = "

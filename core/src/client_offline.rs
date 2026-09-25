@@ -53,6 +53,11 @@ fn outbox_error(e: OutboxError) -> Error {
                 OutboxError::Closed => "outbox.closed",
                 OutboxError::IdInUse => "outbox.id_in_use",
                 OutboxError::BadId => "outbox.bad_id",
+                OutboxError::TooManyFiles => "outbox.too_many_files",
+                OutboxError::FileTooLarge => "outbox.file_too_large",
+                OutboxError::EmptyFile => "outbox.empty_file",
+                OutboxError::EmptyMessage => "outbox.empty_message",
+                OutboxError::FileUnreadable => "outbox.file_unreadable",
                 _ => "outbox.store",
             }
             .into(),
@@ -67,11 +72,14 @@ impl BrookClient {
             http: self.http.clone(),
             base: self.base.clone(),
             session: self.session.clone(),
+            transfers: self.transfers.clone(),
         });
         Net {
             fetch: http.clone(),
             history: http.clone(),
-            post: http,
+            post: http.clone(),
+            upload: http,
+            transfers: self.transfers.clone(),
         }
     }
 
@@ -321,6 +329,28 @@ impl BrookClient {
         let outbox = self.active_outbox().await?;
         outbox
             .enqueue(channel_id, body, reply_to_id, client_id)
+            .await
+            .map_err(outbox_error)
+    }
+
+    /// Queue a message with files (up to [`crate::MAX_FILES_PER_MESSAGE`], each at most
+    /// [`crate::MAX_FILE_BYTES`], none empty; the body may be empty). Each file is copied into
+    /// an encrypted snapshot before this returns (progress: `Preparing` on its transfer id),
+    /// so the paths are read only now. Call it off the UI thread: copying can take seconds.
+    /// The receipt's transfer ids carry upload progress, and `cancel_transfer` on any of
+    /// them cancels the message's sending (Retry resumes it). The same `client_id` again
+    /// returns the stored message's receipt, copying nothing.
+    pub async fn send_queued_with_files(
+        &self,
+        channel_id: &str,
+        body: &str,
+        reply_to_id: Option<String>,
+        client_id: Option<String>,
+        files: Vec<crate::OutgoingFile>,
+    ) -> Result<crate::SendReceipt> {
+        let outbox = self.active_outbox().await?;
+        outbox
+            .enqueue_with_files(channel_id, body, reply_to_id, client_id, files)
             .await
             .map_err(outbox_error)
     }

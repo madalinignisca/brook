@@ -15,9 +15,6 @@
 //! `spawn_blocking`, never on the runtime's workers. The decrypting reader for uploads is
 //! async.
 
-// Used by the outbox from the next commit on; until then only its tests call it.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};

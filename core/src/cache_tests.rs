@@ -397,6 +397,7 @@ mod http {
             http: reqwest::Client::new(),
             base: format!("{}/", server.uri()).parse().unwrap(),
             session,
+            transfers: Arc::new(crate::transfer::Transfers::new()),
         }
     }
 
@@ -813,6 +814,7 @@ mod post_http {
             http: reqwest::Client::new(),
             base: format!("{}/", server.uri()).parse().unwrap(),
             session,
+            transfers: Arc::new(crate::transfer::Transfers::new()),
         };
         (h, epoch)
     }
@@ -1007,7 +1009,7 @@ async fn a_reset_at_zero_does_not_loop() {
 fn hi() -> crate::outbox::Outgoing {
     crate::outbox::Outgoing {
         body: "hi".into(),
-        reply_to_id: None,
+        ..Default::default()
     }
 }
 

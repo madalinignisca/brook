@@ -85,6 +85,8 @@ impl Default for TransferId {
 /// Where a transfer is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferState {
+    /// A queued file is being copied into its encrypted snapshot (before any upload).
+    Preparing,
     /// Bytes are moving.
     Running,
     /// Waiting before the next attempt (the server asked, or the network failed).
@@ -219,6 +221,11 @@ impl Transfers {
             .clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn events_for_tests(&self) -> broadcast::Receiver<TransferEvent> {
+        self.events.subscribe()
+    }
+
     /// A lone transfer ended. A row's registrations stay until the row goes.
     fn forget(&self, id: TransferId) {
         self.cancelled
@@ -228,7 +235,6 @@ impl Transfers {
     }
 
     /// Stop every transfer of these ids through one set of flags.
-    #[cfg_attr(not(test), allow(dead_code))] // the outbox uses it from step 4
     pub(crate) fn register(&self, ids: &[TransferId], flags: &Arc<Flags>) {
         let mut rows = self
             .rows
@@ -239,7 +245,6 @@ impl Transfers {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // the outbox uses it from step 4
     pub(crate) fn unregister(&self, ids: &[TransferId]) {
         let mut rows = self
             .rows
@@ -250,7 +255,7 @@ impl Transfers {
         }
     }
 
-    fn emit(&self, id: TransferId, done: u64, total: u64, state: TransferState) {
+    pub(crate) fn emit(&self, id: TransferId, done: u64, total: u64, state: TransferState) {
         let _ = self.events.send(TransferEvent {
             id,
             done,

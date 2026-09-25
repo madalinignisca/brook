@@ -130,6 +130,7 @@ fn every_pending_state_and_delete_outcome_maps() {
         channel_id: "c".into(),
         body: "b".into(),
         reply_to_id: Some("q".into()),
+        files: vec![],
         state,
     };
     assert_eq!(

@@ -88,6 +88,23 @@ fn net(f: &Arc<Fake>) -> Net {
         fetch: f.clone(),
         history: f.clone(),
         post: f.clone(),
+        upload: f.clone(),
+        transfers: Arc::new(crate::transfer::Transfers::new()),
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::outbox::Upload for Fake {
+    async fn upload(
+        &self,
+        _: crate::transfer::TransferId,
+        _: &Arc<crate::transfer::Flags>,
+        _: &str,
+        _: &crate::outbox::FileRow,
+        _: &crate::snapshot::SnapshotSource,
+        _: u64,
+    ) -> Result<crate::transfer::FileInfo, crate::Error> {
+        Err(crate::Error::Timeout) // no test here sends files
     }
 }
 
