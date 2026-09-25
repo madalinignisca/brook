@@ -1,0 +1,143 @@
+name: release-gtk
+
+# Manual releases of the Linux (GTK) client. Nothing runs on push: a maintainer
+# starts it from the Actions tab (or `gh workflow run release-gtk.yml ...`).
+#
+#   channel=beta,   version=0.2.0-beta.1 -> tag gtk-v0.2.0-beta.1, a pre-release
+#   channel=stable, version=0.2.0        -> tag gtk-v0.2.0, a full release
+#
+# `dry_run` builds and packages everything and uploads the tarballs as workflow
+# artifacts, but creates no tag and no release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Release channel"
+        type: choice
+        options: [beta, stable]
+        default: beta
+        required: true
+      version:
+        description: "Version without the leading v: 0.2.0 (stable) or 0.2.0-beta.1 (beta)"
+        type: string
+        required: true
+      ref:
+        description: "Branch, tag or commit to build"
+        type: string
+        default: main
+        required: true
+      dry_run:
+        description: "Build and package only (no tag, no release)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read  # the release job alone gets write
+
+concurrency:
+  group: release-gtk
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      sha: ${{ steps.v.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - id: v
+        name: Check version against channel; refuse an existing tag
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANNEL" = stable ]; then
+            [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              || { echo "::error::stable needs X.Y.Z, got '$VERSION'"; exit 1; }
+          else
+            [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]] \
+              || { echo "::error::beta needs X.Y.Z-beta.N, got '$VERSION'"; exit 1; }
+          fi
+          tag="gtk-v$VERSION"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::tag $tag already exists"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+
+      - name: Install GTK4 / libadwaita / GStreamer libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.arch }}
+
+      - name: Build (release)
+        run: cargo build --release --locked -p brook-gnome
+
+      - name: Package
+        run: clients/gnome/packaging/make-tarball.sh "${{ inputs.version }}" "${{ matrix.arch }}" dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brook-gnome-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: [validate, build]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          CHANNEL: ${{ inputs.channel }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          prerelease=()
+          if [ "$CHANNEL" = beta ]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "Brook for Linux $VERSION" \
+            --generate-notes \
+            "${prerelease[@]}"
