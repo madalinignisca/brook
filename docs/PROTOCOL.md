@@ -40,6 +40,36 @@
 | `POST /channels/{id}/bots` · `DELETE /channels/{id}/bots/{bot}` | add / remove bot from channel |
 | `POST /bots/{id}/webhook` | **inbound** webhook: external posts as bot (HMAC-signed) |
 
+### 1.0 Refresh tokens
+
+- `POST /auth/refresh` **rotates**: the presented token is retired and a new pair
+  comes back. Save the new refresh token before using it; the old one is done.
+- Each login starts a **family** (that device's chain of rotations). Presenting an
+  already-rotated token again is treated as **theft** and revokes that family only:
+  that device must sign in again, the user's other devices are untouched. Access
+  tokens already issued in the family live out their 15 minutes.
+- **Crash grace:** within **24 hours** of a rotation, the rotated token is accepted
+  **once** more *if its successor was never used*. This covers a client that died, or
+  lost the reply to a dropped connection and then stayed offline, before saving the
+  new token: it replays the old one and gets a fresh pair. The lost successor is
+  retired for good: presenting it later is reuse. A replay after the successor was
+  used, a second replay, one after 24 hours, or one after the token expired is theft
+  as above.
+- **What the grace costs:** someone holding a copy of a rotated token whose successor
+  the device hasn't used yet can use it (within 24 hours). They are caught the next
+  time the device refreshes (every ~10 minutes while it's online): the family ends,
+  and both the device and the copy holder are signed out. The device signs in again.
+- Every grace use and every reuse verdict is recorded in the account's security
+  events (`refresh_token_grace`, `refresh_token_reuse`). A reuse event can also come
+  from an old token replayed after "sign out everywhere"; the family was already
+  revoked then.
+- A token revoked by logout, sign-out or a password change is simply refused
+  (401 `auth.invalid_token`); only rotation reuse ends a family.
+- Two refreshes racing with the same token (two tabs) are serialised by the server:
+  the first rotates, the second takes the grace path, which retires the first's
+  token: its next refresh is a reuse verdict. A client must share one refresh
+  (single-flight).
+
 ### 1.1 Password changes and sessions
 
 - `POST /auth/password {current_password, new_password, sign_out_other_devices?}`
