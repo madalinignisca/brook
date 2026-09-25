@@ -748,21 +748,20 @@ fn send_current(chat: &Rc<Chat>) {
 
     let chat = chat.clone();
     glib::spawn_future_local(async move {
-        // Through the outbox when offline storage is on: saved before this returns,
-        // sent in order, shown as a "sending" bubble until it arrives. A reply (the
-        // outbox has no quote field yet) or no local storage sends directly, online.
-        let queued = reply_to.is_none();
+        // Through the outbox when offline storage is on (replies too): saved before
+        // this returns, sent in order, shown as a "sending" bubble until it arrives.
+        // Without local storage it sends directly, online.
         let handle = chat.runtime.spawn({
             let client = chat.client.clone();
             let (body, reply_to) = (body.clone(), reply_to.clone());
             async move {
-                if queued {
-                    match client.send_queued(&channel_id, &body, None, None).await {
-                        Ok(_) => return Ok(true),
-                        Err(brook_core::Error::Api { code, .. }) if code == "local.unavailable" => {
-                        }
-                        Err(err) => return Err(err),
-                    }
+                match client
+                    .send_queued(&channel_id, &body, reply_to.clone(), None)
+                    .await
+                {
+                    Ok(_) => return Ok(true),
+                    Err(brook_core::Error::Api { code, .. }) if code == "local.unavailable" => {}
+                    Err(err) => return Err(err),
                 }
                 client
                     .send_message(&channel_id, &body, reply_to.as_deref())
@@ -2109,6 +2108,24 @@ fn pending_row(chat: &Rc<Chat>, item: &PendingMessage) -> gtk::ListBoxRow {
         .margin_end(12)
         .opacity(0.6)
         .build();
+    if let Some(target) = &item.reply_to_id {
+        // The quoted message as shown in this channel, if it's on screen.
+        let quoted = chat
+            .message_rows
+            .borrow()
+            .get(target)
+            .map(|w| w.body.text().to_string())
+            .unwrap_or_else(|| "an earlier message".into());
+        let excerpt: String = quoted.chars().take(80).collect();
+        column.append(
+            &gtk::Label::builder()
+                .label(format!("\u{21b3} Replying to {excerpt}"))
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+    }
     column.append(
         &gtk::Label::builder()
             .label(&item.body)
