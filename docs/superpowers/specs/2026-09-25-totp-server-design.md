@@ -217,6 +217,9 @@ Everything here goes through #36's limiter **before** any Argon2 or HMAC work, k
   trusted-IP set, 30-day TTL, #36). The owner's own devices and home network are never
   paced by an attacker elsewhere. From a new network the owner waits at most 15 min per
   attempt, or changes the password from a trusted device, which resets the budget.
+  The exemption covers **only** this per-handle code budget. The per-IP backoff and
+  go-away tiers still apply to trusted IPs, so an attacker who shares the owner's
+  network (same NAT, same /64) stays bounded by them.
 - The password checks in `enroll`, `disable`, `recovery-codes` and the admin reset: as
   in #39.
 - Login's password stage succeeding with TOTP pending records **no** success yet. The IP's
