@@ -1022,4 +1022,7 @@ fn the_send_body_names_the_reply_target_only_for_a_reply() {
     m.reply_to_id = Some("q".into());
     assert_eq!(send_body(&m, "cid")["reply_to_id"], "q");
     assert_eq!(send_body(&m, "cid")["client_id"], "cid");
+    assert!(send_body(&m, "cid").get("attachments").is_none());
+    m.attachments = vec!["f2".into(), "f1".into()];
+    assert_eq!(send_body(&m, "cid")["attachments"], serde_json::json!(["f2", "f1"]));
 }

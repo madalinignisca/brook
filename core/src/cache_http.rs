@@ -141,11 +141,14 @@ impl History for Http {
     }
 }
 
-/// The JSON a queued send posts: `reply_to_id` only when it's a reply.
+/// The JSON a queued send posts: `reply_to_id` only for a reply, `attachments` only with files.
 pub(crate) fn send_body(msg: &crate::outbox::Outgoing, client_id: &str) -> Value {
     let mut v = serde_json::json!({ "body": msg.body, "client_id": client_id });
     if let Some(r) = &msg.reply_to_id {
         v["reply_to_id"] = Value::from(r.as_str());
+    }
+    if !msg.attachments.is_empty() {
+        v["attachments"] = Value::from(msg.attachments.clone()); // in the user's order
     }
     v
 }
