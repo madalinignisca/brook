@@ -52,6 +52,25 @@ pub fn unique_name(dir: &Path, name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
+/// Running inside a Flatpak sandbox (the document portal grants single files).
+fn is_flatpak() -> bool {
+    Path::new("/.flatpak-info").exists()
+}
+
+/// Where the bytes are written first: the chosen file itself, or, when it already exists
+/// and a sibling can be created (not under Flatpak), a hidden part file beside it that is
+/// renamed over it after the checksum matched.
+pub fn write_target(chosen: &Path, flatpak: bool) -> PathBuf {
+    if flatpak || !chosen.exists() {
+        return chosen.to_path_buf();
+    }
+    let name = chosen
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    chosen.with_file_name(format!(".{name}.brook-part"))
+}
+
 /// Where the save dialog opens: the user's Downloads, else home.
 fn downloads_dir() -> PathBuf {
     glib::user_special_dir(glib::UserDirectory::Downloads).unwrap_or_else(glib::home_dir)
@@ -176,19 +195,39 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
                 }
             });
 
+            // Under Flatpak, replacing an existing file writes into it directly.
+            let replaced_in_place = is_flatpak() && path.exists();
             let download = runtime.spawn({
                 let client = client.clone();
                 async move {
-                    let mut sink =
-                        FileSink::create(&path)
-                            .await
-                            .map_err(|err| brook_core::Error::Api {
-                                code: "transfer.io".into(),
-                                message: format!("{:?}", err.kind()),
-                            })?;
+                    // Replacing a file natively: download beside it and swap it in only
+                    // once verified, so a failed save keeps the old copy (#105). Under
+                    // Flatpak the portal grants just the chosen file: write it directly.
+                    // A symlink is followed: the file it points to is what gets replaced.
+                    let path = std::fs::canonicalize(&path).unwrap_or(path);
+                    let target = write_target(&path, is_flatpak());
+                    let io = |err: std::io::Error| brook_core::Error::Api {
+                        code: "transfer.io".into(),
+                        message: format!("{:?}", err.kind()),
+                    };
+                    let mut sink = FileSink::create(&target).await.map_err(io)?;
                     client
                         .download_file(transfer, &file.id, &sha256, file.size, &mut sink)
-                        .await
+                        .await?;
+                    if target != path {
+                        // Keep the replaced file's permissions, then swap it in and sync
+                        // the directory so the rename itself survives a crash.
+                        if let Ok(meta) = tokio::fs::metadata(&path).await {
+                            let _ = tokio::fs::set_permissions(&target, meta.permissions()).await;
+                        }
+                        tokio::fs::rename(&target, &path).await.map_err(io)?;
+                        if let Some(dir) = path.parent() {
+                            if let Ok(d) = tokio::fs::File::open(dir).await {
+                                let _ = d.sync_all().await;
+                            }
+                        }
+                    }
+                    Ok(())
                 }
             });
             glib::spawn_future_local(async move {
@@ -202,7 +241,12 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
                     // Saved, and nothing more: never opened automatically.
                     Ok(()) => status.set_text("Saved"),
                     Err(err) => {
-                        status.set_text(&save_error_text(&err));
+                        let mut text = save_error_text(&err);
+                        if replaced_in_place {
+                            // Under Flatpak a replace writes into the file itself: say so.
+                            text.push_str(". The previous file was removed");
+                        }
+                        status.set_text(&text);
                         save.set_visible(true);
                     }
                 }
@@ -243,6 +287,28 @@ mod tests {
         assert_eq!(unique_name(&dir, "README"), "README (1)");
         std::fs::write(dir.join(".profile"), b"").unwrap();
         assert_eq!(unique_name(&dir, ".profile"), ".profile (1)");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replacing_a_file_writes_beside_it_except_under_flatpak() {
+        let dir = tempfile_dir();
+        let chosen = dir.join("report.pdf");
+        assert_eq!(
+            write_target(&chosen, false),
+            chosen,
+            "a new file is written directly"
+        );
+        std::fs::write(&chosen, b"old").unwrap();
+        assert_eq!(
+            write_target(&chosen, false),
+            dir.join(".report.pdf.brook-part")
+        );
+        assert_eq!(
+            write_target(&chosen, true),
+            chosen,
+            "the portal grants only this file"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
