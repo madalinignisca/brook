@@ -12,7 +12,7 @@ final class FakeClient: FfiBrookClient, @unchecked Sendable {
 
     private struct State {
         var calls: [Call] = []
-        var gate: CheckedContinuation<Void, Never>?
+        var gate: [CheckedContinuation<Void, Never>] = []
         var gateOpen: Bool
         var listener: AuthStateListener?
         var logouts = 0
@@ -20,12 +20,16 @@ final class FakeClient: FfiBrookClient, @unchecked Sendable {
         var totpCalls: [String] = []
         var totpResult: Result<UInt32?, LoginError> = .success(nil)
         var cancels = 0
+        var persistence: [String] = []
+        var restoreOutcome: FfiRestoreOutcome = .notSignedIn
+        var restores = 0
+        var signOutComplete = true
     }
 
     private let result: Result<LoginResult, LoginError>
     private let state: Mutex<State>
 
-    /// `gated`: `login` suspends until `release()` — lets a test observe the in-flight state.
+    /// `gated`: `login` and `restore` suspend until `release()` — lets a test observe the in-flight state.
     init(result: Result<LoginResult, LoginError>, gated: Bool = false) {
         self.result = result
         state = Mutex(State(gateOpen: !gated))
@@ -40,12 +44,12 @@ final class FakeClient: FfiBrookClient, @unchecked Sendable {
     var calls: [Call] { state.withLock { $0.calls } }
 
     func release() {
-        let waiting = state.withLock { s -> CheckedContinuation<Void, Never>? in
+        let waiting = state.withLock { s -> [CheckedContinuation<Void, Never>] in
             s.gateOpen = true
-            defer { s.gate = nil }
+            defer { s.gate = [] }
             return s.gate
         }
-        waiting?.resume()
+        waiting.forEach { $0.resume() }
     }
 
     override func login(handle: String, password: String) async throws -> LoginResult {
@@ -53,18 +57,20 @@ final class FakeClient: FfiBrookClient, @unchecked Sendable {
             s.calls.append(Call(handle: handle, password: password))
             return !s.gateOpen
         }
-        if mustWait {
-            // Suspend outside the lock; `release()` resumes us.
-            await withCheckedContinuation { cont in
-                let openAlready = state.withLock { s -> Bool in
-                    if s.gateOpen { return true }
-                    s.gate = cont
-                    return false
-                }
-                if openAlready { cont.resume() }
-            }
-        }
+        if mustWait { await waitForGate() }
         return try result.get()
+    }
+
+    /// Suspends (outside the lock) until `release()` when the fake is gated.
+    private func waitForGate() async {
+        await withCheckedContinuation { cont in
+            let openAlready = state.withLock { s -> Bool in
+                if s.gateOpen { return true }
+                s.gate.append(cont)
+                return false
+            }
+            if openAlready { cont.resume() }
+        }
     }
 
     /// Keeps the listener so a test can deliver core's auth states in any order.
@@ -116,6 +122,31 @@ final class FakeClient: FfiBrookClient, @unchecked Sendable {
     override func logout() async {
         state.withLock { $0.logouts += 1 }
     }
+
+    // MARK: Staying signed in
+
+    /// The data directories persistence was enabled with, in order.
+    var persistence: [String] { state.withLock { $0.persistence } }
+    var restores: Int { state.withLock { $0.restores } }
+    func setRestore(_ outcome: FfiRestoreOutcome) { state.withLock { $0.restoreOutcome = outcome } }
+    func setSignOutComplete(_ complete: Bool) { state.withLock { $0.signOutComplete = complete } }
+
+    override func enablePersistence(slot _: FfiKeySlot, dataDir: String) {
+        state.withLock { $0.persistence.append(dataDir) }
+    }
+
+    /// Persistence must already be on (core restores nothing otherwise).
+    override func restore() async -> FfiRestoreOutcome {
+        await waitForGate()
+        return state.withLock { s in
+            s.restores += 1
+            guard !s.persistence.isEmpty else { return .notSignedIn }
+            if case let .loggedIn(user) = s.restoreOutcome { s.coreState = .loggedIn(user: user) }
+            return s.restoreOutcome
+        }
+    }
+
+    override func signOutComplete() -> Bool { state.withLock { $0.signOutComplete } }
 }
 
 /// Records what the store asked the factory for, and hands out a prepared client.
@@ -146,4 +177,12 @@ final class FakeChallenge: FfiTotpChallenge, @unchecked Sendable {
     init() { super.init(noHandle: NoHandle()) }
     required init(unsafeFromHandle _: UInt64) { fatalError("never lifted from Rust") }
     override func secondsLeft() -> UInt64 { 300 }
+}
+
+/// A key slot that is never called (the store only hands it to the client).
+final class UnusedSlot: FfiKeySlot {
+    func load(slot _: String) throws -> Data? { fatalError("unused") }
+    func create(slot _: String, bytes _: Data) throws { fatalError("unused") }
+    func replace(slot _: String, bytes _: Data) throws { fatalError("unused") }
+    func delete(slot _: String) throws { fatalError("unused") }
 }
