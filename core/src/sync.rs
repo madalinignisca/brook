@@ -96,8 +96,11 @@ pub(crate) fn channel_row(v: &Value) -> Option<Row> {
 }
 
 pub(crate) fn message_row(v: &Value) -> Option<MessageRow> {
+    let id = s(v, "id")?;
+    // Coverage compares ids as strings: the server's canonical UUIDs are lowercase.
+    debug_assert_eq!(id, id.to_lowercase(), "a message id that isn't canonical");
     Some(MessageRow {
-        id: s(v, "id")?,
+        id,
         channel_id: s(v, "channel_id")?,
         seq: seq(v)?,
         created_at: s(v, "created_at")?,

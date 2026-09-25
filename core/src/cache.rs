@@ -1,0 +1,409 @@
+//! The offline cache's front (plan C3, spec §8, reading half): what the apps read, the change
+//! notices they re-read on, and the triggers that keep it synced.
+//!
+//! Reads never touch the network. `cached_messages` says when a page needs it
+//! (`needs_network`), and the app asks for it with `load_head` / `load_older`, which fetch,
+//! apply and extend coverage in one step.
+//!
+//! Syncs are single-flight. A `sync.hint` above the cursor, and any live event that can't be
+//! applied directly (`reaction.update`; anything with a `seq` but no rows), ask for one,
+//! debounced: a burst of hints costs one `/sync`.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use serde_json::Value;
+use tokio::sync::{broadcast, watch, Mutex};
+
+use crate::apply::{apply, floor_at, Applied, Batch, MessageRow};
+use crate::coverage;
+use crate::store::{Db, StoreError};
+use crate::sync::{self, event_batch, message_row, Fetch, SyncError, Synced};
+
+/// How long a hint (or an unappliable event) waits for others before the sync runs.
+pub(crate) const HINT_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// What changed, after it was committed. The apps re-read what they show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheEvent {
+    /// Channels whose rows (the channel, its members, its messages) changed.
+    Channels(Vec<String>),
+    /// Channels the caller was removed from: gone from the cache.
+    Removed(Vec<String>),
+    /// Profiles that changed (display names, status): re-render those authors.
+    Users(Vec<String>),
+    /// The server reset the sync (`410`): the cache is being rebuilt.
+    Reset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CacheState {
+    pub syncing: bool,
+    pub last_synced: Option<SystemTime>,
+    /// The last sync attempt couldn't reach the server (reads still work).
+    pub offline: bool,
+}
+
+/// Where history pages come from (`GET /channels/{id}/messages`).
+#[async_trait::async_trait]
+pub(crate) trait History: Send + Sync {
+    /// Messages older than `before` (the newest page without it), newest first or in any
+    /// order; at most `limit`.
+    async fn page(
+        &self,
+        channel_id: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Value>, crate::Error>;
+}
+
+/// A channel as cached, with its unread count computed here (`/sync`'s is always 0).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CachedChannel {
+    pub json: Value,
+    pub unread: u32,
+}
+
+/// A page of cached messages, newest first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessagesPage {
+    pub messages: Vec<Value>,
+    /// The cache can't answer this page by itself: never opened (no coverage), or it runs
+    /// below what's cached and the start isn't known. The app shows "loading" and calls
+    /// `load_head` (no `before`) or `load_older`.
+    pub needs_network: bool,
+}
+
+pub(crate) struct Cache {
+    db: Db,
+    me: String,
+    fetch: Arc<dyn Fetch>,
+    history: Arc<dyn History>,
+    events: broadcast::Sender<CacheEvent>,
+    state: watch::Sender<CacheState>,
+    /// Held for a whole sync run: single-flight.
+    running: Mutex<()>,
+    /// A debounced sync is already scheduled.
+    scheduled: std::sync::atomic::AtomicBool,
+    /// Asked for while a run was going: that run may have fetched past the change, so it
+    /// goes round once more.
+    again: std::sync::atomic::AtomicBool,
+}
+
+impl Cache {
+    pub(crate) fn new(
+        db: Db,
+        me: String,
+        fetch: Arc<dyn Fetch>,
+        history: Arc<dyn History>,
+    ) -> Arc<Self> {
+        let (events, _) = broadcast::channel(256);
+        let (state, _) = watch::channel(CacheState::default());
+        Arc::new(Self {
+            db,
+            me,
+            fetch,
+            history,
+            events,
+            state,
+            running: Mutex::new(()),
+            scheduled: std::sync::atomic::AtomicBool::new(false),
+            again: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn events(&self) -> broadcast::Receiver<CacheEvent> {
+        self.events.subscribe()
+    }
+
+    pub(crate) fn state(&self) -> watch::Receiver<CacheState> {
+        self.state.subscribe()
+    }
+
+    fn notify(&self, applied: Applied) {
+        let sorted = |set: HashSet<String>| {
+            let mut v: Vec<String> = set.into_iter().collect();
+            v.sort();
+            v
+        };
+        if !applied.removed.is_empty() {
+            let _ = self
+                .events
+                .send(CacheEvent::Removed(sorted(applied.removed)));
+        }
+        if !applied.channels.is_empty() {
+            let _ = self
+                .events
+                .send(CacheEvent::Channels(sorted(applied.channels)));
+        }
+        if !applied.users.is_empty() {
+            let _ = self.events.send(CacheEvent::Users(sorted(applied.users)));
+        }
+    }
+
+    async fn cursor(&self) -> Result<i64, StoreError> {
+        self.db
+            .call(|c| {
+                c.query_row("SELECT cursor FROM meta WHERE id = 1", [], |r| {
+                    r.get::<_, String>(0)
+                })
+            })
+            .await
+            .map(|s| s.parse().unwrap_or(0))
+    }
+
+    /// Sync until caught up. Single-flight: asked while a run is going, that run goes round
+    /// once more instead (it may already have fetched past the change that asked).
+    pub(crate) async fn sync_now(&self) -> Result<(), SyncError> {
+        use std::sync::atomic::Ordering;
+        let Ok(_run) = self.running.try_lock() else {
+            self.again.store(true, Ordering::SeqCst);
+            return Ok(());
+        };
+        loop {
+            self.again.store(false, Ordering::SeqCst);
+            self.run_once().await?;
+            if !self.again.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn run_once(&self) -> Result<(), SyncError> {
+        self.state.send_modify(|s| s.syncing = true);
+        let result = sync::run(&self.db, &self.me, self.fetch.as_ref()).await;
+        self.state.send_modify(|s| {
+            s.syncing = false;
+            s.offline = matches!(result, Err(SyncError::Net(_)));
+            if result.is_ok() {
+                s.last_synced = Some(SystemTime::now());
+            }
+        });
+        match result {
+            Ok(Synced::Done(applied)) => {
+                self.notify(applied);
+                Ok(())
+            }
+            Ok(Synced::Reset) => {
+                // The rebuild itself is C5's (it needs the store wipe); say so meanwhile.
+                let _ = self.events.send(CacheEvent::Reset);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Ask for a sync in `HINT_DEBOUNCE`; asks meanwhile join it.
+    pub(crate) fn schedule_sync(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        if self.scheduled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(HINT_DEBOUNCE).await;
+            me.scheduled.store(false, Ordering::SeqCst);
+            let _ = me.sync_now().await;
+        });
+    }
+
+    /// `sync.hint {seq}`: nothing to do if the cache is already there.
+    pub(crate) async fn hint(self: &Arc<Self>, seq: i64) {
+        if self.cursor().await.is_ok_and(|c| seq <= c) {
+            return;
+        }
+        self.schedule_sync();
+    }
+
+    /// A live WebSocket event. Rows go through the same guard as `/sync`; an event that
+    /// carries a `seq` but can't be applied here (a per-viewer reaction summary) asks for a
+    /// sync instead of being lost until the periodic one.
+    pub(crate) async fn live_event(self: &Arc<Self>, kind: &str, data: &Value) {
+        match event_batch(kind, data) {
+            Some(batch) => {
+                let me = self.me.clone();
+                let applied = self
+                    .db
+                    .call(move |c| {
+                        let tx = c.transaction()?;
+                        let applied = apply(&tx, &me, &batch)?;
+                        tx.commit()?;
+                        Ok(applied)
+                    })
+                    .await;
+                if let Ok(applied) = applied {
+                    self.notify(applied);
+                }
+            }
+            None => {
+                if let Some(seq) = data.get("seq").and_then(Value::as_i64) {
+                    self.hint(seq).await;
+                }
+            }
+        }
+    }
+
+    /// The channels the caller is in, with unread counts.
+    pub(crate) async fn cached_channels(&self) -> Result<Vec<CachedChannel>, StoreError> {
+        let me = self.me.clone();
+        self.db
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT ch.json,
+                       (SELECT count(*) FROM messages m
+                        WHERE m.channel_id = ch.id
+                          AND m.id > coalesce(json_extract(my.json, '$.last_read_message_id'), '')
+                          AND coalesce(json_extract(m.json, '$.author_id'), '') != ?1
+                          AND json_extract(m.json, '$.deleted') IS NOT 1
+                          AND json_type(m.json, '$.deleted_at') IS NOT 'text')
+                     FROM channels ch
+                     JOIN memberships my ON my.channel_id = ch.id AND my.user_id = ?1 AND my.left = 0
+                     ORDER BY ch.id",
+                )?;
+                let rows = stmt.query_map([&me], |r| {
+                    let json: String = r.get(0)?;
+                    Ok((json, r.get::<_, u32>(1)?))
+                })?;
+                rows.map(|row| {
+                    let (json, unread) = row?;
+                    Ok(CachedChannel {
+                        json: serde_json::from_str(&json).unwrap_or(Value::Null),
+                        unread,
+                    })
+                })
+                .collect()
+            })
+            .await
+    }
+
+    /// A page of cached messages, newest first: before `before` if given. Never the network.
+    pub(crate) async fn cached_messages(
+        &self,
+        channel_id: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<MessagesPage, StoreError> {
+        let (channel_id, before) = (channel_id.to_string(), before.map(str::to_string));
+        self.db
+            .call(move |c| {
+                let tx = c.transaction()?;
+                let range = coverage::range(&tx, &channel_id)?;
+                let mut stmt = tx.prepare(
+                    "SELECT json FROM messages
+                     WHERE channel_id = ?1 AND (?2 IS NULL OR id < ?2)
+                     ORDER BY id DESC LIMIT ?3",
+                )?;
+                let messages: Vec<Value> = stmt
+                    .query_map(rusqlite::params![channel_id, before, limit as i64], |r| {
+                        r.get::<_, String>(0)
+                    })?
+                    .map(|j| j.map(|j| serde_json::from_str(&j).unwrap_or(Value::Null)))
+                    .collect::<rusqlite::Result<_>>()?;
+                drop(stmt);
+                let needs_network = match &range {
+                    None => true, // never opened: fetch the head
+                    // A full page answers if it stays inside the covered range; a short one
+                    // only if nothing older exists.
+                    Some(r) if messages.len() >= limit => !messages
+                        .last()
+                        .and_then(|m| m.get("id")?.as_str())
+                        .zip(r.oldest_id.as_deref())
+                        .is_some_and(|(last, oldest)| last >= oldest),
+                    Some(r) => !r.complete_to_start,
+                };
+                Ok(MessagesPage {
+                    messages,
+                    needs_network,
+                })
+            })
+            .await
+    }
+
+    /// Fetch the newest page and make it the channel's covered range.
+    pub(crate) async fn load_head(
+        &self,
+        channel_id: &str,
+        limit: usize,
+    ) -> Result<(), crate::Error> {
+        self.load(channel_id, None, limit).await
+    }
+
+    /// Fetch the page below the covered range and extend it down.
+    pub(crate) async fn load_older(
+        &self,
+        channel_id: &str,
+        limit: usize,
+    ) -> Result<(), crate::Error> {
+        let id = channel_id.to_string();
+        let oldest = self
+            .db
+            .call(move |c| {
+                let tx = c.transaction()?;
+                Ok(coverage::range(&tx, &id)?.and_then(|r| r.oldest_id))
+            })
+            .await
+            .map_err(|_| crate::Error::UnexpectedResponse)?;
+        match oldest {
+            Some(oldest) => self.load(channel_id, Some(oldest), limit).await,
+            None => self.load(channel_id, None, limit).await,
+        }
+    }
+
+    async fn load(
+        &self,
+        channel_id: &str,
+        before: Option<String>,
+        limit: usize,
+    ) -> Result<(), crate::Error> {
+        // The channel's removal floor as of now: a removal while this request is out makes
+        // its answer stale, and `apply` drops it (`Batch::history_floors`).
+        let id = channel_id.to_string();
+        let floor = self
+            .db
+            .call(move |c| {
+                let tx = c.transaction()?;
+                floor_at(&tx, &id)
+            })
+            .await
+            .map_err(|_| crate::Error::UnexpectedResponse)?;
+        let rows = self
+            .history
+            .page(channel_id, before.as_deref(), limit)
+            .await?;
+        let messages: Vec<MessageRow> = rows.iter().filter_map(message_row).collect();
+        let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+        let (me, id) = (self.me.clone(), channel_id.to_string());
+        let applied = self
+            .db
+            .call(move |c| {
+                let tx = c.transaction()?;
+                let unchanged_floor = floor_at(&tx, &id)? == floor;
+                let applied = apply(
+                    &tx,
+                    &me,
+                    &Batch {
+                        messages,
+                        history: true,
+                        history_floors: [(id.clone(), floor)].into(),
+                        ..Batch::default()
+                    },
+                )?;
+                // Coverage only from a page that landed.
+                if unchanged_floor {
+                    match &before {
+                        None => coverage::record_head(&tx, &id, &ids, limit)?,
+                        Some(b) => coverage::record_older(&tx, &id, b, &ids, limit)?,
+                    }
+                }
+                tx.commit()?;
+                Ok(applied)
+            })
+            .await
+            .map_err(|_| crate::Error::UnexpectedResponse)?;
+        let mut applied = applied;
+        applied.channels.insert(channel_id.to_string()); // coverage changed, even if no rows did
+        self.notify(applied);
+        Ok(())
+    }
+}
