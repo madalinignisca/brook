@@ -442,3 +442,25 @@ async def test_multi_range_is_refused(client: httpx.AsyncClient) -> None:
         f"/api/v1/files/{f['id']}/content", headers={**ha, "Range": "bytes=0-0,2-2"}
     )
     assert r.status_code == 416
+
+
+async def test_a_stalled_upload_is_dropped_and_frees_its_slot(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A half-open upload must not hold its in-flight slot until a proxy timeout."""
+    from app.routers import files as files_router
+
+    ha, _hb, ch = await _setup(client)
+    created = (await _create(client, ha, ch, b"x" * 20)).json()
+    monkeypatch.setattr(files_router, "IDLE_TIMEOUT_S", 0.2)
+
+    async def stalls():  # type: ignore[no-untyped-def]
+        yield b"x" * 5
+        await asyncio.sleep(5)  # the client goes quiet
+        yield b"x" * 15
+
+    r = await client.put(created["upload_url"], content=stalls(), headers=ha)
+    assert r.status_code == 408 and r.json()["error"]["code"] == "file.upload_stalled"
+    assert not files_router._in_flight and _dir_files() == []
+    ok = await client.put(created["upload_url"], content=b"x" * 20, headers=ha)
+    assert ok.status_code == 200
