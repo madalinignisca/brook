@@ -501,6 +501,15 @@ async def send_message(
     if body.client_id is not None:
         stored = await _stored_send(session, user, body.client_id)
         if stored is not None:
+            if stored.channel_id != channel_id:
+                # Not a resend: the client reused a client_id for a different message.
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": "conflict",
+                        "message": "client_id already used in another channel",
+                    },
+                )
             response.status_code = status.HTTP_200_OK
             return stored
     channel = await _require_member(session, channel_id, user)
@@ -780,9 +789,10 @@ def _message_out(
         author_id=message.author_id,
         author_handle=author.handle if author else None,
         author_display_name=author.display_name if author else None,
-        body=message.body,
+        body="" if message.deleted_at is not None else message.body,
         created_at=message.created_at,
         edited_at=message.edited_at,
+        deleted_at=message.deleted_at,
         reply_to_id=message.reply_to_id,
         reply_to=reply,
         reactions=reactions or [],

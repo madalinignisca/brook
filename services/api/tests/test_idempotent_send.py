@@ -97,3 +97,40 @@ def test_live_event_echoes_client_id(sync_client: TestClient) -> None:
             if ev["type"] == "message.new":
                 break
         assert ev["data"]["client_id"] == cid
+
+
+async def test_client_id_reused_in_another_channel_is_a_conflict(client: httpx.AsyncClient) -> None:
+    ha, _hb, ch = await _setup(client)
+    other = (
+        await client.post("/api/v1/channels", json={"kind": "channel", "name": "other"}, headers=ha)
+    ).json()
+    cid = str(uuid.uuid4())
+    first = await client.post(
+        f"/api/v1/channels/{ch}/messages", json={"body": "a", "client_id": cid}, headers=ha
+    )
+    assert first.status_code == 201
+    elsewhere = await client.post(
+        f"/api/v1/channels/{other['id']}/messages", json={"body": "b", "client_id": cid}, headers=ha
+    )
+    assert elsewhere.status_code == 409 and elsewhere.json()["error"]["code"] == "conflict"
+    assert await _history(client, ha, other["id"]) == []
+
+
+async def test_resend_after_delete_returns_the_tombstone(client: httpx.AsyncClient) -> None:
+    ha, _hb, ch = await _setup(client)
+    cid = str(uuid.uuid4())
+    first = (
+        await client.post(
+            f"/api/v1/channels/{ch}/messages", json={"body": "oops", "client_id": cid}, headers=ha
+        )
+    ).json()
+    assert (
+        await client.delete(f"/api/v1/channels/{ch}/messages/{first['id']}", headers=ha)
+    ).status_code == 204
+    again = await client.post(
+        f"/api/v1/channels/{ch}/messages", json={"body": "oops", "client_id": cid}, headers=ha
+    )
+    # The outbox entry resolves to the deleted message; it is not recreated.
+    assert again.status_code == 200 and again.json()["id"] == first["id"]
+    assert again.json()["deleted_at"] is not None and again.json()["body"] == ""
+    assert await _history(client, ha, ch) == []

@@ -273,6 +273,9 @@ class MessageOut(BaseModel):
     body: str
     created_at: datetime
     edited_at: datetime | None
+    # Set on a tombstone (body is then empty). History omits deleted messages; this
+    # shows up where a deleted one is still returned (an outbox resend; later /sync).
+    deleted_at: datetime | None = None
     reply_to_id: uuid.UUID | None = None
     reply_to: ReplyExcerpt | None = None
     reactions: list[ReactionSummary] = Field(default_factory=list)
