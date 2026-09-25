@@ -536,6 +536,8 @@ fn transient_errors_are_the_retryable_ones() {
         "file.upload_in_progress",
         "rate_limited",
         "transfer.network",
+        "transfer.paused",
+        "file.no_space", // "try later" since #126 (Retry-After: 600)
         "http_502",
     ] {
         assert!(is_transient(&api(code)), "{code}");
@@ -543,7 +545,6 @@ fn transient_errors_are_the_retryable_ones() {
     for code in [
         "file.already_committed",
         "file.too_large",
-        "file.no_space",
         "transfer.integrity",
         "transfer.cancelled",
         "http_404",
@@ -631,4 +632,203 @@ async fn a_swept_pending_row_is_created_again_once() {
         .await
         .unwrap();
     assert_eq!(file.status, "committed");
+}
+
+// ---- Step 2 of the outbox attachments plan: caller's token, row flags ----
+
+/// A token source that refuses: the session it belongs to is gone.
+struct Gone;
+
+#[async_trait::async_trait]
+impl TokenSource for Gone {
+    async fn token(&self) -> Result<String> {
+        Err(Error::NotAuthenticated)
+    }
+}
+
+struct Fixed(&'static str);
+
+#[async_trait::async_trait]
+impl TokenSource for Fixed {
+    async fn token(&self) -> Result<String> {
+        Ok(self.0.to_string())
+    }
+}
+
+fn uploader<'a>(c: &'a BrookClient, token: &'a dyn TokenSource) -> Uploader<'a> {
+    Uploader {
+        http: &c.http,
+        base: &c.base,
+        transfers: &c.transfers,
+        token,
+    }
+}
+
+/// The caller's token decides: a source that refuses sends nothing at all, and one that
+/// answers is the bearer on every request (not the client's current session).
+#[tokio::test]
+async fn an_upload_uses_only_the_callers_token() {
+    let server = MockServer::start().await;
+    let client = signed_in(&server).await;
+    let flags = Arc::new(Flags::default());
+    let err = uploader(&client, &Gone)
+        .upload(
+            TransferId::new(),
+            &flags,
+            "c1",
+            "r.pdf",
+            "x",
+            "cid",
+            &MemSource(BYTES.to_vec()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotAuthenticated), "{err:?}");
+    let sent = server.received_requests().await.unwrap();
+    assert!(
+        !sent.iter().any(|r| r.url.path().contains("/files")),
+        "a request went out without the caller's token"
+    );
+    Mock::given(method("POST"))
+        .and(path("/api/v1/channels/c1/files"))
+        .and(header("authorization", "Bearer mine"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "file": file_json("pending", None), "upload_url": "/api/v1/files/f1/content"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(header("authorization", "Bearer mine"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(file_json("committed", Some(&sha(BYTES)))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    uploader(&client, &Fixed("mine"))
+        .upload(
+            TransferId::new(),
+            &flags,
+            "c1",
+            "r.pdf",
+            "x",
+            "cid",
+            &MemSource(BYTES.to_vec()),
+        )
+        .await
+        .unwrap();
+}
+
+/// A pause stops a wait as a pause (the row stays pending), never as a cancel.
+#[tokio::test]
+async fn a_pause_is_not_a_cancel() {
+    let server = MockServer::start().await;
+    let client = Arc::new(signed_in(&server).await);
+    mount_create(&server, 201, "pending").await;
+    Mock::given(method("PUT"))
+        .respond_with(
+            ResponseTemplate::new(409)
+                .insert_header("retry-after", "30")
+                .set_body_json(
+                    json!({"error": {"code": "file.upload_in_progress", "message": "x"}}),
+                ),
+        )
+        .mount(&server)
+        .await;
+    let flags = Arc::new(Flags::default());
+    let (c, f) = (client.clone(), flags.clone());
+    let task = tokio::spawn(async move {
+        uploader(&c, &Fixed("a"))
+            .upload(
+                TransferId::new(),
+                &f,
+                "c1",
+                "r.pdf",
+                "x",
+                "cid",
+                &MemSource(BYTES.to_vec()),
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    flags.pause.store(true, Ordering::SeqCst);
+    let err = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+        .await
+        .expect("the pause didn't stop the wait")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Api { ref code, .. } if code == "transfer.paused"),
+        "{err:?}"
+    );
+    assert!(is_transient(&err), "a pause must leave the row pending");
+}
+
+/// A create waiting out a Retry-After is stopped too (Delete never waits behind it).
+#[tokio::test]
+async fn a_create_waiting_to_retry_stops_on_cancel() {
+    let server = MockServer::start().await;
+    let client = Arc::new(signed_in(&server).await);
+    Mock::given(method("POST"))
+        .and(path("/api/v1/channels/c1/files"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "60"))
+        .mount(&server)
+        .await;
+    let flags = Arc::new(Flags::default());
+    let (c, f) = (client.clone(), flags.clone());
+    let task = tokio::spawn(async move {
+        uploader(&c, &Fixed("a"))
+            .upload(
+                TransferId::new(),
+                &f,
+                "c1",
+                "r.pdf",
+                "x",
+                "cid",
+                &MemSource(BYTES.to_vec()),
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    flags.cancel.store(true, Ordering::SeqCst);
+    let err = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+        .await
+        .expect("the create kept waiting")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Api { ref code, .. } if code == "transfer.cancelled"),
+        "{err:?}"
+    );
+}
+
+/// Ids registered for a row share its flags: cancelling any one stops the row, and a lone
+/// transfer's end doesn't drop the registration.
+#[test]
+fn a_rows_ids_share_its_flags() {
+    let t = Transfers::new();
+    let (a, b) = (TransferId::new(), TransferId::new());
+    let row = Arc::new(Flags::default());
+    t.register(&[a, b], &row);
+    t.flag(b).cancel.store(true, Ordering::SeqCst);
+    assert!(
+        row.cancel.load(Ordering::SeqCst),
+        "the row didn't see the cancel"
+    );
+    t.forget(a);
+    assert!(
+        Arc::ptr_eq(&t.flag(a), &row),
+        "forget dropped a row's registration"
+    );
+    t.unregister(&[a, b]);
+    assert!(!Arc::ptr_eq(&t.flag(a), &row));
+}
+
+#[test]
+fn a_full_server_disk_is_worth_waiting_for() {
+    assert!(is_transient(&Error::Api {
+        code: "file.no_space".into(),
+        message: String::new()
+    }));
 }

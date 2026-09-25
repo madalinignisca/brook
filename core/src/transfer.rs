@@ -159,10 +159,36 @@ pub trait DownloadSink: Send {
     async fn abort(&mut self);
 }
 
-/// Per-client registry: event fan-out and cancel flags.
+/// What stops a transfer: the user's cancel, or a pause (the outbox's session moved on:
+/// the upload resumes later, the row stays pending).
+#[derive(Debug, Default)]
+pub(crate) struct Flags {
+    pub(crate) cancel: AtomicBool,
+    pub(crate) pause: AtomicBool,
+}
+
+impl Flags {
+    /// The error a set flag ends a transfer with (a cancel wins over a pause).
+    fn stopped(&self) -> Option<Error> {
+        if self.cancel.load(Ordering::SeqCst) {
+            Some(cancelled_error())
+        } else if self.pause.load(Ordering::SeqCst) {
+            Some(paused_error())
+        } else {
+            None
+        }
+    }
+}
+
+/// Per-client registry: event fan-out and the flags that stop transfers.
 pub(crate) struct Transfers {
     events: broadcast::Sender<TransferEvent>,
-    cancelled: Mutex<HashMap<TransferId, Arc<AtomicBool>>>,
+    /// Flags of a lone transfer (`upload_file`, downloads), dropped when it ends.
+    cancelled: Mutex<HashMap<TransferId, Arc<Flags>>>,
+    /// Flags shared by every transfer of one outbox row, registered before any of them
+    /// starts and removed with the row: cancelling any of its ids stops the row. A std
+    /// mutex, never held across an await, so `cancel_transfer` stays synchronous.
+    rows: Mutex<HashMap<TransferId, Arc<Flags>>>,
 }
 
 impl Transfers {
@@ -171,10 +197,20 @@ impl Transfers {
         Self {
             events,
             cancelled: Mutex::default(),
+            rows: Mutex::default(),
         }
     }
 
-    fn flag(&self, id: TransferId) -> Arc<AtomicBool> {
+    /// The flags that stop `id`: its row's, if registered, else its own.
+    pub(crate) fn flag(&self, id: TransferId) -> Arc<Flags> {
+        if let Some(row) = self
+            .rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+        {
+            return row.clone();
+        }
         self.cancelled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -183,11 +219,35 @@ impl Transfers {
             .clone()
     }
 
+    /// A lone transfer ended. A row's registrations stay until the row goes.
     fn forget(&self, id: TransferId) {
         self.cancelled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&id);
+    }
+
+    /// Stop every transfer of these ids through one set of flags.
+    #[cfg_attr(not(test), allow(dead_code))] // the outbox uses it from step 4
+    pub(crate) fn register(&self, ids: &[TransferId], flags: &Arc<Flags>) {
+        let mut rows = self
+            .rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for id in ids {
+            rows.insert(*id, flags.clone());
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // the outbox uses it from step 4
+    pub(crate) fn unregister(&self, ids: &[TransferId]) {
+        let mut rows = self
+            .rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for id in ids {
+            rows.remove(id);
+        }
     }
 
     fn emit(&self, id: TransferId, done: u64, total: u64, state: TransferState) {
@@ -208,6 +268,13 @@ const MAX_ATTEMPTS: u32 = 8;
 /// Progress events at most this often (plus the final one).
 const PROGRESS_EVERY: Duration = Duration::from_millis(150);
 const CHUNK: usize = 64 * 1024;
+
+fn paused_error() -> Error {
+    Error::Api {
+        code: "transfer.paused".into(),
+        message: "the transfer was paused".into(),
+    }
+}
 
 fn cancelled_error() -> Error {
     Error::Api {
@@ -245,6 +312,9 @@ pub fn is_transient(err: &Error) -> bool {
                     | "rate_limited"
                     | "auth.rate_limited"
                     | "transfer.network"
+                    | "transfer.paused"
+                    // The server's disk is at its floor: an admin frees space (Retry-After 600).
+                    | "file.no_space"
             ) || code.starts_with("http_5")
         }
         _ => false,
@@ -306,9 +376,11 @@ impl BrookClient {
         self.transfers.events.subscribe()
     }
 
-    /// Stop a transfer: it ends with [`TransferState::Cancelled`] at the next chunk.
+    /// Stop a transfer: it ends with [`TransferState::Cancelled`] at the next chunk. For a
+    /// file of a queued message, this cancels the message's sending (it fails, and Retry
+    /// resumes it).
     pub fn cancel_transfer(&self, id: TransferId) {
-        self.transfers.flag(id).store(true, Ordering::SeqCst);
+        self.transfers.flag(id).cancel.store(true, Ordering::SeqCst);
     }
 
     /// Upload an attachment to `channel_id`. `client_id` (a UUID the caller keeps for this
@@ -326,195 +398,27 @@ impl BrookClient {
         client_id: &str,
         source: &dyn UploadSource,
     ) -> Result<FileInfo> {
-        let cancel = self.transfers.flag(id);
+        let flags = self.transfers.flag(id);
         let total = source.len();
-        let result = self
-            .upload_inner(
-                id,
-                &cancel,
-                channel_id,
-                filename,
-                content_type,
-                client_id,
-                source,
-            )
-            .await;
+        let result = Uploader {
+            http: &self.http,
+            base: &self.base,
+            transfers: &self.transfers,
+            token: &CurrentToken(self),
+        }
+        .upload(
+            id,
+            &flags,
+            channel_id,
+            filename,
+            content_type,
+            client_id,
+            source,
+        )
+        .await;
         self.finish_events(id, &result, total, total);
         self.transfers.forget(id);
         result
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn upload_inner(
-        &self,
-        id: TransferId,
-        cancel: &Arc<AtomicBool>,
-        channel_id: &str,
-        filename: &str,
-        content_type: &str,
-        client_id: &str,
-        source: &dyn UploadSource,
-    ) -> Result<FileInfo> {
-        let total = source.len();
-        if source.is_empty() {
-            return Err(Error::Api {
-                code: "file.empty".into(),
-                message: "an empty file can't be sent".into(),
-            });
-        }
-        let created = self
-            .create_upload(channel_id, filename, content_type, total, client_id)
-            .await?;
-        if created.file.status == "committed" {
-            return Ok(created.file); // an earlier attempt of ours already finished
-        }
-        let mut url = self.base.join(created.upload_url.trim_start_matches('/'))?;
-        let mut attempt = 0u32;
-        let mut recreated = false;
-        loop {
-            if cancel.load(Ordering::SeqCst) {
-                return Err(cancelled_error());
-            }
-            attempt += 1;
-            self.transfers.emit(id, 0, total, TransferState::Running);
-            let reader = source.reader().await.map_err(|e| io_error(&e))?;
-            let body = progress_body(
-                reader,
-                total,
-                id,
-                cancel.clone(),
-                self.transfers.events.clone(),
-            );
-            let token = self.access_token().await?;
-            let sent = self
-                .http
-                .put(url.clone())
-                .bearer_auth(token)
-                .header(CONTENT_LENGTH, total)
-                .timeout(TRANSFER_TIMEOUT)
-                .body(body)
-                .send()
-                .await;
-            let wait = match sent {
-                Err(err) => {
-                    if cancel.load(Ordering::SeqCst) {
-                        return Err(cancelled_error());
-                    }
-                    if attempt >= MAX_ATTEMPTS {
-                        return Err(Error::Http(err));
-                    }
-                    backoff(attempt)
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        return resp.json().await.map_err(|_| Error::UnexpectedResponse);
-                    }
-                    if status == StatusCode::UNAUTHORIZED {
-                        return Err(Error::NotAuthenticated);
-                    }
-                    if status == StatusCode::NOT_FOUND && !recreated {
-                        // The pending row was swept: create it again, once, with the same
-                        // client_id (a committed answer means an earlier attempt finished).
-                        recreated = true;
-                        let again = self
-                            .create_upload(channel_id, filename, content_type, total, client_id)
-                            .await?;
-                        if again.file.status == "committed" {
-                            return Ok(again.file);
-                        }
-                        url = self.base.join(again.upload_url.trim_start_matches('/'))?;
-                        continue;
-                    }
-                    let after = retry_after(&resp);
-                    let (code, details) = error_code(resp).await;
-                    match (status.as_u16(), code.as_deref()) {
-                        (409, Some("file.already_committed")) => {
-                            let theirs: FileInfo = details
-                                .and_then(|d| serde_json::from_value(d).ok())
-                                .ok_or(Error::UnexpectedResponse)?;
-                            let ours = source.sha256().await.map_err(|e| io_error(&e))?;
-                            if theirs.sha256.as_deref() == Some(ours.as_str()) {
-                                return Ok(theirs); // our earlier attempt committed it
-                            }
-                            return Err(api(status, code));
-                        }
-                        // upload_expired: the part was swept (an hour idle) and the row is
-                        // pending again; a fresh PUT to the same URL starts it over.
-                        (408, _)
-                        | (409, Some("file.upload_in_progress" | "file.upload_expired"))
-                        | (429, _) => {
-                            if attempt >= MAX_ATTEMPTS {
-                                return Err(api(status, code));
-                            }
-                            after
-                        }
-                        (500..=599, _) if attempt < MAX_ATTEMPTS => backoff(attempt),
-                        _ => return Err(api(status, code)),
-                    }
-                }
-            };
-            self.transfers
-                .emit(id, 0, total, TransferState::Retrying { after_secs: wait });
-            wait_or_cancel(wait, cancel).await?;
-        }
-    }
-
-    async fn create_upload(
-        &self,
-        channel_id: &str,
-        filename: &str,
-        content_type: &str,
-        size: u64,
-        client_id: &str,
-    ) -> Result<FileCreated> {
-        let url = self
-            .base
-            .join(&format!("api/v1/channels/{channel_id}/files"))?;
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            let token = self.access_token().await?;
-            let sent = self
-                .http
-                .post(url.clone())
-                .bearer_auth(token)
-                .json(&json!({
-                    "filename": filename,
-                    "size": size,
-                    "content_type": content_type,
-                    "client_id": client_id,
-                }))
-                .send()
-                .await;
-            match sent {
-                Err(err) if attempt >= MAX_ATTEMPTS => return Err(Error::Http(err)),
-                Err(_) => tokio::time::sleep(Duration::from_secs(backoff(attempt))).await,
-                Ok(resp) if resp.status().is_success() => {
-                    return resp.json().await.map_err(|_| Error::UnexpectedResponse)
-                }
-                Ok(resp) if resp.status() == StatusCode::UNAUTHORIZED => {
-                    return Err(Error::NotAuthenticated)
-                }
-                Ok(resp)
-                    if (resp.status() == StatusCode::TOO_MANY_REQUESTS
-                        || resp.status().is_server_error())
-                        && attempt < MAX_ATTEMPTS =>
-                {
-                    let wait = if resp.status().is_server_error() {
-                        backoff(attempt)
-                    } else {
-                        retry_after(&resp)
-                    };
-                    tokio::time::sleep(Duration::from_secs(wait)).await;
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let (code, _) = error_code(resp).await;
-                    return Err(api(status, code));
-                }
-            }
-        }
     }
 
     /// Download attachment `file_id` into `sink`, resuming from what it already holds.
@@ -544,7 +448,7 @@ impl BrookClient {
     async fn download_inner(
         &self,
         id: TransferId,
-        cancel: &Arc<AtomicBool>,
+        cancel: &Arc<Flags>,
         file_id: &str,
         sha256: &str,
         size: u64,
@@ -555,7 +459,7 @@ impl BrookClient {
         let mut attempt = 0u32;
         let mut no_range = false;
         loop {
-            if cancel.load(Ordering::SeqCst) {
+            if cancel.cancel.load(Ordering::SeqCst) {
                 return Err(cancelled_error());
             }
             attempt += 1;
@@ -656,7 +560,7 @@ impl BrookClient {
                     size,
                     TransferState::Retrying { after_secs: wait },
                 );
-                wait_or_cancel(wait, cancel).await?;
+                wait_or_stop(wait, cancel).await?;
             }
         }
     }
@@ -664,7 +568,7 @@ impl BrookClient {
     async fn stream_into(
         &self,
         id: TransferId,
-        cancel: &AtomicBool,
+        cancel: &Flags,
         resp: reqwest::Response,
         sink: &mut dyn DownloadSink,
         size: u64,
@@ -672,7 +576,7 @@ impl BrookClient {
         let mut stream = resp.bytes_stream();
         let mut last = Instant::now();
         while let Some(chunk) = stream.next().await {
-            if cancel.load(Ordering::SeqCst) {
+            if cancel.cancel.load(Ordering::SeqCst) {
                 return Err(Streamed::Cancelled);
             }
             let chunk = chunk.map_err(|_| Streamed::Network)?;
@@ -706,6 +610,219 @@ impl BrookClient {
     }
 }
 
+/// Where an upload's bearer token comes from: the client's current session
+/// (`upload_file`), or the outbox's, only while its session epoch is current.
+#[async_trait::async_trait]
+pub(crate) trait TokenSource: Send + Sync {
+    async fn token(&self) -> Result<String>;
+}
+
+/// `upload_file`'s: whatever session is current.
+struct CurrentToken<'a>(&'a BrookClient);
+
+#[async_trait::async_trait]
+impl TokenSource for CurrentToken<'_> {
+    async fn token(&self) -> Result<String> {
+        self.0.access_token().await
+    }
+}
+
+/// The upload core, with the token from the caller: `upload_file` and the outbox share it.
+/// It emits progress and `Retrying`, never an end state (that's the caller's: a transient
+/// end is `Retrying` for the outbox, `Failed` for `upload_file`).
+pub(crate) struct Uploader<'a> {
+    pub(crate) http: &'a reqwest::Client,
+    pub(crate) base: &'a url::Url,
+    pub(crate) transfers: &'a Transfers,
+    pub(crate) token: &'a dyn TokenSource,
+}
+
+impl Uploader<'_> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn upload(
+        &self,
+        id: TransferId,
+        flags: &Arc<Flags>,
+        channel_id: &str,
+        filename: &str,
+        content_type: &str,
+        client_id: &str,
+        source: &dyn UploadSource,
+    ) -> Result<FileInfo> {
+        let total = source.len();
+        if source.is_empty() {
+            return Err(Error::Api {
+                code: "file.empty".into(),
+                message: "an empty file can't be sent".into(),
+            });
+        }
+        let created = self
+            .create_upload(flags, channel_id, filename, content_type, total, client_id)
+            .await?;
+        if created.file.status == "committed" {
+            return Ok(created.file); // an earlier attempt of ours already finished
+        }
+        let mut url = self.base.join(created.upload_url.trim_start_matches('/'))?;
+        let mut attempt = 0u32;
+        let mut recreated = false;
+        loop {
+            if let Some(stop) = flags.stopped() {
+                return Err(stop);
+            }
+            attempt += 1;
+            self.transfers.emit(id, 0, total, TransferState::Running);
+            let reader = source.reader().await.map_err(|e| io_error(&e))?;
+            let body = progress_body(
+                reader,
+                total,
+                id,
+                flags.clone(),
+                self.transfers.events.clone(),
+            );
+            let token = self.token.token().await?;
+            let sent = self
+                .http
+                .put(url.clone())
+                .bearer_auth(token)
+                .header(CONTENT_LENGTH, total)
+                .timeout(TRANSFER_TIMEOUT)
+                .body(body)
+                .send()
+                .await;
+            let wait = match sent {
+                Err(err) => {
+                    if let Some(stop) = flags.stopped() {
+                        return Err(stop);
+                    }
+                    if attempt >= MAX_ATTEMPTS {
+                        return Err(Error::Http(err));
+                    }
+                    backoff(attempt)
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return resp.json().await.map_err(|_| Error::UnexpectedResponse);
+                    }
+                    if status == StatusCode::UNAUTHORIZED {
+                        return Err(Error::NotAuthenticated);
+                    }
+                    if status == StatusCode::NOT_FOUND && !recreated {
+                        // The pending row was swept: create it again, once, with the same
+                        // client_id (a committed answer means an earlier attempt finished).
+                        recreated = true;
+                        let again = self
+                            .create_upload(
+                                flags,
+                                channel_id,
+                                filename,
+                                content_type,
+                                total,
+                                client_id,
+                            )
+                            .await?;
+                        if again.file.status == "committed" {
+                            return Ok(again.file);
+                        }
+                        url = self.base.join(again.upload_url.trim_start_matches('/'))?;
+                        continue;
+                    }
+                    let after = retry_after(&resp);
+                    let (code, details) = error_code(resp).await;
+                    match (status.as_u16(), code.as_deref()) {
+                        (409, Some("file.already_committed")) => {
+                            let theirs: FileInfo = details
+                                .and_then(|d| serde_json::from_value(d).ok())
+                                .ok_or(Error::UnexpectedResponse)?;
+                            let ours = source.sha256().await.map_err(|e| io_error(&e))?;
+                            if theirs.sha256.as_deref() == Some(ours.as_str()) {
+                                return Ok(theirs); // our earlier attempt committed it
+                            }
+                            return Err(api(status, code));
+                        }
+                        // upload_expired: the part was swept (an hour idle) and the row is
+                        // pending again; a fresh PUT to the same URL starts it over.
+                        (408, _)
+                        | (409, Some("file.upload_in_progress" | "file.upload_expired"))
+                        | (429, _) => {
+                            if attempt >= MAX_ATTEMPTS {
+                                return Err(api(status, code));
+                            }
+                            after
+                        }
+                        (500..=599, _) if attempt < MAX_ATTEMPTS => backoff(attempt),
+                        _ => return Err(api(status, code)),
+                    }
+                }
+            };
+            self.transfers
+                .emit(id, 0, total, TransferState::Retrying { after_secs: wait });
+            wait_or_stop(wait, flags).await?;
+        }
+    }
+
+    async fn create_upload(
+        &self,
+        flags: &Flags,
+        channel_id: &str,
+        filename: &str,
+        content_type: &str,
+        size: u64,
+        client_id: &str,
+    ) -> Result<FileCreated> {
+        let url = self
+            .base
+            .join(&format!("api/v1/channels/{channel_id}/files"))?;
+        let mut attempt = 0u32;
+        loop {
+            if let Some(stop) = flags.stopped() {
+                return Err(stop);
+            }
+            attempt += 1;
+            let token = self.token.token().await?;
+            let sent = self
+                .http
+                .post(url.clone())
+                .bearer_auth(token)
+                .json(&json!({
+                    "filename": filename,
+                    "size": size,
+                    "content_type": content_type,
+                    "client_id": client_id,
+                }))
+                .send()
+                .await;
+            match sent {
+                Err(err) if attempt >= MAX_ATTEMPTS => return Err(Error::Http(err)),
+                Err(_) => wait_or_stop(backoff(attempt), flags).await?,
+                Ok(resp) if resp.status().is_success() => {
+                    return resp.json().await.map_err(|_| Error::UnexpectedResponse)
+                }
+                Ok(resp) if resp.status() == StatusCode::UNAUTHORIZED => {
+                    return Err(Error::NotAuthenticated)
+                }
+                Ok(resp)
+                    if (resp.status() == StatusCode::TOO_MANY_REQUESTS
+                        || resp.status().is_server_error())
+                        && attempt < MAX_ATTEMPTS =>
+                {
+                    let wait = if resp.status().is_server_error() {
+                        backoff(attempt)
+                    } else {
+                        retry_after(&resp)
+                    };
+                    wait_or_stop(wait, flags).await?;
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let (code, _) = error_code(resp).await;
+                    return Err(api(status, code));
+                }
+            }
+        }
+    }
+}
+
 enum Streamed {
     Cancelled,
     Network,
@@ -724,11 +841,12 @@ fn content_range_starts_at(resp: &reqwest::Response, offset: u64) -> bool {
         == Some(offset)
 }
 
-async fn wait_or_cancel(secs: u64, cancel: &AtomicBool) -> Result<()> {
+/// Sleep `secs`, or end early with the stop (cancel, or pause: never one for the other).
+async fn wait_or_stop(secs: u64, flags: &Flags) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
-        if cancel.load(Ordering::SeqCst) {
-            return Err(cancelled_error());
+        if let Some(stop) = flags.stopped() {
+            return Err(stop);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -740,7 +858,7 @@ fn progress_body(
     reader: Box<dyn AsyncRead + Send + Unpin>,
     total: u64,
     id: TransferId,
-    cancel: Arc<AtomicBool>,
+    flags: Arc<Flags>,
     events: broadcast::Sender<TransferEvent>,
 ) -> reqwest::Body {
     struct State {
@@ -755,9 +873,9 @@ fn progress_body(
             last: Instant::now(),
         },
         move |mut st| {
-            let (cancel, events) = (cancel.clone(), events.clone());
+            let (flags, events) = (flags.clone(), events.clone());
             async move {
-                if cancel.load(Ordering::SeqCst) {
+                if flags.stopped().is_some() {
                     return Some((
                         Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")),
                         st,
