@@ -191,7 +191,7 @@ async fn only_a_completed_sync_extends_the_top() {
                 ..Batch::default()
             },
         )?;
-        coverage::settle_tops(t)
+        coverage::settle_tops(t, 40)
     })
     .await;
     assert_eq!(range(&db).await.unwrap().newest_id.as_deref(), Some("m8"));
@@ -231,7 +231,7 @@ async fn an_empty_covered_channel_gets_its_first_message() {
                 ..Batch::default()
             },
         )?;
-        coverage::settle_tops(t)
+        coverage::settle_tops(t, 3)
     })
     .await;
     let r = range(&db).await.unwrap();
@@ -240,4 +240,65 @@ async fn an_empty_covered_channel_gets_its_first_message() {
         (Some("m1"), Some("m1"))
     );
     assert!(r.complete_to_start);
+}
+
+/// Rows newer than the completed run's snapshot don't count: a live m9 may follow an m7 and
+/// m8 not delivered yet.
+#[tokio::test]
+async fn settling_counts_only_the_snapshot() {
+    let (db, _d) = open();
+    joined(&db).await;
+    tx(&db, |t| {
+        coverage::record_head(t, "c", &ids(&["m5", "m6"]), 2)
+    })
+    .await;
+    tx(&db, |t| {
+        apply(
+            t,
+            "me",
+            &Batch {
+                messages: vec![msg("m7", 45), msg("m9", 55), msg("m4", 0)],
+                ..Batch::default()
+            },
+        )?;
+        coverage::settle_tops(t, 50)
+    })
+    .await;
+    assert_eq!(range(&db).await.unwrap().newest_id.as_deref(), Some("m7"));
+}
+
+#[tokio::test]
+async fn an_empty_covered_channel_takes_all_its_new_messages() {
+    let (db, _d) = open();
+    joined(&db).await;
+    tx(&db, |t| coverage::record_head(t, "c", &[], 50)).await;
+    tx(&db, |t| {
+        apply(
+            t,
+            "me",
+            &Batch {
+                messages: vec![msg("m1", 3), msg("m2", 4), msg("m3", 5)],
+                ..Batch::default()
+            },
+        )?;
+        coverage::settle_tops(t, 5)
+    })
+    .await;
+    let r = range(&db).await.unwrap();
+    assert_eq!(
+        (r.oldest_id.as_deref(), r.newest_id.as_deref()),
+        (Some("m1"), Some("m3"))
+    );
+}
+
+#[tokio::test]
+async fn a_stale_empty_head_never_completes_a_range() {
+    let (db, _d) = open();
+    joined(&db).await;
+    tx(&db, |t| {
+        coverage::record_head(t, "c", &ids(&["m5", "m6"]), 2)
+    })
+    .await;
+    tx(&db, |t| coverage::record_head(t, "c", &[], 2)).await;
+    assert!(!range(&db).await.unwrap().complete_to_start);
 }

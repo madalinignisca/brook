@@ -559,3 +559,74 @@ async fn a_stale_channel_or_user_row_never_replaces_a_newer_one() {
         Some("Robert")
     );
 }
+
+/// A reply that lands after its target was deleted (a delayed page) quotes "(deleted)", not
+/// the words its older row carried; and an older history version of the target never
+/// rewrites a newer quote.
+#[tokio::test]
+async fn a_late_reply_never_quotes_deleted_words() {
+    let cache = joined().await;
+    cache
+        .apply(Batch {
+            tombstones: vec![("m1".into(), "c".into(), 30)],
+            ..Batch::default()
+        })
+        .await;
+    let mut reply = message("r1", "c", 20, "quoting");
+    reply.json["reply_to_id"] = json!("m1");
+    reply.json["reply_to"] = json!({ "id": "m1", "body": "hello" });
+    cache
+        .apply(Batch {
+            messages: vec![reply],
+            ..Batch::default()
+        })
+        .await;
+    assert_eq!(
+        cache
+            .one(
+                "SELECT json_extract(json, '$.reply_to.body') FROM messages WHERE id = ?1",
+                "r1"
+            )
+            .await
+            .as_deref(),
+        Some("(deleted)")
+    );
+}
+
+#[tokio::test]
+async fn an_old_history_version_never_rewrites_a_quote() {
+    let cache = cache();
+    cache
+        .apply(Batch {
+            channels: vec![channel("c", 10, "general")],
+            memberships: vec![member("c", ME, 10)],
+            ..Batch::default()
+        })
+        .await;
+    let mut reply = message("r1", "c", 20, "quoting");
+    reply.json["reply_to_id"] = json!("m1");
+    reply.json["reply_to"] = json!({ "id": "m1", "body": "edited" });
+    cache
+        .apply(Batch {
+            messages: vec![reply],
+            ..Batch::default()
+        })
+        .await;
+    // The target arrives from an older history page, with its original words.
+    cache
+        .apply(Batch {
+            messages: vec![message("m1", "c", 0, "original")],
+            ..Batch::default()
+        })
+        .await;
+    assert_eq!(
+        cache
+            .one(
+                "SELECT json_extract(json, '$.reply_to.body') FROM messages WHERE id = ?1",
+                "r1"
+            )
+            .await
+            .as_deref(),
+        Some("edited")
+    );
+}

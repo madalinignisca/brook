@@ -181,7 +181,22 @@ pub(crate) fn apply(tx: &Transaction<'_>, me: &str, batch: &Batch) -> rusqlite::
             applied.channels.insert(m.channel_id.clone());
             let deleted = !m.json.get("deleted_at").is_none_or(Value::is_null);
             let body = m.json.get("body").and_then(Value::as_str).unwrap_or("");
-            refresh_excerpts(tx, &m.id, if deleted { None } else { Some(body) })?;
+            // A history row (seq 0) may be older than a quote already cached: only a live or
+            // synced version (the newest), or a deletion, rewrites the quotes.
+            if deleted || m.seq > 0 {
+                refresh_excerpts(tx, &m.id, if deleted { None } else { Some(body) })?;
+            }
+            // A reply landing after its target was deleted takes "(deleted)" from the cached
+            // tombstone: deletion is final, whatever the reply's own (older) quote says.
+            tx.execute(
+                "UPDATE messages SET json = json_set(json, '$.reply_to.body', '(deleted)')
+                 WHERE id = ?1 AND json_type(json, '$.reply_to') = 'object'
+                   AND EXISTS (SELECT 1 FROM messages t
+                               WHERE t.id = json_extract(messages.json, '$.reply_to_id')
+                                 AND (json_extract(t.json, '$.deleted') = 1
+                                      OR json_type(t.json, '$.deleted_at') = 'text'))",
+                [&m.id],
+            )?;
         }
     }
     for (id, channel_id, seq) in &batch.tombstones {

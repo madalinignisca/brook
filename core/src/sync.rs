@@ -60,7 +60,10 @@ pub(crate) async fn run(db: &Db, me: &str, fetch: &dyn Fetch) -> Result<Synced, 
                 // With the rows, or not at all.
                 tx.execute("UPDATE meta SET cursor = ?1 WHERE id = 1", [&next])?;
                 if !more {
-                    crate::coverage::settle_tops(&tx)?; // caught up: ranges reach the top
+                    // Caught up: ranges reach the top of this snapshot. (`next` is ASCII
+                    // digits, checked by `parse_page`.)
+                    let cursor: i64 = next.parse().unwrap_or(0);
+                    crate::coverage::settle_tops(&tx, cursor)?;
                 }
                 tx.commit()?;
                 Ok(applied)

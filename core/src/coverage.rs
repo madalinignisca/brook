@@ -42,9 +42,11 @@ pub(crate) fn record_head(
         // An empty channel: covered, and complete.
         return tx
             .execute(
+                // A stale empty answer never marks a held, non-empty range complete.
                 "INSERT INTO coverage(channel_id, newest_id, oldest_id, complete_to_start)
                  VALUES (?1, NULL, NULL, 1)
-                 ON CONFLICT(channel_id) DO UPDATE SET complete_to_start = 1",
+                 ON CONFLICT(channel_id) DO UPDATE SET complete_to_start = 1
+                 WHERE coverage.newest_id IS NULL",
                 [channel_id],
             )
             .map(|_| ());
@@ -114,15 +116,22 @@ pub(crate) fn record_older(
 /// since the last sync is now cached, whatever order the pages delivered them in (they come
 /// by latest `seq`, not by creation). So each covered channel's range reaches its newest
 /// cached message. Live messages alone never move the top: one could have been missed.
-pub(crate) fn settle_tops(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+///
+/// Only rows the run's snapshot accounts for count: `0 < seq <= cursor`. A live message
+/// newer than the snapshot (it may follow one not yet delivered) and history rows (seq 0,
+/// possibly outside the range) don't.
+pub(crate) fn settle_tops(tx: &Transaction<'_>, cursor: i64) -> rusqlite::Result<()> {
     tx.execute(
         "UPDATE coverage SET
-             newest_id = (SELECT max(id) FROM messages WHERE channel_id = coverage.channel_id),
+             newest_id = (SELECT max(id) FROM messages
+                          WHERE channel_id = coverage.channel_id AND seq > 0 AND seq <= ?1),
              oldest_id = coalesce(oldest_id,
-                                  (SELECT max(id) FROM messages WHERE channel_id = coverage.channel_id))
-         WHERE (SELECT max(id) FROM messages WHERE channel_id = coverage.channel_id)
+                                  (SELECT min(id) FROM messages
+                                   WHERE channel_id = coverage.channel_id AND seq > 0 AND seq <= ?1))
+         WHERE (SELECT max(id) FROM messages
+                WHERE channel_id = coverage.channel_id AND seq > 0 AND seq <= ?1)
                > coalesce(newest_id, '')",
-        [],
+        [cursor],
     )?;
     Ok(())
 }

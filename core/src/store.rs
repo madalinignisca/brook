@@ -58,7 +58,10 @@ impl Kind {
     /// Bumped on any schema change: pre-1.0 there are no migrations (a cache rebuilds; an
     /// outbox is surfaced first).
     fn format(self) -> i64 {
-        1
+        match self {
+            Kind::Cache => 2, // 2: `removed.active` (the removal floor)
+            Kind::Outbox | Kind::Index => 1,
+        }
     }
 
     fn schema(self) -> &'static str {
