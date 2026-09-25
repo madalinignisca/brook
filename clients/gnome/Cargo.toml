@@ -10,7 +10,7 @@ repository.workspace = true
 brook-core = { path = "../../core", version = "0.0.0" }
 gtk = { package = "gtk4", version = "0.9", features = ["v4_10"] }
 adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "fs"] }
 pulldown-cmark = { version = "0.12", default-features = false }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
