@@ -85,6 +85,9 @@ pub enum ServerEvent {
     },
 }
 
+/// Minimum wait before reconnecting after a `rate_limited` close (the close carries no
+/// `Retry-After`).
+const RATE_LIMIT_BACKOFF_SECS: u64 = 5;
 /// How long the server has to answer a command, counted from when it was written.
 pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Client frames above this are refused locally (the server closes with 1009).
@@ -418,6 +421,9 @@ enum RunEnd {
     /// The server closed with 1008 (`auth_failed` | `auth_timeout` | `token_expired`): the
     /// credentials must be refreshed over REST before reconnecting.
     AuthRejected { ready: bool },
+    /// The server closed with 1008 `rate_limited`: this IP must wait. Refreshing would not help
+    /// (and only adds load); back off before reconnecting.
+    RateLimited { ready: bool },
     /// The signed-in identity changed; reconnect at once as the new one.
     SessionChanged,
 }
@@ -564,11 +570,12 @@ async fn run_once(
                     }
                     WsMessage::Close(frame) => {
                         let code = frame.as_ref().map(|f| u16::from(f.code));
-                        tracing::debug!(?code, "websocket closed by server");
-                        break Ok(if code == Some(1008) {
-                            RunEnd::AuthRejected { ready }
-                        } else {
-                            RunEnd::Closed { ready }
+                        let reason = frame.as_ref().map(|f| f.reason.to_string());
+                        tracing::debug!(?code, ?reason, "websocket closed by server");
+                        break Ok(match (code, reason.as_deref()) {
+                            (Some(1008), Some("rate_limited")) => RunEnd::RateLimited { ready },
+                            (Some(1008), _) => RunEnd::AuthRejected { ready },
+                            _ => RunEnd::Closed { ready },
                         });
                     }
                     _ => {} // ping/pong handled by tungstenite; ignore binary
@@ -822,13 +829,34 @@ pub(crate) async fn run(
             &mut generation,
         )
         .await;
+        let rate_limited = matches!(end, Ok(RunEnd::RateLimited { .. }));
         match end {
             Ok(RunEnd::SessionChanged) => continue, // reconnect at once as the new identity
-            Ok(RunEnd::AuthRejected { .. }) => {
+            Ok(RunEnd::AuthRejected { ready }) => {
+                if ready {
+                    backoff = 1; // it was a healthy session: earlier failures are history
+                }
                 // Refresh over REST before reconnecting; reconnecting with the same token
                 // would just be rejected again until the grace period is gone.
                 match refresher.refresh(rev).await {
-                    Ok(RefreshOutcome::Committed) | Ok(RefreshOutcome::Discarded) => continue,
+                    // A session that was up (its token expired): reconnect at once. One that
+                    // never became ready backs off: repeated rejections must not loop.
+                    Ok(RefreshOutcome::Committed) | Ok(RefreshOutcome::Discarded) if ready => {
+                        backoff = 1;
+                        continue;
+                    }
+                    Ok(RefreshOutcome::Committed) | Ok(RefreshOutcome::Discarded) => {
+                        tracing::warn!("auth rejected before ready; backing off")
+                    }
+                    // Wait as asked, then reconnect (and refresh again if still needed); a
+                    // new sign-in or new credentials end the wait at once.
+                    Ok(RefreshOutcome::RateLimited(wait)) => {
+                        tokio::select! {
+                            _ = tokio::time::sleep(wait) => {}
+                            _ = revisions.changed() => {}
+                        }
+                        continue;
+                    }
                     // Rejected: the session is cleared (LoggedOut published); the loop idles
                     // until the next login. NoSession: same.
                     Ok(RefreshOutcome::Rejected) | Ok(RefreshOutcome::NoSession) => continue,
@@ -836,6 +864,14 @@ pub(crate) async fn run(
                         tracing::warn!(%err, "refresh after auth close failed; backing off")
                     }
                 }
+            }
+            // Wait before reconnecting, at least RATE_LIMIT_BACKOFF, growing on repeats.
+            Ok(RunEnd::RateLimited { ready }) => {
+                tracing::warn!("websocket rate limited; backing off");
+                if ready {
+                    backoff = 1; // a healthy session in between starts the wait over
+                }
+                backoff = backoff.max(RATE_LIMIT_BACKOFF_SECS);
             }
             // Reset backoff only after a usable (ready) session, so an immediate close
             // backs off instead of spin-reconnecting.
@@ -845,7 +881,11 @@ pub(crate) async fn run(
             }
             Err(err) => tracing::warn!(%err, "websocket connection error; will reconnect"),
         }
+        // A rate-limited IP may wait up to 60 s (the close carries no hint); anything else keeps
+        // the ordinary 30 s cap, even right after a rate-limited wait.
+        let cap = if rate_limited { 60 } else { 30 };
+        backoff = backoff.min(cap);
         tokio::time::sleep(Duration::from_secs(backoff)).await;
-        backoff = (backoff * 2).min(30);
+        backoff = (backoff * 2).min(cap);
     }
 }

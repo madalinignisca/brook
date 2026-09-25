@@ -21,7 +21,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 
 /// After a transient refresh failure (or while logged out), poll again this soon
 /// — short enough to recover well before the access token expires.
-const REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+pub(crate) const REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Shared client: networking + observable auth state.
 ///
@@ -32,7 +32,7 @@ pub struct BrookClient {
     state_tx: Arc<watch::Sender<AuthState>>,
     state_rx: watch::Receiver<AuthState>,
     /// The active session (set on login), used to authorize chat calls + the WS.
-    session: SessionStore,
+    pub(crate) session: SessionStore,
     /// Realtime events fan-out to UI subscribers.
     events_tx: broadcast::Sender<ServerEvent>,
     /// Guards against starting the realtime task more than once.
@@ -534,16 +534,24 @@ async fn refresh_loop(refresher: Refresher) {
     loop {
         tokio::time::sleep(delay).await;
         let seen = refresher.session.snapshot().await.0;
-        delay = match refresher.refresh(seen).await {
-            Ok(RefreshOutcome::Committed) => REFRESH_INTERVAL,
-            // Nothing to do, a newer login won, or the token was rejected (session cleared):
-            // poll for the next login.
-            Ok(_) => REFRESH_RETRY_INTERVAL,
-            Err(err) => {
-                tracing::warn!(%err, "token refresh failed; retrying soon");
-                REFRESH_RETRY_INTERVAL // transient (network/5xx) → retry before expiry
-            }
-        };
+        let result = refresher.refresh(seen).await;
+        if let Err(err) = &result {
+            tracing::warn!(%err, "token refresh failed; retrying soon");
+        }
+        delay = next_refresh_delay(&result);
+    }
+}
+
+/// When the refresh loop tries again after `result`.
+pub(crate) fn next_refresh_delay(result: &Result<RefreshOutcome>) -> Duration {
+    match result {
+        Ok(RefreshOutcome::Committed) => REFRESH_INTERVAL,
+        // The server said when to come back; never sooner than the usual retry.
+        Ok(RefreshOutcome::RateLimited(wait)) => (*wait).max(REFRESH_RETRY_INTERVAL),
+        // Nothing to do, a newer login won, or the token was rejected (session cleared):
+        // poll for the next login.
+        Ok(_) => REFRESH_RETRY_INTERVAL,
+        Err(_) => REFRESH_RETRY_INTERVAL, // transient (network/5xx) → retry before expiry
     }
 }
 
@@ -574,6 +582,24 @@ impl Refresher {
     }
 }
 
+fn retry_after(resp: &reqwest::Response) -> Duration {
+    parse_retry_after(
+        resp.headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
+/// `Retry-After` in whole seconds (the server's form), within 1 s (a 0 would make a zero-wait
+/// loop) and an hour (the server's harshest tier; a larger value is not believed). Missing or
+/// unreadable (an HTTP date, an overflow): the usual retry interval.
+pub(crate) fn parse_retry_after(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|secs| Duration::from_secs(secs.clamp(1, 3600)))
+        .unwrap_or(REFRESH_RETRY_INTERVAL)
+}
+
 /// What one refresh attempt did.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RefreshOutcome {
@@ -585,6 +611,8 @@ pub(crate) enum RefreshOutcome {
     NoSession,
     /// The server rejected the refresh token; the session was cleared if it still held it.
     Rejected,
+    /// 429: the server asked to wait this long. Not a verdict on the token: the session stays.
+    RateLimited(Duration),
 }
 
 /// Rotate access+refresh tokens once via `/auth/refresh`. Both the success and the
@@ -598,12 +626,35 @@ pub(crate) async fn refresh_once(
     let Some(refresh_token) = session.with_session(|s| s.refresh_token.clone()).await else {
         return Ok(RefreshOutcome::NoSession);
     };
+    // Still inside a 429's wait: do not ask again, whoever the caller is.
+    let not_before = *session.refresh_not_before.lock().unwrap();
+    if let Some(until) = not_before {
+        let now = tokio::time::Instant::now();
+        if now < until {
+            return Ok(RefreshOutcome::RateLimited(until - now));
+        }
+    }
     let url = base.join("api/v1/auth/refresh")?;
     let resp = http
         .post(url)
         .json(&json!({ "refresh_token": refresh_token }))
         .send()
         .await?;
+    // 429 is "come back later", not "this token is bad": clearing the session here would
+    // sign the user out for being rate limited.
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let wait = retry_after(&resp);
+        // Only for the session that asked: a 429 arriving after a new sign-in must not make
+        // the new session wait.
+        if session
+            .with_session(|s| s.refresh_token == refresh_token)
+            .await
+            == Some(true)
+        {
+            *session.refresh_not_before.lock().unwrap() = Some(tokio::time::Instant::now() + wait);
+        }
+        return Ok(RefreshOutcome::RateLimited(wait));
+    }
     if resp.status().is_client_error() {
         session.clear_if_holds(&refresh_token).await;
         return Ok(RefreshOutcome::Rejected);
