@@ -280,9 +280,10 @@ class MessageCreate(BaseModel):
 
 
 class MessageEdit(BaseModel):
-    """Edit a message's body."""
+    """Edit a message's body. May be empty only on a message with files (the route
+    checks: the same "text or files" rule as a send)."""
 
-    body: str = Field(min_length=1, max_length=4000)
+    body: str = Field(default="", max_length=4000)
 
 
 class ReplyExcerpt(BaseModel):

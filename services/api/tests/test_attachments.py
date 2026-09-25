@@ -178,6 +178,18 @@ async def test_a_message_may_be_files_only_but_not_empty(client: httpx.AsyncClie
     captioned = await client.post(url, json={"body": "hi"}, headers=ha)
     assert captioned.status_code == 201
 
+    # Edits follow the same rule: a caption can be added to, and removed from, a file
+    # message; a text-only message can't be edited down to nothing.
+    fid = only_files.json()["id"]
+    added = await client.patch(f"{url}/{fid}", json={"body": "a caption"}, headers=ha)
+    assert added.status_code == 200 and added.json()["body"] == "a caption"
+    removed = await client.patch(f"{url}/{fid}", json={"body": ""}, headers=ha)
+    assert removed.status_code == 200 and removed.json()["body"] == ""
+    blanked = await client.patch(
+        f"{url}/{captioned.json()['id']}", json={"body": "   "}, headers=ha
+    )
+    assert blanked.status_code == 422
+
 
 async def test_attach_rules(client: httpx.AsyncClient) -> None:
     ha, hb, ch = await _setup(client)
