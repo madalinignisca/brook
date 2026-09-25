@@ -57,6 +57,7 @@ mod sync_tests;
 pub mod test_support;
 #[cfg(test)]
 mod totp_tests;
+mod transfer;
 mod ws;
 
 pub use account::{Me, SecondFactor, TotpEnrollment, UserSummary};
@@ -73,4 +74,8 @@ pub use error::{Error, Result};
 pub use keyslot::{InMemoryKeySlot, KeySlot, KeySlotError, KeyStore};
 pub use session::{Session, User};
 pub use state::AuthState;
+pub use transfer::{
+    is_transient, DownloadSink, FileInfo, FileSink, FileSource, SinkError, TransferEvent,
+    TransferId, TransferState, UploadSource,
+};
 pub use ws::ServerEvent;
