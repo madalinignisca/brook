@@ -48,6 +48,44 @@ async def _reuse_events() -> int:
     return await _events("refresh_token_reuse")
 
 
+async def _rotated_ago(raw: str, ago: timedelta) -> None:
+    async with db.get_sessionmaker()() as session:
+        await session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.token_hash == hash_token(raw))
+            .values(rotated_at=utcnow() - ago)
+        )
+        await session.commit()
+
+
+async def test_a_lost_reply_then_a_long_offline_stretch_stays_signed_in(
+    client: httpx.AsyncClient,
+) -> None:
+    # The reply carrying S was lost as the train entered a tunnel; the phone comes
+    # back the next morning and retries with T.
+    await _alice(client)
+    t = await _login(client)
+    assert (await _refresh(client, t)).status_code == 200  # S, never received
+    await _rotated_ago(t, timedelta(hours=23))
+    again = await _refresh(client, t)
+    assert again.status_code == 200
+    assert (await _refresh(client, again.json()["refresh_token"])).status_code == 200
+    assert await _reuse_events() == 0
+
+
+async def test_a_successor_retired_by_the_grace_is_reuse(client: httpx.AsyncClient) -> None:
+    # A thief replays T and takes the grace; the device then presents S, which the
+    # grace retired. That must end the family for both, not start a second grace
+    # (which would let the two retire each other's token for a whole day, uncaught).
+    await _alice(client)
+    t = await _login(client)
+    s = (await _refresh(client, t)).json()["refresh_token"]
+    u = (await _refresh(client, t)).json()["refresh_token"]  # the thief's grace
+    assert (await _refresh(client, s)).status_code == 401  # the device: reuse
+    assert (await _refresh(client, u)).status_code == 401  # the thief's chain is dead
+    assert await _reuse_events() == 1
+
+
 async def test_a_crash_replay_within_grace_keeps_the_device_signed_in(
     client: httpx.AsyncClient,
 ) -> None:
@@ -81,13 +119,7 @@ async def test_reuse_after_the_grace_window_revokes_the_family(client: httpx.Asy
     await _alice(client)
     t = await _login(client)
     s = (await _refresh(client, t)).json()["refresh_token"]
-    async with db.get_sessionmaker()() as session:  # the rotation was a minute ago
-        await session.execute(
-            update(RefreshToken)
-            .where(RefreshToken.token_hash == hash_token(t))
-            .values(rotated_at=utcnow() - timedelta(seconds=60))
-        )
-        await session.commit()
+    await _rotated_ago(t, timedelta(hours=25))  # past the 24 h window
 
     assert (await _refresh(client, t)).status_code == 401
     assert (await _refresh(client, s)).status_code == 401  # the unused successor too

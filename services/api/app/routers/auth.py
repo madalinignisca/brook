@@ -250,8 +250,8 @@ async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) ->
     # someone else that committed while we waited would otherwise look like a lost
     # two-tab race (a silent, uncounted 401), and the device would sign itself out
     # while the other holder kept the chain. Read now, the device sees its token
-    # retired by that replay and takes the grace path, reclaiming the chain; the
-    # other holder's next use is then reuse, and the family ends.
+    # retired by that grace: a reuse verdict, so the family ends for both holders,
+    # recorded.
     await session.refresh(token)
     expired = ensure_utc(token.expires_at) <= utcnow()
     if expired and not token.revoked:
@@ -278,22 +278,21 @@ async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) ->
         # Revoked by logout, sign-out or a password change, not rotated: no chain was
         # continued with it, so it's no evidence of theft. Just refused.
         raise bad
-    # A rotated token, presented again. Either a client died between our rotation and
-    # saving the new token (it replays the old one on relaunch), or someone else holds
-    # a copy. Grace: soon after the rotation, while the successor is still unused,
-    # hand out a fresh one in its place; the successor is retired (CAS again, so two
-    # replays can't both win).
-    #
-    # Not "once" per token: the successor retired here keeps rotated_at, so it is
-    # grace-eligible for 30 s too. That is deliberate: it is how the device reclaims
-    # its chain after someone else's replay (above). Every grace use is recorded, and
-    # any use outside the window, or of a used successor, ends the family.
+    # A rotated token, presented again. Either a client died (or lost our reply to a
+    # dropped connection, then stayed offline) before saving the new token, and now
+    # replays the old one; or someone else holds a copy. Grace: within the window,
+    # while the successor is still unused, hand out a fresh one in its place. The
+    # successor is retired with NO successor of its own (CAS again, so two replays
+    # can't both win): whoever presents it later gets a reuse verdict. That makes the
+    # grace once per rotation. Were the retired successor grace-eligible too, a thief
+    # and the device could keep retiring each other's token for as long as the window
+    # (24 h), both signed in, never caught.
     grace = timedelta(seconds=settings.refresh_reuse_grace_seconds)
     if (
         not expired
         and replaced_by is not None
         and now - ensure_utc(rotated_at) <= grace
-        and await _cas_rotate(session, replaced_by, successor, now)
+        and await _cas_rotate(session, replaced_by, None, now)
     ):
         record_event(session, user.id, "refresh_token_grace")
         return await _issue_tokens(
@@ -317,9 +316,10 @@ async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) ->
 
 
 async def _cas_rotate(
-    session: AsyncSession, token_id: uuid.UUID, successor: uuid.UUID, now: datetime
+    session: AsyncSession, token_id: uuid.UUID, successor: uuid.UUID | None, now: datetime
 ) -> bool:
-    """Retire a live token as rotated into ``successor``; False if it wasn't live."""
+    """Retire a live token as rotated into ``successor`` (None: retired by the grace,
+    so presenting it later is reuse); False if it wasn't live."""
     result = cast(
         "CursorResult[Any]",
         await session.execute(
