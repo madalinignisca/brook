@@ -1,171 +1,294 @@
 # Offline cache, outbox and file cache in core (MVP+ #61, #63, #65, #67)
 
-> Status: **draft for review** · 2026-09-25 · Dial: **Heavy** (local data at rest, data
-> deletion). Core's side of MVP+. It builds on:
+> Status: **draft, review round 1 applied** · 2026-09-25 · Dial: **Heavy** (local data at rest,
+> data deletion). Core's side of MVP+. It builds on:
 > - the server's sync and idempotent-send spec (#71);
-> - the attachments spec (#73, local files);
-> - the local data encryption spec (#46: the per-device key and the `KeySlot` trait).
+> - the attachments spec (#73, local files, `409 file.already_committed` with `FileOut`);
+> - the local data encryption spec (#46: `KeySlot`, missing vs unreadable, the owner's §8).
 >
-> The apps' UI for it is #62 (macOS and GTK), specified with them.
+> The apps' UI is #62.
 
 ## 1. Goal
 An app opens with the last-known channels, members and messages, **with or without a
-connection**, and catches up exactly on what it missed when the connection returns. Done means,
-observably:
-- Offline launch shows the channel list and recent history, as last seen, and says it's offline.
+connection**, and catches up exactly on what it missed. Done means, observably:
+- Offline launch shows the channel list and the cached history, and says it's offline.
 - Online again, edits, deletes, reactions, membership changes and new messages that happened
-  meanwhile appear without re-downloading history (`/sync` from a stored cursor).
-- A message written offline is shown as pending, sent in order when the connection returns,
-  never duplicated (`client_id`), and marked failed with a retry if the server refuses it.
-- A file opened once opens again offline. A file marked **Keep available offline** is downloaded
-  and kept until unmarked.
-- Nothing readable is left on disk. The cache is encrypted with the device key (#46), and wiped
-  by a cursor reset (`410 sync.reset`), a lost key, a different user signing in, or a sign-out with
-  "Remove this device's data" ticked (the owner's §8 decision).
+  meanwhile appear without re-downloading history.
+- A message written offline is pending until sent. It goes in the order written, never
+  duplicated, is never silently dropped, and is marked failed with Retry and Delete if refused.
+- A file opened once opens again offline. **Keep available offline** keeps a file until unmarked.
+- **At rest, only ciphertext:** the stores, their journals, download partials, upload snapshots
+  and leftovers of a crash.
+  - Stated exceptions: a file the user **Saves**, written where they chose; and the copy
+    **Open** hands to another app (§6.4), deleted at quit, at the next launch and by startup
+    reconciliation.
+- Wipes follow #46 §8 and §7 below, with true crypto-erase: each store's and each file's key is
+  destroyed, not just its ciphertext.
 
 ## 2. Not doing
-- Full-text search in the cache (later; a server feature first).
-- Eviction of messages (history is kept once fetched; attachments are evicted, §6).
-- Migrations: pre-1.0 the store has a format version, and a different version is deleted and
-  rebuilt (owner rule).
-- Sharing one store between apps or users: one store per (server, user) on a device.
+- Search in the cache; eviction of messages (history is kept once fetched; files are evicted,
+  §6.5); migrations (pre-1.0: a different format version rebuilds the **cache**, and the outbox
+  is handled per §5.6).
 
-## 3. Storage
-- **SQLite through `rusqlite` with SQLCipher** (the `bundled-sqlcipher` feature: CommonCrypto on
-  Apple, libcrypto on Linux). The whole file is encrypted, with a 256-bit key; nothing is
-  readable, not even ids, times or counts. **Decision worth arguing:** per-row AES-GCM over plain
-  SQLite would avoid the libcrypto dependency on Linux, but leaves the metadata (which channels,
-  how many messages, when) readable in the file, and indexes would only work on cleartext
-  columns.
-- **Key:** `HKDF-SHA256(device_key, info = "brook.cache.v1" | server origin | user id)`, where
-  the device key comes from #46's `KeySlot`. So each (server, user) store has its own key, and
-  crypto-erase of one store is deleting its file (its key can be re-derived, but the ciphertext
-  is gone).
-- **Location:** the app's data directory (the Mac's container
-  `Application Support/Brook/cache/`, Linux `$XDG_DATA_HOME/brook/cache/`), with one file
-  `<hash(origin|user id)>.db`, never the handle or server name in cleartext. The Mac excludes the
-  directory from backups; the key is ThisDeviceOnly anyway.
-- **Schema v1:**
-  - `meta(format, cursor, synced_at)`;
+## 3. Storage and keys
+- **Two stores per (server, user),** each a SQLite database through `rusqlite` with
+  **SQLCipher** (`bundled-sqlcipher`: CommonCrypto on Apple, libcrypto on Linux):
+  - **cache.db:** synced state, rebuildable at any time;
+  - **outbox.db:** unsent messages and attachment snapshots, never rebuilt away (§5.6).
+  Settings on open:
+  - `PRAGMA cipher_memory_security = ON`;
+  - `PRAGMA temp_store = MEMORY`, so no plaintext spill files;
+  - `journal_mode = WAL`. SQLCipher encrypts WAL pages; `-shm` holds only the index. Both are
+    verified by test.
+  **Decision worth arguing:** SQLCipher, over per-row AES-GCM on plain SQLite. Per-row
+  encryption avoids libcrypto on Linux but leaves ids, times and counts readable, and indexes
+  work only on cleartext columns.
+- **Keys are random and independently destroyable** (true crypto-erase):
+  - each store has its own random 256-bit key, held in the `KeySlot` under a named slot
+    (`cache:<store id>`, `outbox:<store id>`; #46 §3a takes a slot name);
+  - each cached file has its own random key, stored in its row in the encrypted cache.db;
+  - destroying a store's slot makes that store, its WAL and any snapshot of it undecryptable,
+    and deleting a file's row does the same for the file.
+  Nothing is derived from a device key that could re-derive it later.
+- **Location:**
+  - the app's data directory (the Mac container's `Application Support/Brook/stores/`;
+    `$XDG_DATA_HOME/brook/stores/` on Linux);
+  - one directory per store id, where the id is a random UUID mapped from (origin, user id) in
+    a small encrypted index, so no handle or server name appears in paths;
+  - the Mac excludes the directory from backups.
+- **cache.db schema v1:**
+  - `meta(format, cursor, generation)`;
   - `channels(id PK, seq, json)`;
-  - `memberships(channel_id, user_id, seq, json, PK(channel_id, user_id))`;
+  - `removed(channel_id PK, seq)`;
+  - `memberships(channel_id, user_id, seq, json)`;
   - `users(id PK, seq, json)`;
-  - `messages(id PK, channel_id, seq, created_at, json)`, indexed by `(channel_id, created_at)`;
-  - `outbox(client_id PK, channel_id, body, attachments json, state, attempts, created_at, error)`;
-  - `files(file_id PK, sha256, size, path, pinned, last_opened)`.
-  Rows keep the server's JSON (`json` column) plus the columns needed to query and order.
+  - `messages(id PK, channel_id, seq, created_at, json)`;
+  - `coverage(channel_id PK, newest_id, oldest_id, complete_to_start bool)`;
+  - `files(file_id PK, sha256, size, key, state, pinned, last_opened)`;
+  - `deletions(path PK)`, the deletion journal (§7.3).
+- **outbox.db schema v1:**
+  - `meta(format)`;
+  - `outbox(ordinal INTEGER PK AUTOINCREMENT, client_id UNIQUE, channel_id, body, state, attempts, error, created_at)`;
+  - `outbox_files(client_id, file_client_id UNIQUE, snapshot_path, sha256, size, content_type, filename, file_id, key)`.
 
-## 4. Sync engine
-- **Every row applied is `seq`-guarded:** an incoming row replaces the stored one only if its
-  `seq` is higher. That holds for `/sync` pages and live WebSocket events alike, so a page
-  computed just before a live event can't overwrite it (#71 §3).
-- **The cursor advances only from `/sync`**, stored in the same transaction as the page's rows.
-  A crash mid-page leaves the old cursor, and the rows re-apply idempotently.
-- **When:**
-  - after every (re)connect, `/sync` pages until `more` is false;
-  - then live events keep the cache current;
-  - a periodic `/sync` every few minutes catches anything a dropped event missed.
-- **First sync** (`since=0`, or after `410 sync.reset` → wipe first) is **state only** (#71):
-  channels, members and users. Messages come by paging:
-  - opening a channel pages `before=` from the newest cached message, or from the top;
-  - `/sync` then keeps it current.
-- **A channel new to the cache** (added to, re-added, or a DM someone opened): its full member
-  list comes in the same page (#71). Its history is paged on open, as above.
-- **`removed_channels`:** the channel, its messages, memberships, outbox entries and cached
-  files are deleted in one transaction (the files after the commit).
-- **Tombstones:** a deleted message keeps its row with an empty body and no attachments; its
-  cached files are deleted.
+## 4. Sync
+### 4.1 Ordering rules (one function applies every row, whatever its source)
+- **Per-row guard:** an incoming row replaces the stored one only if its `seq` is higher. This
+  applies to `/sync` pages, live WebSocket events, history pages and send acknowledgements
+  (§5.3).
+- **Removal fence:**
+  - `removed_channels` writes `removed(channel_id, seq)` and deletes the channel's rows (§7.3
+    for its files);
+  - after that, a row for that channel applies only if its `seq` is higher than the removal's;
+  - a rejoin is a membership row with a higher `seq`: it clears the fence;
+  - a removal older than the stored channel or membership `seq` is ignored.
+  So a stale page can't remove a rejoined channel, and a late event or history page can't
+  resurrect a removed one.
+- **History pages carry no `seq`.** A page applies only if the channel is still present and
+  un-fenced when it arrives. Its rows go in with `seq = 0`, so any real row wins.
+- **The cursor advances only from `/sync`,** in the same transaction as that page's rows. A
+  crash mid-page leaves the old cursor, and replay is idempotent.
+### 4.2 When
+- After every (re)connect: `/sync` until `more` is false. Then live events.
+- A periodic `/sync` every few minutes catches anything a dropped event missed.
+- The **first sync** (`since=0`, or after `410 sync.reset` → the cache is rebuilt, §7) is
+  **state only** (#71): channels, members and users.
+### 4.3 History coverage
+- Per channel, `coverage` records the contiguous range the cache holds:
+  - `newest_id` / `oldest_id`;
+  - `complete_to_start`, for when a page came back short.
+- **Opening a channel with no coverage:**
+  1. fetch the newest page (no `before`);
+  2. merge it (a live message that arrived earlier is inside or after it);
+  3. set the range.
+- Scrolling back pages `before = oldest_id` and extends the range down.
+- `/sync` and live messages extend the top. A message older than `newest_id` inside the range is
+  an edit or late delivery, and the guard handles it.
+- A message outside the range (e.g. arrived before the first head fetch) is kept, but never
+  treated as proof of coverage.
 
 ## 5. Outbox (#63)
-- A send creates the outbox row first (`client_id`: a UUIDv4 made at compose time), shown at
-  once as **pending**. Then, when connected, core POSTs it with that `client_id`.
-- **200 or 201:** the stored message replaces the pending one (matched by the echoed
-  `client_id`), and the outbox row is deleted in the same transaction.
-- **Order:** one sender per channel, oldest first; a failed row blocks later rows of its channel
-  only (so a conversation never reorders).
-- **Retries:** network errors retry with backoff and never mark the row failed. A 4xx refusal
-  (403 removed or archived, 422 attachments) marks it **failed**, with the server's code and
-  Retry and Delete actions. A 409 `conflict` (a `client_id` reused elsewhere) is a bug and is
-  marked failed.
-- **Attachments in an outbox entry:** each file is created with its own `client_id` (#73), PUT
-  from the local copy, then attached. A PUT that loses to its own earlier attempt gets `409
-  file.already_committed`; the stored `sha256` is compared with the local bytes, and equal
-  means done.
+1. **Queued means durable.** A send commits the outbox row, and for attachments their
+   encrypted snapshots, **before** it is shown as pending:
+   - `client_id` is a UUIDv4;
+   - `ordinal` is a monotonic enqueue order, not a timestamp;
+   - each attachment is copied into the outbox store as an encrypted snapshot, with its own
+     `file_client_id` and `sha256`, so later edits, moves or deletion of the source file
+     change nothing.
+2. **Sender:** one per channel, by `ordinal`. A failed row blocks later rows of that channel
+   only. On startup, rows left `sending` by a crash go back to `pending` and are re-sent with
+   the same `client_id` (idempotent).
+3. **Acknowledgement (200 or 201):**
+   - the returned message is applied through §4.1's guard, so a later edit or tombstone
+     already in the cache wins;
+   - in the same transaction, the outbox row whose `client_id` equals the **echoed**
+     `client_id` is deleted;
+   - an echo that doesn't match is a bug: the row is marked failed and never auto-resent.
+4. **Attachments:**
+   - create each file with its `file_client_id` (#73);
+   - PUT the decrypted snapshot, streamed;
+   - `409 file.already_committed`: compare `details.sha256` with the snapshot's. Equal means
+     done; different means failed.
+   - then send the message referencing the `file_id`s. Snapshots are deleted after the ack.
+5. **Retries, Delete and Retry:**
+   - network errors retry with backoff and never fail the row;
+   - a 4xx marks it **failed** with the server's code;
+   - Retry and Delete are serialised with the sender;
+   - Delete of a row in flight waits for that attempt. If it was accepted, the message
+     exists and the UI shows it as sent (a send can't be revoked).
+6. **Rebuilds never drop sends.**
+   - A cache rebuild (`410`, a cache format change) leaves outbox.db untouched.
+   - An outbox format change, a missing key, sign-out with "Remove this device's data", or a
+     different user signing in **would** delete unsent messages. The app says so first ("2
+     messages haven't been sent and will be deleted"), and for sign-out the user can cancel.
+7. **Online-only** (the key is unreadable, or the store can't be written): sends go straight
+   to the server as today, are **not** shown as queued, and the app says offline sending is
+   unavailable.
 
-## 6. File cache (#65, #67)
-- **Downloads:** `GET /files/{id}/content` streamed to a temporary file inside the cache
-  directory, resumed with `Range` + `If-Range: <sha256 ETag>` after an interruption, and checked
-  against `FileOut.sha256` before it is moved into place. Files are stored encrypted
-  (AES-256-GCM in 1 MiB chunks, key derived like the store's with `info = "brook.files.v1"`),
-  because SQLCipher covers only the database.
-- **Uploads:** streamed from the user's file with the upload's own per-request timeout (the
-  client-wide 30 s doesn't apply to transfers); a 401 before the PUT starts refreshes, then
-  re-opens the file.
-- **Open / Save:** the app gets a decrypted copy only when the user opens or saves:
-  - **Save** writes to the location the user chose;
-  - **Open** writes a temporary copy in the app's temp directory, deleted when the app quits or
-    on the next launch;
-  - core never writes plaintext anywhere else.
-- **Pinned** (`Keep available offline`): downloaded right away and never evicted. **Unpinned**:
-  an LRU cap (default 1 GB per store) evicts least-recently-opened files.
+## 6. Files (#65, #67)
+### 6.1 Format
+- Each file has its own random 256-bit key, stored in its cache.db row.
+- It's encrypted in 1 MiB chunks: AES-256-GCM with nonce = the chunk index (96-bit big-endian
+  counter), which is unique because the key is unique to the file. AAD = `file_id | index |
+  last-chunk flag`.
+- A file is complete only when its last chunk (flagged) is written and the plaintext `sha256`
+  matches `FileOut.sha256`.
+- A rewrite never reuses a key: a changed download starts a new key and a new file.
+### 6.2 Downloads
+- Written **already encrypted**: each received MiB is sealed and appended. A partial is
+  ciphertext, recorded in `files.state = partial` with its last complete chunk.
+- Resume uses `Range` from that chunk's end, with `If-Range: <sha256>`. If the server's file
+  changed, the partial is discarded and a new key is used.
+### 6.3 Uploads
+- Uploads stream from the outbox snapshot (decrypted in memory, chunk by chunk), with a
+  per-transfer timeout. The client-wide 30 s doesn't apply.
+- A 401 before the PUT starts refreshes, then re-opens the snapshot.
+### 6.4 Open and Save
+- **Save** decrypts straight into the user's chosen location.
+- **Open** decrypts into the app's temporary directory, because another app needs a file. That
+  copy is deleted:
+  - when the app quits;
+  - at the next launch;
+  - by startup reconciliation (§7.3).
+  This is the one plaintext copy the app makes on its own, and §1 states it. A later option
+  could skip Open for sensitive files.
+### 6.5 Pinning and eviction
+- Pinned files are downloaded at once and never evicted. Others are evicted by LRU above a cap
+  (default 1 GB per store).
 
 ## 7. Wipes
+### 7.1 Triggers
 | Trigger | Effect |
 |---|---|
-| `410 sync.reset` | the store for that (server, user) is deleted and rebuilt from a state-only sync |
-| Format version differs | the same |
-| The device key is **missing** (`KeySlot` says absent) | every store is deleted, a new key is made |
-| The key is **unreadable** (locked device, entitlement fault) | nothing is deleted; the app runs online-only until it can read the key (#46 §3.4) |
-| A different user signs in on this server | that (server, user) is a different store; the other store is kept unless the user chose to remove it at sign-out |
-| Sign-out with "Remove this device's data" ticked | that store and its files are deleted, after the logout call |
-| A channel is removed | §4 |
+| `410 sync.reset`, or a cache format change | cache.db rebuilt: new cache key, old slot destroyed; outbox kept |
+| Outbox format change | unsent messages surfaced (§5.6), then outbox.db rebuilt |
+| A store's key is **missing** | that store rebuilt (cache) or surfaced then rebuilt (outbox) |
+| A key is **unreadable** | nothing deleted; online-only (§5.7) until it can be read |
+| **A different user signs in** (owner, #46 §8) | the other users' stores on this device are wiped, after surfacing their unsent messages |
+| Sign-out with "Remove this device's data" (ticked by default) | this user's stores and files wiped, **locally and first**, whether or not the logout request succeeds |
+| A channel is removed | §4.1 |
+### 7.2 Quiesce, then erase
+A wipe or channel removal:
+1. bumps the store's `generation` (in memory and in `meta`);
+2. cancels in-flight downloads, uploads, history requests and the sender for that store or
+   channel, and waits for them to stop;
+3. closes database handles;
+4. destroys the key slot (crypto-erase) **before** deleting files.
+Every operation checks the generation it started under before writing, so nothing recreates
+wiped data.
+### 7.3 Crash-safe deletion
+- File deletions are journalled in `deletions` inside the transaction that removes their rows.
+  The unlink happens after the commit, and the journal entry is cleared after the unlink.
+- **Startup reconciliation**, before anything else:
+  - finish journalled deletions;
+  - delete files in the store directory with no row;
+  - delete download partials of files no longer wanted;
+  - delete upload snapshots with no outbox row;
+  - delete everything in the Open temp directory.
 
-## 8. Core API (FFI-exposed)
-- `cached_channels()`, `cached_messages(channel, before?, limit)`, `pending_messages(channel)`.
-- A `CacheEvent` stream: which channel changed. The UI re-reads; it doesn't get rows pushed.
-- `send_message(channel, body, attachments)` → `client_id`: always through the outbox.
-- `retry_send(client_id)` and `delete_pending(client_id)`.
-- `open_file(file_id)` → a temp path; `save_file(file_id, destination)`.
-- `pin_file` and `unpin_file`; `cache_state()` (online or offline, syncing, last synced).
-- `logout(remove_data: bool)`, which extends today's `logout()`.
+## 8. Core API (FFI)
+- **Reading:**
+  - `cached_channels()`;
+  - `cached_messages(channel, before?, limit)`, which pages from the network and extends
+    coverage when needed;
+  - `pending_messages(channel)`;
+  - `cache_state()`: online/offline, syncing, last synced, and whether offline storage is
+    available.
+- **Change notices:** a `CacheEvent` stream (which channel changed); the UI re-reads.
+- **Sending:** `send_message(channel, body, attachment_paths)` → `client_id`, durable before it
+  returns (§5.1); `retry_send` and `delete_pending`.
+- **Files:** `open_file(file_id)` → temp path; `save_file(file_id, destination)`; `pin_file` and
+  `unpin_file`.
+- **Sign-out:** `logout(remove_data: bool)`, and `unsent_count()` for the sign-out warning.
 
 ## 9. Tests (each seen failing under a named mutation)
-- **Store:**
-  - the file is unreadable without its key (no SQLite header, no plaintext strings);
-  - the wrong key fails to open;
-  - a format change deletes and rebuilds.
-- **`seq` guard:**
+- **At rest:**
+  - no plaintext bytes (a sentinel string in a message or file) anywhere under the store
+    directory, including `-wal`, `-shm` and partials: after writes, after a simulated crash
+    mid-download, and mid-transaction;
+  - a store opens only with its own key;
+  - destroying a slot makes a copied store file unreadable.
+- **File format:**
+  - nonce and AAD per chunk;
+  - a truncated or reordered chunk fails;
+  - resume after a crash continues from the last complete chunk without reusing a nonce under
+    a different plaintext;
+  - a changed server file discards the partial and gets a new key.
+- **Ordering:**
   - a stale page after a live event keeps the live row;
-  - replaying a page is idempotent;
-  - a crash between rows and cursor (simulated) re-applies.
-- **Sync against the TestServer:**
-  - offline start serves the cache;
-  - reconnect pages to `more=false`;
-  - `410` wipes and rebuilds;
-  - `removed_channels` deletes messages, outbox and files;
-  - a new channel brings its members;
-  - opening a channel pages history.
+  - a stale removal after a rejoin keeps the channel;
+  - a late event or history page after a removal doesn't resurrect it;
+  - an ack after a tombstone keeps the tombstone;
+  - page replay after a crash is idempotent.
+- **Coverage:**
+  - a live message into an empty channel, then open: the head page is fetched and there's no
+    gap;
+  - a short page sets `complete_to_start`.
 - **Outbox:**
-  - pending → sent, matched by `client_id`;
+  - durable before pending (kill between the two);
   - a lost response and a resend make one message;
-  - order within a channel;
-  - a refusal marks failed and blocks only that channel;
-  - an attachment whose PUT loses to itself is resolved by `sha256`.
-- **Files:**
-  - a resumed download with `If-Range`;
-  - a sha256 mismatch is discarded;
-  - encrypted at rest (no plaintext bytes in the cache directory);
-  - the temp copy is deleted;
-  - LRU eviction never removes a pinned file.
-- **Wipes:** each row of §7, including "unreadable never deletes".
-- **Live (itest):** go offline (block the server), read the cache, queue a message, come back,
-  and the message is sent exactly once; an edit made elsewhere while offline shows up after
-  reconnect.
+  - equal timestamps keep enqueue order;
+  - a crash while `sending` resumes with the same `client_id`;
+  - Delete during an in-flight accepted send shows it as sent;
+  - an echo mismatch fails the row;
+  - a source file edited after enqueue uploads the snapshot's bytes;
+  - `already_committed` with an equal and with a different `sha256`;
+  - `410` keeps the outbox;
+  - sign-out surfaces the unsent count.
+- **Wipes:**
+  - each row of §7.1;
+  - an unreadable key never deletes;
+  - a wipe during a download leaves nothing behind;
+  - a crash between commit and unlink is finished at the next startup;
+  - sign-out deletion completes with the server unreachable.
+- **Live (itest):**
+  - offline read, a queued message, reconnect, and exactly one send;
+  - an edit made elsewhere while offline appears after reconnect.
 
 ## 10. Where this fails
 | Failure | Response |
 |---|---|
-| SQLCipher adds libcrypto to the Linux build | Flatpak's runtime ships it; the tarball's INSTALL lists it (Linux client's call) |
-| A very long offline period | `/sync` pages; if the server pruned tombstones past the cursor, `410` rebuilds |
-| The same account on two devices edits while both are offline | the server decides by commit order; each cache follows `seq` |
-| Disk full | writes fail, the app stays online-only and says so; the store is never half-written (SQLite transactions) |
+| SQLCipher adds libcrypto on Linux | the Flatpak runtime ships it; the tarball's INSTALL lists it (Linux client's call) |
+| A long offline period past tombstone retention | `410` rebuilds the cache; the outbox is kept |
+| The same account edits on two offline devices | the server orders by commit; each cache follows `seq` |
+| Disk full | the transaction fails and nothing is half-written; the app goes online-only and says so |
+| Another app keeps the Open copy open after the app quits | it's deleted at the next launch or reconciliation |
+
+## 11. Review log
+**Round 1 — Codex + Vibe (Heavy).** All accepted. Changes:
+- Stores and files get random, independently destroyable keys (real crypto-erase, not
+  deletion of re-derivable ciphertext), and the `KeySlot` gains named slots (#46 §3a).
+- Encryption holds before the first disk write: encrypted download partials, memory-only
+  SQLite temp storage, WAL/shm checked, and the Open copy stated as the one exception, with
+  launch-time cleanup.
+- A chunk format with a per-file key and counter nonces, and authenticated position and last
+  chunk.
+- A separate outbox store that survives rebuilds, with its loss surfaced and never silent;
+  encrypted attachment snapshots at enqueue; a monotonic ordinal; crash recovery of `sending`
+  rows; Delete and Retry serialised; an echo mismatch fails the row.
+- A removal fence; history pages guarded; history coverage tracking; acks through the `seq`
+  guard.
+- Quiesce by store generation before a wipe; a deletion journal and startup reconciliation;
+  sign-out's local deletion independent of the network.
+- The account-switch rule follows #46 §8.
+- The test list covers the interleavings.
