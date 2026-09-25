@@ -320,6 +320,10 @@ class File(Base):
     message_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("messages.id", ondelete="SET NULL"), default=None, index=True
     )
+    # Where it sits in its message's attachment list, as the sender ordered them (set
+    # on attach). Reads order by it, so every route shows the files in the same order
+    # as the send's own answer, not in upload order.
+    position: Mapped[int | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 

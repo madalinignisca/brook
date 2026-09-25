@@ -524,10 +524,22 @@ async def send_message(
         if stored is not None:
             return _resend_answer(stored, channel_id, response)
 
-    # Quote-reply: the target must be a live message in this same channel.
+    # Quote-reply: the target must be a live message in this same channel. Its own code,
+    # not 404: a 404 here read as "channel not found", and a queued reply to a message
+    # deleted meanwhile failed as if the whole channel were gone. With this code the
+    # client can offer to send it without the quote. One answer for missing, deleted
+    # and other-channel targets, so it tells nobody whether an id exists elsewhere.
     reply: ReplyExcerpt | None = None
     if body.reply_to_id is not None:
-        quoted = await _get_message(session, channel_id, body.reply_to_id)
+        quoted = await session.get(Message, body.reply_to_id)
+        if quoted is None or quoted.channel_id != channel_id or quoted.deleted_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "message.reply_target_gone",
+                    "message": "The message being replied to no longer exists",
+                },
+            )
         reply = _excerpt(quoted, await session.get(User, quoted.author_id))
 
     message = Message(
@@ -583,7 +595,7 @@ async def _attachments_for(
         await session.scalars(
             select(File)
             .where(File.message_id.in_(message_ids), File.status == "committed")
-            .order_by(File.created_at)
+            .order_by(File.position, File.created_at)
         )
     ).all()
     out: dict[uuid.UUID, list[FileOut]] = {}
@@ -612,7 +624,7 @@ async def _attach_files(
     )
     by_id = {row.id: row for row in rows}
     attached: list[FileOut] = []
-    for file_id in file_ids:
+    for position, file_id in enumerate(file_ids):
         row = by_id.get(file_id)
         if (
             row is None
@@ -623,6 +635,7 @@ async def _attach_files(
         ):
             raise _unattachable()
         row.message_id = message.id
+        row.position = position
         attached.append(storage.file_out(row))
     return attached
 
