@@ -3,6 +3,9 @@
 //! QR rendering, the manual-entry key, input clean-up and wording live here as plain
 //! functions with tests; the dialogs wire them to core's calls (PROTOCOL.md §1.2).
 
+// Temporary, until the dialogs land on top of core's TOTP API (same PR, never merged alone).
+#![allow(dead_code)]
+
 use brook_core::Error;
 use gtk::{gdk, glib};
 
