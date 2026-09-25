@@ -38,6 +38,10 @@ mod state;
 mod store;
 #[cfg(test)]
 mod store_tests;
+#[allow(dead_code)] // wired into the client with the read API (C3)
+mod sync;
+#[cfg(test)]
+mod sync_tests;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;

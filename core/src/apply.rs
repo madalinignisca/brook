@@ -57,6 +57,9 @@ pub(crate) struct Batch {
     pub(crate) removed: Vec<(String, i64)>,
     /// Other members' departures: `(channel id, user id, seq)`.
     pub(crate) left: Vec<(String, String, i64)>,
+    /// Live deletes, which carry only ids: `(message id, channel id, seq)`. They patch the
+    /// stored row into a tombstone (the author and time stay), never replace it.
+    pub(crate) tombstones: Vec<(String, String, i64)>,
 }
 
 /// What `apply` changed, for change notices (`CacheEvent`).
@@ -199,6 +202,23 @@ pub(crate) fn apply(tx: &Transaction<'_>, me: &str, batch: &Batch) -> rusqlite::
         if changed > 0 {
             applied.channels.insert(m.channel_id.clone());
         }
+    }
+    for (id, channel_id, seq) in &batch.tombstones {
+        if !channel_present(tx, channel_id)? || fenced_at_or_above(tx, channel_id, *seq)? {
+            continue;
+        }
+        let changed = tx.execute(
+            "UPDATE messages SET seq = ?2,
+                 json = json_set(json, '$.body', '', '$.seq', ?2,
+                                 '$.reactions', json('[]'), '$.attachments', json('[]'),
+                                 '$.deleted_at', coalesce(json_extract(json, '$.deleted_at'), 'deleted'))
+             WHERE id = ?1 AND seq < ?2",
+            params![id, seq],
+        )?;
+        if changed > 0 {
+            applied.channels.insert(channel_id.clone());
+        }
+        // Not cached: nothing to show, and the next /sync brings the server's tombstone.
     }
     Ok(applied)
 }
