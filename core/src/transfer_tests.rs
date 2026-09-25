@@ -552,3 +552,83 @@ fn transient_errors_are_the_retryable_ones() {
     }
     assert!(!is_transient(&Error::NotAuthenticated));
 }
+
+#[tokio::test]
+async fn an_expired_upload_is_put_again() {
+    let server = MockServer::start().await;
+    let client = signed_in(&server).await;
+    mount_create(&server, 201, "pending").await;
+    let expired = ResponseTemplate::new(409)
+        .insert_header("retry-after", "1")
+        .set_body_json(json!({"error": {"code": "file.upload_expired", "message": "x"}}));
+    let ok = ResponseTemplate::new(200).set_body_json(file_json("committed", Some(&sha(BYTES))));
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/files/f1/content"))
+        .respond_with(Sequence(Mutex::new(vec![expired, ok])))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let file = client
+        .upload_file(
+            TransferId::new(),
+            "c1",
+            "r.pdf",
+            "application/pdf",
+            "cid",
+            &MemSource(BYTES.to_vec()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(file.status, "committed");
+    assert!(is_transient(&Error::Api {
+        code: "file.upload_expired".into(),
+        message: String::new()
+    }));
+}
+
+#[tokio::test]
+async fn a_swept_pending_row_is_created_again_once() {
+    let server = MockServer::start().await;
+    let client = signed_in(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/channels/c1/files"))
+        .respond_with(Sequence(Mutex::new(vec![
+            ResponseTemplate::new(201).set_body_json(json!({
+                "file": file_json("pending", None), "upload_url": "/api/v1/files/f1/content"
+            })),
+            ResponseTemplate::new(201).set_body_json(json!({
+                "file": file_json("pending", None), "upload_url": "/api/v1/files/f2/content"
+            })),
+        ])))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/files/f1/content"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(json!({"error": {"code": "not_found", "message": "x"}})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/files/f2/content"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(file_json("committed", Some(&sha(BYTES)))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let file = client
+        .upload_file(
+            TransferId::new(),
+            "c1",
+            "r.pdf",
+            "application/pdf",
+            "cid",
+            &MemSource(BYTES.to_vec()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(file.status, "committed");
+}

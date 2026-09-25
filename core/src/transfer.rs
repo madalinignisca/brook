@@ -241,6 +241,7 @@ pub fn is_transient(err: &Error) -> bool {
                 code.as_str(),
                 "file.upload_stalled"
                     | "file.upload_in_progress"
+                    | "file.upload_expired"
                     | "rate_limited"
                     | "auth.rate_limited"
                     | "transfer.network"
@@ -367,8 +368,9 @@ impl BrookClient {
         if created.file.status == "committed" {
             return Ok(created.file); // an earlier attempt of ours already finished
         }
-        let url = self.base.join(created.upload_url.trim_start_matches('/'))?;
+        let mut url = self.base.join(created.upload_url.trim_start_matches('/'))?;
         let mut attempt = 0u32;
+        let mut recreated = false;
         loop {
             if cancel.load(Ordering::SeqCst) {
                 return Err(cancelled_error());
@@ -411,6 +413,19 @@ impl BrookClient {
                     if status == StatusCode::UNAUTHORIZED {
                         return Err(Error::NotAuthenticated);
                     }
+                    if status == StatusCode::NOT_FOUND && !recreated {
+                        // The pending row was swept: create it again, once, with the same
+                        // client_id (a committed answer means an earlier attempt finished).
+                        recreated = true;
+                        let again = self
+                            .create_upload(channel_id, filename, content_type, total, client_id)
+                            .await?;
+                        if again.file.status == "committed" {
+                            return Ok(again.file);
+                        }
+                        url = self.base.join(again.upload_url.trim_start_matches('/'))?;
+                        continue;
+                    }
                     let after = retry_after(&resp);
                     let (code, details) = error_code(resp).await;
                     match (status.as_u16(), code.as_deref()) {
@@ -424,7 +439,11 @@ impl BrookClient {
                             }
                             return Err(api(status, code));
                         }
-                        (408, _) | (409, Some("file.upload_in_progress")) | (429, _) => {
+                        // upload_expired: the part was swept (an hour idle) and the row is
+                        // pending again; a fresh PUT to the same URL starts it over.
+                        (408, _)
+                        | (409, Some("file.upload_in_progress" | "file.upload_expired"))
+                        | (429, _) => {
                             if attempt >= MAX_ATTEMPTS {
                                 return Err(api(status, code));
                             }
