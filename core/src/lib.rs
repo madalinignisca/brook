@@ -30,6 +30,10 @@ mod session_store;
 #[cfg(test)]
 mod signout_tests;
 mod state;
+#[allow(dead_code)] // wired up by C2-C5; C1 lands the layer and its tests
+mod store;
+#[cfg(test)]
+mod store_tests;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;

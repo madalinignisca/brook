@@ -24,7 +24,7 @@ jobs:
         # vp8, opus, H.264 decode).
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev \
+          sudo apt-get install -y libssl-dev libgtk-4-dev libadwaita-1-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice
