@@ -525,9 +525,12 @@ impl Outbox {
         self.db
             .call(move |c| {
                 c.execute(
+                    // Without the quote only for a row refused *because* of the quote: another
+                    // failure (an echo mismatch: the server did store it) keeps it as it was.
                     "UPDATE outbox SET state = 'pending', error = NULL,
                          reply_to_id = CASE WHEN ?2 THEN NULL ELSE reply_to_id END
-                     WHERE client_id = ?1 AND state = 'failed'",
+                     WHERE client_id = ?1 AND state = 'failed'
+                       AND (NOT ?2 OR error = 'message.reply_target_gone')",
                     rusqlite::params![cid, drop_reply],
                 )
             })

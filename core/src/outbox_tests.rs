@@ -1118,3 +1118,21 @@ async fn retry_without_reply_leaves_a_pending_reply_alone() {
     let p = s.outbox.pending("c1").await.unwrap();
     assert_eq!(p[0].reply_to_id.as_deref(), Some(Q));
 }
+
+/// Only a reply refused for its quote is changed: another failure (here an echo mismatch,
+/// where the server did store the message) is left for Retry or Delete.
+#[tokio::test]
+async fn retry_without_reply_only_acts_on_a_gone_quote() {
+    let s = setup().await;
+    s.server.script([Answer::WrongEcho]);
+    let id = s.outbox.enqueue("c1", "yes", reply(Q), None).await.unwrap();
+    failed(&s).await;
+    s.outbox.retry_without_reply(&id).await.unwrap();
+    let p = s.outbox.pending("c1").await.unwrap();
+    assert!(
+        matches!(p[0].state, PendingState::Failed { .. }),
+        "{:?}",
+        p[0].state
+    );
+    assert_eq!(p[0].reply_to_id.as_deref(), Some(Q));
+}
