@@ -35,8 +35,10 @@ Owner decisions of 2026-09-25 are marked **(owner)**.
 
 ## 3. Wire (under `/api/v1`)
 
-**`POST /channels/{id}/files {filename, size, content_type}`**, for members of a
-non-archived channel:
+**`POST /channels/{id}/files {filename, size, content_type, client_id?}`**, for members of
+a non-archived channel. `client_id` (UUID) makes it idempotent like messages (sync spec
+§4): a retry after a lost response returns the same `file_id`, with a fresh policy if the
+file is still pending, instead of a second pending row counted against the quota.
 ```
 201 {file_id, upload: {url, fields}, expires_in: 600}
 ```
@@ -73,7 +75,15 @@ files).
 The presigned GET carries the response overrides of §5.
 
 **`DELETE /files/{id}`**, by the uploader or a channel owner: removes the row and the
-object. A file attached to a message leaves its message showing "file removed".
+object. A file attached to a message leaves its message showing "file removed", and the
+delete **re-stamps that message's `seq`** (sync spec §2), or every offline cache would
+keep the file.
+
+**Uploads don't resume:** a failed upload is started again (a new policy, the same
+`client_id`). **Downloads do:** presigned GET supports `Range`, verified on RustFS 1.0.0
+(`206`, correct `Content-Range`, with the forced disposition and type still applied). After
+the URL expires mid-download, the client calls `GET /files/{id}` again and resumes with
+`Range` on the new URL.
 
 **`FileOut`**:
 ```
@@ -116,6 +126,10 @@ Caddy adds headers on `/brook-files/*` that no signature can remove:
 - `X-Content-Type-Options: nosniff`;
 - `Content-Security-Policy: sandbox; default-src 'none'`;
 - `Cross-Origin-Resource-Policy: same-origin`.
+
+**Signed URLs stay out of logs.** Caddy has no access log on this site today. If one is
+ever added, it must drop the query string on `/brook-files/*`, because a signed URL is a
+bearer capability for its lifetime. The api never logs `download_url` or the policy.
 
 **Clients** save to Downloads (with the platform save dialog), append ` (1)` on a name
 clash, never auto-open, and treat `content_type` as untrusted for anything but choosing a
