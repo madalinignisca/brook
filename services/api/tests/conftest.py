@@ -15,7 +15,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app import config, db
+from app import config, db, ratelimit
 from app.main import create_app
 from app.models import Base
 
@@ -28,6 +28,14 @@ def _test_secret_keyring(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every test boots with a valid (throwaway) secret keyring (§5.7 startup guard)."""
     monkeypatch.setenv("BROOK_SECRET_KEYS", TEST_SECRET_KEYS)
     monkeypatch.setenv("BROOK_SECRET_PRIMARY_KEY_ID", "1")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_limiter() -> Iterator[None]:
+    """Each test starts with an empty auth limiter (all test clients share one IP)."""
+    ratelimit.get_limiter.cache_clear()
+    yield
+    ratelimit.get_limiter.cache_clear()
 
 
 @pytest.fixture
