@@ -1,5 +1,7 @@
 //! Core configuration.
 
+use std::time::Duration;
+
 use url::Url;
 
 use crate::{Error, Result};
@@ -9,6 +11,9 @@ use crate::{Error, Result};
 pub struct CoreConfig {
     /// Base URL of the Brook server (e.g. `https://chat.example.com`).
     pub base_url: Url,
+    /// Upper bound on any one REST request. Holders of the refresh lock (refresh, login,
+    /// password change) make REST requests, so an unbounded request could block sign-in forever.
+    pub(crate) request_timeout: Duration,
 }
 
 impl CoreConfig {
@@ -42,7 +47,17 @@ impl CoreConfig {
             _ => return Err(Error::InsecureServerUrl),
         }
 
-        Ok(Self { base_url: url })
+        Ok(Self {
+            base_url: url,
+            request_timeout: Duration::from_secs(30),
+        })
+    }
+
+    /// Override the REST request bound (tests use a short one).
+    #[doc(hidden)]
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 }
 
