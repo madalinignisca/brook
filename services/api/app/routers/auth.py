@@ -435,9 +435,7 @@ async def change_password(
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(
     body: RefreshIn,
-    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
-    limiter: Annotated[AuthLimiter, Depends(get_limiter)],
 ) -> None:
     """End this device's login: every token of the presented token's family (idempotent).
 
@@ -449,8 +447,10 @@ async def logout(
     other devices are other families. Revoked here, not rotated: presenting one of
     these later is a plain 401, not a reuse. Always 204: an unknown token says nothing.
     """
-    # Unauthenticated and now a family-wide write: throttled like /refresh.
-    enforce(limiter, client_ip(request.client.host if request.client else None))
+    # Deliberately not rate-limited. The limiter's per-IP budget is shared with failed
+    # logins, so a household behind one NAT address, throttled after a few mistyped
+    # passwords, would get 429 on sign-out and keep its tokens live. There's nothing
+    # to guess here (a token is 384 random bits), and each call is one indexed UPDATE.
     token = await session.scalar(
         select(RefreshToken).where(RefreshToken.token_hash == hash_token(body.refresh_token))
     )

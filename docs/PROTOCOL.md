@@ -63,7 +63,7 @@
   events (`refresh_token_grace`, `refresh_token_reuse`). A reuse event can also come
   from an old token replayed after "sign out everywhere"; the family was already
   revoked then; likewise after a logout (recorded as `logout`). `POST /auth/logout`
-  is rate-limited per IP like `/auth/refresh`.
+  is never rate-limited, so a sign-out always reaches the server.
 - **Logout** ends the presented token's whole family, so a refresh that was in flight
   when the user signed out can't leave its new token live. Send whichever token you
   hold; the user's other devices are untouched.

@@ -218,3 +218,20 @@ async def test_logout_with_an_unknown_token_is_a_quiet_204(client: httpx.AsyncCl
     r = await client.post(f"{AUTH}/logout", json={"refresh_token": "not-a-token"})
     assert r.status_code == 204
     assert (await _refresh(client, live)).status_code == 200
+
+
+async def test_logout_works_from_a_throttled_address(client: httpx.AsyncClient) -> None:
+    # A household behind one address, throttled after mistyped passwords, can still
+    # sign out: a 429 there would leave the device's tokens live.
+    from app import ratelimit
+
+    await _alice(client)
+    t = await _login(client)
+    lim = ratelimit.get_limiter()
+    for _ in range(lim.config.backoff_after + 2):
+        await client.post(f"{AUTH}/login", json={"handle": "alice", "password": "nope-x"})
+    assert (
+        await client.post(f"{AUTH}/login", json={"handle": "alice", "password": PW})
+    ).status_code == 429
+    assert (await client.post(f"{AUTH}/logout", json={"refresh_token": t})).status_code == 204
+    assert await _events("logout") == 1
