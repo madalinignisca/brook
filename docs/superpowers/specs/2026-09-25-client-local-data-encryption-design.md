@@ -63,6 +63,17 @@ In Rust, the `oo7` crate speaks both the Secret portal (inside Flatpak) and the
 Secret Service (outside), so core can own one Linux backend. Apple needs a small
 Swift keychain shim behind a core callback.
 
+Two traps (Linux review):
+- **Select the backend explicitly; never let it fall back.** Inside Flatpak,
+  `oo7::Keyring::new()` silently falls back to the D-Bus Secret Service when the
+  portal is missing, which would quietly downgrade "isolated" to "readable by
+  other apps". Core picks the portal backend under Flatpak and treats "no portal"
+  as §5. The Flatpak manifest must also **not** grant
+  `--talk-name=org.freedesktop.secrets`, so a fallback is impossible even by bug.
+- **One construction, not two.** Use oo7's portal-backed file keyring *or* the
+  HKDF-from-portal-secret construction above, not both. Core chooses when it
+  implements (proposed: oo7's file keyring, so no hand-rolled key derivation).
+
 **Flatpak is the Linux configuration that actually delivers app isolation.** The
 native tarball (#38) works, but the settings screen says "Protected from: backups,
 file browsing. Not from: other apps you run."
@@ -72,6 +83,12 @@ file browsing. Not from: other apps you run."
 The Secret portal and the Secret Service both need a backend running
 (gnome-keyring, KWallet, or the standalone `oo7-daemon`). On a bare sway session
 often none runs, and a Flatpak's portal then has nothing to hand out.
+
+Detection probes **capability**, not the desktop name (`XDG_CURRENT_DESKTOP` says
+nothing about what runs): try the portal (under Flatpak) or the Secret Service.
+A service that is present but **locked** counts as unavailable: on sway,
+gnome-keyring started by D-Bus activation can pop its own unlock prompt, which is
+exactly the prompt-driven store the owner does not want to rely on.
 
 Brook detects this on first run and **asks once, never silently degrading**:
 
