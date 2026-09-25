@@ -8,6 +8,10 @@ name: release-gtk
 #
 # `dry_run` builds and packages everything and uploads the tarballs as workflow
 # artifacts, but creates no tag and no release.
+#
+# Every action is pinned to a commit SHA (the version is in the comment): this
+# workflow produces the binaries people download, so a moved upstream tag must not
+# be able to change what gets published. Bump deliberately.
 
 on:
   workflow_dispatch:
@@ -49,7 +53,7 @@ jobs:
       tag: ${{ steps.v.outputs.tag }}
       sha: ${{ steps.v.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
@@ -58,8 +62,15 @@ jobs:
         env:
           CHANNEL: ${{ inputs.channel }}
           VERSION: ${{ inputs.version }}
+          REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
+          # A stable release comes from main or an existing tag, never from an
+          # unmerged branch or a loose commit.
+          if [ "$CHANNEL" = stable ] && [ "$REF" != main ] \
+             && ! git rev-parse -q --verify "refs/tags/$REF" >/dev/null; then
+            echo "::error::stable releases build from main or a tag, got '$REF'"; exit 1
+          fi
           if [ "$CHANNEL" = stable ]; then
             [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
               || { echo "::error::stable needs X.Y.Z, got '$VERSION'"; exit 1; }
@@ -85,7 +96,7 @@ jobs:
             arch: aarch64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.validate.outputs.sha }}
 
@@ -95,9 +106,11 @@ jobs:
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-${{ matrix.arch }}
 
@@ -105,9 +118,12 @@ jobs:
         run: cargo build --release --locked -p brook-gnome
 
       - name: Package
-        run: clients/gnome/packaging/make-tarball.sh "${{ inputs.version }}" "${{ matrix.arch }}" dist
+        env:  # never interpolate inputs into the script itself
+          VERSION: ${{ inputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: clients/gnome/packaging/make-tarball.sh "$VERSION" "$ARCH" dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: brook-gnome-${{ matrix.arch }}
           path: dist/
@@ -120,7 +136,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
