@@ -261,7 +261,9 @@ class FileCreated(BaseModel):
 class MessageCreate(BaseModel):
     """Send a message into a channel."""
 
-    body: str = Field(min_length=1, max_length=4000)
+    # May be empty when files are attached (a photo without a caption); a message needs
+    # text or files, checked below.
+    body: str = Field(default="", max_length=4000)
     reply_to_id: uuid.UUID | None = None
     # Outbox idempotency: a UUID the client generates once per message. Resending
     # with the same one returns the stored message (200), never a duplicate.
@@ -269,6 +271,12 @@ class MessageCreate(BaseModel):
     # Committed files to attach (attachments spec §3): uploaded by the author, to this
     # channel, not attached yet.
     attachments: list[uuid.UUID] = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def _text_or_files(self) -> MessageCreate:
+        if not self.body.strip() and not self.attachments:
+            raise ValueError("A message needs text or at least one attachment")
+        return self
 
 
 class MessageEdit(BaseModel):

@@ -163,6 +163,22 @@ async def test_attach_and_see_it_in_history(client: httpx.AsyncClient) -> None:
     assert history[0]["attachments"][0]["filename"] == "report.pdf"
 
 
+async def test_a_message_may_be_files_only_but_not_empty(client: httpx.AsyncClient) -> None:
+    ha, _hb, ch = await _setup(client)
+    url = f"/api/v1/channels/{ch}/messages"
+    f = await _upload(client, ha, ch, b"photo", name="photo.jpg")
+    only_files = await client.post(url, json={"attachments": [f["id"]]}, headers=ha)
+    assert only_files.status_code == 201
+    assert only_files.json()["body"] == "" and only_files.json()["deleted_at"] is None
+    assert [a["id"] for a in only_files.json()["attachments"]] == [f["id"]]
+    nothing = await client.post(url, json={"body": ""}, headers=ha)
+    assert nothing.status_code == 422
+    blank = await client.post(url, json={"body": "  \n "}, headers=ha)  # no files: junk
+    assert blank.status_code == 422
+    captioned = await client.post(url, json={"body": "hi"}, headers=ha)
+    assert captioned.status_code == 201
+
+
 async def test_attach_rules(client: httpx.AsyncClient) -> None:
     ha, hb, ch = await _setup(client)
     other = (
@@ -248,6 +264,8 @@ async def test_limits(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
     # 1000 free - 8 pending - 3 new = 989 < 995: the shared disk's floor holds.
     floor = await _create(client, ha, ch, b"x" * 3)
     assert floor.status_code == 507 and floor.json()["error"]["code"] == "file.no_space"
+    # "Try later": clients keep the upload and retry after this long.
+    assert floor.headers["Retry-After"] == "600"
 
 
 # ---------------------------------------------------------------- lifecycle
