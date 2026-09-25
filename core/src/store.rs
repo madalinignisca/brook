@@ -193,6 +193,44 @@ fn registry() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// A store's registry entry, held for as long as anything opens, rebuilds or erases it.
+/// Dropped unarmed once the store's thread owns the entry (`hand_over`).
+struct Reservation {
+    key: PathBuf,
+    armed: bool,
+}
+
+impl Reservation {
+    fn take(key: PathBuf) -> Result<Self, StoreError> {
+        if registry().insert(key.clone()) {
+            Ok(Self { key, armed: true })
+        } else {
+            Err(StoreError::AlreadyOpen)
+        }
+    }
+
+    fn hand_over(mut self) -> PathBuf {
+        self.armed = false;
+        self.key.clone()
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.armed {
+            registry().remove(&self.key);
+        }
+    }
+}
+
+/// `kind`'s files in `dir`, with `dir` made and **canonical**: the registry keys on the real
+/// path, so a symlink or `..` can't be a second way into an open store.
+fn paths_in(dir: &Path, kind: Kind) -> Result<Paths, StoreError> {
+    fs::create_dir_all(dir).map_err(|_| StoreError::Io)?;
+    let dir = fs::canonicalize(dir).map_err(|_| StoreError::Io)?;
+    Ok(Paths::new(&dir, kind))
+}
+
 /// Open (or make) `kind`'s store in `dir`, keyed by its slot. Blocking: run it off async
 /// workers.
 pub(crate) fn open(
@@ -201,114 +239,145 @@ pub(crate) fn open(
     store_id: &str,
     keys: &KeyStore<dyn KeySlot>,
 ) -> Result<Opened, StoreError> {
-    let paths = Paths::new(dir, kind);
-    if !registry().insert(paths.db.clone()) {
-        return Err(StoreError::AlreadyOpen);
-    }
-    let result = open_registered(dir, kind, store_id, keys, &paths);
-    if !matches!(result, Ok(Opened::Ready { .. })) {
-        registry().remove(&paths.db); // the thread owns the entry only once it runs
-    }
-    result
+    let paths = paths_in(dir, kind)?;
+    let reservation = Reservation::take(paths.db.clone())?;
+    open_reserved(kind, store_id, keys, &paths, reservation)
 }
 
-fn open_registered(
-    dir: &Path,
+enum Inner {
+    Ready(Connection, Option<Rebuilt>),
+    Other(Opened),
+}
+
+fn open_reserved(
     kind: Kind,
     store_id: &str,
     keys: &KeyStore<dyn KeySlot>,
     paths: &Paths,
+    reservation: Reservation,
 ) -> Result<Opened, StoreError> {
-    let key = match keys.get_or_create(&kind.slot(store_id)) {
-        Ok(key) => key,
-        Err(KeySlotError::Exists | KeySlotError::Unavailable | KeySlotError::Fatal(_)) => {
-            return Ok(Opened::Locked);
-        }
-    };
-    let check = key_check(key.bytes());
-    let mut rebuilt = None;
-    if paths.db.exists() {
-        let stored = fs::read(&paths.check).ok();
-        if stored.as_deref() != Some(check.as_slice()) {
-            // Not this key's database: the key it was made with is gone.
-            remove_all(paths)?;
-            rebuilt = Some(Rebuilt::KeyMissing);
-        }
-    }
-    fs::create_dir_all(dir).map_err(|_| StoreError::Io)?;
-    let fresh = !paths.db.exists();
-    let conn = match connect(&paths.db, key.bytes()) {
-        Ok(conn) => conn,
-        Err(_) if !fresh => return Ok(Opened::Damaged),
-        Err(_) => return Err(StoreError::Io),
-    };
-    if fresh {
-        conn.execute_batch(kind.schema())
-            .map_err(|_| StoreError::Sql)?;
-        conn.execute(
-            "INSERT INTO meta(id, format) VALUES (1, ?1)",
-            [kind.format()],
-        )
-        .map_err(|_| StoreError::Sql)?;
-        // Only now is the database this key's: a crash before this line leaves a database
-        // without a check, which the next open treats as keyless and remakes (it was empty).
-        write_atomically(&paths.check, &check)?;
-    } else {
-        let format: rusqlite::Result<i64> =
-            conn.query_row("SELECT format FROM meta WHERE id = 1", [], |r| r.get(0));
-        match format {
-            Ok(f) if f == kind.format() => {}
+    let mut inner = open_inner(kind, store_id, keys, paths)?;
+    if let Inner::Ready(conn, None) = inner {
+        // A cache in another format is remade (pre-1.0: no migrations), under the same
+        // reservation.
+        match format_of(&conn) {
+            Ok(f) if f == kind.format() => inner = Inner::Ready(conn, None),
             Ok(_) if kind == Kind::Outbox => return Ok(Opened::NeedsRebuild),
             Ok(_) => {
                 drop(conn);
                 remove_all(paths)?;
-                return open_registered(dir, kind, store_id, keys, paths).map(|o| match o {
-                    Opened::Ready { db, .. } => Opened::Ready {
-                        db,
-                        rebuilt: Some(Rebuilt::FormatChanged),
-                    },
+                inner = match open_inner(kind, store_id, keys, paths)? {
+                    Inner::Ready(conn, _) => Inner::Ready(conn, Some(Rebuilt::FormatChanged)),
                     other => other,
-                });
+                };
             }
-            // The key matched but the database can't be read: damage, never "absent".
+            // The key opened it but it can't be read: damage, never "absent".
             Err(_) => return Ok(Opened::Damaged),
         }
     }
-    Ok(Opened::Ready {
-        db: Db::spawn(conn, paths.db.clone()),
-        rebuilt,
-    })
+    match inner {
+        Inner::Ready(conn, rebuilt) => Ok(Opened::Ready {
+            db: Db::spawn(conn, reservation.hand_over()),
+            rebuilt,
+        }),
+        Inner::Other(opened) => Ok(opened),
+    }
+}
+
+fn format_of(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT format FROM meta WHERE id = 1", [], |r| r.get(0))
+}
+
+fn open_inner(
+    kind: Kind,
+    store_id: &str,
+    keys: &KeyStore<dyn KeySlot>,
+    paths: &Paths,
+) -> Result<Inner, StoreError> {
+    let key = match keys.get_or_create(&kind.slot(store_id)) {
+        Ok(key) => key,
+        Err(KeySlotError::Exists | KeySlotError::Unavailable | KeySlotError::Fatal(_)) => {
+            return Ok(Inner::Other(Opened::Locked));
+        }
+    };
+    let check = key_check(key.bytes());
+    if paths.db.exists() {
+        let matches = match fs::read(&paths.check) {
+            Ok(stored) => stored == check,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            // Unreadable is not absent: nothing is decided, nothing is deleted.
+            Err(_) => return Err(StoreError::Io),
+        };
+        return Ok(match (matches, connect(&paths.db, key.bytes())) {
+            (true, Ok(conn)) => Inner::Ready(conn, None),
+            // The key is right but the file won't open: damage, kept.
+            (true, Err(_)) => Inner::Other(Opened::Damaged),
+            // The check was lost (a crash before it was written, or it was removed), but
+            // the key opens the database: it is this key's. Keep it, restore the check.
+            (false, Ok(conn)) => {
+                write_atomically(&paths.check, &check)?;
+                Inner::Ready(conn, None)
+            }
+            // Neither the check nor the database answers to this key: its key is gone.
+            (false, Err(_)) => {
+                remove_all(paths)?;
+                let conn = create(kind, paths, key.bytes(), &check)?;
+                Inner::Ready(conn, Some(Rebuilt::KeyMissing))
+            }
+        });
+    }
+    Ok(Inner::Ready(
+        create(kind, paths, key.bytes(), &check)?,
+        None,
+    ))
+}
+
+fn create(
+    kind: Kind,
+    paths: &Paths,
+    key: &[u8; 32],
+    check: &[u8],
+) -> Result<Connection, StoreError> {
+    let conn = connect(&paths.db, key).map_err(|_| StoreError::Io)?;
+    conn.execute_batch(kind.schema())
+        .map_err(|_| StoreError::Sql)?;
+    conn.execute(
+        "INSERT INTO meta(id, format) VALUES (1, ?1)",
+        [kind.format()],
+    )
+    .map_err(|_| StoreError::Sql)?;
+    // A crash before this line leaves a database without a check: the next open finds the
+    // key still opens it, and restores the check.
+    write_atomically(&paths.check, check)?;
+    Ok(conn)
 }
 
 /// Make `kind`'s store fresh after the caller surfaced what is lost (an outbox's format
-/// change). The store must not be open.
+/// change). The store must not be open; it stays reserved from the delete to the reopen.
 pub(crate) fn rebuild(
     dir: &Path,
     kind: Kind,
     store_id: &str,
     keys: &KeyStore<dyn KeySlot>,
 ) -> Result<Opened, StoreError> {
-    let paths = Paths::new(dir, kind);
-    if registry().contains(&paths.db) {
-        return Err(StoreError::AlreadyOpen);
-    }
+    let paths = paths_in(dir, kind)?;
+    let reservation = Reservation::take(paths.db.clone())?;
     remove_all(&paths)?;
-    open(dir, kind, store_id, keys)
+    open_reserved(kind, store_id, keys, &paths, reservation)
 }
 
 /// Erase a store without reading it (a damaged or locked one, or a sign-out wipe once its
 /// handles are closed): destroy the key first (crypto-erase), then delete the files. The
-/// store must not be open. Returns whether the key was destroyed; the files go either way.
+/// store must not be open, and stays reserved throughout. Returns whether the key was
+/// destroyed; the files go either way.
 pub(crate) fn reset(
     dir: &Path,
     kind: Kind,
     store_id: &str,
     keys: &KeyStore<dyn KeySlot>,
 ) -> Result<bool, StoreError> {
-    let paths = Paths::new(dir, kind);
-    if registry().contains(&paths.db) {
-        return Err(StoreError::AlreadyOpen);
-    }
+    let paths = paths_in(dir, kind)?;
+    let _reservation = Reservation::take(paths.db.clone())?;
     let destroyed = keys.destroy(&kind.slot(store_id)).is_ok();
     remove_all(&paths)?;
     Ok(destroyed)

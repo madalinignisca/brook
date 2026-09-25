@@ -299,3 +299,124 @@ async fn a_panicking_job_releases_the_store() {
         .unwrap();
     assert_eq!(users, 3);
 }
+
+/// An unreadable check file is not a missing one: nothing is decided, nothing deleted.
+#[tokio::test]
+async fn an_unreadable_check_deletes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let (db, _) = ready(store::open(dir.path(), Kind::Outbox, "s1", &keys(&slot)));
+    db.close().await;
+    let check = dir.path().join("outbox.check");
+    let before = std::fs::read(dir.path().join("outbox.db")).unwrap();
+    std::fs::set_permissions(&check, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let r = store::open(dir.path(), Kind::Outbox, "s1", &keys(&slot));
+    std::fs::set_permissions(&check, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(r.unwrap_err(), StoreError::Io);
+    assert_eq!(std::fs::read(dir.path().join("outbox.db")).unwrap(), before);
+}
+
+/// The check was lost (a crash before it was written), but the key still opens the
+/// database: it's kept, with its data, and the check is restored.
+#[tokio::test]
+async fn a_lost_check_with_the_right_key_keeps_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let (db, _) = ready(store::open(dir.path(), Kind::Cache, "s1", &keys(&slot)));
+    write_sentinel(&db, 4).await;
+    db.close().await;
+    std::fs::remove_file(dir.path().join("cache.check")).unwrap();
+    let (db, rebuilt) = ready(store::open(dir.path(), Kind::Cache, "s1", &keys(&slot)));
+    assert_eq!(rebuilt, None);
+    let users: i64 = db
+        .call(|c| c.query_row("SELECT count(*) FROM users", [], |r| r.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(users, 4, "a valid database was remade");
+    assert!(dir.path().join("cache.check").exists());
+}
+
+/// A second path to the same directory (a symlink) is the same store.
+#[tokio::test]
+async fn an_alias_is_the_same_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let alias = tempfile::tempdir().unwrap();
+    let link = alias.path().join("link");
+    std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let (_db, _) = ready(store::open(dir.path(), Kind::Cache, "s1", &keys(&slot)));
+    assert_eq!(
+        store::open(&link, Kind::Cache, "s1", &keys(&slot)).unwrap_err(),
+        StoreError::AlreadyOpen
+    );
+    assert_eq!(
+        store::reset(&link, Kind::Cache, "s1", &keys(&slot)).unwrap_err(),
+        StoreError::AlreadyOpen
+    );
+}
+
+const CRASH_DIR: &str = "BROOK_STORE_CRASH_DIR";
+
+/// The child half of the crash test: commit some rows, start a transaction, and die.
+#[test]
+fn crash_child() {
+    let Ok(dir) = std::env::var(CRASH_DIR) else {
+        return; // only ever runs as the child
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let slot = Arc::new(InMemoryKeySlot::default());
+        slot.put("cache:s1", vec![3; 32]);
+        let (db, _) = ready(store::open(
+            Path::new(&dir),
+            Kind::Cache,
+            "s1",
+            &keys(&slot),
+        ));
+        write_sentinel(&db, 5).await;
+        db.call(|c| {
+            c.execute_batch("BEGIN;")?;
+            for i in 0..500 {
+                c.execute(
+                    "INSERT INTO users(id, seq, json) VALUES (?1, 1, ?2)",
+                    [format!("t{i}"), format!("{SENTINEL}-tx")],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    });
+    std::process::abort(); // a kill: no destructors, no close
+}
+
+/// A real crash mid-transaction: no plaintext anywhere, the committed rows survive and the
+/// uncommitted ones don't.
+#[tokio::test]
+async fn a_crash_mid_transaction_leaves_only_ciphertext_and_committed_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["store_tests::crash_child", "--exact", "--test-threads=1"])
+        .env(CRASH_DIR, dir.path())
+        .output()
+        .unwrap()
+        .status;
+    assert!(!status.success(), "the child didn't crash");
+    assert!(dir.path().join("cache.db").exists());
+    assert_eq!(
+        plaintext_anywhere(dir.path(), SENTINEL),
+        Vec::<String>::new()
+    );
+    let slot = Arc::new(InMemoryKeySlot::default());
+    slot.put("cache:s1", vec![3; 32]);
+    let (db, rebuilt) = ready(store::open(dir.path(), Kind::Cache, "s1", &keys(&slot)));
+    assert_eq!(rebuilt, None);
+    let users: i64 = db
+        .call(|c| c.query_row("SELECT count(*) FROM users", [], |r| r.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(users, 5, "committed rows lost or uncommitted ones kept");
+}
