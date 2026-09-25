@@ -195,12 +195,16 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
                 }
             });
 
+            // Under Flatpak, replacing an existing file writes into it directly.
+            let replaced_in_place = is_flatpak() && path.exists();
             let download = runtime.spawn({
                 let client = client.clone();
                 async move {
                     // Replacing a file natively: download beside it and swap it in only
                     // once verified, so a failed save keeps the old copy (#105). Under
                     // Flatpak the portal grants just the chosen file: write it directly.
+                    // A symlink is followed: the file it points to is what gets replaced.
+                    let path = std::fs::canonicalize(&path).unwrap_or(path);
                     let target = write_target(&path, is_flatpak());
                     let io = |err: std::io::Error| brook_core::Error::Api {
                         code: "transfer.io".into(),
@@ -211,7 +215,17 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
                         .download_file(transfer, &file.id, &sha256, file.size, &mut sink)
                         .await?;
                     if target != path {
+                        // Keep the replaced file's permissions, then swap it in and sync
+                        // the directory so the rename itself survives a crash.
+                        if let Ok(meta) = tokio::fs::metadata(&path).await {
+                            let _ = tokio::fs::set_permissions(&target, meta.permissions()).await;
+                        }
                         tokio::fs::rename(&target, &path).await.map_err(io)?;
+                        if let Some(dir) = path.parent() {
+                            if let Ok(d) = tokio::fs::File::open(dir).await {
+                                let _ = d.sync_all().await;
+                            }
+                        }
                     }
                     Ok(())
                 }
@@ -227,7 +241,12 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
                     // Saved, and nothing more: never opened automatically.
                     Ok(()) => status.set_text("Saved"),
                     Err(err) => {
-                        status.set_text(&save_error_text(&err));
+                        let mut text = save_error_text(&err);
+                        if replaced_in_place {
+                            // Under Flatpak a replace writes into the file itself: say so.
+                            text.push_str(". The previous file was removed");
+                        }
+                        status.set_text(&text);
                         save.set_visible(true);
                     }
                 }
