@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use brook_core::{
     CallHandle, CallState, CallStatus, EndReason, EngineError, IceCandidate, IceServer, MediaKind,
-    MediaSource, Participant, PcKind, SubStream,
+    MediaSource, Participant, PcKind, PublishOffer, SubStream, TrackLabel,
 };
 
 use crate::listener::{subscribe_watch, Subscription};
@@ -52,6 +52,21 @@ pub enum FfiMediaSource {
     Camera,
     Screen,
     Unknown,
+}
+
+/// What one publish m-line carries (`call.publish` `tracks`, PROTOCOL.md §3.3).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiTrackLabel {
+    pub mid: String,
+    pub kind: FfiMediaKind,
+    pub source: FfiMediaSource,
+}
+
+/// A publish offer with one label per audio/video m-line (inactive ones included).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiPublishOffer {
+    pub sdp: String,
+    pub tracks: Vec<FfiTrackLabel>,
 }
 
 /// Which participant a subscribe-PC `mid` belongs to.
@@ -180,6 +195,41 @@ impl From<MediaSource> for FfiMediaSource {
         }
     }
 }
+impl From<FfiMediaKind> for MediaKind {
+    fn from(k: FfiMediaKind) -> Self {
+        match k {
+            FfiMediaKind::Audio => Self::Audio,
+            FfiMediaKind::Video => Self::Video,
+            FfiMediaKind::Unknown => Self::Unknown,
+        }
+    }
+}
+impl From<FfiMediaSource> for MediaSource {
+    fn from(s: FfiMediaSource) -> Self {
+        match s {
+            FfiMediaSource::Mic => Self::Mic,
+            FfiMediaSource::Camera => Self::Camera,
+            FfiMediaSource::Screen => Self::Screen,
+            FfiMediaSource::Unknown => Self::Unknown,
+        }
+    }
+}
+impl From<FfiPublishOffer> for PublishOffer {
+    fn from(o: FfiPublishOffer) -> Self {
+        Self {
+            sdp: o.sdp,
+            tracks: o
+                .tracks
+                .into_iter()
+                .map(|t| TrackLabel {
+                    mid: t.mid,
+                    kind: t.kind.into(),
+                    source: t.source.into(),
+                })
+                .collect(),
+        }
+    }
+}
 impl From<SubStream> for FfiSubStream {
     fn from(s: SubStream) -> Self {
         Self {
@@ -250,7 +300,9 @@ impl From<FfiEngineError> for EngineError {
 #[uniffi::export(with_foreign)]
 #[async_trait]
 pub trait FfiMediaEngine: Send + Sync {
-    async fn create_publish_offer(&self) -> Result<String, FfiEngineError>;
+    /// The publish offer (set as the publish PC's local description) with a label for every
+    /// audio/video m-line: `screen` for a screen share's, including a stopped one.
+    async fn create_labelled_offer(&self) -> Result<FfiPublishOffer, FfiEngineError>;
     async fn apply_publish_answer(&self, sdp: String) -> Result<(), FfiEngineError>;
     async fn apply_subscribe_offer(
         &self,
@@ -273,8 +325,13 @@ pub(crate) struct EngineAdapter(pub(crate) Arc<dyn FfiMediaEngine>);
 
 #[async_trait]
 impl brook_core::MediaEngine for EngineAdapter {
+    /// Core always calls the labelled one; this exists for the trait and never loses labels
+    /// because core does not use it.
     async fn create_publish_offer(&self) -> Result<String, EngineError> {
-        Ok(self.0.create_publish_offer().await?)
+        Ok(self.0.create_labelled_offer().await?.sdp)
+    }
+    async fn create_labelled_offer(&self) -> Result<PublishOffer, EngineError> {
+        Ok(self.0.create_labelled_offer().await?.into())
     }
     async fn apply_publish_answer(&self, sdp: String) -> Result<(), EngineError> {
         Ok(self.0.apply_publish_answer(sdp).await?)
@@ -424,9 +481,26 @@ mod tests {
 
     #[async_trait]
     impl FfiMediaEngine for FakeEngine {
-        async fn create_publish_offer(&self) -> Result<String, FfiEngineError> {
-            self.log.lock().unwrap().push("create_publish_offer".into());
-            Ok("offer-from-swift".into())
+        async fn create_labelled_offer(&self) -> Result<FfiPublishOffer, FfiEngineError> {
+            self.log
+                .lock()
+                .unwrap()
+                .push("create_labelled_offer".into());
+            Ok(FfiPublishOffer {
+                sdp: "offer-from-swift".into(),
+                tracks: vec![
+                    FfiTrackLabel {
+                        mid: "a0".into(),
+                        kind: FfiMediaKind::Audio,
+                        source: FfiMediaSource::Mic,
+                    },
+                    FfiTrackLabel {
+                        mid: "s2".into(),
+                        kind: FfiMediaKind::Video,
+                        source: FfiMediaSource::Screen,
+                    },
+                ],
+            })
         }
         async fn apply_publish_answer(&self, sdp: String) -> Result<(), FfiEngineError> {
             self.log
@@ -496,9 +570,18 @@ mod tests {
     async fn adapter_forwards_every_method_with_exact_fields() {
         let fake = Arc::new(FakeEngine::default());
         let adapter = EngineAdapter(fake.clone());
+        let offer = adapter.create_labelled_offer().await.unwrap();
+        assert_eq!(offer.sdp, "offer-from-swift");
         assert_eq!(
-            adapter.create_publish_offer().await.unwrap(),
-            "offer-from-swift"
+            offer
+                .tracks
+                .iter()
+                .map(|t| (t.mid.as_str(), t.kind, t.source))
+                .collect::<Vec<_>>(),
+            [
+                ("a0", MediaKind::Audio, MediaSource::Mic),
+                ("s2", MediaKind::Video, MediaSource::Screen)
+            ]
         );
         adapter.apply_publish_answer("ans-1".into()).await.unwrap();
         adapter
@@ -534,7 +617,7 @@ mod tests {
         assert_eq!(
             fake.log(),
             [
-                "create_publish_offer",
+                "create_labelled_offer",
                 "apply_publish_answer:ans-1",
                 "apply_subscribe_offer:off-1:m7>p9:Video:Camera",
                 "remote:Subscribe:Some(\"cand-A|Some(\\\"mid-B\\\")|Some(3)\")",
@@ -600,6 +683,14 @@ mod tests {
         let publish = peer.recv().await;
         assert_eq!(publish["type"], "call.publish");
         assert_eq!(publish["data"]["sdp"], "offer-from-swift");
+        // Swift's labels reach the wire as given (a screen stays a screen).
+        assert_eq!(
+            publish["data"]["tracks"],
+            json!([
+                { "mid": "a0", "kind": "audio", "source": "mic" },
+                { "mid": "s2", "kind": "video", "source": "screen" }
+            ])
+        );
         assert!(fake
             .log()
             .iter()

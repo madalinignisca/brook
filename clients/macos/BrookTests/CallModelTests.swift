@@ -63,7 +63,14 @@ final class FakeHandle: FfiCallHandleProtocol, @unchecked Sendable {
         try? await Task.sleep(for: leaveDelay)
     }
     func localCandidate(pc: FfiPcKind, candidate: FfiIceCandidate?) {}
-    func republish() async throws {}
+    let republishes = Mutex(0)
+    var refuseRepublish = false
+    var republishGate: Gate?
+    func republish() async throws {
+        republishes.withLock { $0 += 1 }
+        if let republishGate { await republishGate.wait() }
+        if refuseRepublish { throw LoginError.Disconnected }
+    }
     func setMedia(audio: Bool, video: Bool) async throws {
         media.withLock { $0.append("\(audio):\(video)") }
         let step = script.withLock { $0.isEmpty ? nil : $0.removeFirst() }
@@ -110,10 +117,22 @@ final class FakeMedia: CallEngine, @unchecked Sendable {
     func onLocalVideoTrack(_ callback: @escaping @Sendable (RTCVideoTrack) -> Void) {
         localVideo.withLock { $0 = callback }
     }
-    func onRemoteTracks(_ callback: @escaping @Sendable ([RemoteTrack]) -> Void) {}
+    let remoteTracks = Mutex<(@Sendable ([RemoteTrack]) -> Void)?>(nil)
+    func onRemoteTracks(_ callback: @escaping @Sendable ([RemoteTrack]) -> Void) {
+        remoteTracks.withLock { $0 = callback }
+    }
     func attach(_ events: EngineEvents) {}
+    let screen = Mutex<[String]>([])
+    var refuseShare = false
+    func startScreenShare(_ capture: VideoCapture) async throws {
+        screen.withLock { $0.append("start") }
+        if refuseShare { throw FfiEngineError.Failed(message: "no") }
+    }
+    func stopScreenShare() async { screen.withLock { $0.append("stop") } }
+    let shareEnded = Mutex<(@Sendable () -> Void)?>(nil)
+    func onScreenShareEnded(_ callback: @escaping @Sendable () -> Void) { shareEnded.withLock { $0 = callback } }
+    func createLabelledOffer() async throws -> FfiPublishOffer { FfiPublishOffer(sdp: "", tracks: []) }
     // FfiMediaEngine (core's side; unused by these tests)
-    func createPublishOffer() async throws -> String { "" }
     func applyPublishAnswer(sdp: String) async throws {}
     func applySubscribeOffer(sdp: String, streams: [FfiSubStream]) async throws -> String { "" }
     func addRemoteCandidate(pc: FfiPcKind, candidate: FfiIceCandidate?) throws {}
@@ -334,6 +353,113 @@ final class CallReviewFixTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(300))
         XCTAssertEqual(replies, 1)
         XCTAssertNil(center.call, "the joined call was not left")
+    }
+}
+
+@MainActor
+final class ScreenShareModelTests: XCTestCase {
+    let full = JoinPlan(microphone: true, camera: true, explanation: nil)
+    let capture = SyntheticVideoCapture()
+
+    func testShareStartsThenRenegotiatesOnce() async {
+        let handle = FakeHandle(), media = FakeMedia()
+        let call = CallModel(channelName: "c", plan: full, handle: handle, media: media)
+        await call.shareScreen(capture)
+        XCTAssertTrue(call.sharing)
+        XCTAssertEqual(media.screen.withLock { $0 }, ["start"])
+        XCTAssertEqual(handle.republishes.withLock { $0 }, 1)
+        await call.stopSharing()
+        XCTAssertFalse(call.sharing)
+        XCTAssertEqual(media.screen.withLock { $0 }, ["start", "stop"])
+        XCTAssertEqual(handle.republishes.withLock { $0 }, 2)
+    }
+
+    func testRefusedStartDoesNotRenegotiate() async {
+        let handle = FakeHandle(), media = FakeMedia()
+        media.refuseShare = true
+        let call = CallModel(channelName: "c", plan: full, handle: handle, media: media)
+        await call.shareScreen(capture)
+        XCTAssertFalse(call.sharing)
+        XCTAssertNotNil(call.shareError)
+        XCTAssertEqual(handle.republishes.withLock { $0 }, 0)
+    }
+
+    /// A share the server never heard about must not keep capturing.
+    func testFailedRenegotiationUndoesTheShare() async {
+        let handle = FakeHandle(), media = FakeMedia()
+        handle.refuseRepublish = true
+        let call = CallModel(channelName: "c", plan: full, handle: handle, media: media)
+        await call.shareScreen(capture)
+        XCTAssertFalse(call.sharing)
+        XCTAssertEqual(media.screen.withLock { $0 }, ["start", "stop"])
+    }
+
+    /// The system ended the share: the UI stops showing it and renegotiates once.
+    func testShareEndedBySystemRenegotiates() async throws {
+        let handle = FakeHandle(), media = FakeMedia()
+        let call = CallModel(channelName: "c", plan: full, handle: handle, media: media)
+        await call.start()
+        await call.shareScreen(capture)
+        XCTAssertEqual(handle.republishes.withLock { $0 }, 1)
+        media.shareEnded.withLock { $0 }?()
+        await drainMain()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(call.sharing)
+        XCTAssertEqual(handle.republishes.withLock { $0 }, 2)
+    }
+
+    /// The system ends the share while its renegotiation is still in flight: the UI must not
+    /// then show it as shared.
+    func testShareEndedWhileStartingIsNotShownAsSharing() async throws {
+        let handle = FakeHandle(), media = FakeMedia()
+        handle.republishGate = Gate()
+        let call = CallModel(channelName: "c", plan: full, handle: handle, media: media)
+        await call.start()
+        let sharing = Task { await call.shareScreen(capture) }
+        try await Task.sleep(for: .milliseconds(100))  // start done, republish held
+        media.shareEnded.withLock { $0 }?()
+        await drainMain()
+        handle.republishGate?.open()
+        await sharing.value
+        XCTAssertFalse(call.sharing, "an ended share shown as sharing")
+        XCTAssertEqual(handle.republishes.withLock { $0 }, 2, "no renegotiation for the end")
+    }
+
+    func testEndedCallIsNotSharing() async {
+        let call = CallModel(channelName: "c", plan: full, handle: FakeHandle(), media: FakeMedia())
+        await call.shareScreen(capture)
+        call.apply(FfiCallState(status: .ended(reason: .removed), callId: "k1", selfParticipant: "p1", participants: []))
+        XCTAssertFalse(call.sharing)
+    }
+
+    func testListenOnlyCannotShare() async {
+        let media = FakeMedia()
+        let listenOnly = JoinPlan(microphone: false, camera: false, explanation: JoinPlan.micDenied)
+        let call = CallModel(channelName: "c", plan: listenOnly, handle: FakeHandle(), media: media)
+        await call.shareScreen(capture)
+        XCTAssertEqual(media.screen.withLock { $0 }, [])
+    }
+
+    /// Another participant's screen becomes its own tile, first.
+    func testRemoteScreenBecomesAFirstTile() async throws {
+        let media = FakeMedia()
+        let call = CallModel(channelName: "c", plan: full, handle: FakeHandle(), media: media)
+        await call.start()
+        let linux = FfiParticipant(participantId: "p2", userId: "u2", displayName: "Linux", audio: true, video: true)
+        call.apply(FfiCallState(status: .connected, callId: "k1", selfParticipant: "p1", participants: [linux]))
+        let factory = RTCPeerConnectionFactory()
+        let cam = factory.videoTrack(with: factory.videoSource(), trackId: "cam")
+        let scr = factory.videoTrack(with: factory.videoSource(), trackId: "scr")
+        media.remoteTracks.withLock { $0 }?([
+            RemoteTrack(mid: "1", participantId: "p2", kind: .video, source: .camera, track: cam),
+            RemoteTrack(mid: "2", participantId: "p2", kind: .video, source: .screen, track: scr),
+        ])
+        await drainMain()
+        let tiles = call.tiles
+        XCTAssertEqual(tiles.map(\.name), ["Linux's screen", "You", "Linux"])
+        XCTAssertTrue(tiles[0].isScreen)
+        XCTAssertTrue(tiles[0].track === scr)
+        XCTAssertTrue(tiles[2].track === cam)
     }
 }
 
