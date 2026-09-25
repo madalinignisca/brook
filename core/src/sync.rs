@@ -24,7 +24,7 @@ pub(crate) trait Fetch: Send + Sync {
 
 #[derive(Debug)]
 pub(crate) enum SyncError {
-    Store(StoreError),
+    Store(#[allow(dead_code)] StoreError), // kept for Debug
     Net(crate::Error),
     /// A page we can't read: nothing applied, the cursor unchanged.
     Malformed,
@@ -40,6 +40,7 @@ pub(crate) enum Synced {
 }
 
 /// Fetch and apply pages until `more` is false.
+#[cfg(test)]
 pub(crate) async fn run(db: &Db, me: &str, fetch: &dyn Fetch) -> Result<Synced, SyncError> {
     let mut changed = Applied::default();
     Ok(match run_into(db, me, fetch, &mut changed).await? {

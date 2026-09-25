@@ -268,11 +268,8 @@ async fn store_ids_are_random_and_stable() {
 }
 
 #[test]
-fn stores_stay_off_until_wipes_land() {
-    assert!(
-        !store::stores_enabled(),
-        "the durable-store switch turned on before C5"
-    );
+fn stores_are_on_now_that_wipes_landed() {
+    assert!(store::stores_enabled());
 }
 
 /// A job that panics stops the store's thread, but the store is released: `close` returns,
@@ -471,4 +468,35 @@ async fn only_the_owner_can_enter_the_store_directory() {
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&stores), 0o700);
     assert_eq!(mode(&stores.join("cache.check")), 0o600);
+}
+
+/// A close cancelled while jobs are still queued leaves the wait for the next close: that
+/// one returns only once the database really is shut.
+#[tokio::test]
+async fn a_cancelled_close_still_leaves_a_close_to_wait_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let (db, _) = ready(store::open(dir.path(), Kind::Cache, "s", &keys(&slot)));
+    let db = Arc::new(db);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let job = tokio::spawn({
+        let (db, done) = (db.clone(), done.clone());
+        async move {
+            db.call(move |_| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await; // the job is running
+    let cancelled = tokio::time::timeout(std::time::Duration::from_millis(50), db.close()).await;
+    assert!(cancelled.is_err(), "the first close didn't wait");
+    db.close().await;
+    assert!(
+        done.load(std::sync::atomic::Ordering::SeqCst),
+        "a later close returned while the database was still busy"
+    );
+    job.await.unwrap().unwrap();
 }
