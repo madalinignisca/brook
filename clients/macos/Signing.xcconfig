@@ -1,0 +1,9 @@
+// Release signing. The identity lives in Local.xcconfig (gitignored), so the repository names
+// no account. Without it Release falls back to ad-hoc, which cannot launch: under the hardened
+// runtime, library validation refuses the embedded WebRTC.framework when neither the app nor
+// the framework carries a Team ID. build.sh release checks for it.
+//
+// Local.xcconfig:
+//   CODE_SIGN_IDENTITY = Developer ID Application
+//   DEVELOPMENT_TEAM = <your team id>
+#include? "Local.xcconfig"
