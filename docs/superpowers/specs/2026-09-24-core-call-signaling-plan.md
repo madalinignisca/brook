@@ -37,7 +37,7 @@ named mutation. Test infrastructure first, because every later task depends on i
   tests pass; `cargo check -p brook-gnome`.
 - **Mergeable only with client recovery:** GNOME and KDE must return to their login screen on a
   mid-session `LoggedOut` (today GNOME only re-enables a hidden button; KDE handles only the initial
-  result). That client work is brook-linux's; P1 merges once it confirms both clients recover at runtime.
+  result). That client work is the Linux side's; P1 merges once it confirms both clients recover at runtime.
 
 ### P2 — Transport command path (§3.1)
 - `Conn` watch `{generation, ready}`; outgoing mpsc of `Command {frame, expect, generation, reply,
@@ -76,15 +76,15 @@ named mutation. Test infrastructure first, because every later task depends on i
   capture layer installed **the way clients install theirs** plus the required cap, and a second run
   without the cap that must fail (proves the cap is what protects dependency logs).
 - `core/README.md`: the call API, the engine contract, and the required `tungstenite` log cap.
-- Client caps: GNOME has it (brook-linux, 263fb96); KDE — brook-linux; macOS/bindings install no
+- Client caps: GNOME has it (the Linux side, 263fb96); KDE — the Linux side; macOS/bindings install no
   tracing subscriber today (nothing is emitted) — the bindings README states the cap is mandatory if one
   is added.
-- **Check:** tests green; README states the cap; GNOME/KDE caps confirmed by brook-linux.
+- **Check:** tests green; README states the cap; GNOME/KDE caps confirmed by the Linux side.
 
 ### P6 — Integration and hand-off
 - `cargo fmt --all --check`, clippy `-D warnings`, `cargo test` (default members), `cargo deny`
-  (no new failures vs main). PR opened; signatures announced to brook-linux (adapter) and the server side.
-- **Live acceptance** (design §7) happens with the first engine: brook-linux's GTK adapter or the macOS
+  (no new failures vs main). PR opened; signatures announced to the Linux side (adapter) and the server side.
+- **Live acceptance** (design §7) happens with the first engine: the Linux side's GTK adapter or the macOS
   engine (C2) against the test server, with the browser harness as the other party.
 
 ## Where this fails
@@ -96,13 +96,13 @@ named mutation. Test infrastructure first, because every later task depends on i
 | P2 | tungstenite split sink/stream + select! cancellation drops a half-written frame | writes go through a single writer task; select! only on channel receives |
 | P4 | test flakiness from real timers | tokio `start_paused` time for timeout tests; barriers, never sleeps, for ordering |
 | P4 | engine futures outliving the call | `finish()` + engine fence; FakeEngine asserts no op completes with effect after close |
-| P6 | KDE can't be built here (Qt) | `cargo check` of KDE is done by brook-linux; core changes are additive for it except P1's runtime behaviour |
+| P6 | KDE can't be built here (Qt) | `cargo check` of KDE is done by the Linux side; core changes are additive for it except P1's runtime behaviour |
 
 ## If it stops halfway
 Each task leaves core compiling with all tests green. P1 is mergeable only together with the GNOME/KDE
 login-recovery change (see P1). P2–P3 rewrite the WS loop both chat clients already use, so every task
 carries the full existing core test suite plus `cargo check -p brook-gnome` and a GNOME runtime chat
-check by brook-linux before its merge — not just P1. P4 adds new API; no client changes source until it
+check by the Linux side before its merge — not just P1. P4 adds new API; no client changes source until it
 adopts it.
 
 ## Review log
