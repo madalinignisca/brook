@@ -90,6 +90,44 @@ def decode_access_token(settings: Settings, token: str) -> dict[str, Any]:
     return data
 
 
+TOTP_PENDING_TTL_S = 300
+
+
+def create_totp_pending_token(settings: Settings, user_id: uuid.UUID) -> tuple[str, str]:
+    """``(token, jti)``: proof that the password was right, for the TOTP step only.
+
+    Its ``type`` is ``totp_pending``, so every place that accepts access tokens
+    refuses it (they all require ``type == 'access'``), and ``/auth/totp`` accepts
+    nothing else (decode_totp_pending_token). Five minutes, single use by ``jti``.
+    """
+    now = utcnow()
+    jti = secrets.token_urlsafe(16)
+    payload: dict[str, Any] = {
+        "sub": str(user_id),
+        "type": "totp_pending",
+        "jti": jti,
+        "iat": int(now.timestamp()),
+        "iat_ms": int(now.timestamp() * 1000),
+        "exp": int((now + timedelta(seconds=TOTP_PENDING_TTL_S)).timestamp()),
+    }
+    return jwt.encode(payload, settings.jwt_signing_key, algorithm=settings.jwt_algorithm), jti
+
+
+def decode_totp_pending_token(settings: Settings, token: str) -> dict[str, Any]:
+    """Decode a pending token; raises ``jwt.PyJWTError`` unless it is exactly one.
+    The mirror of decode_access_token's type check: an access token presented here
+    must never become an unbounded code-guessing credential."""
+    data: dict[str, Any] = jwt.decode(
+        token,
+        settings.jwt_signing_key,
+        algorithms=[settings.jwt_algorithm],
+        options={"require": ["exp", "iat", "sub", "jti"]},
+    )
+    if data.get("type") != "totp_pending":
+        raise jwt.InvalidTokenError("not a totp_pending token")
+    return data
+
+
 def new_refresh_token() -> tuple[str, str]:
     """Return ``(raw_token, token_hash)``; only the hash is persisted."""
     raw = secrets.token_urlsafe(48)

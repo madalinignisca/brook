@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     jwt_signing_key: str = _DEV_JWT_KEY  # nosec B105 - dev default; guarded at startup
     jwt_algorithm: str = "HS256"
     access_ttl_seconds: int = 15 * 60
+
+    # TOTP: the name authenticator apps show next to the account (otpauth issuer).
+    totp_issuer: str = "Brook"
     refresh_ttl_seconds: int = 7 * 24 * 3600
 
     # Calls (Phase 4). Unset URL = no SFU configured: call commands answer
