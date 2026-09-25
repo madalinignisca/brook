@@ -161,6 +161,7 @@ pub(crate) struct Commands {
     tx: mpsc::Sender<Outgoing>,
     conn: watch::Receiver<Conn>,
     pub(crate) routes: Routes,
+    raw: broadcast::Sender<(String, Value)>,
 }
 
 /// The transport side of [`Commands`], consumed by the socket task.
@@ -178,6 +179,9 @@ pub(crate) struct Transport {
     #[cfg_attr(not(test), allow(dead_code))]
     released_tx: mpsc::UnboundedSender<Outgoing>,
     released_rx: mpsc::UnboundedReceiver<Outgoing>,
+    /// Every server event as it came (`type`, `data`), for the offline cache: its rows carry
+    /// the `seq` the typed events drop, and `sync.hint` has no typed event.
+    raw: broadcast::Sender<(String, Value)>,
 }
 
 pub(crate) fn command_channel() -> (Commands, Transport) {
@@ -185,11 +189,13 @@ pub(crate) fn command_channel() -> (Commands, Transport) {
     let (conn_tx, conn_rx) = watch::channel(Conn::default());
     let (released_tx, released_rx) = mpsc::unbounded_channel();
     let routes = Routes::default();
+    let (raw, _) = broadcast::channel(512);
     (
         Commands {
             tx,
             conn: conn_rx,
             routes: routes.clone(),
+            raw: raw.clone(),
         },
         Transport {
             rx,
@@ -200,6 +206,7 @@ pub(crate) fn command_channel() -> (Commands, Transport) {
             hold_writes: None,
             released_tx,
             released_rx,
+            raw,
         },
     )
 }
@@ -208,6 +215,11 @@ pub(crate) fn command_channel() -> (Commands, Transport) {
 impl Commands {
     pub(crate) fn conn(&self) -> watch::Receiver<Conn> {
         self.conn.clone()
+    }
+
+    /// Server events as they came (`type`, `data`), for the offline cache.
+    pub(crate) fn raw_events(&self) -> broadcast::Receiver<(String, Value)> {
+        self.raw.subscribe()
     }
 
     /// Send `frame` (a `{type, data}` object; the `id` is assigned here) on socket
@@ -701,6 +713,11 @@ async fn handle_text(
     };
     let ty = frame["type"].as_str().unwrap_or_default().to_string();
     let data = frame.get("data").cloned().unwrap_or(Value::Null);
+
+    // Every server event (not a reply to one of ours) also goes out raw, for the cache.
+    if frame.get("re").is_none() {
+        let _ = transport.raw.send((ty.clone(), data.clone()));
+    }
 
     // A reply to one of our commands.
     if let Some(re) = frame.get("re").and_then(Value::as_str) {

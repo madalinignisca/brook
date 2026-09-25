@@ -36,6 +36,12 @@ pub enum CacheEvent {
     Users(Vec<String>),
     /// The server reset the sync (`410`): the cache is being rebuilt.
     Reset,
+    /// A channel's unsent messages changed (queued, sending, sent, failed, removed): re-read
+    /// `pending_messages`.
+    Outbox(String),
+    /// The outbox couldn't be kept (its key was lost, or its format changed): unsent
+    /// messages on this device were lost. Say so once.
+    OutboxLost,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

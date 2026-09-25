@@ -40,6 +40,10 @@ mod local;
 mod local_tests;
 #[cfg(test)]
 mod log_secrecy_tests;
+#[allow(dead_code)] // wired into BrookClient next (C5b)
+mod offline;
+#[cfg(test)]
+mod offline_tests;
 #[allow(dead_code)] // wired into the client once stores turn on (C5)
 mod outbox;
 #[cfg(test)]

@@ -128,6 +128,8 @@ pub(crate) struct Outbox {
     channels: StdMutex<HashMap<String, Arc<ChannelSender>>>,
     tasks: StdMutex<Vec<tokio::task::JoinHandle<()>>>,
     closed: AtomicBool,
+    /// Where change notices go (`CacheEvent::Outbox`), once set.
+    events: std::sync::OnceLock<tokio::sync::broadcast::Sender<crate::cache::CacheEvent>>,
 }
 
 /// One channel's sender: its lock (held for a whole attempt, and by Retry, Delete and direct
@@ -182,6 +184,7 @@ impl Outbox {
             channels: StdMutex::default(),
             tasks: StdMutex::default(),
             closed: AtomicBool::new(false),
+            events: std::sync::OnceLock::new(),
         }))
     }
 
@@ -189,6 +192,20 @@ impl Outbox {
     #[cfg(test)]
     pub(crate) fn db_for_tests(&self) -> &Db {
         &self.db
+    }
+
+    /// Send change notices to `events` (`CacheEvent::Outbox(channel)` on every change).
+    pub(crate) fn set_events(
+        &self,
+        events: tokio::sync::broadcast::Sender<crate::cache::CacheEvent>,
+    ) {
+        let _ = self.events.set(events);
+    }
+
+    fn changed(&self, channel_id: &str) {
+        if let Some(events) = self.events.get() {
+            let _ = events.send(crate::cache::CacheEvent::Outbox(channel_id.to_string()));
+        }
     }
 
     fn check_open(&self) -> Result<(), OutboxError> {
@@ -304,6 +321,7 @@ impl Outbox {
             }
             Ok(_) => {
                 sender.wake.notify_one();
+                self.changed(channel_id);
                 Ok(client_id)
             }
             Err(_) => self.send_direct(&sender, channel_id, body, client_id).await,
@@ -437,6 +455,7 @@ impl Outbox {
             .await
             .map_err(|_| OutboxError::Store)?;
         sender.wake.notify_one();
+        self.changed(&channel);
         Ok(())
     }
 
@@ -469,6 +488,7 @@ impl Outbox {
             .await
             .map_err(|_| OutboxError::Store)?;
         sender.wake.notify_one(); // the rows behind it may go now
+        self.changed(&channel);
         Ok(match found.as_deref() {
             None | Some("accepted") => Deleted::AlreadySent,
             Some(_) => Deleted::Removed,
@@ -500,6 +520,7 @@ impl Outbox {
                 .attempt(channel_id, &next.0, &next.1, next.2, epoch)
                 .await;
             drop(held);
+            self.changed(channel_id); // sent, failed, accepted or back to pending
             match outcome {
                 Attempt::Next => backoff = Duration::from_secs(1),
                 Attempt::Wait(after) => {
@@ -570,6 +591,7 @@ impl Outbox {
         if !accepted && self.set_state(client_id, "sending", None).await.is_err() {
             return Attempt::Wait(None);
         }
+        self.changed(channel_id);
         // Checked right before sending, after every await, and handed to `Post`. (A POST
         // already on the wire when a sign-out lands can't be taken back; it carries this
         // user's old token, never the next session's.)
