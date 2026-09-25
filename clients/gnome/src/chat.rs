@@ -201,6 +201,12 @@ pub fn build(client: Arc<BrookClient>, runtime: Handle, is_admin: bool) -> gtk::
         .tooltip_text("Search messages")
         .build();
     sidebar_header.pack_end(&search_button);
+    let main_menu = gtk::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .tooltip_text("Main menu")
+        .popover(&main_menu_popover(&chat))
+        .build();
+    sidebar_header.pack_end(&main_menu);
     search_button.connect_clicked({
         let chat = chat.clone();
         move |_| search_dialog(&chat)
@@ -1179,6 +1185,37 @@ fn delete_message_confirm(chat: &Rc<Chat>, channel_id: String, message_id: Strin
 }
 
 /// The channel-settings menu: rename / archive / unarchive / delete (on `current`).
+/// The sidebar's main menu: account settings.
+fn main_menu_popover(chat: &Rc<Chat>) -> gtk::Popover {
+    let popover = gtk::Popover::new();
+    let change_password = gtk::Button::builder()
+        .label("Change Password…")
+        .has_frame(false)
+        .build();
+    let menu = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .margin_top(4)
+        .margin_bottom(4)
+        .margin_start(4)
+        .margin_end(4)
+        .build();
+    menu.append(&change_password);
+    popover.set_child(Some(&menu));
+    change_password.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        move |_| {
+            popover.popdown();
+            crate::account::change_password_dialog(
+                &chat.message_list,
+                chat.client.clone(),
+                chat.runtime.clone(),
+            );
+        }
+    });
+    popover
+}
+
 fn channel_settings_popover(chat: &Rc<Chat>) -> gtk::Popover {
     let menu = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
