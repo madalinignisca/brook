@@ -15,6 +15,29 @@
 - **Quit isn't sign-out.** With persistence on, Drop fences the store but neither clears the
   slot nor revokes the session.
 
+### P1 — Core: `KeySlot` and the key store
+- The UniFFI foreign trait, **synchronous**:
+  - `load(slot)` → `Option<bytes>`;
+  - `create(slot, bytes)`: create-only, returns `Exists` if taken;
+  - `replace(slot, bytes)`: an **atomic** overwrite-or-create (`SecItemUpdate`, or add if
+    absent; oo7 `create_item(replace: true)`);
+  - `delete(slot)`.
+  Errors: `Exists`, `Unavailable` (locked, `errSecInteractionNotAllowed`, `errSecAuthFailed`,
+  a locked Secret Service), and `Fatal(code)`. `Fatal` carries a **numeric status code
+  only**, never backend text.
+- `KeyStore::get_or_create(slot)`: load; if absent, `getrandom` 32 bytes (an entropy failure is
+  an error, never a weaker key), then `create`. On `Exists`, load again; if that load is absent
+  or unreadable, return `Unavailable`, never a new key.
+- Key and token bytes are held in `Zeroizing`. Every type carrying them has a redacted `Debug`.
+- `InMemoryKeySlot` for tests, with scripted failures per call.
+- **Check, each with a mutation:**
+  - absent → created once, 32 random bytes;
+  - `Exists` → the winner's key; `Exists` then an absent load → `Unavailable`;
+  - `Unavailable` and `Fatal` never create, delete or replace;
+  - slots are isolated (one slot's operations never touch another's);
+  - an entropy failure makes no key;
+  - no key bytes in `Debug` or logs (canaries).
+
 ### P2 — Core: staying signed in (#58)
 - **Stored:** slot `session:<origin>` holds `{user, refresh token}` (the full `User`, so a restore
   needs no `/me` before it can install), with a redacted `Debug`. The access token is never
