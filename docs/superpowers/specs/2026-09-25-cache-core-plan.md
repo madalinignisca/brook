@@ -32,8 +32,9 @@
 ## C1 — Stores (spec §3)
 - `store.rs`:
   - `Store::open(dir, slot_name, KeyStore)`: `get_or_create` the 256-bit key (P1's `KeyStore`),
-    then `PRAGMA key` (raw hex key form), `cipher_memory_security = ON`, `temp_store = MEMORY`
-    and `journal_mode = WAL`;
+    then `PRAGMA key` (raw hex key form), `cipher_memory_security = ON`, `temp_store = MEMORY`,
+    `journal_mode = WAL` and `cipher_log_level = NONE` (a wrong key otherwise makes SQLCipher
+    print to stderr by itself; `Damaged` is reported through `tracing`);
   - check `meta.format`. A mismatch in **cache.db** rebuilds it; in **outbox.db** it is
     surfaced (C4) before any rebuild;
   - **Missing vs unreadable, on durable evidence.** Beside each database, a non-secret
@@ -119,7 +120,8 @@
   idempotently); `410` rebuilds cache.db and leaves outbox.db untouched.
 
 ## C3 — Read API and events (spec §8, reading half)
-- `cached_channels()`, `cached_messages(channel, before?, limit)`, `pending_messages(channel)`
+- `cached_channels()` (each with its **computed** unread count: `/sync`'s is always 0),
+  `cached_messages(channel, before?, limit)`, `pending_messages(channel)`
   and `cache_state()` (a watch receiver), plus a `CacheEvent { channel_id }` stream. FFI over
   UniFFI; the Mac UI is #62.
 - **Tests:** offline launch returns the last-synced state; events fire after commit, never
@@ -222,6 +224,9 @@
   - a key-check file as durable evidence, one opener per store, and a reset that needs no
     read;
   - senders follow every way a session ends.
+- **Linux client review** (LGTM): C0 is GO on Linux (the Arch spike: system `libcrypto.so.3`, no
+  sentinel in `.db`/`-wal`/`-shm`, a wrong key refused); `cipher_log_level = NONE`; the
+  computed unread count; the Linux CI and INSTALL changes are the Linux client's, in C1.
 - **Server review** (LGTM with notes):
   - explicit failed rows for 404/403/409/413/422;
   - the rejoin supplement's lower `seq` is stated;
