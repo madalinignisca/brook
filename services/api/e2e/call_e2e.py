@@ -90,7 +90,8 @@ async def _media_flowing(page: Page, who: str) -> dict[str, int]:
     s1 = await page.evaluate("window.brook.stats()")
     await asyncio.sleep(2)
     s2 = await page.evaluate("window.brook.stats()")
-    assert s2["inboundVideoBytes"] > s1["inboundVideoBytes"] > 0, (
+    # Only growth is required: the first sample may legitimately still be 0.
+    assert s2["inboundVideoBytes"] > s1["inboundVideoBytes"] and s2["inboundVideoBytes"] > 0, (
         f"{who}: no inbound video {s1}->{s2}"
     )
     assert s2["framesDecoded"] > s1["framesDecoded"], f"{who}: no frames decoded {s1}->{s2}"
@@ -144,6 +145,60 @@ async def main() -> None:
         )
         print("PASS remote video on alice's side is attributed to Bob")
 
+        # Screen share (PROTOCOL.md §3.3 `tracks`): alice adds a third m-line labelled
+        # "screen" on her SAME publish PC. Janus does not add it to bob's existing
+        # subscription by itself; the server must, and bob must DECODE it.
+        await alice.evaluate("window.brook.shareScreen(true)")
+        screen_mid = await wait_for(
+            bob,
+            "(Object.entries(window.brook.remote)"
+            ".find(([m, r]) => r.source === 'screen') || [])[0]",
+            "bob receives alice's screen stream",
+        )
+        f1 = (await bob.evaluate("window.brook.framesByMid()")).get(screen_mid, 0)
+        await asyncio.sleep(2)
+        f2 = (await bob.evaluate("window.brook.framesByMid()")).get(screen_mid, 0)
+        assert f2 > f1, f"screen stream not decoding on mid {screen_mid}: {f1}->{f2}"
+        print(f"PASS screen share: bob decodes alice's screen on mid {screen_mid} ({f2} frames)")
+        await alice.evaluate("window.brook.stopScreen()")
+        await wait_for(
+            bob,
+            "!Object.values(window.brook.remote).some(r => r.source === 'screen')",
+            "bob's screen stream goes away when alice stops sharing",
+        )
+        print("PASS stop sharing: screen stream renegotiated away")
+
+        # Re-share after a (soft, direction-inactive) stop: a NEW transceiver, the
+        # supported pattern. Bob must decode it, with exactly ONE screen stream.
+        await alice.evaluate("window.brook.shareScreen(true)")
+        mid2 = await wait_for(
+            bob,
+            "(Object.entries(window.brook.remote)"
+            ".find(([m, r]) => r.source === 'screen') || [])[0]",
+            "bob receives the re-shared screen",
+        )
+        screens = await bob.evaluate(
+            "Object.values(window.brook.remote).filter(r => r.source === 'screen').length"
+        )
+        assert screens == 1, f"expected exactly one screen stream, bob has {screens}"
+        g1 = (await bob.evaluate("window.brook.framesByMid()")).get(mid2, 0)
+        await asyncio.sleep(2)
+        g2 = (await bob.evaluate("window.brook.framesByMid()")).get(mid2, 0)
+        assert g2 > g1, f"re-shared screen not decoding on mid {mid2}: {g1}->{g2}"
+        print(f"PASS re-share after stop: one screen stream, decoding on mid {mid2}")
+
+        # Unsupported: transceiver.stop() then share again makes Chrome RECYCLE the
+        # rejected m-line under a new mid, which Janus 1.4.2 answers with the stale
+        # mid (breaking the PC). The server must refuse it cleanly as `invalid`.
+        await alice.evaluate("window.brook.stopScreen(true)")
+        refused = await alice.evaluate(
+            "window.brook.shareScreen(true).then(() => null, e => e.code || String(e))"
+        )
+        assert refused == "invalid", f"recycled m-line not refused cleanly: {refused!r}"
+        state = await alice.evaluate("pubPc.connectionState")
+        assert state == "connected", f"alice's publish PC broke: {state}"
+        print("PASS recycled m-line refused as `invalid`; publish PC still connected")
+
         await bob.evaluate("window.brook.leave()")
         await wait_for(
             alice, "Object.keys(window.brook.participants).length === 0", "alice sees bob leave"
@@ -157,4 +212,5 @@ async def main() -> None:
         await browser.close()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

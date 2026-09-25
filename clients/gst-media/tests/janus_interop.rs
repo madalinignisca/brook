@@ -276,7 +276,12 @@ impl Participant {
                                     s["mid"].as_str().unwrap().to_string(),
                                     (
                                         s["participant_id"].as_str().unwrap().to_string(),
-                                        s["kind"].as_str().unwrap().to_string(),
+                                        // "kind:source", e.g. "video:screen"
+                                        format!(
+                                            "{}:{}",
+                                            s["kind"].as_str().unwrap(),
+                                            s["source"].as_str().unwrap_or("?")
+                                        ),
                                     ),
                                 );
                             }
@@ -352,6 +357,11 @@ impl Participant {
     /// Wait until some remote video mid belonging to a stream in the latest
     /// offer has decoded at least `frames` more frames than it had at call time.
     async fn wait_video(&self, frames: usize) {
+        self.wait_video_of("video:", frames).await
+    }
+
+    /// Like `wait_video`, for streams whose "kind:source" starts with `prefix`.
+    async fn wait_video_of(&self, prefix: &str, frames: usize) {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         let baseline = self.snapshot();
         loop {
@@ -361,7 +371,7 @@ impl Participant {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(_, (_, k))| k == "video")
+                .filter(|(_, (_, k))| k.starts_with(prefix))
                 .map(|(m, _)| m.clone())
                 .collect();
             let ok = active.iter().any(|mid| {
@@ -389,6 +399,38 @@ impl Participant {
             .iter()
             .map(|(m, n)| (m.clone(), n.load(Ordering::Relaxed)))
             .collect()
+    }
+
+    /// Publish again on the same PC, with the engine's m-line labels as
+    /// `tracks` (screen share start/stop).
+    async fn republish(&self) {
+        let offer = self.engine.create_publish_offer().await.unwrap();
+        let tracks: Vec<Value> = self
+            .engine
+            .publish_tracks()
+            .iter()
+            .map(|t| json!({"mid": t.mid, "kind": t.kind, "source": t.source}))
+            .collect();
+        println!("[{}] republish with tracks {tracks:?}", self.name);
+        let (tx, rx) = oneshot::channel();
+        let _ = self.cmd.send((
+            json!({"type": "call.publish", "data": {
+                "call_id": self.call_id, "sdp": offer, "tracks": tracks}}),
+            Some(tx),
+        ));
+        let answer = tokio::time::timeout(TIMEOUT, rx)
+            .await
+            .expect("publish reply")
+            .unwrap();
+        assert_eq!(
+            answer["type"], "call.publish.answer",
+            "[{}] {answer}",
+            self.name
+        );
+        self.engine
+            .apply_publish_answer(answer["data"]["sdp"].as_str().unwrap())
+            .await
+            .unwrap();
     }
 
     async fn leave(self) {
@@ -457,6 +499,49 @@ async fn two_participants_and_renegotiation() {
         mids,
         "stale decoders left behind"
     );
+
+    bob.leave().await;
+    alice.leave().await;
+}
+
+/// Screen share against the real server + Janus: alice shares mid-call on
+/// her existing publish PC (labelled via `tracks`), bob's subscribe PC gets a
+/// re-offer with a `source: "screen"` stream and decodes it; stopping
+/// removes it from bob's streams.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a running Brook server + Janus with screen share (see module docs)"]
+async fn screen_share_reaches_the_other_participant() {
+    let env = env();
+    let (a, b) = (&env.users[0], &env.users[1]);
+    let alice = Participant::join(&env, &a.0, &a.1).await;
+    let bob = Participant::join(&env, &b.0, &b.1).await;
+    bob.wait_video_of("video:camera", 20).await;
+
+    alice
+        .engine
+        .start_screen_share(brook_media_gst::ScreenSource::Test)
+        .unwrap();
+    alice.republish().await;
+    bob.wait_video_of("video:screen", 20).await;
+
+    alice.engine.stop_screen_share().unwrap();
+    alice.republish().await;
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while bob
+        .streams
+        .lock()
+        .unwrap()
+        .values()
+        .any(|(_, k)| k == "video:screen")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "screen still offered to bob"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The camera keeps flowing after the share ends.
+    bob.wait_video_of("video:camera", 20).await;
 
     bob.leave().await;
     alice.leave().await;
