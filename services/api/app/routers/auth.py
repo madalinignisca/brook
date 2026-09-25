@@ -185,6 +185,9 @@ async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) ->
     user = await session.get(User, token.user_id)
     if user is None or user.status != "active":
         raise bad
+    # Read before the UPDATE: the ORM UPDATE's synchronize_session sets
+    # token.revoked=True in memory even when it matched no row.
+    was_revoked = bool(token.revoked)
     # Compare-and-set: only the first concurrent rotation flips revoked→true, so
     # two simultaneous /refresh calls can't both mint a new token (TOCTOU-safe).
     result = cast(
@@ -195,7 +198,7 @@ async def _rotate(body: RefreshIn, session: AsyncSession, settings: Settings) ->
             .values(revoked=True)
         ),
     )
-    if result.rowcount != 1 and not token.revoked:
+    if result.rowcount != 1 and not was_revoked:
         # It was unrevoked when read: a concurrent rotation won (two tabs).
         raise _LostRotationRace(status_code=bad.status_code, detail=bad.detail)
     if result.rowcount != 1:
