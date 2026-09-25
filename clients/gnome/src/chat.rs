@@ -2217,7 +2217,9 @@ fn spawn_cache_loop(chat: &Rc<Chat>) {
                 }
                 Ok(CacheEvent::Removed(_) | CacheEvent::Reset) | Err(RecvError::Lagged(_)) => {
                     refresh_channels(&chat, None);
+                    report_outbox_lost(&chat);
                 }
+                Ok(CacheEvent::OutboxLost) => report_outbox_lost(&chat),
                 Ok(_) => {}
                 Err(RecvError::Closed) => break,
             }
@@ -2282,29 +2284,63 @@ fn badges_from_cache(chat: &Rc<Chat>) {
 /// The offline banner, from the cache's state (every few seconds), and the one-time
 /// clean-up of other accounts' saved data once this user's storage is open.
 fn watch_offline(chat: &Rc<Chat>) {
+    // Core's state feed (#113): it follows sign-ins and switches by itself and resets
+    // to the default on sign-out, so the banner never shows a previous user's state.
+    let mut state = chat.client.subscribe_cache_state();
     let chat_weak = Rc::downgrade(chat);
-    let checked_others = Rc::new(std::cell::Cell::new(false));
-    glib::timeout_add_seconds_local(3, move || {
-        let Some(chat) = chat_weak.upgrade() else {
-            return glib::ControlFlow::Break;
-        };
-        if chat.offline_banner.root().is_none() {
-            return glib::ControlFlow::Break; // signed out: the view is gone
-        }
-        let handle = chat.runtime.spawn({
-            let client = chat.client.clone();
-            async move { client.cache_state().await }
-        });
-        let checked_others = checked_others.clone();
-        glib::spawn_future_local(async move {
-            let Ok(Ok(state)) = handle.await else { return };
-            chat.offline_banner.set_revealed(state.offline);
-            if !checked_others.replace(true) {
+    glib::spawn_future_local(async move {
+        let mut checked_others = false;
+        loop {
+            let current = state.borrow_and_update().clone();
+            let Some(chat) = chat_weak.upgrade() else {
+                break;
+            };
+            if chat.offline_banner.root().is_none() {
+                break; // signed out: the view is gone
+            }
+            chat.offline_banner.set_revealed(current.offline);
+            // The first completed sync means this user's storage is open: now is the
+            // time to clear another account's saved data (#46 §8).
+            if current.last_synced.is_some() && !checked_others {
+                checked_others = true;
                 wipe_other_accounts(&chat);
             }
-        });
-        glib::ControlFlow::Continue
+            drop(chat);
+            if state.changed().await.is_err() {
+                break;
+            }
+        }
     });
+    report_outbox_lost(chat);
+}
+
+/// Unsent messages this device couldn't keep (their storage key was lost): say so once
+/// and acknowledge exactly that loss, so a newer one is still reported.
+fn report_outbox_lost(chat: &Rc<Chat>) {
+    thread_local! {
+        // One alert at a time: a second notice before the first is dismissed adds none.
+        static SHOWING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if SHOWING.with(std::cell::Cell::get) {
+        return;
+    }
+    let Some(n) = chat.client.outbox_lost() else {
+        return;
+    };
+    SHOWING.with(|s| s.set(true));
+    let alert = adw::AlertDialog::new(
+        Some("Unsent Messages Lost"),
+        Some("Some unsent messages on this device couldn't be recovered."),
+    );
+    alert.add_response("ok", "OK");
+    alert.connect_response(None, {
+        let client = chat.client.clone();
+        move |_, _| {
+            client.acknowledge_outbox_lost(n);
+            SHOWING.with(|s| s.set(false));
+        }
+    });
+    alert.present(Some(&chat.message_list));
 }
 
 /// A different account used this device before: its saved data goes (#46 §8).
