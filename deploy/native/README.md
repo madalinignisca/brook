@@ -47,7 +47,12 @@ ssh busuioc 'curl -fsS -X POST http://127.0.0.1:8000/api/v1/auth/register \
     -H "Content-Type: application/json" \
     -d @-' <<<'{"handle":"<admin>","display_name":"<Name>","password":"<password>"}'
 ssh busuioc 'sudo systemctl enable --now caddy'
+curl -fsS https://chat.madalin.me/health     # through Caddy + TLS, not just loopback
 ```
+
+The last check matters: install.sh's own health check talks to the api on
+loopback and cannot see a Caddy → api failure (e.g. an SELinux denial; EPEL's
+Caddy ships no policy today, so it runs unconfined, but verify rather than trust).
 
 Further accounts: log in as admin and `POST /api/v1/auth/register` with the
 admin's bearer token (registration is admin-only once a user exists).
@@ -67,6 +72,21 @@ curl -fsS https://chat.madalin.me/health
 ssh busuioc 'journalctl -u brook-api -u brook-janus --since -10min -p warning'
 git ls-remote ssh://a1git/srv/git/stilbag-magento.git   # the git server on the same VM still works
 ```
+
+## Rollback
+
+There is no automatic rollback: install.sh replaces `/opt/brook/api` in place and
+the next start migrates. Before each restart it dumps the database to
+`/var/backups/brook/brook-<UTC>.dump` (last 5 kept). To go back:
+
+```sh
+ssh busuioc 'sudo systemctl stop brook-api'
+ssh busuioc 'sudo -u postgres pg_restore --clean --if-exists -d brook /var/backups/brook/<dump>'
+# then re-run "Install or upgrade" with the previous good commit instead of origin/main
+```
+
+Messages written between the dump and the rollback are lost; for a family server
+that is an accepted trade-off.
 
 ## Shared-host rules (busuioc is also the git server)
 

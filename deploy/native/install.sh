@@ -110,6 +110,10 @@ log "PostgreSQL"
 if [ ! -f /var/lib/pgsql/data/PG_VERSION ]; then
     postgresql-setup --initdb
 fi
+# The api's DB login rests on this line (peer: OS user brook = role brook). Assert
+# it rather than trust the packaging default: without it the api never starts.
+grep -Eq '^local[[:space:]]+all[[:space:]]+all[[:space:]]+peer' /var/lib/pgsql/data/pg_hba.conf \
+    || { echo "pg_hba.conf: expected 'local all all peer'; fix it, then re-run" >&2; exit 1; }
 systemctl enable --now postgresql
 # The api connects over the local socket with peer auth (OS user brook = role
 # brook), so there is no database password to generate, store or leak, and
@@ -125,14 +129,18 @@ fi
 # ---------------------------------------------------------------- secrets
 log "secrets (/etc/brook, generated once, never leave this host)"
 install -d -m 0755 /etc/brook
+# Each file is guarded on its own so an interrupted first run heals on re-run.
+# The Janus API secret is shared: api.env always takes it from janus.env.
+umask 077
 if [ ! -f /etc/brook/janus.env ]; then
-    umask 077
-    janus_secret=$(openssl rand -hex 32)
     cat > /etc/brook/janus.env <<EOF
-JANUS_API_SECRET=$janus_secret
+JANUS_API_SECRET=$(openssl rand -hex 32)
 JANUS_PUBLIC_IP=$BROOK_PUBLIC_IP
 JANUS_RTP_PORTS=$RTP_PORTS
 EOF
+fi
+if [ ! -f /etc/brook/api.env ]; then
+    janus_secret=$(sed -n 's/^JANUS_API_SECRET=//p' /etc/brook/janus.env)
     cat > /etc/brook/api.env <<EOF
 BROOK_DATABASE_URL=postgresql+asyncpg://brook@/brook?host=/run/postgresql
 BROOK_JWT_SIGNING_KEY=$(openssl rand -hex 32)
@@ -140,8 +148,8 @@ BROOK_AUTO_CREATE_SCHEMA=false
 BROOK_JANUS_URL=ws://127.0.0.1:8188
 BROOK_JANUS_API_SECRET=$janus_secret
 EOF
-    umask 022
 fi
+umask 022
 chown root:janus /etc/brook/janus.env && chmod 0640 /etc/brook/janus.env
 chown root:brook /etc/brook/api.env && chmod 0640 /etc/brook/api.env
 
@@ -151,14 +159,33 @@ install -m 0644 "$SRC/deploy/native/brook-api.service" "$SRC/deploy/native/brook
     /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable brook-janus brook-api
+# No automatic rollback: /opt/brook/api was just replaced in place and the next
+# start migrates. This dump is the way back from a bad migration (README.md
+# "Rollback"). Taken before the restart, so it is the pre-migration schema.
+install -d -m 0700 -o postgres -g postgres /var/backups/brook
+if [ "$(psql_su -d brook -c "SELECT to_regclass('public.alembic_version') IS NOT NULL")" = t ]; then
+    runuser -u postgres -- pg_dump -Fc brook > "/var/backups/brook/brook-$(date -u +%Y%m%dT%H%M%SZ).dump"
+    # Names are UTC timestamps, so a reverse sort is newest-first; keep the last 5.
+    find /var/backups/brook -name 'brook-*.dump' | sort -r | tail -n +6 | xargs -r rm --
+fi
 systemctl restart brook-janus
 systemctl restart brook-api
 
 # Caddyfile is installed on every run; Caddy itself is only reloaded if it is
 # already live (fresh installs go live via README.md, after the admin exists).
 [ -f /etc/caddy/Caddyfile.dist ] || cp -a /etc/caddy/Caddyfile /etc/caddy/Caddyfile.dist
-sed "s/BROOK_DOMAIN/$BROOK_DOMAIN/" "$SRC/deploy/native/Caddyfile" > /etc/caddy/Caddyfile
-if systemctl is-active -q caddy; then systemctl reload caddy; fi
+# This is the one internet-facing config: validate before installing, show any
+# change, and reload only when something actually changed.
+new_caddyfile=$(mktemp)
+sed "s/BROOK_DOMAIN/$BROOK_DOMAIN/" "$SRC/deploy/native/Caddyfile" > "$new_caddyfile"
+caddy validate --adapter caddyfile --config "$new_caddyfile" >/dev/null
+if ! cmp -s "$new_caddyfile" /etc/caddy/Caddyfile; then
+    diff -u /etc/caddy/Caddyfile "$new_caddyfile" || true
+    install -m 0644 "$new_caddyfile" /etc/caddy/Caddyfile
+    restorecon /etc/caddy/Caddyfile
+    if systemctl is-active -q caddy; then systemctl reload caddy; fi
+fi
+rm -f "$new_caddyfile"
 
 log "health"
 for _ in $(seq 20); do

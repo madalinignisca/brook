@@ -12,6 +12,12 @@
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 
+# firewall-offline-cmd refuses to run against a live daemon. Once firewalld is
+# up, change rules with firewall-cmd --permanent + --reload instead of re-running.
+if systemctl is-active -q firewalld; then
+    echo "firewalld is already running; use firewall-cmd, not this script" >&2
+    exit 1
+fi
 dnf -y -q install firewalld
 
 zone=public
