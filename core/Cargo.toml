@@ -27,6 +27,11 @@ url = { workspace = true }
 # Keys for the local store: OS randomness, wiped from memory after use.
 getrandom = "0.3"
 zeroize = "1"
+# The offline cache and outbox (#61, #63): SQLCipher, CommonCrypto on Apple, the system
+# libcrypto on Linux (plan C0: go on both). ring is already in the tree via rustls: the
+# stores' key check (HMAC-SHA256).
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
+ring = "0.17"
 
 [dev-dependencies]
 # Log-secrecy test: capture everything, including tungstenite's `log` records.
