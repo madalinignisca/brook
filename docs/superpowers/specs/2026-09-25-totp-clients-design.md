@@ -50,10 +50,19 @@ so a wrong code answered 401 would start a refresh instead of asking again.
   step succeeds; `AuthState` stays `Authenticating` meanwhile, and a new `login` or `logout`
   discards the challenge.
 - `complete_totp(challenge, code)` / `complete_recovery(challenge, recovery_code)`: take the
-  refresh lock like login, install the pair, return the remaining recovery-code count if the
-  server sent one. `auth.totp_expired` ends the challenge (the UI goes back to the password).
-- **`totp_activate` runs exactly like `change_password`:** the server revokes this device's
-  tokens too and returns a new pair, so the call holds the refresh lock from before the request
+  refresh lock like login, then **check the challenge is still the current one** (each has a
+  unique id; core keeps the current id, cleared by `login`, `logout`, `cancel_totp` and by a
+  success). Only then is a result applied: a success installs the pair and consumes the
+  challenge, returning the remaining recovery-code count if sent; `auth.totp_expired` ends it
+  (the UI goes back to the password). A completion whose challenge is no longer current changes
+  nothing and returns `ChallengeSuperseded`, whatever the server said; if the server issued a
+  pair for it, that pair is discarded and its refresh token revoked best-effort
+  (`POST /auth/logout`). So a duplicate submission, a Back, or a login/logout racing an
+  in-flight completion can neither sign in late nor send the UI back to the password.
+- `cancel_totp(challenge)`: what Back calls; the challenge stops being current.
+- **`totp_activate` runs exactly like `change_password`:** activation applies the #45 cutoff,
+  which revokes every token issued before it, this device's included; this device stays signed
+  in only through the pair the response carries (server spec §2.3), so the call holds the refresh lock from before the request
   until the pair is committed (CAS against the token used), in its own bounded task. Without it a
   background refresh with the pre-activation token is rejected and the device signs itself out
   right after turning 2FA on. The own-socket close (`session_revoked`, after the response) is
@@ -72,7 +81,9 @@ so a wrong code answered 401 would start a refresh instead of asking again.
   system can autofill from the Passwords app), "Use a recovery code instead", and Back. Paste of
   "123 456" is accepted (spaces stripped). A wrong code says "Wrong or already-used code. Wait
   for the next one." (every code-accepting endpoint shares the replay guard, so the first sign-in
-  right after activation needs the next code). Expired challenge → back to the password with a
+  right after activation needs the next code). A wrong recovery code says "That recovery code
+  is wrong or already used. Try another one." (recovery codes never rotate). Back cancels the
+  challenge (`cancel_totp`); the submit button is disabled while a completion is in flight. Expired challenge → back to the password with a
   note. Recovery-code input is normalised (case, dashes, spaces); codes display as
   `iiii-xxxx-xxxx-xxxx-xxxx`.
 - Account menu: **Turn On Two-Factor Sign-In…** / **Turn Off…**, from `totp_enabled`.
@@ -85,6 +96,10 @@ so a wrong code answered 401 would start a refresh instead of asking again.
 - Admin: "Reset a User's Two-Factor Sign-In…", shaped like the password reset sheet.
 
 ## 6. Tests
+- Core, challenge ownership: two submissions for one challenge → exactly one installs, the other
+  returns `ChallengeSuperseded` and leaves the session as the first left it; `cancel_totp`
+  during an in-flight completion (gated server) → nothing installed, the late pair's refresh
+  token revoked; `logout` and a new `login` during an in-flight completion → the same.
 - Core, TestServer: login sends `supports_totp`; login → TotpRequired and **nothing installed**;
   activate under the lock: a background refresh racing it never signs the user out, the pair is
   committed, and a close of this device's socket before or after the commit reconnects with it; complete with a correct code
@@ -93,7 +108,8 @@ so a wrong code answered 401 would start a refresh instead of asking again.
   a pending token never reaches `Authorization` or the WS auth frame; enrol/activate/disable/admin
   reset bodies exact, 401 → one refresh, errors body-free; secrecy of URI, codes and token in
   `Display`/`Debug`/logs.
-- macOS models: code field validation and paste; state machine password → code → signed in /
+- macOS models: code field validation and paste; the recovery-code error text differs from the
+  TOTP one; Back while submitting leaves the password step without a late sign-in; state machine password → code → signed in /
   back; enrolment steps and field lifetime; menu item from `totp_enabled`; admin visibility.
 - Live (itest, throwaway accounts): enrol, activate with a code computed in the test from the
   URI's secret (RFC 6238 SHA-1, 30 s), sign in with password + code, replay of the same code
@@ -112,3 +128,13 @@ so a wrong code answered 401 would start a refresh instead of asking again.
 ## 8. Open for the owner
 Those of the server spec §8 (event retention; IPs in auth events). Turning TOTP on always signs
 out the other devices (decided in the server review), so the enrolment sheet has no checkbox.
+
+## 9. Review log
+**Round 1 — Codex + Vibe (Heavy).** Codex, all accepted: challenge ownership checked under the
+lock before any result is applied, success consumes it, stale completions change nothing
+(`ChallengeSuperseded`), with duplicate-submission and login/logout race tests; Back cancels
+the challenge and a late pair is discarded and revoked; separate wording for a wrong recovery
+code. Vibe: "activation keeps this device's tokens, so no socket close or lock is needed".
+Rejected with evidence: server spec §2.3 applies the #45 cutoff on activation (every token issued
+before it, this device's included) and keeps this device signed in only through the returned
+pair; the Linux client's review read it the same way. §4 now states this explicitly.
