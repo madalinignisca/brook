@@ -34,7 +34,10 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 | Profile: status message + emoji ("In a meeting") | ⬜ | PN | lightweight, drives presence UI |
 | Account deactivate (keep history) | ⬜ | P7 | `users.status=deactivated` exists |
 | Multi-device sessions + revoke | 🟡 | P0b | refresh tokens exist; no session list UI |
-| Logout | ✅ | P0 | server revoke done; client wiring ⬜ |
+| Logout | 🟡 | P0 | server revoke done; client wiring in progress (MVP+) |
+| Stay signed in across restarts (platform secret store) | ⬜ | MVP+ | Keychain / Secret portal |
+| Offline cache (channels, members, messages) | ⬜ | MVP+ | core SQLite, encrypted (#46); opens offline |
+| Offline outbox (send when back online) | ⬜ | MVP+ | |
 
 ## 2. Conversations & channels
 
@@ -59,7 +62,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 | Feature | Status | Phase | Notes |
 |---|---|---|---|
 | Send message (single path) | ✅ | P1 | REST → WS fan-out |
-| History pagination (`before`) | ✅ | P1 | `after`/forward-sync ⬜ |
+| History pagination (`before`/`after`) | ✅ | P1 | a change feed for edits, deletes, reactions and membership ⬜ (MVP+ #60) |
 | Edit message | 🟢 | P1b | `PATCH /messages/{id}` (author-only) + `message.update`; UI in both clients |
 | Delete message (soft) | 🟢 | P1b | `DELETE /messages/{id}` (author/admin) + `message.delete`; UI in both clients |
 | Markdown formatting (bold/italic/code/links) | 🟢 | P1b | render: GNOME pulldown-cmark→Pango, KDE `Text.MarkdownText`; clickable links |
@@ -72,7 +75,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 | Unread / read-state tracking | 🟡 | PN | server+core done (read marker, unread_count, mark-read); client badges ⬜ |
 | Drafts (per channel) | ⬜ | P1b | client-local |
 | Message search | 🟢 | P1b | `GET /channels/search?q=` (ILIKE, membership-scoped); search dialog in both clients. Postgres FTS = P2 upgrade |
-| File attachments | ⬜ | P2 | |
+| File attachments | ⬜ | P2 → MVP+ | cached once opened; "Keep available offline" |
 
 ## 4. Presence & realtime (PN — Presence workstream)
 
