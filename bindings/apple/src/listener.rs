@@ -46,6 +46,16 @@ impl Subscription {
     }
 }
 
+impl Subscription {
+    /// A subscription backed by `task`, which must check `cancelled` before each delivery.
+    pub(crate) fn from_task(cancelled: Arc<AtomicBool>, task: JoinHandle<()>) -> Arc<Self> {
+        Arc::new(Self {
+            cancelled,
+            task: Mutex::new(Some(task)),
+        })
+    }
+}
+
 impl Drop for Subscription {
     fn drop(&mut self) {
         self.cancel();
@@ -54,9 +64,20 @@ impl Drop for Subscription {
 
 /// Deliver `rx`'s states to `listener` until cancelled or the sender is gone.
 pub(crate) fn subscribe_receiver(
-    mut rx: watch::Receiver<AuthState>,
+    rx: watch::Receiver<AuthState>,
     listener: Arc<dyn AuthStateListener>,
 ) -> Arc<Subscription> {
+    subscribe_watch(rx, move |state: AuthState| listener.on_state(state.into()))
+}
+
+/// The latest-state delivery shared by every listener (auth, call state): the current
+/// value first, then each change; a slow listener may skip intermediate values but never
+/// sees them out of order; cancellation stops it, with at most one late delivery.
+pub(crate) fn subscribe_watch<T, F>(mut rx: watch::Receiver<T>, deliver: F) -> Arc<Subscription>
+where
+    T: Clone + Send + Sync + 'static,
+    F: Fn(T) + Send + 'static,
+{
     let cancelled = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&cancelled);
     let task = runtime().spawn(async move {
@@ -64,13 +85,13 @@ pub(crate) fn subscribe_receiver(
             // `borrow_and_update` marks the value seen, so the following `changed()` only
             // fires for a newer one (plain `borrow` would re-deliver it). Clone, then drop
             // the borrow before calling foreign code: no lock is held across the FFI.
-            let state: FfiAuthState = rx.borrow_and_update().clone().into();
+            let value: T = rx.borrow_and_update().clone();
             if flag.load(Ordering::SeqCst) {
                 break;
             }
-            listener.on_state(state);
+            deliver(value);
             if rx.changed().await.is_err() {
-                break; // sender dropped: the client is gone
+                break; // sender dropped: the source is gone
             }
         }
     });

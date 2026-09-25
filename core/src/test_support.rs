@@ -19,7 +19,7 @@ use crate::{BrookClient, CoreConfig};
 
 /// How `/auth/refresh` answers.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum RefreshMode {
+pub enum RefreshMode {
     /// Issue a fresh token pair.
     Rotate,
     /// Answer with this status and an error envelope.
@@ -38,14 +38,14 @@ struct ServerState {
 type Shared = Arc<Mutex<ServerState>>;
 
 /// A running test origin.
-pub(crate) struct TestServer {
-    pub(crate) base: String,
+pub struct TestServer {
+    pub base: String,
     state: Shared,
     sockets: mpsc::UnboundedReceiver<WsPeer>,
 }
 
 impl TestServer {
-    pub(crate) async fn start() -> Self {
+    pub async fn start() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(ServerState {
             next: 0,
@@ -71,20 +71,20 @@ impl TestServer {
     }
 
     /// A client pointed at this origin (loopback http is allowed by core).
-    pub(crate) fn client(&self) -> BrookClient {
+    pub fn client(&self) -> BrookClient {
         BrookClient::new(CoreConfig::new(&self.base).unwrap()).unwrap()
     }
 
-    pub(crate) fn set_refresh_mode(&self, mode: RefreshMode) {
+    pub fn set_refresh_mode(&self, mode: RefreshMode) {
         self.state.lock().unwrap().refresh_mode = mode;
     }
 
-    pub(crate) fn refresh_calls(&self) -> u32 {
+    pub fn refresh_calls(&self) -> u32 {
         self.state.lock().unwrap().refresh_calls
     }
 
     /// The next socket a client opens (bounded wait).
-    pub(crate) async fn accept(&mut self) -> WsPeer {
+    pub async fn accept(&mut self) -> WsPeer {
         tokio::time::timeout(Duration::from_secs(10), self.sockets.recv())
             .await
             .expect("client never connected")
@@ -143,13 +143,13 @@ async fn ws_upgrade(State(state): State<Shared>, upgrade: WebSocketUpgrade) -> R
 }
 
 /// The server end of one client socket, driven by the test.
-pub(crate) struct WsPeer {
+pub struct WsPeer {
     socket: WebSocket,
 }
 
 impl WsPeer {
     /// Next JSON frame from the client (bounded wait; panics on close or timeout).
-    pub(crate) async fn recv(&mut self) -> Value {
+    pub async fn recv(&mut self) -> Value {
         loop {
             let msg = tokio::time::timeout(Duration::from_secs(10), self.socket.recv())
                 .await
@@ -164,7 +164,7 @@ impl WsPeer {
         }
     }
 
-    pub(crate) async fn send(&mut self, frame: Value) {
+    pub async fn send(&mut self, frame: Value) {
         self.socket
             .send(AxMessage::Text(frame.to_string().into()))
             .await
@@ -172,7 +172,7 @@ impl WsPeer {
     }
 
     /// Standard handshake: expect the `auth` frame, answer `ready` (echoing `re` when present).
-    pub(crate) async fn accept_auth(&mut self) -> Value {
+    pub async fn accept_auth(&mut self) -> Value {
         let auth = self.recv().await;
         assert_eq!(auth["type"], "auth", "first frame must be auth: {auth}");
         let mut ready = json!({ "type": "ready", "data": { "user_id": "id-alice" } });
@@ -184,7 +184,7 @@ impl WsPeer {
     }
 
     /// Wait until the client closes this socket (bounded); panics if it sends a text frame.
-    pub(crate) async fn expect_closed(&mut self) {
+    pub async fn expect_closed(&mut self) {
         loop {
             match tokio::time::timeout(Duration::from_secs(10), self.socket.recv())
                 .await
@@ -197,7 +197,7 @@ impl WsPeer {
         }
     }
 
-    pub(crate) async fn close(&mut self, code: u16, reason: &str) {
+    pub async fn close(&mut self, code: u16, reason: &str) {
         let _ = self
             .socket
             .send(AxMessage::Close(Some(CloseFrame {

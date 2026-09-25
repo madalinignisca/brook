@@ -19,8 +19,8 @@ for t in "${SLICES[@]}"; do
   rustup target list --installed | grep -qx "$t" || { echo "missing Rust target: $t (rustup target add $t)" >&2; exit 1; }
 done
 
-rm -rf "$BUILD" "$PKG/BrookCoreFFI.xcframework" "$PKG/Sources/BrookCore/Generated"
-mkdir -p "$BUILD/headers" "$PKG/Sources/BrookCore/Generated"
+rm -rf "$BUILD" "$PKG/BrookCoreFFI.xcframework" "$PKG/Sources/BrookCoreGenerated" "$PKG/Sources/BrookCore/Generated"
+mkdir -p "$BUILD/headers" "$PKG/Sources/BrookCoreGenerated"
 
 cd "$ROOT"
 for t in "${SLICES[@]}"; do
@@ -31,7 +31,7 @@ BINDGEN="$ROOT/target/release/uniffi-bindgen-swift"
 
 # Library mode: bindings are generated from the UniFFI metadata embedded in the built library.
 META_LIB="$ROOT/target/${SLICES[0]}/release/libbrook_ffi.dylib"
-"$BINDGEN" --swift-sources "$META_LIB" "$PKG/Sources/BrookCore/Generated"
+"$BINDGEN" --swift-sources "$META_LIB" "$PKG/Sources/BrookCoreGenerated"
 "$BINDGEN" --headers "$META_LIB" "$BUILD/headers"
 # A plain (non-`framework`) module named as the generated Swift imports it: the xcframework
 # wraps a static `.a` + headers, not framework bundles, so `--xcframework` does not apply.

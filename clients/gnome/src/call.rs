@@ -15,8 +15,8 @@ use std::sync::Arc;
 use adw::prelude::*;
 use brook_core::{BrookClient, CallHandle, CallState, CallStatus, EndReason, MediaEngine};
 use brook_media_gst::{
-    CameraSource, EngineConfig, EngineEvent, GstEngine, MicSource, PcKind, SinkFactory, TrackKind,
-    VideoCodec,
+    CameraSource, EngineConfig, EngineEvent, GstEngine, MediaSource, MicSource, PcKind,
+    SinkFactory, TrackKind, VideoCodec,
 };
 use gtk::{gdk, glib};
 use tokio::runtime::Handle;
@@ -96,6 +96,7 @@ pub struct CallView {
     status: adw::Banner,
     mic_button: gtk::ToggleButton,
     camera_button: gtk::ToggleButton,
+    share_button: gtk::ToggleButton,
     hangup_button: gtk::Button,
     tiles: Rc<RefCell<HashMap<String, Tile>>>,
 }
@@ -152,6 +153,7 @@ impl CallView {
 
         let mic_button = control_toggle("microphone-sensitivity-high-symbolic", "Mute microphone");
         let camera_button = control_toggle("camera-web-symbolic", "Turn camera off");
+        let share_button = control_toggle("video-display-symbolic", "Share your screen");
         let hangup_button = gtk::Button::builder()
             .icon_name("call-stop-symbolic")
             .tooltip_text("Leave call")
@@ -169,6 +171,7 @@ impl CallView {
             .build();
         controls.append(&mic_button);
         controls.append(&camera_button);
+        controls.append(&share_button);
         controls.append(&hangup_button);
 
         let status = adw::Banner::new("");
@@ -189,9 +192,23 @@ impl CallView {
             status,
             mic_button,
             camera_button,
+            share_button,
             hangup_button,
             tiles: Rc::default(),
         };
+        // Sharing is shown as an accent-coloured toggle.
+        view.share_button.connect_toggled(|b| {
+            b.set_tooltip_text(Some(if b.is_active() {
+                "Stop sharing your screen"
+            } else {
+                "Share your screen"
+            }));
+            if b.is_active() {
+                b.add_css_class("suggested-action");
+            } else {
+                b.remove_css_class("suggested-action");
+            }
+        });
 
         // Icons and tooltips follow the toggle state (active = muted / off).
         view.mic_button.connect_toggled(|b| {
@@ -227,19 +244,39 @@ impl CallView {
         self.self_view.set_paintable(paintable_of(sink).as_ref());
     }
 
-    /// Add (or re-bind) the video tile for a remote stream.
-    pub fn set_remote_video(&self, mid: &str, sink: &gst::Element, name: &str) {
+    /// Add (or re-bind) the video tile for a remote stream. A shared screen
+    /// gets a large tile at the front of the grid.
+    pub fn set_remote_video(&self, mid: &str, sink: &gst::Element, name: &str, screen: bool) {
         let paintable = paintable_of(sink);
         let mut tiles = self.tiles.borrow_mut();
         let tile = tiles.entry(mid.to_string()).or_insert_with(|| {
             let tile = new_tile();
-            self.grid.append(&tile.child);
+            if screen {
+                self.grid.prepend(&tile.child);
+            } else {
+                self.grid.append(&tile.child);
+            }
             tile
         });
+        let (w, h) = if screen { (640, 360) } else { (320, 180) };
+        tile.picture.set_size_request(w, h);
         tile.picture.set_paintable(paintable.as_ref());
         tile.label.set_text(name);
         drop(tiles);
         self.refresh_empty();
+    }
+
+    /// Called with the desired state when the user toggles screen sharing.
+    pub fn connect_share_toggled(&self, f: impl Fn(bool) + 'static) {
+        self.share_button.connect_toggled(move |b| f(b.is_active()));
+    }
+
+    /// Reflect the actual sharing state (e.g. the picker was cancelled)
+    /// without re-triggering the toggle handler's action.
+    pub fn set_sharing(&self, on: bool, handler_guard: &std::cell::Cell<bool>) {
+        handler_guard.set(true);
+        self.share_button.set_active(on);
+        handler_guard.set(false);
     }
 
     /// Rename a tile (e.g. once the roster maps its mid to a participant).
@@ -443,7 +480,7 @@ pub fn present_loopback(app: &adw::Application, runtime: &Handle) {
                         kind: TrackKind::Video,
                         sink,
                     } => {
-                        view.set_remote_video(&mid, &sink, "You (via loopback)");
+                        view.set_remote_video(&mid, &sink, "You (via loopback)", false);
                     }
                     EngineEvent::LocalCandidate { candidate, .. } => {
                         if let Err(err) =
@@ -547,25 +584,33 @@ pub fn open_call(
 
     // The handle, once joined; dropped (-> leave) when the window goes away.
     let handle: Rc<RefCell<Option<Arc<CallHandle>>>> = Rc::default();
-    // mid -> participant id, from the latest applied subscribe offer.
-    let mids: Rc<RefCell<HashMap<String, String>>> = Rc::default();
+    // mid -> (participant id, is a shared screen), from the latest applied
+    // subscribe offer.
+    let mids: Rc<RefCell<HashMap<String, (String, bool)>>> = Rc::default();
     // The latest call state (roster names).
     let state: Rc<RefCell<Option<CallState>>> = Rc::default();
 
     let name_of = {
         let (mids, state) = (mids.clone(), state.clone());
         move |mid: &str| -> String {
-            let pid = mids.borrow().get(mid).cloned();
-            state
+            let Some((pid, screen)) = mids.borrow().get(mid).cloned() else {
+                return String::new();
+            };
+            let name = state
                 .borrow()
                 .as_ref()
                 .and_then(|s| {
                     s.participants
                         .iter()
-                        .find(|p| Some(&p.participant_id) == pid.as_ref())
+                        .find(|p| p.participant_id == pid)
                         .map(|p| p.display_name.clone())
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            if screen {
+                format!("{name} (screen)")
+            } else {
+                name
+            }
         }
     };
     let name_of = Rc::new(name_of);
@@ -583,6 +628,67 @@ pub fn open_call(
             }
         }
     });
+    // Screen share: the desktop's picker, then a new m-line on the publish
+    // PC and a republish; off stops it and republishes. `quiet` suppresses the
+    // handler while the UI is reset programmatically.
+    let quiet = Rc::new(std::cell::Cell::new(false));
+    view.connect_share_toggled({
+        let (view, handle, runtime, engine, quiet) = (
+            view.clone(),
+            handle.clone(),
+            runtime.clone(),
+            engine.clone(),
+            quiet.clone(),
+        );
+        move |on| {
+            if quiet.get() {
+                return;
+            }
+            let Some(call) = handle.borrow().clone() else {
+                view.set_sharing(false, &quiet);
+                return;
+            };
+            let (view, runtime, engine, quiet) =
+                (view.clone(), runtime.clone(), engine.clone(), quiet.clone());
+            glib::spawn_future_local(async move {
+                let result = if on {
+                    match runtime.spawn(brook_media_gst::request_screen_cast()).await {
+                        Ok(Ok(source)) => {
+                            engine.start_screen_share(source).map_err(|e| e.to_string())
+                        }
+                        Ok(Err(err)) => Err(err.to_string()),
+                        Err(err) => Err(err.to_string()),
+                    }
+                } else {
+                    stop_share(&engine, &runtime)
+                };
+                match result {
+                    Ok(()) => {
+                        // The republish's own result, not just the task's.
+                        let republished = runtime
+                            .spawn(async move { call.republish().await })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r.map_err(|e| e.to_string()));
+                        if let Err(err) = republished {
+                            tracing::warn!(%err, "republish after screen share toggle");
+                            if on {
+                                // Nobody will see this share: undo it.
+                                let _ = stop_share(&engine, &runtime);
+                                view.set_sharing(false, &quiet);
+                                view.set_status("Couldn't share the screen");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::info!(%err, "screen share not started");
+                        view.set_sharing(false, &quiet);
+                    }
+                }
+            });
+        }
+    });
+
     view.connect_hangup({
         let window = window.downgrade();
         move || {
@@ -613,6 +719,7 @@ pub fn open_call(
             state.clone(),
             name_of.clone(),
         );
+        let quiet_events = quiet.clone();
         let window = window.downgrade();
         async move {
             let engine_dyn: Arc<dyn MediaEngine> = engine.clone();
@@ -652,9 +759,14 @@ pub fn open_call(
                     }
                     EngineEvent::LocalPreview { sink } => view.set_self_view(&sink),
                     EngineEvent::SubscribeStreams(streams) => {
-                        let video: HashMap<String, String> = streams
+                        let video: HashMap<String, (String, bool)> = streams
                             .iter()
-                            .map(|s| (s.mid.clone(), s.participant_id.clone()))
+                            .map(|s| {
+                                (
+                                    s.mid.clone(),
+                                    (s.participant_id.clone(), s.source == MediaSource::Screen),
+                                )
+                            })
                             .collect();
                         *mids.borrow_mut() = video;
                         // Tiles for mids no longer in the offer are gone.
@@ -670,7 +782,21 @@ pub fn open_call(
                         mid,
                         kind: TrackKind::Video,
                         sink,
-                    } => view.set_remote_video(&mid, &sink, &name_of(&mid)),
+                    } => {
+                        let screen = mids.borrow().get(&mid).is_some_and(|(_, screen)| *screen);
+                        view.set_remote_video(&mid, &sink, &name_of(&mid), screen)
+                    }
+                    // The desktop ended our share (its "stop sharing" button,
+                    // or the window closed): stop it here too, and republish.
+                    EngineEvent::ScreenShareEnded { message } => {
+                        tracing::info!(%message, "screen share ended by the desktop");
+                        // The share is over either way: reset the button first.
+                        view.set_sharing(false, &quiet_events);
+                        if stop_share(&engine, &runtime).is_ok() {
+                            let call = call.clone();
+                            runtime.spawn(async move { call.republish().await });
+                        }
+                    }
                     EngineEvent::Error { message, .. } => {
                         tracing::warn!(%message, "media engine error");
                         call.engine_failed(message);
@@ -681,6 +807,18 @@ pub fn open_call(
         }
     });
     window
+}
+
+/// Stop the engine's share and close the portal session (on the runtime).
+fn stop_share(engine: &Arc<GstEngine>, runtime: &Handle) -> Result<(), String> {
+    match engine.stop_screen_share() {
+        Ok(Some(session)) => {
+            runtime.spawn(session.close());
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 /// Reflect core's call state: status banner, tile names, end of call.
