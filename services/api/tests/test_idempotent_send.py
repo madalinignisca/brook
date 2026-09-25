@@ -134,3 +134,35 @@ async def test_resend_after_delete_returns_the_tombstone(client: httpx.AsyncClie
     assert again.status_code == 200 and again.json()["id"] == first["id"]
     assert again.json()["deleted_at"] is not None and again.json()["body"] == ""
     assert await _history(client, ha, ch) == []
+
+
+async def test_removed_member_resend_is_refused_like_a_fresh_send(
+    client: httpx.AsyncClient,
+) -> None:
+    ha, hb, ch = await _setup(client)
+    cid = str(uuid.uuid4())
+    sent = await client.post(
+        f"/api/v1/channels/{ch}/messages", json={"body": "hi", "client_id": cid}, headers=hb
+    )
+    assert sent.status_code == 201
+    bob_id = (await client.get(f"{AUTH}/me", headers=hb)).json()["id"]
+    # No member-removal route exists yet (PROTOCOL lists it); remove the row directly.
+    from sqlalchemy import delete
+
+    from app import db
+    from app.models import Membership
+
+    async with db.get_sessionmaker()() as s:
+        await s.execute(
+            delete(Membership).where(
+                Membership.channel_id == uuid.UUID(ch), Membership.user_id == uuid.UUID(bob_id)
+            )
+        )
+        await s.commit()
+    again = await client.post(
+        f"/api/v1/channels/{ch}/messages", json={"body": "hi", "client_id": cid}, headers=hb
+    )
+    fresh = await client.post(f"/api/v1/channels/{ch}/messages", json={"body": "new"}, headers=hb)
+    # A resend gets exactly what a fresh send gets (not the stored copy).
+    assert fresh.status_code in (403, 404)
+    assert again.status_code == fresh.status_code

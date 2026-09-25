@@ -498,6 +498,11 @@ async def send_message(
     author already stored returns that message, 200 instead of 201, unchanged even
     if the body differs (same outbox entry; the stored one wins), and is not fanned
     out again (members already got it). Never a 409, never a duplicate."""
+    channel = await _require_member(session, channel_id, user)
+    if channel.archived_at is not None:
+        raise _forbidden("This channel is archived")
+    # After the membership and archive checks: a resend gets exactly the answer a
+    # fresh send would, so a removed member's replay is a 403, not their stored copy.
     if body.client_id is not None:
         stored = await _stored_send(session, user, body.client_id)
         if stored is not None:
@@ -512,9 +517,6 @@ async def send_message(
                 )
             response.status_code = status.HTTP_200_OK
             return stored
-    channel = await _require_member(session, channel_id, user)
-    if channel.archived_at is not None:
-        raise _forbidden("This channel is archived")
 
     # Quote-reply: the target must be a live message in this same channel.
     reply: ReplyExcerpt | None = None
