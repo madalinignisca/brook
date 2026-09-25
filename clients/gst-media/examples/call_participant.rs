@@ -116,8 +116,11 @@ async fn main() {
 
     let (handle_tx, handle_rx) = oneshot::channel::<Arc<CallHandle>>();
     let tracks: Arc<Mutex<HashMap<String, (TrackKind, String)>>> = Arc::default();
+    // mid -> participant id, from the latest applied subscribe offer.
+    let owners: Arc<Mutex<HashMap<String, String>>> = Arc::default();
     {
         let tracks = tracks.clone();
+        let owners = owners.clone();
         tokio::spawn(async move {
             let Ok(call) = handle_rx.await else { return };
             while let Some(ev) = engine_events.recv().await {
@@ -133,12 +136,18 @@ async fn main() {
                             .insert(mid, (kind, sink.name().to_string()));
                     }
                     EngineEvent::ConnectionState { pc, state } => println!("{pc:?} PC: {state:?}"),
-                    EngineEvent::SubscribeStreams(s) => println!(
-                        "subscribe offer applied: {:?}",
-                        s.iter()
-                            .map(|s| format!("{}={:?}/{}", s.mid, s.kind, s.participant_id))
-                            .collect::<Vec<_>>()
-                    ),
+                    EngineEvent::SubscribeStreams(s) => {
+                        println!(
+                            "subscribe offer applied: {:?}",
+                            s.iter()
+                                .map(|s| format!("{}={:?}/{}", s.mid, s.kind, s.participant_id))
+                                .collect::<Vec<_>>()
+                        );
+                        owners
+                            .lock()
+                            .unwrap()
+                            .extend(s.iter().map(|s| (s.mid.clone(), s.participant_id.clone())));
+                    }
                     EngineEvent::Error { pc, message } => {
                         println!("ENGINE ERROR {pc:?}: {message}");
                         call.engine_failed(message);
@@ -188,12 +197,43 @@ async fn main() {
         }
     }
     if let Some(clip) = &clip {
-        match engine_for_echo.publish_base_time() {
-            Some(base) => println!(
-                "{}",
-                echo_check::report(clip, CLIP_RATE, base.nseconds(), &received)
+        // Analyse only the chosen participant's audio (BROOK_ECHO_FROM = display
+        // name; default: the only other participant), so a lingering ghost or a
+        // third party can't contaminate the measurement.
+        let roster = state.borrow().participants.clone();
+        let wanted = std::env::var("BROOK_ECHO_FROM").ok();
+        let target = match &wanted {
+            Some(name) => roster.iter().find(|p| &p.display_name == name),
+            None if roster.len() == 1 => roster.first(),
+            None => None,
+        };
+        let chunks: Vec<(u64, Vec<i16>)> = target
+            .map(|p| {
+                let owners = owners.lock().unwrap();
+                let tracks = tracks.lock().unwrap();
+                let recorded = received.lock().unwrap();
+                owners
+                    .iter()
+                    .filter(|(_, pid)| **pid == p.participant_id)
+                    .filter_map(|(mid, _)| tracks.get(mid))
+                    .filter(|(kind, _)| *kind == TrackKind::Audio)
+                    .filter_map(|(_, sink)| recorded.get(sink))
+                    .flatten()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        match (target, engine_for_echo.publish_base_time()) {
+            (None, _) => println!(
+                "echo check: no single target participant (roster {:?}; set BROOK_ECHO_FROM)",
+                roster.iter().map(|p| &p.display_name).collect::<Vec<_>>()
             ),
-            None => println!("echo check: no publish pipeline"),
+            (Some(_), None) => println!("echo check: no publish pipeline"),
+            (Some(p), Some(base)) => println!(
+                "{} [from {}]",
+                echo_check::report(clip, CLIP_RATE, base.nseconds(), &chunks),
+                p.display_name
+            ),
         }
     }
     let _ = call.leave().await;
@@ -210,6 +250,7 @@ mod echo_check {
     //! reappears in what we receive, delayed. Both pipelines run on the system
     //! clock, so sent and received samples share one timeline.
 
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     use gst::prelude::*;
@@ -221,8 +262,9 @@ mod echo_check {
     const FRAME_MS: u64 = 5;
     const RX_RATE: u64 = 8_000;
 
-    /// Received audio: (absolute clock time of the first sample, samples at 8 kHz mono).
-    pub type Received = Arc<Mutex<Vec<(u64, Vec<i16>)>>>;
+    /// Received audio per recording sink (by element name): chunks of
+    /// (absolute clock time of the first sample, samples at 8 kHz mono).
+    pub type Received = Arc<Mutex<HashMap<String, Vec<(u64, Vec<i16>)>>>>;
 
     /// Deterministic speech-like signal: voiced syllables (a glottal-ish
     /// harmonic series shaped by moving formants) of 80-300 ms, with gaps and
@@ -299,6 +341,7 @@ mod echo_check {
         )
         .expect("recording sink");
         let sink = bin.by_name("rec").unwrap();
+        let key = bin.name().to_string();
         sink.connect("handoff", false, move |args| {
             let el = args[0].get::<gst::Element>().ok()?;
             let buf = args[1].get::<gst::Buffer>().ok()?;
@@ -315,6 +358,8 @@ mod echo_check {
             received
                 .lock()
                 .unwrap()
+                .entry(key.clone())
+                .or_default()
                 .push(((base + pts).nseconds(), samples));
             None
         });
@@ -357,14 +402,14 @@ mod echo_check {
     }
 
     /// Correlate the received audio with the clip (sent from `base_ns`).
-    pub fn report(clip: &[i16], rate: u32, base_ns: u64, received: &Received) -> String {
+    pub fn report(clip: &[i16], rate: u32, base_ns: u64, received: &[(u64, Vec<i16>)]) -> String {
         let clip_env = envelope(clip, rate as u64);
         let frames = clip_env.len() + 400;
         // Received samples onto the clip's timeline (frame 0 = clip start).
         let per = (RX_RATE * FRAME_MS / 1000) as usize;
         let mut sq = vec![0.0f64; frames];
         let mut cnt = vec![0usize; frames];
-        for (t0, chunk) in received.lock().unwrap().iter() {
+        for (t0, chunk) in received {
             let Some(offset) = t0.checked_sub(base_ns) else {
                 continue;
             };
