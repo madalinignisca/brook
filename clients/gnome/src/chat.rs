@@ -863,6 +863,14 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
         row.append(&quote);
     }
     row.append(&body_label);
+    // Attached files (a tombstone has none): shown, and saved only on request.
+    for file in &message.attachments {
+        row.append(&crate::attachments::attachment_row(
+            file,
+            chat.client.clone(),
+            chat.runtime.clone(),
+        ));
+    }
 
     // Reactions row: chips + a quick-react picker.
     let reactions_box = gtk::Box::builder()

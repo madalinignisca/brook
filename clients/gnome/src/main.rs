@@ -10,6 +10,7 @@
 //! tasks and signal handlers so nothing keeps the window graph alive (no cycles).
 
 mod account;
+mod attachments;
 mod call;
 mod chat;
 mod keyring;
