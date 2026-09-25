@@ -13,9 +13,10 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -489,11 +490,24 @@ async def send_message(
     user: CurrentUser,
     session: Session,
     hub: HubDep,
+    response: Response,
 ) -> MessageOut:
-    """Persist a message then fan it out to the channel's members over the WS."""
+    """Persist a message then fan it out to the channel's members over the WS.
+
+    With a ``client_id`` the send is idempotent (sync spec §4): a resend of one the
+    author already stored returns that message, 200 instead of 201, unchanged even
+    if the body differs (same outbox entry; the stored one wins), and is not fanned
+    out again (members already got it). Never a duplicate; the one 409 is a
+    client_id reused in a different channel (a different message, not a resend)."""
     channel = await _require_member(session, channel_id, user)
     if channel.archived_at is not None:
         raise _forbidden("This channel is archived")
+    # After the membership and archive checks: a resend gets exactly the answer a
+    # fresh send would, so a removed member's replay is a 403, not their stored copy.
+    if body.client_id is not None:
+        stored = await _stored_send(session, user, body.client_id)
+        if stored is not None:
+            return _resend_answer(stored, channel_id, response)
 
     # Quote-reply: the target must be a live message in this same channel.
     reply: ReplyExcerpt | None = None
@@ -507,9 +521,22 @@ async def send_message(
         author_id=user.id,
         body=body.body,
         reply_to_id=body.reply_to_id,
+        client_id=body.client_id,
     )
-    session.add(message)
-    await session.flush()
+    try:
+        # A savepoint around the insert: if a concurrent resend of the same client_id
+        # won the unique index, only this savepoint rolls back (discarding the failed
+        # row, which a plain rollback + next query's autoflush would try to insert
+        # again), and we answer with the winner's row, as a later resend would get.
+        async with session.begin_nested():
+            session.add(message)
+            await session.flush()
+    except IntegrityError:
+        assert body.client_id is not None  # noqa: S101 - only that index can conflict here
+        stored = await _stored_send(session, user, body.client_id)
+        if stored is None:
+            raise
+        return _resend_answer(stored, channel_id, response)
     # Sending implicitly reads the channel up to your own message — but only ever
     # advance the marker (don't rewind past a newer message read concurrently).
     membership = await _membership(session, channel_id, user.id)
@@ -526,6 +553,37 @@ async def send_message(
     member_ids = [m.id for m in members]
     await hub.send_to_users(member_ids, _envelope("message.new", jsonable_encoder(out)))
     return out
+
+
+def _resend_answer(stored: MessageOut, channel_id: uuid.UUID, response: Response) -> MessageOut:
+    """The answer to a resend (both the early lookup and the lost-race path): the
+    stored message with 200, or 409 if the client reused the client_id elsewhere."""
+    if stored.channel_id != channel_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "conflict", "message": "client_id already used in another channel"},
+        )
+    response.status_code = status.HTTP_200_OK
+    return stored
+
+
+async def _stored_send(
+    session: AsyncSession, user: User, client_id: uuid.UUID
+) -> MessageOut | None:
+    """The message ``user`` already sent with ``client_id``, rendered as the POST
+    returns it, or None."""
+    message = await session.scalar(
+        select(Message).where(Message.author_id == user.id, Message.client_id == client_id)
+    )
+    if message is None:
+        return None
+    reply = None
+    if message.reply_to_id is not None:
+        quoted = await session.get(Message, message.reply_to_id)
+        if quoted is not None:
+            reply = _excerpt(quoted, await session.get(User, quoted.author_id))
+    reactions = await _reactions_for(session, [message.id], user.id)
+    return _message_out(message, user, reply, reactions.get(message.id))
 
 
 async def _get_message(
@@ -735,12 +793,14 @@ def _message_out(
         author_id=message.author_id,
         author_handle=author.handle if author else None,
         author_display_name=author.display_name if author else None,
-        body=message.body,
+        body="" if message.deleted_at is not None else message.body,
         created_at=message.created_at,
         edited_at=message.edited_at,
+        deleted_at=message.deleted_at,
         reply_to_id=message.reply_to_id,
         reply_to=reply,
         reactions=reactions or [],
+        client_id=message.client_id,
         mentions=mentions or [],
         mention_everyone=mention_everyone,
     )
