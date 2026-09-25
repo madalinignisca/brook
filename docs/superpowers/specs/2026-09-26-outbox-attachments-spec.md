@@ -29,15 +29,36 @@ deletes local data (snapshots), and changes the outbox format.
 2. **Queued means durable, snapshots included.** Before `send_queued_with_files` returns,
    each file has been copied into the user's store as an encrypted **snapshot**, and the
    row plus its `outbox_files` rows are committed in one transaction. Editing, moving or
-   deleting the source file afterwards changes nothing. Snapshots are written first; a
-   crash before the commit leaves orphan snapshots, which reconciliation removes (6).
+   deleting the source file afterwards changes nothing. Snapshots are written first and
+   **fsynced (file and directory) before the row commits**, so a committed row never points
+   at a snapshot a power cut could lose. A crash before the commit leaves orphan snapshots,
+   which reconciliation removes (6). The stored `size` is the bytes actually copied, not a
+   size read before the copy (a file growing mid-copy can't give the PUT a wrong length).
+   **The same `client_id` again** returns the stored row's receipt (its files, with fresh
+   `transfer_id`s), and anything snapshotted by the repeat call is removed before it
+   returns. The stored row wins, files included, as for body and reply target.
 3. **Snapshot format** (design §6.1): a random 256-bit key per snapshot, kept in its
    `outbox_files` row inside the encrypted outbox. 1 MiB chunks sealed with AES-256-GCM.
-   The nonce is the chunk index (96-bit big-endian), and AAD = `file_client_id | index |
-   last-chunk flag`. The plaintext sha256 is computed while copying and stored. A snapshot
-   that fails authentication, is truncated, or lacks its flagged last chunk fails the row
-   with `outbox.snapshot_damaged`; it is never uploaded as it stands.
-4. **Sender, per row with files, in order:**
+   The nonce is the chunk index (96-bit big-endian), and AAD is fixed-width: the 16 bytes of
+   `file_client_id` (a UUID), the chunk index as u64 big-endian, and one byte for the
+   last-chunk flag. A snapshot is written once, under a key made for it; a rewrite (a
+   repeat call, a re-snapshot) gets a new key, so a nonce is never reused under one key.
+   The plaintext sha256 is computed while copying and stored.
+   **A snapshot is verified before its first byte is uploaded** (decrypt every chunk,
+   check the flagged last chunk and the sha256; a read, no plaintext written). A failure
+   fails the row with `outbox.snapshot_damaged`: nothing of it is uploaded, and it isn't
+   retried. A read error during the PUT itself (after a good verification) is a transient
+   local fault, and the next attempt verifies again.
+4. **Sender, per row with files, in order.** Every upload request (create, PUT, and each
+   retry of either) runs **under the row's session epoch**, like the message POST. The
+   token is taken from the session only if its epoch is the sender's, otherwise the
+   attempt stops and the row waits (a user switch can't upload one user's snapshot with
+   another's token). The epoch is checked again between files. Signing out cancels the
+   outbox's in-flight transfers (they resume, by `file_client_id`, at the next sign-in of
+   that user).
+   A row with files holds its channel's queue while it uploads (per-channel order is the
+   outbox's rule): a later text message in that channel waits for it. That is stated to
+   the user by the pending row's progress, and other channels are unaffected.
    1. each file without a `file_id` is uploaded through `transfer.rs`'s upload path, from a
       decrypting `UploadSource` over the snapshot, with its `file_client_id` and the
       receipt's `transfer_id`. Progress arrives on `transfer_events()`. `409
@@ -61,24 +82,43 @@ deletes local data (snapshots), and changes the outbox format.
       the snapshot files are removed after that commit (journalled like cache deletions:
       the design's `deletions` table in outbox.db).
 5. **Failures:**
-   - transient (network, 5xx, 408/409 in progress, 429): retried with backoff; the row
-     stays pending;
-   - an upload refused for good (4xx) fails the row with the server's code;
+   - transient (network, 5xx including `507 file.no_space`, 408/409 in progress, 429, and
+     **401 / `NotAuthenticated`**, which waits for the session's refresh or the next
+     sign-in, as a text row does): retried with backoff; the row stays pending, and the
+     file's transfer events say `Retrying`, never `Failed`;
+   - an upload refused for good (other 4xx) fails the row with the server's code, and that
+     file's `PendingFile.error` carries it, so the UI can say which file was refused;
    - `422 file.not_attachable` on the POST re-uploads once (3a), then fails the row;
    - `413 file.too_large` / `file.quota_exceeded` on an upload fail the row;
-   - cancelling a queued file's `transfer_id` fails the row with `transfer.cancelled`.
+   - **cancel** is for the row, through any of its files' `transfer_id`s. It sets the
+     row's cancel flag, checked before each create, between PUT chunks, and before the
+     POST. A file not started yet never starts; an uploading file stops at the next chunk;
+     an uploaded file stays uploaded (its id is kept for Retry). The row then fails with
+     `transfer.cancelled`. A cancel that arrives after the POST was sent is too late: the
+     message may already exist, and the ack decides. **Retry clears the flag.**
    Retry and Delete work as for any failed row. **Retry** re-uses the uploaded `file_id`s
    and re-uploads only what's missing. **Delete** removes the row, its `outbox_files` rows
-   and (after the commit) its snapshots.
+   and (after the commit) its snapshots. **Delete of an uploading row cancels its
+   transfers first**, then waits for the channel's lock, so a Delete tap never waits
+   for hours of upload.
    `PendingMessage` gains `files: Vec<PendingFile { file_client_id, transfer_id, filename,
-   size, uploaded }>`, so the UI can draw per-file progress and state after a restart.
-   Transfer ids are re-issued at startup, and `pending_messages` returns the current ones.
+   size, uploaded, error }>`, so the UI can draw per-file progress and state after a
+   restart. Transfer ids are re-issued at startup, and `pending_messages` returns the
+   current ones.
 6. **Reconciliation** (design §7.3) runs for the outbox store after it opens with its key
-   and its tables were read. It finishes journalled deletions and removes snapshot files
-   with no `outbox_files` row. With an unreadable key, nothing is removed.
+   and its tables were read, and **finishes before the outbox takes an enqueue** (inside
+   `Outbox::open`), so a snapshot being written for an uncommitted row can never look
+   like an orphan. It finishes journalled deletions and removes snapshot files with no
+   `outbox_files` row. With an unreadable key, nothing is removed.
 7. **Direct send** (outbox not writable): a message with files is refused with
    `outbox.store`. Files can't be sent without a snapshot, and a direct upload from the
-   source file would break "the bytes you queued are the bytes sent".
+   source file would break "the bytes you queued are the bytes sent". With **no** outbox
+   (its key locked or damaged), files can't be sent at all; that's the design's §5.7
+   rule, unchanged here.
+7a. **A message with files and no text:** the server requires a non-empty body today
+   (`schemas.py`). Pending its answer, `send_queued_with_files` refuses an empty body with
+   `outbox.empty_body` before anything is copied; if the server lifts the rule, this
+   check goes.
 8. **Wipes** (sign-out with "Remove this device's data", other users, a lost key) remove the
    snapshot directory with the store, as they already do for everything under it.
 9. **Outbox format 3**: the `outbox_files` table as used here, the `deletions` journal, and
@@ -99,7 +139,25 @@ deletes local data (snapshots), and changes the outbox format.
     - `Preparing` progress arrives during the snapshot;
     - a first `not_attachable` re-creates the files (a swept one gets a new id and its bytes
       again), and a second fails the row;
-    - duplicate ids never reach the POST.
+    - duplicate ids never reach the POST;
+    - an upload started under user A never continues under user B's token, and signing out
+      cancels in-flight transfers;
+    - a 401 on an upload leaves the row pending;
+    - a damaged snapshot fails the row before any PUT;
+    - cancel in each file state, and Retry after it;
+    - Delete of an uploading row returns without waiting for the upload;
+    - the same `client_id` again returns the stored receipt and leaves no extra snapshot;
+    - reconciliation never removes a snapshot of a row being enqueued.
+
+## Review round 1 (adversarial review of the spec)
+
+Taken: epoch-bound uploads and cancel on sign-out (4); 401 and 507 transient (5);
+verification before upload (3); fsync before commit, size from the copy, a key per write,
+fixed-width AAD (2, 3); reconciliation before enqueue (6); a repeat call returns the stored
+receipt (2); an empty body refused until the server says otherwise (7a); cancel per file
+state and Delete cancelling first (5); a per-file error (5); `Retrying` rather than
+`Failed` events for retried uploads (5); head-of-line blocking stated (4). Already covered
+before the review: the 24 h sweep (4.3a); request order (server fix under way).
 
 ## Not doing
 
