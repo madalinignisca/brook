@@ -316,16 +316,16 @@ pub(crate) fn reset(
 
 fn connect(path: &Path, key: &[u8; 32]) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
+    // Before the key: a wrong key otherwise makes SQLCipher print to stderr by itself.
+    conn.execute_batch("PRAGMA cipher_log_level = NONE;")?;
     let hex = Zeroizing::new(key.iter().map(|b| format!("{b:02x}")).collect::<String>());
     // Raw key form: no KDF, the key is already random.
     conn.execute_batch(&Zeroizing::new(format!(
         "PRAGMA key = \"x'{}'\";",
         hex.as_str()
     )))?;
-    // A wrong key otherwise makes SQLCipher print to stderr by itself.
     conn.execute_batch(
-        "PRAGMA cipher_log_level = NONE;
-         PRAGMA cipher_memory_security = ON;
+        "PRAGMA cipher_memory_security = ON;
          PRAGMA temp_store = MEMORY;
          PRAGMA foreign_keys = ON;",
     )?;
@@ -383,12 +383,16 @@ impl Db {
         std::thread::Builder::new()
             .name("brook-store".into())
             .spawn(move || {
+                // Runs on every exit, a panicking job's unwind included: the store is
+                // released and `close` hears it, or the store could never reopen.
+                let _release = Release {
+                    path,
+                    done: Some(done),
+                };
                 for job in rx {
                     job(&mut conn);
                 }
-                drop(conn); // closes the database before anyone hears it stopped
-                registry().remove(&path);
-                let _ = done.send(());
+                drop(conn); // closes the database before `_release` runs
             })
             .expect("spawn the store thread");
         Self {
@@ -420,6 +424,21 @@ impl Db {
         self.jobs = None;
         if let Some(stopped) = self.stopped.take() {
             let _ = stopped.await;
+        }
+    }
+}
+
+/// Releases a store's registry entry and reports it stopped, when its thread ends.
+struct Release {
+    path: PathBuf,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        registry().remove(&self.path);
+        if let Some(done) = self.done.take() {
+            let _ = done.send(());
         }
     }
 }

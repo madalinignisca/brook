@@ -279,3 +279,23 @@ fn stores_stay_off_until_wipes_land() {
         "the durable-store switch turned on before C5"
     );
 }
+
+/// A job that panics stops the store's thread, but the store is released: `close` returns,
+/// and the store opens again with its data.
+#[tokio::test]
+async fn a_panicking_job_releases_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let (db, _) = ready(store::open(dir.path(), Kind::Cache, "s1", &keys(&slot)));
+    write_sentinel(&db, 3).await;
+    let r: Result<(), StoreError> = db.call(|_| panic!("a bug in a job")).await;
+    assert_eq!(r, Err(StoreError::Closed));
+    db.close().await;
+    let (db, rebuilt) = ready(store::open(dir.path(), Kind::Cache, "s1", &keys(&slot)));
+    assert_eq!(rebuilt, None);
+    let users: i64 = db
+        .call(|c| c.query_row("SELECT count(*) FROM users", [], |r| r.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(users, 3);
+}
