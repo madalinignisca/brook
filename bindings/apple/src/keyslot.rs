@@ -23,6 +23,10 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for FfiKeySlotError {
 }
 
 /// Named-slot byte storage, implemented in Swift. Synchronous, like core's trait.
+///
+/// **Must not call back into the client**, or wait on anything that does: core calls these
+/// while holding its local-data lock (opening and wiping stores) or the session's write
+/// lock, so a re-entering call would deadlock. `KeychainSlot` only calls `SecItem*`.
 #[uniffi::export(with_foreign)]
 pub trait FfiKeySlot: Send + Sync {
     fn load(&self, slot: String) -> Result<Option<Vec<u8>>, FfiKeySlotError>;
