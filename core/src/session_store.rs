@@ -74,6 +74,10 @@ pub(crate) struct SessionStore {
     closed: Arc<AtomicBool>,
     /// Unique per store (per client): what binds a TOTP challenge to the client it came from.
     id: u64,
+    /// Staying signed in: the stored copy, written through inside the write sections below.
+    persistence: Arc<OnceLock<crate::persist::Persistence>>,
+    /// Whether the last sign-out made the stored copy unusable (deleted or fenced).
+    sign_out_complete: Arc<AtomicBool>,
 }
 
 static NEXT_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -90,6 +94,29 @@ impl SessionStore {
             detached: Arc::default(),
             closed: Arc::default(),
             id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
+            persistence: Arc::default(),
+            sign_out_complete: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    pub(crate) fn set_persistence(&self, p: crate::persist::Persistence) {
+        let _ = self.persistence.set(p);
+    }
+
+    pub(crate) fn persistence(&self) -> Option<&crate::persist::Persistence> {
+        self.persistence.get()
+    }
+
+    pub(crate) fn sign_out_complete(&self) -> bool {
+        self.sign_out_complete.load(Ordering::SeqCst)
+    }
+
+    /// A restore's stored token was refused: delete the stored copy only if it still holds that
+    /// token, checked inside the write section (a newer sign-in may have replaced it).
+    pub(crate) async fn clear_persisted_if_holds(&self, refresh_token: &str) {
+        let _cell = self.cell.write().await;
+        if let Some(p) = self.persistence.get() {
+            p.clear_if_holds(refresh_token);
         }
     }
 
@@ -172,6 +199,12 @@ impl SessionStore {
                 return Err(());
             }
             let old = cell.session.take();
+            if old.is_some() {
+                // The displaced sign-in must not be restorable, whatever this login's outcome.
+                if let Some(p) = self.persistence.get() {
+                    p.clear();
+                }
+            }
             cell.rev.epoch += 1;
             cell.rev.credential_rev = 0;
             (cell.rev, old)
@@ -206,6 +239,9 @@ impl SessionStore {
             if !self.is_closed() && cell.login_gen == gen && cell.challenge_open {
                 let user = session.user.clone();
                 cell.challenge_open = false;
+                if let Some(p) = self.persistence.get() {
+                    p.write(&session);
+                }
                 cell.session = Some(session);
                 cell.rev.epoch += 1;
                 cell.rev.credential_rev = 0;
@@ -242,6 +278,9 @@ impl SessionStore {
                 return false;
             }
             let user = session.user.clone();
+            if let Some(p) = self.persistence.get() {
+                p.write(&session);
+            }
             cell.session = Some(session);
             cell.rev.epoch += 1;
             cell.rev.credential_rev = 0;
@@ -265,6 +304,12 @@ impl SessionStore {
                 self.closed.store(true, Ordering::SeqCst);
             }
             let old = cell.session.take();
+            // A sign-out clears the stored copy before it returns; a close (quit) keeps it.
+            if !close {
+                if let Some(p) = self.persistence.get() {
+                    self.sign_out_complete.store(p.clear(), Ordering::SeqCst);
+                }
+            }
             cell.rev.epoch += 1;
             cell.rev.credential_rev = 0;
             let _ = self.state_tx.send(AuthState::LoggedOut); // under the lock (see install)
@@ -286,7 +331,11 @@ impl SessionStore {
         let store = self.clone();
         runtime.spawn(async move {
             if let Some(old) = store.sign_out(true).await {
-                store.revoke_detached(old.refresh_token);
+                // Quit isn't sign-out: with a stored session, the token stays valid for the
+                // next launch. Without one, a dropped client is a signed-out one.
+                if store.persistence.get().is_none() {
+                    store.revoke_detached(old.refresh_token);
+                }
             }
         });
     }
@@ -347,6 +396,9 @@ impl SessionStore {
                 Some(s) if s.refresh_token == rotated_from => {
                     s.access_token = access_token;
                     s.refresh_token = refresh_token;
+                    if let Some(p) = self.persistence.get() {
+                        p.write(s); // rotation made the stored token dead: follow it
+                    }
                     cell.rev.credential_rev += 1;
                     cell.rev
                 }
@@ -366,6 +418,9 @@ impl SessionStore {
             let mut cell = self.cell.write().await;
             match cell.session.as_ref() {
                 Some(s) if s.refresh_token == rejected => {
+                    if let Some(p) = self.persistence.get() {
+                        p.clear(); // a remote sign-out: not restorable either
+                    }
                     cell.session = None;
                     cell.rev.epoch += 1;
                     cell.rev.credential_rev = 0;
@@ -424,6 +479,35 @@ mod tests {
         out.await.unwrap();
         assert!(store.snapshot().await.1.is_none());
         assert_eq!(*state.borrow(), AuthState::LoggedOut);
+    }
+
+    /// Persistence follows store order: an install and a sign-out queued back to back leave the
+    /// stored copy cleared, not rewritten by a late install.
+    #[tokio::test]
+    async fn the_stored_copy_follows_store_order() {
+        let (store, _state) = store();
+        let slot = Arc::new(crate::InMemoryKeySlot::default());
+        let dir = tempfile::tempdir().unwrap();
+        store.set_persistence(crate::persist::Persistence::new(
+            slot.clone(),
+            "https://h",
+            dir.path().to_path_buf(),
+        ));
+        let gen = store.reserve_login().await;
+        let held = store.cell.write().await;
+        let s = store.clone();
+        let install = tokio::spawn(async move { s.install_for_login(gen, session(1)).await });
+        tokio::task::yield_now().await;
+        let s = store.clone();
+        let out = tokio::spawn(async move { s.sign_out(false).await });
+        tokio::task::yield_now().await;
+        drop(held);
+        assert!(install.await.unwrap());
+        out.await.unwrap();
+        assert!(
+            !slot.contains("session:https://h"),
+            "the install's write landed after the sign-out's clear"
+        );
     }
 
     /// The drop fence is synchronous: even with no runtime to run the cleanup on (and before

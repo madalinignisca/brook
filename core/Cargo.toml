@@ -37,3 +37,4 @@ base64 = "0.22"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "test-util", "net"] }
 wiremock = "0.6"
+tempfile = "3"

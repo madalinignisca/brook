@@ -2,14 +2,14 @@
 
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A Brook user as returned by the API (`UserOut`).
 ///
 /// Full-field equality is deliberate: the auth state is published on a watch
 /// channel, which only notifies receivers when the value changes — so comparing
 /// every field ensures metadata updates (e.g. display name) reach the UI.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct User {
     /// Stable user id.
     pub id: String,

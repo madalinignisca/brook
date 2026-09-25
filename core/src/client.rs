@@ -65,6 +65,21 @@ impl std::fmt::Debug for TotpChallenge {
     }
 }
 
+/// What a restore at launch found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// Signed in with the stored session (its refresh token rotated and stored again).
+    LoggedIn(User),
+    /// Nothing to restore (never stored, signed out, fenced, or the server refused it).
+    NotSignedIn,
+    /// The secure store is locked or failing: nothing was deleted; sign in by hand for now.
+    Unavailable,
+    /// The server couldn't be reached: the stored session is kept for next time.
+    Offline,
+    /// A sign-in or sign-out happened meanwhile and won; nothing was changed.
+    Superseded,
+}
+
 /// A password login's answer: a pair (not yet a session), or a TOTP step.
 enum Issued {
     Pair(TokenPair),
@@ -244,6 +259,85 @@ impl BrookClient {
             }
         });
         task.await.map_err(|_| Error::UnexpectedResponse)?
+    }
+
+    /// Keep the session across launches in `slot` (a platform secure store), with sign-out
+    /// fences in `data_dir`. Off unless called; set once, before signing in or restoring.
+    pub fn enable_persistence(&self, slot: Arc<dyn crate::KeySlot>, data_dir: std::path::PathBuf) {
+        let origin = self.base.as_str().trim_end_matches('/').to_string();
+        self.session
+            .set_persistence(crate::persist::Persistence::new(slot, &origin, data_dir));
+    }
+
+    /// Whether the last sign-out made the stored session unusable (deleted, or fenced). False
+    /// only when the secure store *and* the fence both failed: tell the user.
+    pub fn sign_out_complete(&self) -> bool {
+        self.session.sign_out_complete()
+    }
+
+    /// At launch: sign in with the stored session, if there is a usable one. Runs as a login
+    /// attempt (a sign-in or sign-out meanwhile wins), refreshes the stored token, and installs
+    /// and re-stores the new pair in one step.
+    pub async fn restore(&self) -> RestoreOutcome {
+        self.session.note_runtime();
+        let gen = self.session.reserve_login().await;
+        let (session, http, base) = (self.session.clone(), self.http.clone(), self.base.clone());
+        let task = tokio::spawn(async move {
+            let _flight = session.refresh_lock.clone().lock_owned().await;
+            let Some(p) = session.persistence() else {
+                return RestoreOutcome::NotSignedIn;
+            };
+            if p.fenced() {
+                let _ = p.clear(); // best effort; the fence keeps it unusable either way
+                return RestoreOutcome::NotSignedIn;
+            }
+            let stored = match p.load() {
+                Ok(Some(stored)) => stored,
+                Ok(None) => return RestoreOutcome::NotSignedIn,
+                Err(_) => return RestoreOutcome::Unavailable, // locked or failing: delete nothing
+            };
+            let Ok(url) = base.join("api/v1/auth/refresh") else {
+                return RestoreOutcome::Offline;
+            };
+            let resp = match http
+                .post(url)
+                .json(&json!({ "refresh_token": stored.refresh_token }))
+                .send()
+                .await
+            {
+                Ok(resp) => resp,
+                Err(_) => return RestoreOutcome::Offline,
+            };
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || resp.status().is_server_error()
+            {
+                return RestoreOutcome::Offline;
+            }
+            if !resp.status().is_success() {
+                // Refused: forget it, but only if it's still the stored one.
+                session
+                    .clear_persisted_if_holds(&stored.refresh_token)
+                    .await;
+                return RestoreOutcome::NotSignedIn;
+            }
+            let Ok(pair) = resp.json::<TokenPair>().await else {
+                return RestoreOutcome::Offline;
+            };
+            let restored = Session {
+                access_token: pair.access_token,
+                refresh_token: pair.refresh_token,
+                user: stored.user,
+            };
+            let user = restored.user.clone();
+            // Install and re-store in one write section, only if still current.
+            if session.install_for_login(gen, restored.clone()).await {
+                RestoreOutcome::LoggedIn(user)
+            } else {
+                session.revoke_detached(restored.refresh_token);
+                RestoreOutcome::Superseded
+            }
+        });
+        task.await.unwrap_or(RestoreOutcome::Offline)
     }
 
     /// The background loops' handles (tests: to see them end).
