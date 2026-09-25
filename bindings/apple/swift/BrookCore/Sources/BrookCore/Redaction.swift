@@ -34,6 +34,7 @@ extension LoginResult: CustomStringConvertible, CustomDebugStringConvertible,
     public var description: String {
         switch self {
         case let .loggedIn(session): "loggedIn(\(session))"
+        case .totpRequired: "totpRequired(<challenge>)" // the pending token stays in Rust
         }
     }
 
@@ -44,6 +45,34 @@ extension LoginResult: CustomStringConvertible, CustomDebugStringConvertible,
         switch self {
         case let .loggedIn(session):
             Mirror(self, children: ["loggedIn": session], displayStyle: .enum)
+        case .totpRequired:
+            Mirror(self, children: ["totpRequired": "<challenge>"], displayStyle: .enum)
         }
     }
+}
+
+// Two-factor values carry codes or secrets: they render as their kind only.
+
+extension FfiSecondFactor: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    public var description: String {
+        switch self {
+        case .code: "code(<redacted>)"
+        case .recovery: "recovery(<redacted>)"
+        }
+    }
+
+    public var debugDescription: String { description }
+    public var customMirror: Mirror { Mirror(self, children: [], displayStyle: .enum) }
+}
+
+extension FfiTotpEnrollment: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    public var description: String { "FfiTotpEnrollment(<redacted>)" }
+    public var debugDescription: String { description }
+    public var customMirror: Mirror { Mirror(self, children: []) }
+}
+
+extension FfiTotpChallenge: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    public var description: String { "FfiTotpChallenge(<redacted>)" }
+    public var debugDescription: String { description }
+    public var customMirror: Mirror { Mirror(self, children: []) }
 }
