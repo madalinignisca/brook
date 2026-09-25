@@ -1,0 +1,82 @@
+name: flatpak
+
+# Builds the GNOME client's Flatpak bundle and checks, inside the sandbox, that
+# every GStreamer element a call needs is there (runtime plugins differ from a
+# distro's). Runs on PRs touching the client; releases use release-gtk.yml.
+
+on:
+  pull_request:
+    paths:
+      - "clients/gnome/**"
+      - "clients/gst-media/**"
+      - "core/**"
+      - "Cargo.lock"
+      - ".github/workflows/flatpak.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+      options: --privileged
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Build
+        run: |
+          flatpak remote-add --user --if-not-exists flathub \
+            https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak-builder --user --install-deps-from=flathub --force-clean --disable-rofiles-fuse \
+            --repo=repo build clients/gnome/packaging/flatpak/dev.brook.Brook.yml
+
+      - name: Elements a call needs, inside the sandbox
+        run: |
+          set -u
+          m=clients/gnome/packaging/flatpak/dev.brook.Brook.yml
+          # The container has no machine-id; gst-inspect's D-Bus probe wants one.
+          [ -s /etc/machine-id ] || dbus-uuidgen > /etc/machine-id || true
+          missing=0
+          # Show one full answer, so a broken probe is not mistaken for missing plugins.
+          flatpak-builder --disable-rofiles-fuse --run build "$m" gst-inspect-1.0 videoconvert | head -5
+          # Required: every call uses these.
+          for e in webrtcbin nicesrc nicesink dtlssrtpenc dtlssrtpdec srtpenc srtpdec \
+                   rtpopuspay opusenc opusdec rtph264pay rtph264depay h264parse \
+                   rtpvp8pay vp8enc vp8dec capssetter decodebin videoconvert videoscale \
+                   videorate audioconvert audioresample autoaudiosrc autoaudiosink \
+                   gtk4paintablesink; do
+            if flatpak-builder --disable-rofiles-fuse --run build "$m" gst-inspect-1.0 --exists "$e" 2>/dev/null; then
+              echo "ok       $e"
+            elif [ "$e" = gtk4paintablesink ]; then
+              echo "linked   $e (registered by the app at startup)"
+            else
+              echo "MISSING  $e"; missing=1
+            fi
+          done
+          # One of each group is enough (the engine picks what exists).
+          for group in "openh264enc x264enc vah264enc vah264lpenc" \
+                       "avdec_h264 openh264dec vah264dec" \
+                       "v4l2src pipewiresrc" "pipewiresrc ximagesrc"; do
+            found=""
+            for e in $group; do
+              flatpak-builder --disable-rofiles-fuse --run build "$m" gst-inspect-1.0 --exists "$e" 2>/dev/null \
+                && found="$found $e"
+            done
+            if [ -n "$found" ]; then echo "ok       {$group}:$found"
+            else echo "MISSING  one of {$group}"; missing=1; fi
+          done
+          exit $missing
+
+      - name: Bundle
+        if: ${{ !cancelled() }}
+        run: flatpak build-bundle repo brook.flatpak dev.brook.Brook
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !cancelled() }}
+        with:
+          name: brook-flatpak-x86_64
+          path: brook.flatpak
+          if-no-files-found: warn

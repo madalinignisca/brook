@@ -18,3 +18,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 brook-media-gst = { path = "../gst-media", version = "0.0.0" }
 gst = { package = "gstreamer", version = "0.23" }
 gst-webrtc = { package = "gstreamer-webrtc", version = "0.23" }
+# The gtk4paintablesink element, linked in and registered at startup (call.rs),
+# so packages don't depend on a distro or runtime shipping gst-plugins-rs.
+gstgtk4 = { package = "gst-plugin-gtk4", version = "0.13" }

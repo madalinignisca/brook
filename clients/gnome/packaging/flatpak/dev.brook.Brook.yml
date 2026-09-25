@@ -1,0 +1,50 @@
+# Flatpak manifest for the GNOME client (built by .github/workflows/flatpak.yml
+# and the release-gtk workflow). Local build:
+#   flatpak-builder --user --install-deps-from=flathub --force-clean \
+#     --install build clients/gnome/packaging/flatpak/dev.brook.Brook.yml
+id: dev.brook.Brook
+runtime: org.gnome.Platform
+runtime-version: "51"
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: brook-gnome
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # Cameras are opened directly through V4L2 (the camera portal hands out
+  # PipeWire nodes, which the engine does not use yet).
+  - --device=all
+  - --socket=pulseaudio
+  - --share=network
+  # Deliberately NOT granted: --talk-name=org.freedesktop.secrets. Local data
+  # keys come from the Secret portal only, so nothing can fall back to the
+  # session-wide Secret Service (spec 2026-09-25-client-local-data-encryption).
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/brook-gnome/cargo
+modules:
+  - name: brook-gnome
+    buildsystem: simple
+    build-options:
+      # Crates are fetched at build time (a self-published bundle, not Flathub,
+      # which would need vendored sources instead).
+      build-args:
+        - --share=network
+    build-commands:
+      - cargo build --release --locked -p brook-gnome
+      - install -Dm755 target/release/brook-gnome -t /app/bin/
+      - install -Dm644 clients/gnome/data/dev.brook.Brook.desktop -t /app/share/applications/
+      - install -Dm644 clients/gnome/data/icons/dev.brook.Brook.svg -t /app/share/icons/hicolor/scalable/apps/
+      - install -Dm644 clients/gnome/data/dev.brook.Brook.metainfo.xml -t /app/share/metainfo/
+    sources:
+      - type: dir
+        path: ../../../..
+        skip:
+          - .git
+          - target
+          - services
+          - clients/macos

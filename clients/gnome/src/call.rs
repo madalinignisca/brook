@@ -48,11 +48,14 @@ fn paintable_of(sink: &gst::Element) -> Option<gdk::Paintable> {
 /// the call view renders into aren't installed.
 pub fn engine_config_from_env() -> Result<EngineConfig, String> {
     gst::init().map_err(|e| format!("GStreamer: {e}"))?;
+    // The GTK 4 video sink is compiled in, so neither the Flatpak runtime nor a
+    // distro package has to provide it. A system copy, when installed, wins (it
+    // may be newer); registering ours next to it would duplicate the element.
+    if gst::ElementFactory::find("gtk4paintablesink").is_none() {
+        gstgtk4::plugin_register_static().map_err(|e| format!("GTK 4 video sink: {e}"))?;
+    }
     for (element, package) in [
-        (
-            "gtk4paintablesink",
-            "the GStreamer GTK 4 plugin (gst-plugin-gtk4)",
-        ),
+        ("gtk4paintablesink", "the built-in GTK 4 video sink"),
         ("autoaudiosink", "GStreamer good plugins"),
     ] {
         if gst::ElementFactory::find(element).is_none() {

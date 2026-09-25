@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.brook.Brook</id>
+  <name>Brook</name>
+  <summary>Resource-respecting team chat</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <launchable type="desktop-id">dev.brook.Brook.desktop</launchable>
+  <url type="homepage">https://github.com/madalinignisca/brook</url>
+  <description>
+    <p>
+      Brook is a self-hosted team chat: channels, direct messages, and calls with
+      audio, video and screen sharing, against your own Brook server.
+    </p>
+  </description>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-09-25"/>
+  </releases>
+</component>
