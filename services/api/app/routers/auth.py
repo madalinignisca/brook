@@ -435,7 +435,9 @@ async def change_password(
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(
     body: RefreshIn,
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
+    limiter: Annotated[AuthLimiter, Depends(get_limiter)],
 ) -> None:
     """End this device's login: every token of the presented token's family (idempotent).
 
@@ -443,17 +445,34 @@ async def logout(
     already rotated the presented token into a successor the client will discard,
     and revoking only the presented one would leave that successor live for its whole
     TTL. Any token of the family will do, rotated or not; one that already can't
-    refresh (it was rotated) could end the family through /refresh anyway, so this
-    gives nobody a new power. The user's other devices are other families. Revoked
-    here, not rotated: presenting one of these later is a plain 401, not a reuse."""
-    family = select(RefreshToken.family_id).where(
-        RefreshToken.token_hash == hash_token(body.refresh_token)
+    refresh (it was rotated) could end the family through /refresh anyway. The user's
+    other devices are other families. Revoked here, not rotated: presenting one of
+    these later is a plain 401, not a reuse. Always 204: an unknown token says nothing.
+    """
+    # Unauthenticated and now a family-wide write: throttled like /refresh.
+    enforce(limiter, client_ip(request.client.host if request.client else None))
+    token = await session.scalar(
+        select(RefreshToken).where(RefreshToken.token_hash == hash_token(body.refresh_token))
     )
-    await session.execute(
-        update(RefreshToken)
-        .where(RefreshToken.family_id.in_(family), RefreshToken.revoked.is_(False))
-        .values(revoked=True)
+    if token is None:
+        return
+    # The user lock, like every other revoke: a refresh rotating this family right now
+    # holds it until its new token is committed. Without it, this UPDATE's snapshot
+    # (READ COMMITTED) could predate that token and miss it, leaving it live (tested
+    # on Postgres, test_token_races.py).
+    await lock_user(session, token.user_id)
+    result = cast(
+        "CursorResult[Any]",
+        await session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.family_id == token.family_id, RefreshToken.revoked.is_(False))
+            .values(revoked=True)
+        ),
     )
+    if result.rowcount:
+        # A thief holding any family token can end the family here as via /refresh;
+        # this keeps it on record, and explains a later reuse event on an old token.
+        record_event(session, token.user_id, "logout")
     await session.commit()
 
 

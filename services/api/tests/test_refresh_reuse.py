@@ -209,6 +209,7 @@ async def test_logout_ends_the_successor_of_a_refresh_in_flight(
     assert (await _refresh(client, s)).status_code == 401
     assert (await _refresh(client, other_device)).status_code == 200  # another family
     assert await _reuse_events() == 0  # a logged-out token is refused, not theft
+    assert await _events("logout") == 1  # on record, whoever held the token
 
 
 async def test_logout_with_an_unknown_token_is_a_quiet_204(client: httpx.AsyncClient) -> None:
