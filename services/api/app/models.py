@@ -265,3 +265,39 @@ class AuthEvent(Base):
     kind: Mapped[str] = mapped_column(String(40))
     via: Mapped[str] = mapped_column(String(16), default="api")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class File(Base):
+    """An attachment (attachments spec §8). The bytes live on the local filesystem at
+    ``<BROOK_FILES_DIR>/<id[:2]>/<id>``, never named after the user's filename."""
+
+    __tablename__ = "files"
+    __table_args__ = (
+        Index("ix_files_status_created", "status", "created_at"),
+        Index(
+            "uq_files_uploader_client_id",
+            "uploader_id",
+            "client_id",
+            unique=True,
+            postgresql_where=text("client_id IS NOT NULL"),
+            sqlite_where=text("client_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    channel_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("channels.id", ondelete="CASCADE"))
+    uploader_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    filename: Mapped[str] = mapped_column(Text)  # sanitised ASCII (app/filenames.py)
+    original_name: Mapped[str] = mapped_column(Text)  # display only
+    size: Mapped[int] = mapped_column(BigInteger)
+    content_type: Mapped[str] = mapped_column(String(255))
+    sha256: Mapped[str | None] = mapped_column(String(64), default=None)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    client_id: Mapped[uuid.UUID | None] = mapped_column(default=None)
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), default=None, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)

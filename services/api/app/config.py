@@ -30,6 +30,14 @@ class Settings(BaseSettings):
 
     # TOTP: the name authenticator apps show next to the account (otpauth issuer).
     totp_issuer: str = "Brook"
+
+    # Attachments (spec 2026-09-25-attachments): plain files on the local disk.
+    files_dir: str = "./data/files"
+    files_max_bytes: int = 100 * 1024 * 1024
+    files_quota_bytes: int = 5 * 1024 * 1024 * 1024
+    # Refuse uploads that would leave less than this free: the disk is shared (on the
+    # production host, with the git server), and attachments must never fill it.
+    files_min_free_bytes: int = 5 * 1024 * 1024 * 1024
     refresh_ttl_seconds: int = 7 * 24 * 3600
 
     # Calls (Phase 4). Unset URL = no SFU configured: call commands answer

@@ -35,6 +35,20 @@ def _test_secret_keyring(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _files_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Each test stores attachments in its own directory, with no disk-space floor
+    (a CI runner's free space must not decide test outcomes; the floor is tested
+    explicitly), and a fresh upload-start bucket."""
+    from app.routers import files as files_router
+
+    monkeypatch.setenv("BROOK_FILES_DIR", str(tmp_path / "files"))
+    monkeypatch.setenv("BROOK_FILES_MIN_FREE_BYTES", "0")
+    files_router._create_buckets.clear()
+    yield
+    files_router._create_buckets.clear()
+
+
+@pytest.fixture(autouse=True)
 def _fresh_limiter() -> Iterator[None]:
     """Each test starts with an empty auth limiter (all test clients share one IP)."""
     ratelimit.get_limiter.cache_clear()

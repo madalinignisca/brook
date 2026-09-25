@@ -60,6 +60,12 @@ services:
       # X-Forwarded-For through, and "*" would then trust it: narrow this to the
       # CDN's ranges at the same time.
       FORWARDED_ALLOW_IPS: "*"
+      # Attachments are plain files (owner decision): a named volume, no object store.
+      BROOK_FILES_DIR: /data/files
+      # The dev laptop's free space shouldn't block uploads; production keeps 5 GB.
+      BROOK_FILES_MIN_FREE_BYTES: ${BROOK_FILES_MIN_FREE_BYTES:-0}
+    volumes:
+      - files:/data/files
     depends_on:
       postgres:
         condition: service_healthy
@@ -125,6 +131,7 @@ services:
 
 volumes:
   pgdata:
+  files:
   miniodata:
   caddy_data:
   caddy_config:

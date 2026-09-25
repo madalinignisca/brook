@@ -223,6 +223,39 @@ class MemberAdd(BaseModel):
     handle: str = Field(min_length=2, max_length=64)
 
 
+class FileCreate(BaseModel):
+    """Start an attachment upload (attachments spec §3)."""
+
+    filename: str = Field(min_length=1, max_length=1024)
+    size: int = Field(ge=1)
+    content_type: str = Field(min_length=1, max_length=255)
+    # Idempotent like messages: a retry after a lost response returns the same file.
+    client_id: uuid.UUID | None = None
+
+
+class FileOut(BaseModel):
+    """An attachment. ``filename`` is the sanitised ASCII name clients save under;
+    ``original_name`` is display text only, never a filesystem name."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    channel_id: uuid.UUID
+    uploader_id: uuid.UUID
+    filename: str
+    original_name: str
+    size: int
+    content_type: str
+    status: str
+    sha256: str | None
+    created_at: datetime
+
+
+class FileCreated(BaseModel):
+    file: FileOut
+    upload_url: str
+
+
 class MessageCreate(BaseModel):
     """Send a message into a channel."""
 
@@ -231,6 +264,9 @@ class MessageCreate(BaseModel):
     # Outbox idempotency: a UUID the client generates once per message. Resending
     # with the same one returns the stored message (200), never a duplicate.
     client_id: uuid.UUID | None = None
+    # Committed files to attach (attachments spec §3): uploaded by the author, to this
+    # channel, not attached yet.
+    attachments: list[uuid.UUID] = Field(default_factory=list, max_length=10)
 
 
 class MessageEdit(BaseModel):
@@ -281,6 +317,7 @@ class MessageOut(BaseModel):
     reactions: list[ReactionSummary] = Field(default_factory=list)
     # Echoed so the sender's cache matches its pending outbox entry to this message.
     client_id: uuid.UUID | None = None
+    attachments: list[FileOut] = Field(default_factory=list)
     # Specific @handle mentions resolved to member ids (set only on the live send).
     mentions: list[uuid.UUID] = Field(default_factory=list)
     # True when @channel / @here mentioned everyone (avoids listing all member ids).

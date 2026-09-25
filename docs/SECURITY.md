@@ -38,8 +38,10 @@ All methods converge on **one internal session**: `api` issues a short-lived **a
 
 ## 4. Files
 
-- Upload: client asks `api` for an **S3 POST Policy** (not a bare presigned PUT) → the policy embeds a **`content-length-range`** so MinIO **rejects oversize uploads at the edge, mid-transfer** — a presigned *PUT* cannot enforce size and would let a client write unbounded bytes (disk-fill DoS) before any `/commit` check. Download: presigned **GET** (single object, short TTL).
-- Presigned URLs are **bearer capabilities** — anyone holding one within its TTL can use it. Mitigations: **short TTL**, HTTPS only, scope to a single object+operation, and `api` authorizes the requester before minting.
+- **Plain files on the local disk** (owner decision for small single-server deployments; the attachments spec has the design). The api streams an upload to its own part file with a **hard cap at the declared size** (it stops reading mid-transfer), and Caddy caps the body again at 100 MB. A per-user quota and a **free-space floor** (5 GB by default) mean attachments can never fill a disk the host shares, e.g. with a git server.
+- **Names can't hurt:** bytes are stored under a UUID, never the user's filename; the name clients save under is sanitised and transliterated to ASCII (paths, controls, bidi overrides, Windows device names removed).
+- **Downloads can't execute on our origin:** every download is `Content-Disposition: attachment`, active types (HTML, SVG, XML, scripts, PDF) are served as `application/octet-stream`, and `nosniff` + a CSP `sandbox` are set by the api and again by Caddy.
+- **No bearer URLs:** downloads use the normal access token (checked when the request starts), so there are no signed links to leak through logs or sharing.
 - At rest: see §4a — encryption at rest is the **operator's infrastructure concern**, not an app feature.
 
 ## 4a. Encryption at rest is the operator's, and must never block the app

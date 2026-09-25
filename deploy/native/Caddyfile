@@ -13,5 +13,16 @@ BROOK_DOMAIN {
 	# The dev call harness is off in production (BROOK_DEV_HARNESS unset); refuse
 	# the path at the edge too so a config slip cannot expose it.
 	respond /dev/* 404
+	# Attachment bytes (attachments spec §3, §5). The api enforces the declared size;
+	# this is a second cap in front of it. And a second layer of "never render, never
+	# run" on downloads, in case a response ever left the api without its headers.
+	@filecontent path_regexp ^/api/v1/files/[^/]+/content$
+	request_body @filecontent {
+		max_size 100MiB
+	}
+	header @filecontent {
+		X-Content-Type-Options nosniff
+		Content-Security-Policy "sandbox; default-src 'none'"
+	}
 	reverse_proxy 127.0.0.1:8000
 }

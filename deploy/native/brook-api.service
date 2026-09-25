@@ -15,6 +15,12 @@ Group=brook
 WorkingDirectory=/opt/brook/api
 EnvironmentFile=/etc/brook/api.env
 Environment=PATH=/opt/brook/api/.venv/bin:/usr/bin
+# Attachments live as plain files (owner decision, attachments spec §2). systemd
+# creates /var/lib/brook owned by brook and makes it the one writable path under
+# ProtectSystem=strict. SELinux: the default var_lib_t label, nothing custom.
+StateDirectory=brook
+StateDirectoryMode=0750
+Environment=BROOK_FILES_DIR=/var/lib/brook/files
 # Same contract as the container entrypoint: migrate to head, then serve.
 # Idempotent (a no-op when current), single node only.
 ExecStartPre=/opt/brook/api/.venv/bin/alembic upgrade head
