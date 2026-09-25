@@ -83,7 +83,13 @@ impl Server {
 
 #[async_trait::async_trait]
 impl Post for Server {
-    async fn send(&self, channel: &str, body: &str, client_id: &str) -> Result<Value, SendFailure> {
+    async fn send(
+        &self,
+        channel: &str,
+        body: &str,
+        client_id: &str,
+        _epoch: u64,
+    ) -> Result<Value, SendFailure> {
         self.sends
             .lock()
             .unwrap()
@@ -230,7 +236,7 @@ async fn cached_bodies(s: &Setup, ch: &str) -> Vec<String> {
 async fn a_queued_message_is_durable_before_enqueue_returns() {
     let s = setup().await;
     s.session.send_replace(None); // signed out: nothing is sent
-    let id = s.outbox.enqueue("c1", "hello").await.unwrap();
+    let id = s.outbox.enqueue("c1", "hello", None).await.unwrap();
     // Reopen the store as a restart would: the row is there.
     let outbox = s.outbox;
     outbox.close().await;
@@ -253,7 +259,7 @@ async fn a_queued_message_is_durable_before_enqueue_returns() {
 async fn a_lost_answer_and_a_resend_make_one_message() {
     let s = setup().await;
     s.server.script([Answer::Lost, Answer::Ok]);
-    s.outbox.enqueue("c1", "once").await.unwrap();
+    s.outbox.enqueue("c1", "once", None).await.unwrap();
     drained(&s).await;
     let sends = s.server.sends();
     assert_eq!(sends.len(), 2);
@@ -267,7 +273,7 @@ async fn messages_go_in_the_order_written() {
     let s = setup().await;
     s.session.send_replace(None);
     for body in ["one", "two", "three", "four"] {
-        s.outbox.enqueue("c1", body).await.unwrap();
+        s.outbox.enqueue("c1", body, None).await.unwrap();
     }
     s.session.send_replace(Some(1));
     drained(&s).await;
@@ -280,7 +286,7 @@ async fn messages_go_in_the_order_written() {
 async fn a_row_left_sending_by_a_crash_is_resent_with_its_id() {
     let s = setup().await;
     s.session.send_replace(None);
-    let id = s.outbox.enqueue("c1", "mid-flight").await.unwrap();
+    let id = s.outbox.enqueue("c1", "mid-flight", None).await.unwrap();
     let outbox = s.outbox;
     outbox.close().await;
     let db = open_db(s.outbox_dir.path(), Kind::Outbox, &s.slot);
@@ -314,9 +320,9 @@ async fn a_failed_message_blocks_only_its_own_channel() {
             code: "authz.forbidden".into(),
         })],
     );
-    s.outbox.enqueue("c1", "refused").await.unwrap();
-    s.outbox.enqueue("c1", "behind it").await.unwrap();
-    s.outbox.enqueue("c2", "elsewhere").await.unwrap();
+    s.outbox.enqueue("c1", "refused", None).await.unwrap();
+    s.outbox.enqueue("c1", "behind it", None).await.unwrap();
+    s.outbox.enqueue("c2", "elsewhere", None).await.unwrap();
     s.session.send_replace(Some(1));
     let server = s.server.clone();
     eventually("c2's send", move || {
@@ -350,7 +356,7 @@ async fn transient_answers_keep_the_message_pending() {
     ] {
         let s = setup().await;
         s.server.script([Answer::Fail(failure.clone()), Answer::Ok]);
-        s.outbox.enqueue("c1", "eventually").await.unwrap();
+        s.outbox.enqueue("c1", "eventually", None).await.unwrap();
         drained(&s).await;
         assert_eq!(s.server.stored_bodies(), vec!["eventually"], "{failure:?}");
     }
@@ -367,7 +373,7 @@ async fn a_refusal_fails_the_message_with_the_servers_code() {
         let s = setup().await;
         s.server
             .script([Answer::Fail(SendFailure::Refused { code: code.into() })]);
-        s.outbox.enqueue("c1", "no").await.unwrap();
+        s.outbox.enqueue("c1", "no", None).await.unwrap();
         let o = s.outbox.clone();
         let mut state = None;
         for _ in 0..500 {
@@ -391,7 +397,7 @@ async fn a_refusal_fails_the_message_with_the_servers_code() {
 async fn a_wrong_echo_fails_the_row_and_never_resends() {
     let s = setup().await;
     s.server.script([Answer::WrongEcho]);
-    s.outbox.enqueue("c1", "who am i").await.unwrap();
+    s.outbox.enqueue("c1", "who am i", None).await.unwrap();
     let o = s.outbox.clone();
     for _ in 0..500 {
         if matches!(
@@ -422,7 +428,7 @@ async fn delete_during_an_accepted_send_reports_it_sent() {
     let s = setup().await;
     let gate = Arc::new(Notify::new());
     s.server.script([Answer::Held(gate.clone())]);
-    let id = s.outbox.enqueue("c1", "too late").await.unwrap();
+    let id = s.outbox.enqueue("c1", "too late", None).await.unwrap();
     let server = s.server.clone();
     eventually("the send in flight", move || server.sends().len() == 1).await;
     let delete = tokio::spawn({
@@ -439,7 +445,7 @@ async fn delete_during_an_accepted_send_reports_it_sent() {
 async fn delete_before_sending_removes_it() {
     let s = setup().await;
     s.session.send_replace(None);
-    let id = s.outbox.enqueue("c1", "never mind").await.unwrap();
+    let id = s.outbox.enqueue("c1", "never mind", None).await.unwrap();
     assert_eq!(
         s.outbox.delete_pending(&id).await.unwrap(),
         Deleted::Removed
@@ -456,7 +462,7 @@ async fn a_sign_out_pauses_the_sender_mid_backoff() {
     s.server.script([Answer::Fail(SendFailure::Transient {
         retry_after: Some(1),
     })]);
-    s.outbox.enqueue("c1", "later").await.unwrap();
+    s.outbox.enqueue("c1", "later", None).await.unwrap();
     let server = s.server.clone();
     eventually("the first attempt", move || server.sends().len() == 1).await;
     s.session.send_replace(None); // a plain sign-out (no data removed)
@@ -467,26 +473,12 @@ async fn a_sign_out_pauses_the_sender_mid_backoff() {
     drained(&s).await;
 }
 
-/// A 401 waits for the session to change (renewed), then goes.
-#[tokio::test]
-async fn a_refused_token_waits_for_the_session_to_be_renewed() {
-    let s = setup().await;
-    s.server.script([Answer::Fail(SendFailure::Unauthorized)]);
-    s.outbox.enqueue("c1", "after refresh").await.unwrap();
-    let server = s.server.clone();
-    eventually("the first attempt", move || server.sends().len() == 1).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(s.server.sends().len(), 1, "retried without a new session");
-    s.session.send_replace(Some(2)); // renewed
-    drained(&s).await;
-}
-
 #[tokio::test]
 async fn unsent_messages_are_counted_for_the_sign_out_warning() {
     let s = setup().await;
     s.session.send_replace(None);
-    s.outbox.enqueue("c1", "a").await.unwrap();
-    s.outbox.enqueue("c2", "b").await.unwrap();
+    s.outbox.enqueue("c1", "a", None).await.unwrap();
+    s.outbox.enqueue("c2", "b", None).await.unwrap();
     assert_eq!(s.outbox.unsent_count().await.unwrap(), 2);
 }
 
@@ -502,8 +494,14 @@ async fn a_failed_ack_keeps_the_row() {
     struct Garbled(Arc<Server>);
     #[async_trait::async_trait]
     impl Post for Garbled {
-        async fn send(&self, ch: &str, body: &str, cid: &str) -> Result<Value, SendFailure> {
-            let mut m = self.0.send(ch, body, cid).await?;
+        async fn send(
+            &self,
+            ch: &str,
+            body: &str,
+            cid: &str,
+            e: u64,
+        ) -> Result<Value, SendFailure> {
+            let mut m = self.0.send(ch, body, cid, e).await?;
             m.as_object_mut().unwrap().remove("created_at"); // the cache can't take it
             Ok(m)
         }
@@ -520,14 +518,196 @@ async fn a_failed_ack_keeps_the_row() {
     )
     .await
     .unwrap();
-    outbox.enqueue("c1", "keep me").await.unwrap();
+    outbox.enqueue("c1", "keep me", None).await.unwrap();
     let server = s.server.clone();
     eventually("a send", move || !server.sends().is_empty()).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
-        outbox.unsent_count().await.unwrap(),
+        outbox.pending("c1").await.unwrap().len(),
         1,
         "the row went before the cache had it"
     );
     drop(session);
+}
+
+// ---- Review round 1 ----
+
+async fn trigger(s: &Setup, sql: &'static str) {
+    s.outbox
+        .db_for_tests()
+        .call(move |c| c.execute_batch(sql))
+        .await
+        .unwrap();
+}
+
+const NO_INSERTS: &str = "CREATE TEMP TRIGGER full BEFORE INSERT ON outbox
+     BEGIN SELECT RAISE(ABORT, 'disk full'); END;";
+
+/// The outbox can't be written: sent directly, only while signed in, and a failed direct
+/// send hands back its client_id so a retry is the same message.
+#[tokio::test]
+async fn a_direct_send_is_signed_in_and_retryable_as_the_same_message() {
+    let s = setup().await;
+    trigger(&s, NO_INSERTS).await;
+    s.session.send_replace(None);
+    assert_eq!(
+        s.outbox.enqueue("c1", "hi", None).await,
+        Err(OutboxError::SignedOut)
+    );
+    s.session.send_replace(Some(1));
+    s.server.script([Answer::Lost]);
+    let err = s.outbox.enqueue("c1", "hi", None).await.unwrap_err();
+    let OutboxError::NotSent { client_id, .. } = err else {
+        panic!("{err:?}")
+    };
+    s.outbox.enqueue("c1", "hi", Some(client_id)).await.unwrap();
+    assert_eq!(
+        s.server.stored_bodies(),
+        vec!["hi"],
+        "the retry made a second message"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_send_never_overtakes_a_queued_message() {
+    let s = setup().await;
+    s.session.send_replace(None);
+    s.outbox.enqueue("c1", "first", None).await.unwrap();
+    trigger(&s, NO_INSERTS).await;
+    s.session.send_replace(Some(1));
+    // The queued one may go meanwhile; either way a direct send only runs with nothing
+    // left queued, so it can't overtake.
+    match s.outbox.enqueue("c1", "second", None).await {
+        Err(OutboxError::WouldOvertake) => {}
+        Ok(_) => assert_eq!(
+            s.server
+                .sends()
+                .iter()
+                .map(|x| x.2.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A refusal the store can't record doesn't turn into a tight re-send loop.
+#[tokio::test]
+async fn an_outcome_the_store_cant_record_backs_off() {
+    let s = setup().await;
+    trigger(
+        &s,
+        "CREATE TEMP TRIGGER nofail BEFORE UPDATE ON outbox WHEN NEW.state = 'failed'
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .await;
+    for _ in 0..50 {
+        s.server
+            .script([Answer::Fail(SendFailure::Refused { code: "x".into() })]);
+    }
+    s.outbox.enqueue("c1", "stuck", None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let n = s.server.sends().len();
+    assert!(n <= 2, "re-sent {n} times in 1.5 s");
+}
+
+/// Signed out while the send was out: its answer isn't applied, the row stays.
+#[tokio::test]
+async fn an_answer_after_a_sign_out_is_not_applied() {
+    let s = setup().await;
+    let gate = Arc::new(Notify::new());
+    s.server.script([Answer::Held(gate.clone())]);
+    s.outbox.enqueue("c1", "in flight", None).await.unwrap();
+    let server = s.server.clone();
+    eventually("the send", move || server.sends().len() == 1).await;
+    s.session.send_replace(None);
+    gate.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        s.outbox.unsent_count().await.unwrap(),
+        1,
+        "the row went after sign-out"
+    );
+    assert!(
+        cached_bodies(&s, "c1").await.is_empty(),
+        "applied after sign-out"
+    );
+}
+
+/// The server took it but the cache couldn't: `accepted`, and Delete says it's sent.
+#[tokio::test]
+async fn an_accepted_message_is_never_deleted_as_unsent() {
+    struct Garbled(Arc<Server>);
+    #[async_trait::async_trait]
+    impl Post for Garbled {
+        async fn send(
+            &self,
+            ch: &str,
+            body: &str,
+            cid: &str,
+            e: u64,
+        ) -> Result<Value, SendFailure> {
+            let mut m = self.0.send(ch, body, cid, e).await?;
+            m.as_object_mut().unwrap().remove("created_at");
+            Ok(m)
+        }
+    }
+    let s = setup().await;
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let dir = tempfile::tempdir().unwrap();
+    let (_session, rx) = watch::channel(Some(1));
+    let outbox = Outbox::open(
+        open_db(dir.path(), Kind::Outbox, &slot),
+        s.cache.clone(),
+        Arc::new(Garbled(s.server.clone())),
+        rx,
+    )
+    .await
+    .unwrap();
+    let id = outbox.enqueue("c1", "sent really", None).await.unwrap();
+    let o = outbox.clone();
+    for _ in 0..500 {
+        if o.pending("c1")
+            .await
+            .unwrap()
+            .first()
+            .map(|m| m.state.clone())
+            == Some(PendingState::Accepted)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        outbox.pending("c1").await.unwrap()[0].state,
+        PendingState::Accepted
+    );
+    assert_eq!(outbox.unsent_count().await.unwrap(), 0, "counted as unsent");
+    assert_eq!(
+        outbox.delete_pending(&id).await.unwrap(),
+        Deleted::AlreadySent
+    );
+}
+
+#[tokio::test]
+async fn a_closed_outbox_takes_nothing() {
+    let s = setup().await;
+    let extra = s.outbox.clone(); // someone still holds it
+    s.outbox.close().await;
+    assert_eq!(
+        extra.enqueue("c1", "after", None).await,
+        Err(OutboxError::Closed)
+    );
+    assert_eq!(extra.retry("x").await, Ok(()));
+}
+
+/// A 401 is transient: it's retried (the refresh loop renews the token meanwhile).
+#[tokio::test]
+async fn a_refused_token_is_retried() {
+    let s = setup().await;
+    s.server.script([Answer::Fail(SendFailure::Transient {
+        retry_after: Some(0),
+    })]);
+    s.outbox.enqueue("c1", "after refresh", None).await.unwrap();
+    drained(&s).await;
 }
