@@ -51,6 +51,9 @@ The client uploads the bytes directly to `upload.url` with `upload.fields`.
 **`POST /files/{id}/commit`**, by the uploader:
 - The server `HEAD`s the object. It must exist with a size of at least 1 and at most the
   declared size, and the declared content type.
+- The **HEAD-verified size** is stored in `files.size`, and that value is what counts
+  toward the quota. The policy allows anything up to the declared size, so the declared
+  value isn't trusted.
 - On success the file becomes `committed` and `200 FileOut` is returned. A second commit
   is idempotent (200 with the same body).
 - `409 file.not_uploaded` if the object isn't there; `422 file.mismatch` on a size or type
@@ -76,7 +79,9 @@ object. A file attached to a message leaves its message showing "file removed".
 ```
 {id, filename, original_name, size, content_type, created_at, uploader_id, channel_id}
 ```
-`MessageOut` gains `attachments: [FileOut]`.
+`MessageOut` gains `attachments: [FileOut]`, and so do the WebSocket `message.new` and
+`message.update` payloads. `PATCH` can't change a message's attachments in MVP+. `FileOut`
+also carries `etag` (the object ETag at commit), so a cache can check what it holds.
 
 ## 4. Filenames (owner)
 
