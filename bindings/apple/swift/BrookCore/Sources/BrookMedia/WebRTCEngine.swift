@@ -17,6 +17,13 @@ public protocol VideoCapture: AnyObject, Sendable {
     func start(into source: RTCVideoSource) async throws
     func stop() async
     var isCapturing: Bool { get }
+    /// Called when the system ends the capture on its own (screen share stopped from the menu
+    /// bar, display disconnected). Cameras never do.
+    func setEndedHandler(_ handler: @escaping @Sendable () -> Void)
+}
+
+extension VideoCapture {
+    public func setEndedHandler(_ handler: @escaping @Sendable () -> Void) {}
 }
 
 /// A remote track and who it belongs to, from the latest subscribe offer's `streams`.
@@ -26,6 +33,17 @@ public struct RemoteTrack: @unchecked Sendable {
     public let kind: FfiMediaKind
     public let source: FfiMediaSource
     public let track: RTCMediaStreamTrack
+
+    public init(
+        mid: String, participantId: String, kind: FfiMediaKind, source: FfiMediaSource,
+        track: RTCMediaStreamTrack
+    ) {
+        self.mid = mid
+        self.participantId = participantId
+        self.kind = kind
+        self.source = source
+        self.track = track
+    }
 }
 
 public struct MediaOptions: @unchecked Sendable {
@@ -128,8 +146,39 @@ public final class WebRTCEngine: FfiMediaEngine, @unchecked Sendable {
 
     // MARK: FfiMediaEngine
 
+    /// What core calls: the offer with a label per audio/video m-line (`screen` for the share's).
+    public func createLabelledOffer() async throws -> FfiPublishOffer {
+        try await mapped { try await self.core.createLabelledOffer() }
+    }
+
+    /// The offer alone (tests, diagnostics).
     public func createPublishOffer() async throws -> String {
-        try await mapped { try await self.core.createPublishOffer() }
+        try await createLabelledOffer().sdp
+    }
+
+    /// Start sharing: a sendonly video m-line fed by `capture` on the publish connection (the
+    /// stopped share's m-line when there is one). The caller then renegotiates
+    /// (`FfiCallHandle.republish`). Throws before the first publish offer, or while sharing.
+    public func startScreenShare(_ capture: VideoCapture) async throws {
+        try await mapped { try await self.core.startScreenShare(capture) }
+    }
+
+    /// Stop sharing: capture stops and the m-line goes `inactive` (never `stop()`: a stopped
+    /// transceiver's slot can be recycled under a new mid, which the SFU refuses). The caller
+    /// then renegotiates.
+    public func stopScreenShare() async {
+        await core.stopScreenShare()
+    }
+
+    /// Called (on the engine queue) when the system ended the share on its own; the engine
+    /// has already set the m-line inactive, and the caller renegotiates.
+    public func onScreenShareEnded(_ callback: @escaping @Sendable () -> Void) {
+        core.enqueue { $0.screenEndedCallback = callback }
+    }
+
+    /// Whether a share is running.
+    public func isSharingScreen() async -> Bool {
+        await core.isSharingScreen
     }
 
     public func applyPublishAnswer(sdp: String) async throws {
@@ -196,6 +245,14 @@ actor EngineCore {
     private var audioTrack: RTCAudioTrack?
     private var videoSource: RTCVideoSource?
     private(set) var localVideoTrack: RTCVideoTrack?
+    /// The screen share's transceiver, kept (inactive) after a share stops and reused by the
+    /// next one, so the m-line keeps its mid.
+    private var screenTransceiver: RTCRtpTransceiver?
+    private var screenSource: RTCVideoSource?
+    private var screenCapture: VideoCapture?
+    var screenEndedCallback: (@Sendable () -> Void)?
+    private var screenBusy = false
+    private var screenWaiters: [CheckedContinuation<Void, Never>] = []
     /// The user's intent; applied to tracks and capture as they come to exist.
     private var media = (audio: true, video: true)
     private var captureRunning = false
@@ -249,7 +306,7 @@ actor EngineCore {
 
     // MARK: publish
 
-    func createPublishOffer() async throws -> String {
+    func createLabelledOffer() async throws -> FfiPublishOffer {
         try check()
         let pc = try publish ?? makePublish()
         if capture != nil, media.video { try await syncCapture() }
@@ -258,7 +315,117 @@ actor EngineCore {
         try check()
         try await pc.setLocalDescription(offer)
         try check()
-        return offer.sdp
+        return FfiPublishOffer(sdp: offer.sdp, tracks: labels(pc))
+    }
+
+    /// A label for every audio/video m-line with a mid, inactive ones included (the contract
+    /// allows labelling them, and a stopped share must stay `screen`).
+    private func labels(_ pc: RTCPeerConnection) -> [FfiTrackLabel] {
+        pc.transceivers.compactMap { t -> FfiTrackLabel? in
+            let mid = t.mid
+            guard !mid.isEmpty else { return nil }  // not yet negotiated
+            switch t.mediaType {
+            case .audio: return FfiTrackLabel(mid: mid, kind: .audio, source: .mic)
+            case .video:
+                // By the sender's track id, not identity: `transceivers` returns new wrappers
+                // on every call. The share's track stays on its sender while inactive.
+                let screen = t.sender.track?.trackId == Self.screenTrackId
+                return FfiTrackLabel(mid: mid, kind: .video, source: screen ? .screen : .camera)
+            default: return nil
+            }
+        }
+    }
+
+    // MARK: screen share
+
+    /// Screen operations (start, stop, the screen part of close) run one at a time: each
+    /// awaits capture, and an interleaved stop or close must not miss a start in flight.
+    private func withScreenLock<T>(_ body: () async throws -> T) async rethrows -> T {
+        while screenBusy {
+            await withCheckedContinuation { screenWaiters.append($0) }
+        }
+        screenBusy = true
+        defer {
+            screenBusy = false
+            if !screenWaiters.isEmpty { screenWaiters.removeFirst().resume() }
+        }
+        return try await body()
+    }
+
+    func startScreenShare(_ capture: VideoCapture) async throws {
+        try await withScreenLock {
+            try check()
+            guard let pc = publish else { throw EngineFailure("start publishing before sharing") }
+            guard screenCapture == nil else { throw EngineFailure("already sharing the screen") }
+            let source: RTCVideoSource
+            if let existing = screenTransceiver, let kept = screenSource {
+                source = kept
+                var error: NSError?
+                existing.setDirection(.sendOnly, error: &error)
+                if let error { throw EngineFailure("screen m-line: \(error.localizedDescription)") }
+            } else {
+                source = factory.videoSource(forScreenCast: true)
+                let track = factory.videoTrack(with: source, trackId: Self.screenTrackId)
+                let initial = RTCRtpTransceiverInit()
+                initial.direction = .sendOnly
+                initial.streamIds = ["brook-screen"]
+                guard let t = pc.addTransceiver(with: track, init: initial) else {
+                    throw EngineFailure("could not add the screen track")
+                }
+                screenTransceiver = t
+                screenSource = source
+            }
+            // Before the start: an end that happens while starting is not lost. The handler goes
+            // through the screen lock, so it runs after this start settles and sees the result.
+            // Weak: the capture holds the handler, which must not hold the capture back.
+            capture.setEndedHandler { [weak self, weak capture] in
+                guard let capture else { return }
+                self?.enqueue { core in Task { await core.screenEndedBySystem(capture) } }
+            }
+            do {
+                try await startBounded(capture, source)
+            } catch {
+                // Timed out or failed: whatever the capture set up before failing is stopped
+                // (a start that completes later is stopped by startBounded itself).
+                setScreenInactive()
+                await capture.stop()
+                throw error
+            }
+            if fence.isSet || closing {
+                await capture.stop()
+                throw EngineFailure("engine closed")
+            }
+            screenCapture = capture
+        }
+    }
+
+    func stopScreenShare() async {
+        await withScreenLock {
+            guard let capture = screenCapture else { return }
+            screenCapture = nil
+            setScreenInactive()
+            await capture.stop()
+        }
+    }
+
+    /// The system ended the capture (menu bar, display gone): drop the share, set the m-line
+    /// inactive, and tell the UI so it renegotiates.
+    func screenEndedBySystem(_ capture: VideoCapture) async {
+        let ended: Bool = await withScreenLock {
+            guard let current = screenCapture, current === capture else { return false }
+            screenCapture = nil
+            setScreenInactive()
+            await capture.stop()
+            return true
+        }
+        if ended, !closing { screenEndedCallback?() }
+    }
+
+    var isSharingScreen: Bool { screenCapture != nil }
+
+    private func setScreenInactive() {
+        var error: NSError?
+        screenTransceiver?.setDirection(.inactive, error: &error)
     }
 
     private func makePublish() throws -> RTCPeerConnection {
@@ -505,6 +672,14 @@ actor EngineCore {
             await capture.stop()
             captureRunning = false
         }
+        // Through the screen lock: a share still starting finishes first (bounded by the
+        // capture timeout), sees the fence, and stops its capture before `closed`.
+        await withScreenLock {
+            if let screen = screenCapture {
+                screenCapture = nil
+                await screen.stop()
+            }
+        }
         publish?.close()
         subscribe?.close()
         publish = nil
@@ -513,6 +688,8 @@ actor EngineCore {
         audioTrack = nil
         videoSource = nil
         localVideoTrack = nil
+        screenTransceiver = nil
+        screenSource = nil
         remoteTracks = [:]
         pending = []
         isClosed = true
@@ -571,6 +748,8 @@ actor EngineCore {
             s.values.mapValues { "\($0)" }
         }
     }
+
+    static let screenTrackId = "screen"
 
     private static let noConstraints = RTCMediaConstraints(
         mandatoryConstraints: nil, optionalConstraints: nil)

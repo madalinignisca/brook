@@ -42,8 +42,12 @@ final class LiveCallTests: XCTestCase {
         let engine = WebRTCEngine(options: MediaOptions(
             audio: true, video: SyntheticVideoCapture(), audioDevice: device))
         let frames = FrameCounter()
+        let screenFrames = FrameCounter()
+        let attached = Locked(Set<String>())
         engine.onRemoteTracks { tracks in
-            for t in tracks where t.kind == .video { (t.track as? RTCVideoTrack)?.add(frames) }
+            for t in tracks where t.kind == .video && attached.withLock({ $0.insert(t.mid).inserted }) {
+                (t.track as? RTCVideoTrack)?.add(t.source == .screen ? screenFrames : frames)
+            }
         }
         let call = try await client.joinCall(channelId: channel, engine: engine, publish: true)
         engine.attach(call)
@@ -78,6 +82,25 @@ final class LiveCallTests: XCTestCase {
             let codecs = await engine.statistics(.subscribe, type: "inbound-rtp")
                 .map { "\($0["kind"] ?? "?"): \($0["decoderImplementation"] ?? "-") \($0["framesDecoded"] ?? "")" }
             print("LIVE subscribe: \(codecs)")
+        }
+
+        // BROOK_TEST_EXPECT_PEER_SCREEN=1: the peer shares its screen; it must decode here.
+        if e["BROOK_TEST_EXPECT_PEER_SCREEN"] == "1" {
+            await eventually("peer screen decoded here", timeout: 60) { screenFrames.frames > 20 }
+            print("LIVE peer screen frames: \(screenFrames.frames)")
+        }
+        // BROOK_TEST_SHARE_SCREEN=<seconds>: share a synthetic screen for that long (the peer
+        // reports decoding it), then stop; both renegotiations must be accepted.
+        if let seconds = e["BROOK_TEST_SHARE_SCREEN"].flatMap(Int.init) {
+            try await engine.startScreenShare(SyntheticVideoCapture(width: 1280, height: 720))
+            try await call.republish()
+            print("LIVE sharing a synthetic screen for \(seconds) s")
+            try await Task.sleep(for: .seconds(seconds))
+            await engine.stopScreenShare()
+            try await call.republish()
+            print("LIVE stopped sharing; staying 15 s so the peer sees the stop re-offer")
+            try await Task.sleep(for: .seconds(15))
+            XCTAssertEqual(log.last?.status, .connected, "call did not survive the share")
         }
 
         try await call.leave()

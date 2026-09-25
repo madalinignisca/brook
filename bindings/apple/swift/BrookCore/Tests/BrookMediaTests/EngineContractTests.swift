@@ -21,6 +21,14 @@ final class ScriptedCapture: VideoCapture, @unchecked Sendable {
     }
     /// Ordered record of "started" / "stopped" (tests append their own marks).
     let events = Locked([String]())
+    private let ended = Locked<(@Sendable () -> Void)?>(nil)
+    func setEndedHandler(_ handler: @escaping @Sendable () -> Void) { ended.withLock { $0 = handler } }
+    /// What the system does when it ends a capture on its own (e.g. the user stops sharing
+    /// from the menu bar).
+    func endBySystem() {
+        state.withLock { $0.running = false }
+        ended.withLock { $0 }?()
+    }
 
     init(_ mode: Mode) { state = Locked(State(mode: mode)) }
 
@@ -156,6 +164,112 @@ final class EngineContractTests: XCTestCase {
         capture.releaseStop()
         await closing.value
         XCTAssertEqual(events.entries, [], "delivered while closing")
+    }
+
+    // MARK: screen share lifecycle
+
+    private func sharingEngine() async throws -> WebRTCEngine {
+        let e = engine(capture: nil)
+        _ = try await e.createPublishOffer()  // a publish connection to share on
+        return e
+    }
+
+    /// Stop while the share's capture is still starting: once the start completes it must not
+    /// be left running (no owner could stop it afterwards).
+    func testStopDuringAStartingShareLeavesNothingRunning() async throws {
+        let e = try await sharingEngine()
+        let screen = ScriptedCapture(.held)
+        let start = Task { try await e.startScreenShare(screen) }
+        await eventually("share start reached") { screen.isHeld }
+        let stop = Task { await e.stopScreenShare() }
+        try? await Task.sleep(for: .milliseconds(100))
+        screen.release()
+        _ = try? await start.value
+        await stop.value
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(screen.isCapturing, "screen capture left running")
+        let sharing = await e.isSharingScreen()
+        XCTAssertFalse(sharing)
+        await e.close()
+    }
+
+    /// close() during a starting share: `closed` completes only once that capture stopped.
+    func testClosedWaitsForAStartingShare() async throws {
+        let e = try await sharingEngine()
+        let screen = ScriptedCapture(.held)
+        let start = Task { try await e.startScreenShare(screen) }
+        await eventually("share start reached") { screen.isHeld }
+        let closing = Task {
+            await e.close()
+            screen.events.withLock { $0.append("closed") }
+        }
+        try? await Task.sleep(for: .milliseconds(100))
+        screen.release()
+        await closing.value
+        _ = try? await start.value
+        XCTAssertEqual(screen.events.withLock { $0 }, ["started", "stopped", "closed"])
+    }
+
+    /// The system ends the capture while it is still starting: the end is not lost.
+    func testShareEndedWhileStartingIsNotLost() async throws {
+        let e = try await sharingEngine()
+        let screen = ScriptedCapture(.held)
+        let told = Locked(0)
+        e.onScreenShareEnded { told.withLock { $0 += 1 } }
+        let start = Task { try await e.startScreenShare(screen) }
+        await eventually("share start reached") { screen.isHeld }
+        screen.release()
+        screen.endBySystem()  // before the engine resumed from the start
+        _ = try? await start.value
+        await eventually("end reported") { told.withLock { $0 } == 1 }
+        let sharing = await e.isSharingScreen()
+        XCTAssertFalse(sharing, "an ended capture recorded as sharing")
+        await e.close()
+    }
+
+    /// The engine's ended handler does not keep a stopped capture alive.
+    func testStoppedShareCaptureIsReleased() async throws {
+        let e = try await sharingEngine()
+        var screen: ScriptedCapture? = ScriptedCapture(.immediate)
+        weak let watched = screen
+        try await e.startScreenShare(screen!)
+        await e.stopScreenShare()
+        screen = nil
+        XCTAssertNil(watched, "capture retained after stop")
+        await e.close()
+    }
+
+    /// A share whose capture never starts fails within the bound, and its capture is told to
+    /// stop (a stream set up before the hang must not stay outstanding).
+    func testTimedOutShareIsStopped() async throws {
+        let e = WebRTCEngine(options: MediaOptions(
+            audio: true, video: nil, audioDevice: SyntheticAudioDevice(toneHz: nil),
+            captureTimeout: .milliseconds(200)))
+        _ = try await e.createPublishOffer()
+        let screen = ScriptedCapture(.never)
+        await XCTAssertThrowsAsync { try await e.startScreenShare(screen) }
+        XCTAssertGreaterThanOrEqual(screen.stops, 1, "timed-out share never stopped")
+        let sharing = await e.isSharingScreen()
+        XCTAssertFalse(sharing)
+        await e.close()
+    }
+
+    /// The system ends the share (menu bar "Stop Sharing", display gone): the engine drops it,
+    /// the m-line goes inactive, and the UI is told so it renegotiates.
+    func testShareEndedBySystemIsReported() async throws {
+        let e = try await sharingEngine()
+        let screen = ScriptedCapture(.immediate)
+        let told = Locked(0)
+        e.onScreenShareEnded { told.withLock { $0 += 1 } }
+        try await e.startScreenShare(screen)
+        screen.endBySystem()
+        await eventually("UI told the share ended") { told.withLock { $0 } == 1 }
+        let sharing = await e.isSharingScreen()
+        XCTAssertFalse(sharing)
+        let offer = try await e.createLabelledOffer()
+        let mid = try XCTUnwrap(offer.tracks.first { $0.source == .screen }?.mid)
+        XCTAssertTrue(section(offer.sdp, mid: mid).contains("a=inactive"), "ended share still sending")
+        await e.close()
     }
 
     // MARK: capture bound

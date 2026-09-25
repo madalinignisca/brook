@@ -14,9 +14,13 @@ final class RecordingEngine: FfiMediaEngine, @unchecked Sendable {
     var log: [String] { entries.withLock { $0 } }
     private func record(_ entry: String) { entries.withLock { $0.append(entry) } }
 
-    func createPublishOffer() async throws -> String {
+    func createLabelledOffer() async throws -> FfiPublishOffer {
         record("createPublishOffer")
-        return offer
+        // Labelled like a real engine: the server refuses an offer whose active m-lines
+        // are not all labelled (PROTOCOL.md §3.3).
+        let tracks = offer.contains("m=audio")
+            ? [FfiTrackLabel(mid: "0", kind: .audio, source: .mic)] : []
+        return FfiPublishOffer(sdp: offer, tracks: tracks)
     }
     func applyPublishAnswer(sdp: String) async throws { record("applyPublishAnswer") }
     /// Other participants in the shared channel cause subscribe offers. A fake can't answer

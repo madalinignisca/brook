@@ -66,6 +66,7 @@ struct TileView: View {
 
 struct CallView: View {
     let call: CallModel
+    var pickScreen: () async -> VideoCapture? = { nil }
     let leave: () async -> Void
 
     var body: some View {
@@ -78,6 +79,13 @@ struct CallView: View {
             }
             if let explanation = call.plan.explanation {
                 Text(explanation).font(.callout).foregroundStyle(.secondary)
+            }
+            if call.sharing {
+                Label("You're sharing your screen", systemImage: "rectangle.on.rectangle")
+                    .font(.callout).foregroundStyle(.green)
+            }
+            if let error = call.shareError {
+                Text(error).font(.callout).foregroundStyle(.red)
             }
             ScrollView {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 10)], spacing: 10) {
@@ -104,6 +112,21 @@ struct CallView: View {
                 .disabled(!call.plan.camera || call.isEnded)
                 .keyboardShortcut("v", modifiers: [.command, .shift])
 
+                Button {
+                    Task {
+                        if call.sharing {
+                            await call.stopSharing()
+                        } else if let capture = await pickScreen() {
+                            await call.shareScreen(capture)
+                        }
+                    }
+                } label: {
+                    Label(call.sharing ? "Stop sharing" : "Share screen",
+                          systemImage: call.sharing ? "rectangle.on.rectangle.slash" : "rectangle.on.rectangle")
+                }
+                .disabled(!call.plan.publishes || call.isEnded || call.sharingBusy)
+                .keyboardShortcut("s", modifiers: [.command, .shift])
+
                 Button(role: .destructive) {
                     Task { await leave() }
                 } label: {
@@ -124,12 +147,19 @@ struct CallView: View {
 /// Without a call it closes normally, and the window closes itself once the call is gone.
 struct CallWindow: View {
     let center: CallCenter
+    /// One picker per request: a cancelled request's late callback can only reach its own
+    /// (finished) picker, never the next request's.
+    @State private var picker: ScreenPicker?
     @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some View {
         Group {
             if let call = center.call {
-                CallView(call: call) {
+                CallView(call: call, pickScreen: {
+                    let fresh = ScreenPicker()
+                    picker = fresh
+                    return await fresh.pick()
+                }) {
                     await center.leave()
                 }
             } else if center.joining {
@@ -143,7 +173,13 @@ struct CallWindow: View {
         // Dismissing goes through the close button, so it must be enabled first (the control
         // above updates in the same pass); dismiss on the next turn of the run loop.
         .onChange(of: center.call == nil) { _, gone in
-            if gone { DispatchQueue.main.async { dismissWindow(id: "call") } }
+            if gone {
+                picker?.cancel()  // a picker left open would keep its observer registered
+                DispatchQueue.main.async { dismissWindow(id: "call") }
+            }
+        }
+        .onChange(of: center.call?.isEnded ?? false) { _, ended in
+            if ended { picker?.cancel() }
         }
     }
 }
