@@ -12,6 +12,7 @@
 mod account;
 mod call;
 mod chat;
+mod keyring;
 mod prefs;
 mod totp;
 mod totp_ui;
@@ -21,7 +22,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
-use brook_core::{AuthState, BrookClient, CoreConfig, LoginOutcome};
+use brook_core::{AuthState, BrookClient, CoreConfig, LoginOutcome, RestoreOutcome};
 use gtk::glib;
 
 const APP_ID: &str = "dev.brook.Brook";
@@ -130,6 +131,11 @@ fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
         login_button: login_button.downgrade(),
         window: window.downgrade(),
         signed_out_by_user: Rc::default(),
+        keyring: Rc::new(Keyring {
+            slot: Arc::new(keyring::SecretServiceSlot::new()),
+            usable: std::cell::Cell::new(false),
+        }),
+        signins: Rc::default(),
     };
     // The client for the server currently in use; replaced when the user logs
     // in to a different server. Dropping the old client ends its state watcher.
@@ -170,7 +176,7 @@ fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
 
             let reuse = matches!(&*current.borrow(), Some((s, _)) if *s == server);
             if !reuse {
-                match new_client(&server) {
+                match new_client(&server, &ui.keyring) {
                     Ok(client) => {
                         *current.borrow_mut() = Some((server.clone(), client.clone()));
                         watch_auth_state(&ui, &current, server.clone(), Arc::downgrade(&client));
@@ -211,6 +217,68 @@ fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
     });
 
     window.present();
+
+    // Stay signed in (#58): with a usable keyring and a remembered server, sign in with
+    // the stored session before the user has to type anything.
+    restore_at_launch(&ui, &current, initial_server);
+}
+
+/// Check the keyring (off the UI thread: it may take up to its deadline), then restore
+/// the remembered server's session if there is one.
+fn restore_at_launch(ui: &LoginUi, current: &CurrentClient, server: String) {
+    // The form stays insensitive until the probe and any restore settle: a Log In in
+    // between would build a client without persistence, which the restore would then
+    // replace (submit ignores clicks while the button is insensitive).
+    let settle = {
+        let (label, button) = (ui.error_label.clone(), ui.login_button.clone());
+        move |note: &str| {
+            if let (Some(label), Some(button)) = (label.upgrade(), button.upgrade()) {
+                label.set_text(note);
+                button.set_sensitive(true);
+            }
+        }
+    };
+    if let Some(button) = ui.login_button.upgrade() {
+        button.set_sensitive(false);
+    }
+    let ui = ui.clone();
+    let current = current.clone();
+    let slot = ui.keyring.slot.clone();
+    let probe = ui.runtime.spawn_blocking(move || slot.available());
+    glib::spawn_future_local(async move {
+        let usable = probe.await.unwrap_or(false);
+        ui.keyring.usable.set(usable);
+        if !usable || prefs::saved_server().is_none() {
+            settle(""); // nothing to restore: the login form is ready
+            return;
+        }
+        let Ok(client) = new_client(&server, &ui.keyring) else {
+            settle("");
+            return;
+        };
+        if let Some(label) = ui.error_label.upgrade() {
+            label.set_text("Signing in…");
+        }
+        *current.borrow_mut() = Some((server.clone(), client.clone()));
+        watch_auth_state(&ui, &current, server, Arc::downgrade(&client));
+        let restore = ui.runtime.spawn({
+            let client = client.clone();
+            async move { client.restore().await }
+        });
+        let outcome = restore.await.unwrap_or(RestoreOutcome::Offline);
+        // LoggedIn is published through the watcher (it opens the chat); the others
+        // leave the login form, with a note where it helps.
+        let note = match outcome {
+            RestoreOutcome::Unavailable => {
+                "Brook couldn't read your keyring, so you'll need to sign in."
+            }
+            RestoreOutcome::Offline => {
+                "Can't reach the server right now. Your sign-in is kept for next time."
+            }
+            _ => "",
+        };
+        settle(note);
+    });
 }
 
 /// Replace the login form with the two-factor code step (the password was right).
@@ -249,10 +317,24 @@ fn back_to_password(ui: &LoginUi, message: &str) {
 
 /// Build a core client for `server`. Plain http is only allowed for loopback,
 /// or anywhere with the hidden dev opt-in `BROOK_ALLOW_INSECURE_HTTP=1`.
-fn new_client(server: &str) -> brook_core::Result<Arc<BrookClient>> {
+fn new_client(server: &str, keyring: &Keyring) -> brook_core::Result<Arc<BrookClient>> {
     let allow_insecure_http = std::env::var("BROOK_ALLOW_INSECURE_HTTP").as_deref() == Ok("1");
     let config = CoreConfig::with_options(server, allow_insecure_http)?;
-    Ok(Arc::new(BrookClient::new(config)?))
+    let client = BrookClient::new(config)?;
+    // Only with a keyring that answered at launch: otherwise every sign-in would try
+    // (and fence) a store that isn't there. Sign-out fences live in the data dir.
+    if keyring.usable.get() {
+        let data_dir = glib::user_data_dir().join("brook");
+        client.enable_persistence(keyring.slot.clone(), data_dir);
+    }
+    Ok(Arc::new(client))
+}
+
+/// The desktop keyring, shared by every client this window creates.
+struct Keyring {
+    slot: Arc<keyring::SecretServiceSlot>,
+    /// Whether it answered unlocked at launch (no keyring or a locked one: sign in by hand).
+    usable: std::cell::Cell<bool>,
 }
 
 /// The server in use and its client.
@@ -268,6 +350,10 @@ struct LoginUi {
     window: glib::WeakRef<adw::ApplicationWindow>,
     /// Set by Sign Out, so the login view doesn't call it "You were signed out".
     signed_out_by_user: Rc<std::cell::Cell<bool>>,
+    keyring: Rc<Keyring>,
+    /// Bumped on every completed sign-in, so a late note from an older sign-out can
+    /// tell that a newer sign-in happened meanwhile.
+    signins: Rc<std::cell::Cell<u64>>,
 }
 
 /// Reactive UI: apply a client's observable auth state on the GTK main loop.
@@ -335,6 +421,7 @@ fn watch_auth_state(
                     error_label.set_text("");
                 }
                 AuthState::LoggedIn(user) => {
+                    ui.signins.set(ui.signins.get() + 1);
                     let Some(client) = client.upgrade() else {
                         break;
                     };
@@ -347,12 +434,35 @@ fn watch_auth_state(
                         let sign_out: Rc<dyn Fn()> = Rc::new({
                             let (client, runtime) = (client.clone(), ui.runtime.clone());
                             let asked = ui.signed_out_by_user.clone();
+                            let error_label = ui.error_label.clone();
+                            let signins = ui.signins.clone();
                             move || {
                                 asked.set(true);
+                                let at_sign_out = signins.get();
+                                let signins = signins.clone();
                                 let client = client.clone();
                                 // Core ends the session at once and publishes
                                 // LoggedOut; the watcher above goes back to login.
-                                runtime.spawn(async move { client.logout().await });
+                                let done = runtime.spawn(async move {
+                                    client.logout().await;
+                                    client.sign_out_complete()
+                                });
+                                let error_label = error_label.clone();
+                                glib::spawn_future_local(async move {
+                                    // Both the keyring delete and its fallback failed:
+                                    // the stored sign-in may still be usable here.
+                                    // Only while no newer sign-in has completed.
+                                    let forgot = done.await;
+                                    let stale = signins.get() != at_sign_out;
+                                    if let (Ok(false), false) = (forgot, stale) {
+                                        if let Some(label) = error_label.upgrade() {
+                                            label.set_text(
+                                                "Signed out, but Brook couldn't forget this \
+                                                 sign-in on this computer.",
+                                            );
+                                        }
+                                    }
+                                });
                             }
                         });
                         let view = chat::build(client, ui.runtime.clone(), is_admin, sign_out);

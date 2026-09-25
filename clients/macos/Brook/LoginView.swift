@@ -46,6 +46,12 @@ struct LoginView: View {
                     .multilineTextAlignment(.center)
                     .textSelection(.enabled)
             }
+            if let warning = form.store.signOutWarning {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
+            }
             if let warning = form.insecureWarning {
                 Label(warning, systemImage: "exclamationmark.triangle")
                     .font(.callout)

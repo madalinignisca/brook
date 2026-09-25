@@ -31,6 +31,8 @@ pub enum RefreshMode {
     RateLimited(u32),
     /// Never answer (a stalled request).
     Stall,
+    /// A 500 whose plain-text body echoes the submitted token (a misbehaving proxy).
+    EchoFail,
 }
 
 /// How the password endpoints answer (`/auth/password`, `/users/{id}/password`).
@@ -64,6 +66,10 @@ struct ServerState {
     stall_login: bool,
     /// Answer `/auth/login` with 401 `auth.invalid_credentials`.
     login_fails: bool,
+    /// Never answer `/auth/logout` (the server doesn't hear a sign-out).
+    stall_logout: bool,
+    /// Held before a refresh *rejection* is sent (a scripted `Fail`).
+    refresh_reject_gate: Option<Arc<Semaphore>>,
     password_mode: PasswordMode,
     /// Answer this many authenticated calls (password, users) with 401 first.
     expire_next: u32,
@@ -113,6 +119,8 @@ impl TestServer {
             refresh_calls: 0,
             stall_login: false,
             login_fails: false,
+            stall_logout: false,
+            refresh_reject_gate: None,
             password_mode: PasswordMode::Ok,
             expire_next: 0,
             password_gate: None,
@@ -211,6 +219,17 @@ impl TestServer {
                     .to_string()
             })
             .collect()
+    }
+
+    pub fn set_stall_logout(&self, stall: bool) {
+        self.state.lock().unwrap().stall_logout = stall;
+    }
+
+    /// Hold refresh rejections (`RefreshMode::Fail`) until the gate gets a permit.
+    pub fn gate_refresh_rejection(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        self.state.lock().unwrap().refresh_reject_gate = Some(gate.clone());
+        gate
     }
 
     pub fn set_login_fails(&self, fails: bool) {
@@ -482,6 +501,9 @@ async fn complete_totp(State(state): State<Shared>, Json(body): Json<Value>) -> 
 
 /// Revoke one refresh token (idempotent), as the server does.
 async fn logout(State(state): State<Shared>, Json(body): Json<Value>) -> Response {
+    if state.lock().unwrap().stall_logout {
+        std::future::pending::<()>().await;
+    }
     let mut state = state.lock().unwrap();
     state
         .requests
@@ -646,8 +668,20 @@ async fn refresh(State(state): State<Shared>, Json(body): Json<Value>) -> Respon
         after_commit(gate).await; // rotated server-side; the response is still to come
         return Json(pair).into_response();
     }
+    if let RefreshMode::Fail(_) = mode {
+        let gate = state.lock().unwrap().refresh_reject_gate.clone();
+        after_commit(gate).await;
+    }
     match mode {
         RefreshMode::Stall | RefreshMode::Rotate => unreachable!(),
+        RefreshMode::EchoFail => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "upstream said: {}",
+                body["refresh_token"].as_str().unwrap_or_default()
+            ),
+        )
+            .into_response(),
         RefreshMode::Strict => error(
             401,
             "auth.invalid_token",

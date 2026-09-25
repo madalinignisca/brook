@@ -28,6 +28,9 @@ struct Settings {
         environment["BROOK_ALLOW_INSECURE_HTTP"] == "1" || defaults.bool(forKey: Self.allowInsecureKey)
     }
 
+    /// The server of the last successful sign-in, if any (the launch restore's server).
+    var lastGoodServer: String? { defaults.string(forKey: Self.lastServerKey) }
+
     /// Called only after a successful login, so a mistyped address is never remembered.
     func saveLastGoodServer(_ server: String) {
         defaults.set(server, forKey: Self.lastServerKey)

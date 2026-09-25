@@ -6,6 +6,7 @@
 
 mod call;
 mod client;
+mod keyslot;
 mod listener;
 mod runtime;
 mod types;
