@@ -20,10 +20,10 @@ Brook is a classic **client / server** system with a **dedicated media server (S
         │                │        │                 │ PostgreSQL  │       │
         │                │        │                 └─────────────┘       │
         │                │        │                 ┌─────────────┐       │
-        │   presigned    │        └────────────────►│ MinIO (S3)  │       │
-        ├───────────────────────────────────────────│  files      │       │
-        │   HTTPS PUT/GET│                           └─────────────┘       │
-        │                │                                                │
+        │                │        │                 │ files on    │       │
+        │                │        │                 │ local disk  │       │
+        │                │        │                 │ (via api)   │       │
+        │                │        │                 └─────────────┘       │
         │  SRTP/DTLS     │   ┌──────────────────────────────────────┐     │
         └───────────────────►│ sfu (Janus + VideoRoom plugin)       │     │
            media + screen │   │ forwards media; never transcodes     │     │
@@ -38,7 +38,7 @@ Brook is a classic **client / server** system with a **dedicated media server (S
 | **gateway** | Caddy | Single public entry point; terminates **TLS** (auto Let's Encrypt) for HTTPS + WSS; routes to `api`. The **Janus Admin API is never routed publicly** (internal network only). |
 | **api** | Python + FastAPI | Auth, users, channels/DMs, message persistence + fan-out (WebSocket), file metadata + presigned URL minting, bot registry, webhook in/out, **owns Janus sessions & proxies call signaling**. |
 | **sfu** | Janus + VideoRoom | Real-time media **router** (SFU). Receives one upstream per sender, forwards to subscribers. **No transcoding.** See [MEDIA.md](MEDIA.md). |
-| **storage** | MinIO (S3-compatible) | File blobs. Clients PUT/GET via short-lived **presigned URLs** — bytes never proxy through `api`. |
+| **storage** | Local filesystem | Attachment bytes under `/var/lib/brook/files`, written and served by `api` (owner decision: object storage earns its keep only for horizontal scaling). |
 | **db** | PostgreSQL | Users, channels, membership, messages, files metadata, bots, tokens. |
 | **core** | Rust library | Shared client logic: networking, protocol, state, file transfer, **call signaling**, crypto. Compiled into every client. |
 | **clients** | per-platform native | Thin native UI over `core`. One per OS. |
@@ -51,9 +51,9 @@ Brook deliberately separates concerns into three planes, each with different pro
 2. **Realtime plane** — WebSocket over **WSS** (`client ↔ api`): live messages, presence, typing, and **call signaling relay** (SDP/ICE to/from Janus). Bidirectional, low-latency.
 3. **Media plane** — **SRTP/DTLS** (`client ↔ sfu`): the actual audio/video/screen-share packets. Encrypted by WebRTC itself. High-bandwidth, never touches `api`.
 
-Plus an **out-of-band data plane**: file bytes go **client ↔ MinIO** directly over HTTPS via presigned URLs.
+File bytes go **client ↔ api** over HTTPS (streamed uploads with a hard cap, ranged downloads).
 
-> Key consequence: the bandwidth-heavy paths (media, files) bypass the `api`, so the `api` stays light and easy to scale.
+> Key consequence: media, the bandwidth-heavy path, bypasses the `api`. Files go through it, which is fine for a family-sized server; a deployment that must scale out would move them to object storage.
 
 ## 4. Why an SFU, and what it does
 
@@ -84,7 +84,7 @@ Every client = **native UI** + **shared Rust `core`**. The core exposes an async
 
 ## 8. Deployment
 
-Local dev is a single `docker-compose` bringing up Postgres, MinIO, Janus, Caddy, and the api. See [../deploy/](../deploy/). Production is the same components behind Caddy with real certificates.
+Local dev is a single `docker-compose` bringing up Postgres, Janus, Caddy, and the api (attachments on a named volume). See [../deploy/](../deploy/). Production is the same components behind Caddy with real certificates.
 
 ### Realtime state & scaling (decided)
 The WebSocket layer is **stateful** (presence, channel fan-out, call signaling, offline replay), so `api` is **not** trivially stateless:

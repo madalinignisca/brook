@@ -29,9 +29,9 @@
 | `GET  /channels/{id}/messages?before=&after=&limit=` | history: `before=<id>` (back-paginate) or `after=<id>` (**forward-sync** missed messages on reconnect) |
 | `POST /channels/{id}/messages` | **send a message (the only send path)**; server persists then fans out via WS. Optional `client_id` (UUID, per message): a resend with one the author already stored returns that message, **200** and unchanged (even with a different body), never a duplicate; a deleted one comes back as its tombstone (`deleted_at` set, empty body). Reusing a `client_id` in **another** channel is `409 conflict`. `client_id` is echoed in the response and in `message.new` |
 | `PATCH /messages/{id}` · `DELETE /messages/{id}` | edit / soft-delete (author or channel owner) |
-| `POST /channels/{id}/files` | begin upload → **S3 POST Policy** (`{url, fields}` with a `content-length-range`) + `file_id` (state `pending`) |
-| `POST /files/{id}/commit` | finalize: server confirms the object exists + type ok → state `committed` (attachable) |
-| `GET  /files/{id}` · `DELETE /files/{id}` | request **presigned GET** → `{download_url}` · delete |
+| `POST /channels/{id}/files` | `{filename, size, content_type, client_id?}` → `{file, upload_url}` (state `pending`); `413 file.too_large` / `file.quota_exceeded`, `507 file.no_space` |
+| `PUT  /files/{id}/content` | the raw bytes (not multipart), streamed with a hard cap at `size` → `200 FileOut` (`committed`, `sha256`); `409 file.already_committed` with `details: FileOut` if another upload won |
+| `GET  /files/{id}/content` · `DELETE /files/{id}` | download (bearer auth, `Range` + `If-Range: "<sha256>"`; always `Content-Disposition: attachment`) · delete (the uploader or a channel owner) |
 | ~~`POST /channels/{id}/calls`~~ | superseded: calls are joined over the WS with `call.join` (§3), one path, no REST step |
 | `POST /devices` · `DELETE /devices/{id}` | register/unregister an APNs/FCM push token (mobile) |
 | `GET  /bots` · `POST /bots` | list / register bots (returns signing secret once) |
@@ -399,7 +399,7 @@ Mobile OSes suspend background WebSockets, so an always-on WSS cannot be the del
 - Idempotency: client supplies a client-side message id; server dedupes.
 - Offline: `core` queues outgoing commands and replays on reconnect; server dedupes by client id.
 - Versioning: REST is path-versioned under the **`/api/v1`** base (matching §1); WS envelope may carry a `v` field later.
-- **File upload states:** `pending` (POST Policy issued; MinIO enforces size via `content-length-range`) → `committed` (`POST /files/{id}/commit` confirmed object exists + type ok). Only `committed` files may be attached to messages; uncommitted/orphaned objects are reaped by a sweep.
+- **File upload states:** `pending` (created; the bytes not in yet) → `committed` (the `PUT` streamed exactly `size` bytes and was renamed into place). Only `committed` files may be attached (`attachments: [file_id]` on a message send: the author's own, in this channel, not yet attached, else `422 file.not_attachable`). Pending uploads older than 1 h and files never attached within 24 h are swept. A file's `filename` is sanitised, transliterated ASCII (save under this); `original_name` is display text only. Design: `docs/superpowers/specs/2026-09-25-attachments-server-design.md`.
 - **Pagination:** `limit` default 50, **max 100**; page backwards with `before=<message_id>`.
 - **Sizes & lifetimes** (TTLs, message/file/payload caps, rate limits): single source of truth is [SECURITY.md](SECURITY.md) §7.
 - **Errors:** uniform JSON body `{ "error": { "code": "<machine_code>", "message": "<human>", "details?": {} } }` with a sensible HTTP status. Codes are a stable taxonomy (e.g. `auth.invalid_credentials`, `auth.totp_required`, `authz.forbidden`, `not_found`, `rate_limited`, `validation.*`, `conflict`). WS errors use an `error` event with the same shape.

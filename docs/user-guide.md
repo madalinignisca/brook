@@ -101,6 +101,16 @@ If the app can't reach the server at all, it shows an error window explaining wh
 | Bots / slash commands | ⏳ Planned (Phase 3) |
 | Voice/video calls + screen share | ⏳ Planned (Phase 4) |
 
+## Why do my file names look different?
+
+When you share a file, Brook saves it under a **plain, safe name**: accents and other
+scripts are transliterated to Latin letters (`Ștefan–raport.pdf` becomes
+`Stefan-raport.pdf`, `日本語.txt` becomes `RiBenYu.txt`), and anything that could confuse
+or harm a computer (hidden characters, paths, reserved names) is removed. That way a file
+opens the same on Windows, macOS, Linux and phones. The name exactly as it was sent is
+still shown next to the file, so nothing is lost. Files you receive are always saved to
+your Downloads folder and never opened automatically.
+
 ## See also
 
 - [Administrator Guide](admin-guide.md) · [Roadmap](ROADMAP.md)

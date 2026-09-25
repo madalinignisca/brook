@@ -22,8 +22,11 @@ COPY alembic.ini docker-entrypoint.sh ./
 RUN chmod +x docker-entrypoint.sh && uv sync --locked --no-dev
 
 # Run as an unprivileged user.
+# /data/files: the attachments volume's mount point. A new named volume copies this
+# directory's ownership, so appuser can write to it (a root-owned volume would not).
 RUN useradd --create-home --uid 10001 appuser \
-    && chown -R appuser:appuser /app
+    && mkdir -p /data/files \
+    && chown -R appuser:appuser /app /data/files
 USER appuser
 
 EXPOSE 8000

@@ -14,20 +14,23 @@ from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from .. import files as storage
 from ..db import get_session
 from ..deps import get_current_user
 from ..hub import Hub, get_hub
-from ..models import Channel, Membership, Message, Reaction, User, utcnow
+from ..models import Channel, File, Membership, Message, Reaction, User, utcnow
 from ..schemas import (
     ChannelCreate,
     ChannelOut,
     ChannelPatch,
+    FileOut,
     MemberAdd,
     MessageCreate,
     MessageEdit,
@@ -261,7 +264,8 @@ async def search_messages(
         .limit(limit)
     )
     rows = (await session.execute(stmt)).all()
-    return [_message_out(m, author) for m, author in rows]
+    files = await _attachments_for(session, [m.id for m, _ in rows])
+    return [_message_out(m, author, attachments=files.get(m.id)) for m, author in rows]
 
 
 @router.post("", response_model=ChannelOut, status_code=status.HTTP_201_CREATED)
@@ -471,10 +475,13 @@ async def history(
     messages = [m for m, _ in rows]
     excerpts = await _reply_excerpts(session, messages)
     reactions = await _reactions_for(session, [m.id for m in messages], user.id)
+    files = await _attachments_for(session, [m.id for m in messages])
     # Mentions are resolved only on the live send (they drive notifications); not
     # recomputed per history read (that would mis-resolve against today's membership).
     return [
-        _message_out(m, author, excerpts.get(m.reply_to_id), reactions.get(m.id))
+        _message_out(
+            m, author, excerpts.get(m.reply_to_id), reactions.get(m.id), attachments=files.get(m.id)
+        )
         for m, author in rows
     ]
 
@@ -537,6 +544,7 @@ async def send_message(
         if stored is None:
             raise
         return _resend_answer(stored, channel_id, response)
+    attached = await _attach_files(session, message, body.attachments, user, channel_id)
     # Sending implicitly reads the channel up to your own message — but only ever
     # advance the marker (don't rewind past a newer message read concurrently).
     membership = await _membership(session, channel_id, user.id)
@@ -549,10 +557,73 @@ async def send_message(
 
     members = await _members(session, channel_id)
     mentions, everyone = _mentions_in(message.body, members)
-    out = _message_out(message, user, reply, mentions=mentions, mention_everyone=everyone)
+    out = _message_out(
+        message, user, reply, mentions=mentions, mention_everyone=everyone, attachments=attached
+    )
     member_ids = [m.id for m in members]
     await hub.send_to_users(member_ids, _envelope("message.new", jsonable_encoder(out)))
     return out
+
+
+async def _attachments_for(
+    session: AsyncSession, message_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[FileOut]]:
+    """Committed attachments per message, in one query."""
+    if not message_ids:
+        return {}
+    rows = (
+        await session.scalars(
+            select(File)
+            .where(File.message_id.in_(message_ids), File.status == "committed")
+            .order_by(File.created_at)
+        )
+    ).all()
+    out: dict[uuid.UUID, list[FileOut]] = {}
+    for row in rows:
+        assert row.message_id is not None  # noqa: S101 - filtered by the query
+        out.setdefault(row.message_id, []).append(FileOut.model_validate(row))
+    return out
+
+
+async def _attach_files(
+    session: AsyncSession,
+    message: Message,
+    file_ids: list[uuid.UUID],
+    user: User,
+    channel_id: uuid.UUID,
+) -> list[FileOut]:
+    """Attach committed files to a new message, in its transaction. Each must be the
+    author's own upload, to this channel, committed, and not attached yet; anything
+    else refuses the whole send (422 file.not_attachable)."""
+    if not file_ids:
+        return []
+    if len(set(file_ids)) != len(file_ids):
+        raise _unattachable()
+    rows = list(
+        (await session.scalars(select(File).where(File.id.in_(file_ids)).with_for_update())).all()
+    )
+    by_id = {row.id: row for row in rows}
+    attached: list[FileOut] = []
+    for file_id in file_ids:
+        row = by_id.get(file_id)
+        if (
+            row is None
+            or row.uploader_id != user.id
+            or row.channel_id != channel_id
+            or row.status != "committed"
+            or row.message_id is not None
+        ):
+            raise _unattachable()
+        row.message_id = message.id
+        attached.append(FileOut.model_validate(row))
+    return attached
+
+
+def _unattachable() -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={"code": "file.not_attachable", "message": "A file can't be attached"},
+    )
 
 
 def _resend_answer(stored: MessageOut, channel_id: uuid.UUID, response: Response) -> MessageOut:
@@ -583,7 +654,10 @@ async def _stored_send(
         if quoted is not None:
             reply = _excerpt(quoted, await session.get(User, quoted.author_id))
     reactions = await _reactions_for(session, [message.id], user.id)
-    return _message_out(message, user, reply, reactions.get(message.id))
+    files = await _attachments_for(session, [message.id])
+    return _message_out(
+        message, user, reply, reactions.get(message.id), attachments=files.get(message.id)
+    )
 
 
 async def _get_message(
@@ -624,7 +698,8 @@ async def edit_message(
     reactions = (await _reactions_for(session, [message_id], user.id)).get(message_id, [])
 
     # Edits don't re-resolve/re-notify mentions (mentions fire on the original send).
-    out = _message_out(message, user, reply, reactions)
+    files = await _attachments_for(session, [message_id])
+    out = _message_out(message, user, reply, reactions, attachments=files.get(message_id))
     member_ids = [m.id for m in await _members(session, channel_id)]
     await hub.send_to_users(member_ids, _envelope("message.update", jsonable_encoder(out)))
     return out
@@ -645,7 +720,15 @@ async def delete_message(
         raise _forbidden("Only the author or an admin can delete a message")
 
     message.deleted_at = utcnow()
+    # The message's files go with it (attachments spec §7): rows now, bytes after commit.
+    file_ids = list(
+        (await session.scalars(select(File.id).where(File.message_id == message_id))).all()
+    )
+    if file_ids:
+        await session.execute(delete(File).where(File.id.in_(file_ids)))
     await session.commit()
+    for file_id in file_ids:
+        await run_in_threadpool(storage.remove, file_id)
 
     member_ids = [m.id for m in await _members(session, channel_id)]
     await hub.send_to_users(
@@ -786,6 +869,7 @@ def _message_out(
     reactions: list[ReactionSummary] | None = None,
     mentions: list[uuid.UUID] | None = None,
     mention_everyone: bool = False,
+    attachments: list[FileOut] | None = None,
 ) -> MessageOut:
     return MessageOut(
         id=message.id,
@@ -801,6 +885,8 @@ def _message_out(
         reply_to=reply,
         reactions=reactions or [],
         client_id=message.client_id,
+        # A tombstone carries no attachments (their files are removed with it).
+        attachments=[] if message.deleted_at is not None else (attachments or []),
         mentions=mentions or [],
         mention_everyone=mention_everyone,
     )
