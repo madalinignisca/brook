@@ -22,6 +22,8 @@ import uuid
 from pathlib import Path
 
 from .config import get_settings
+from .models import File
+from .schemas import FileOut
 
 PART_SUFFIX = ".part"
 
@@ -106,3 +108,38 @@ def stale_entries(older_than_s: float) -> list[Path]:
         return []
     cutoff = time.time() - older_than_s
     return [p for p in base.glob("*/*") if p.is_file() and p.stat().st_mtime < cutoff]
+
+
+# Types a browser would execute or render as a document: served as plain bytes, so a
+# file on our own origin can never run as chat.madalin.me (spec §5).
+ACTIVE_TYPES = frozenset(
+    {
+        "text/html",
+        "application/xhtml+xml",
+        "image/svg+xml",
+        "text/xml",
+        "application/xml",
+        "application/javascript",
+        "text/javascript",
+        "application/x-javascript",
+        "text/css",
+        "application/pdf",  # a PDF viewer runs script too; saved, not rendered here
+    }
+)
+
+
+def served_type(content_type: str) -> str:
+    """The type a download is served as: active types become plain bytes."""
+    base = content_type.split(";", 1)[0].strip().lower()
+    if base in ACTIVE_TYPES or "script" in base or "html" in base or "xml" in base:
+        return "application/octet-stream"
+    return base or "application/octet-stream"
+
+
+def file_out(row: File) -> FileOut:
+    """The client's view of a file. ``content_type`` is the SERVED type, so a client
+    that builds a blob from the bytes with this type can't render active content on
+    our origin either (the download headers can't reach that path)."""
+    out = FileOut.model_validate(row)
+    out.content_type = served_type(row.content_type)
+    return out

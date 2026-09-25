@@ -62,5 +62,20 @@ def test_original_name_keeps_unicode_but_not_invisibles() -> None:
 
 
 def test_long_tar_gz_keeps_both_extensions() -> None:
-    name = safe_filename("backup-" + "x" * 300 + ".tar.gz")
-    assert len(name.encode()) <= 255 and name.endswith(".tar.gz")
+    """Owner decision: extensions win, the name shrinks."""
+    name = safe_filename("x" * 300 + ".tar.gz")
+    assert len(name.encode()) == 255 and name.endswith("x.tar.gz")
+    three = safe_filename("y" * 300 + ".min.js.map")
+    assert len(three.encode()) <= 255 and three.endswith("y.min.js.map")
+    # A long "extension" isn't one: it counts as stem and gets shortened.
+    odd = safe_filename("z" * 300 + ".averyveryverylongpart")
+    assert len(odd.encode()) <= 255
+
+
+@pytest.mark.parametrize("raw", ["LPT1 .txt", "con .txt", "Nul  .log"])
+def test_device_names_with_spaces_before_the_dot(raw: str) -> None:
+    assert safe_filename(raw).startswith("_")
+
+
+def test_extension_only_names_keep_the_extension() -> None:
+    assert safe_filename("‮.exe") == "file.exe"

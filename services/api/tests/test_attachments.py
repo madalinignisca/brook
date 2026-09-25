@@ -329,3 +329,115 @@ async def test_upload_whose_part_was_swept_asks_for_a_retry(
     async with db.get_sessionmaker()() as s:
         row = await s.get(File, uuid.UUID(created["file"]["id"]))
         assert row is not None and row.status == "pending"
+
+
+# ---------------------------------------------------------------- auth review of #81
+
+
+async def test_parallel_puts_to_one_file_are_refused_while_one_streams(
+    client: httpx.AsyncClient,
+) -> None:
+    """B1: a second PUT for a file already uploading is refused before it writes a byte,
+    so K parallel PUTs can't multiply the disk use of one create."""
+    from app.routers import files as files_router
+
+    ha, _hb, ch = await _setup(client)
+    created = (await _create(client, ha, ch, b"x" * 10)).json()
+    fid = uuid.UUID(created["file"]["id"])
+    files_router._in_flight.add(fid)  # an upload of this file is streaming right now
+    try:
+        r = await client.put(created["upload_url"], content=b"x" * 10, headers=ha)
+    finally:
+        files_router._in_flight.discard(fid)
+    assert r.status_code == 409 and r.json()["error"]["code"] == "file.upload_in_progress"
+    assert _dir_files() == []  # it never opened a part file
+    ok = await client.put(created["upload_url"], content=b"x" * 10, headers=ha)
+    assert ok.status_code == 200 and not files_router._in_flight
+
+
+async def test_disk_floor_is_rechecked_while_streaming(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import config
+    from app.routers import files as files_router
+
+    ha, _hb, ch = await _setup(client)
+    created = (await _create(client, ha, ch, b"x" * 20_000)).json()
+    monkeypatch.setattr(files_router, "FREE_CHECK_EVERY", 4096)
+    free = iter([10**12] + [0] * 100)  # plenty at start, then the disk fills up
+    monkeypatch.setattr(storage, "free_bytes", lambda: next(free))
+    monkeypatch.setenv("BROOK_FILES_MIN_FREE_BYTES", "1000")
+    config.get_settings.cache_clear()
+
+    async def body():  # type: ignore[no-untyped-def]
+        for _ in range(5):
+            yield b"x" * 4000
+
+    r = await client.put(created["upload_url"], content=body(), headers=ha)
+    assert r.status_code == 507 and r.json()["error"]["code"] == "file.no_space"
+    assert _dir_files() == []
+
+
+async def test_file_delete_authorisation(client: httpx.AsyncClient) -> None:
+    """B2: uploader or channel owner may delete; another member may not; a non-member
+    gets 404."""
+    ha, hb, ch = await _setup(client)  # alice created the channel: its owner
+    await client.post(
+        f"{AUTH}/register", json={"handle": "eve", "display_name": "E", "password": PW}, headers=ha
+    )
+    he = await _login(client, "eve")
+    alices = await _upload(client, ha, ch, b"a")
+    bobs = await _upload(client, hb, ch, b"b")
+    assert (await client.delete(f"/api/v1/files/{alices['id']}", headers=hb)).status_code == 403
+    assert (await client.delete(f"/api/v1/files/{alices['id']}", headers=he)).status_code == 404
+    assert (
+        await client.delete(f"/api/v1/files/{bobs['id']}", headers=ha)
+    ).status_code == 204  # owner
+    assert (
+        await client.delete(f"/api/v1/files/{alices['id']}", headers=ha)
+    ).status_code == 204  # uploader
+    assert _dir_files() == []
+
+
+async def test_no_uploads_into_an_archived_channel(client: httpx.AsyncClient) -> None:
+    from app.models import Channel
+
+    ha, _hb, ch = await _setup(client)
+    async with db.get_sessionmaker()() as s:
+        await s.execute(
+            update(Channel).where(Channel.id == uuid.UUID(ch)).values(archived_at=utcnow())
+        )
+        await s.commit()
+    r = await _create(client, ha, ch, b"x")
+    assert r.status_code == 403
+
+
+@pytest.mark.parametrize("bad", ["application/pdf\r\nSet-Cookie: x", "text", "a b/c", "x/y z"])
+async def test_content_type_must_be_a_mime_token(client: httpx.AsyncClient, bad: str) -> None:
+    ha, _hb, ch = await _setup(client)
+    body = {"filename": "a", "size": 1, "content_type": bad}
+    r = await client.post(f"/api/v1/channels/{ch}/files", json=body, headers=ha)
+    assert r.status_code == 422 and r.json()["error"]["code"] == "file.bad_content_type"
+
+
+async def test_file_record_reports_the_served_type(client: httpx.AsyncClient) -> None:
+    """H2: a client building a blob with FileOut.content_type can't render SVG either."""
+    ha, _hb, ch = await _setup(client)
+    body = {"filename": "x.svg", "size": 3, "content_type": "Image/SVG+XML; charset=utf-8"}
+    created = await client.post(f"/api/v1/channels/{ch}/files", json=body, headers=ha)
+    assert created.json()["file"]["content_type"] == "application/octet-stream"
+    ok = await client.post(
+        f"/api/v1/channels/{ch}/files",
+        json={"filename": "p.png", "size": 3, "content_type": "image/png"},
+        headers=ha,
+    )
+    assert ok.json()["file"]["content_type"] == "image/png"
+
+
+async def test_multi_range_is_refused(client: httpx.AsyncClient) -> None:
+    ha, _hb, ch = await _setup(client)
+    f = await _upload(client, ha, ch, b"0123456789")
+    r = await client.get(
+        f"/api/v1/files/{f['id']}/content", headers={**ha, "Range": "bytes=0-0,2-2"}
+    )
+    assert r.status_code == 416

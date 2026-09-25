@@ -32,30 +32,32 @@ async def sweep_once() -> dict[str, int]:
     """One pass; returns what it removed (for logs and tests)."""
     now = utcnow()
     async with get_sessionmaker()() as session:
+        # The conditions are in the DELETE itself, not only in a prior SELECT: a file
+        # attached (or committed) between a select and a delete must survive.
         stale_pending = list(
             (
                 await session.scalars(
-                    select(File.id).where(
-                        File.status == "pending", File.created_at < now - PENDING_TTL
-                    )
+                    delete(File)
+                    .where(File.status == "pending", File.created_at < now - PENDING_TTL)
+                    .returning(File.id)
                 )
             ).all()
         )
         unattached = list(
             (
                 await session.scalars(
-                    select(File.id).where(
+                    delete(File)
+                    .where(
                         File.status == "committed",
                         File.message_id.is_(None),
                         File.created_at < now - UNATTACHED_TTL,
                     )
+                    .returning(File.id)
                 )
             ).all()
         )
+        await session.commit()
         doomed = stale_pending + unattached
-        if doomed:
-            await session.execute(delete(File).where(File.id.in_(doomed)))
-            await session.commit()
         known = set((await session.scalars(select(File.id))).all())
 
     for file_id in doomed:

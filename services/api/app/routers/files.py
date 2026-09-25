@@ -8,6 +8,7 @@ supported) and delete. Attaching happens in ``POST /channels/{id}/messages``.
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from typing import Annotated, Any, cast
@@ -17,6 +18,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from sqlalchemy import func, select, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import files as storage
@@ -31,23 +33,6 @@ from .channels import _membership, _require_member
 log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["files"])
-
-# Types a browser would execute or render as a document: served as plain bytes, so a
-# file on our own origin can never run as chat.madalin.me (spec §5).
-ACTIVE_TYPES = frozenset(
-    {
-        "text/html",
-        "application/xhtml+xml",
-        "image/svg+xml",
-        "text/xml",
-        "application/xml",
-        "application/javascript",
-        "text/javascript",
-        "application/x-javascript",
-        "text/css",
-        "application/pdf",  # a PDF viewer runs script too; saved, not rendered here
-    }
-)
 
 # Starting uploads: a small per-user bucket so a client can't flood pending rows.
 _CREATE_BURST = 20.0
@@ -66,6 +51,15 @@ def _create_allowed(user_id: uuid.UUID) -> int | None:
     return None
 
 
+# Uploads in flight (single worker, like the hub): at most one per file, and a few per
+# user. Without this, K parallel PUTs to one pending file each fill their own part file
+# (up to the declared size) outside every quota and floor: K x 100 MB from one create.
+_in_flight: set[uuid.UUID] = set()
+_in_flight_per_user: dict[uuid.UUID, int] = {}
+MAX_UPLOADS_PER_USER = 3
+FREE_CHECK_EVERY = 8 * 1024 * 1024  # re-check the disk floor while streaming
+
+
 def _error(code: int, err: str, message: str, details: object = None) -> HTTPException:
     detail: dict[str, object] = {"code": err, "message": message}
     if details is not None:
@@ -78,7 +72,7 @@ def _not_found() -> HTTPException:
 
 
 def _out(row: File) -> FileOut:
-    return FileOut.model_validate(row)
+    return storage.file_out(row)
 
 
 @router.post(
@@ -95,6 +89,14 @@ async def create_file(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> FileCreated:
     """Reserve a file: validate limits, record the names, return where to PUT it."""
+    wait = _create_allowed(user.id)  # first: a flood costs a dict lookup, not queries
+    if wait is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "rate_limited", "message": "Too many uploads started"},
+            headers={"Retry-After": str(wait)},
+        )
+    content_type = _clean_content_type(body.content_type)
     channel = await _require_member(session, channel_id, user)
     if channel.archived_at is not None:
         raise _error(status.HTTP_403_FORBIDDEN, "authz.forbidden", "This channel is archived")
@@ -128,23 +130,27 @@ async def create_file(
     free = await run_in_threadpool(storage.free_bytes)
     if free - int(pending or 0) - body.size < settings.files_min_free_bytes:
         raise _error(507, "file.no_space", "The server is low on disk space")
-    wait = _create_allowed(user.id)
-    if wait is not None:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={"code": "rate_limited", "message": "Too many uploads started"},
-            headers={"Retry-After": str(wait)},
-        )
     row = File(
         channel_id=channel_id,
         uploader_id=user.id,
         filename=safe_filename(body.filename),
         original_name=original_name(body.filename),
         size=body.size,
-        content_type=body.content_type.strip().lower(),
+        content_type=content_type,
         client_id=body.client_id,
     )
-    session.add(row)
+    try:
+        async with session.begin_nested():  # a concurrent retry with this client_id
+            session.add(row)
+            await session.flush()
+    except IntegrityError:
+        existing = await session.scalar(
+            select(File).where(File.uploader_id == user.id, File.client_id == body.client_id)
+        )
+        if existing is None or existing.channel_id != channel_id:
+            raise
+        response.status_code = status.HTTP_200_OK
+        return FileCreated(file=_out(existing), upload_url=f"/api/v1/files/{existing.id}/content")
     await session.commit()
     await session.refresh(row)
     return FileCreated(file=_out(row), upload_url=f"/api/v1/files/{row.id}/content")
@@ -172,9 +178,34 @@ async def upload_content(
             _out(row).model_dump(mode="json"),
         )
     declared = row.size
+    user_id = user.id  # read before the rollback: it expires every loaded object
     await session.rollback()  # don't hold a transaction open while the body streams
 
+    if file_id in _in_flight:
+        raise _error(status.HTTP_409_CONFLICT, "file.upload_in_progress", "Already uploading")
+    if _in_flight_per_user.get(user_id, 0) >= MAX_UPLOADS_PER_USER:
+        raise _error(status.HTTP_429_TOO_MANY_REQUESTS, "rate_limited", "Too many uploads at once")
+    _in_flight.add(file_id)
+    _in_flight_per_user[user_id] = _in_flight_per_user.get(user_id, 0) + 1
+    try:
+        return await _stream_and_commit(file_id, declared, request, session)
+    finally:
+        _in_flight.discard(file_id)
+        left = _in_flight_per_user.get(user_id, 1) - 1
+        if left > 0:
+            _in_flight_per_user[user_id] = left
+        else:
+            _in_flight_per_user.pop(user_id, None)
+
+
+async def _stream_and_commit(
+    file_id: uuid.UUID, declared: int, request: Request, session: AsyncSession
+) -> FileOut:
+    settings = get_settings()
+    if await run_in_threadpool(storage.free_bytes) < settings.files_min_free_bytes:
+        raise _error(507, "file.no_space", "The server is low on disk space")
     part = await run_in_threadpool(storage.PartWriter, file_id)
+    next_check = FREE_CHECK_EVERY
     try:
         async for chunk in request.stream():
             if part.size + len(chunk) > declared:
@@ -182,6 +213,10 @@ async def upload_content(
                     status.HTTP_413_CONTENT_TOO_LARGE, "file.too_large", "More bytes than declared"
                 )
             await run_in_threadpool(part.write, chunk)
+            if part.size >= next_check:
+                next_check += FREE_CHECK_EVERY
+                if await run_in_threadpool(storage.free_bytes) < settings.files_min_free_bytes:
+                    raise _error(507, "file.no_space", "The server is low on disk space")
         if part.size != declared:
             raise _error(422, "file.size_mismatch", "Fewer bytes than declared")
         await run_in_threadpool(part.finish)
@@ -225,22 +260,31 @@ async def upload_content(
         await run_in_threadpool(part.discard)
 
 
-def _download_type(content_type: str) -> str:
-    base = content_type.split(";", 1)[0].strip().lower()
-    if base in ACTIVE_TYPES or "script" in base or "html" in base or "xml" in base:
-        return "application/octet-stream"
-    return base or "application/octet-stream"
+_MIME = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$")
+
+
+def _clean_content_type(raw: str) -> str:
+    """``type/subtype`` only: lowercased, parameters dropped, and anything that isn't a
+    token (controls, CR/LF, spaces) refused. It ends up in a response header."""
+    base = raw.split(";", 1)[0].strip().lower()
+    if not _MIME.match(base):
+        raise _error(422, "file.bad_content_type", "Not a valid content type")
+    return base
 
 
 @router.get("/files/{file_id}/content")
 async def download_content(
     file_id: uuid.UUID,
+    request: Request,
     user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> FileResponse:
     """Stream a committed file to a member of its channel. Range is supported (resume),
     and the headers make sure it is saved, never rendered or run (spec §5). A pending
     file is 404: it doesn't exist yet for anyone."""
+    if "," in request.headers.get("range", ""):
+        # Resume only needs one range; thousands of tiny ranges cost a seek each.
+        raise _error(416, "file.bad_range", "Only a single byte range is supported")
     row = await session.get(File, file_id)
     if row is None or row.status != "committed":
         raise _not_found()
@@ -252,7 +296,7 @@ async def download_content(
         raise _not_found()
     return FileResponse(
         path,
-        media_type=_download_type(row.content_type),
+        media_type=storage.served_type(row.content_type),
         filename=row.filename,
         content_disposition_type="attachment",
         headers={

@@ -29,8 +29,8 @@ _INVISIBLE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u2069\u061c\ufeff]"
 _RESERVED = re.compile(r'[<>:"|?*]')
 _SPACES = re.compile(r"\s+")
 # Windows device names, reserved with any extension: "CON", "con.txt", "COM1.log".
-_DOUBLE_EXT_INNER = frozenset({"tar"})
-_DEVICE = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$", re.IGNORECASE)
+# Windows treats "CON .txt" (spaces before the dot) as the device too.
+_DEVICE = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])\s*(\..*)?$", re.IGNORECASE)
 
 
 def _strip_invisible(name: str) -> str:
@@ -52,6 +52,9 @@ def safe_filename(raw: str) -> str:
     name = re.split(r"[\\/]", name)[-1]
     name = _RESERVED.sub("_", name)
     name = _SPACES.sub(" ", name)
+    only_ext = re.fullmatch(r"\.+([A-Za-z0-9]{1,16})", name.strip(" "))
+    if only_ext:  # ".exe" (e.g. what's left of "\u202e.exe"): keep it as file.exe
+        return f"{FALLBACK}.{only_ext.group(1)}"
     name = name.strip(" .")
     if not name:
         return FALLBACK
@@ -61,17 +64,18 @@ def safe_filename(raw: str) -> str:
 
 
 def _cap(name: str) -> str:
-    """At most MAX_BYTES, keeping the extension (the part after the last dot, if short)."""
+    """At most MAX_BYTES. Owner decision: extensions win, the name shrinks. The whole
+    multi-part extension is kept (``.tar.gz``, ``.min.js.map``: up to 3 short trailing
+    parts) and only the stem is shortened."""
     if len(name.encode()) <= MAX_BYTES:
         return name
-    stem, dot, ext = name.rpartition(".")
-    if not dot or not stem or len(ext) > 16:
-        stem, ext = name, ""
-    # Double extensions people rely on (report.tar.gz): keep both parts.
-    inner_stem, inner_dot, inner = stem.rpartition(".")
-    if ext and inner_dot and inner_stem and inner.lower() in _DOUBLE_EXT_INNER:
-        stem, ext = inner_stem, f"{inner}.{ext}"
-    suffix = f".{ext}" if ext else ""
+    parts = name.split(".")
+    ext_parts: list[str] = []
+    # Walk back over short alphanumeric parts, keeping at least one character of stem.
+    while len(parts) > 1 and len(ext_parts) < 3 and re.fullmatch(r"[A-Za-z0-9]{1,8}", parts[-1]):
+        ext_parts.insert(0, parts.pop())
+    stem = ".".join(parts)
+    suffix = "".join(f".{p}" for p in ext_parts)
     room = MAX_BYTES - len(suffix.encode())
     stem = stem.encode()[:room].decode("ascii", "ignore").rstrip(" .") or FALLBACK
     return stem + suffix

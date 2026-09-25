@@ -581,7 +581,7 @@ async def _attachments_for(
     out: dict[uuid.UUID, list[FileOut]] = {}
     for row in rows:
         assert row.message_id is not None  # noqa: S101 - filtered by the query
-        out.setdefault(row.message_id, []).append(FileOut.model_validate(row))
+        out.setdefault(row.message_id, []).append(storage.file_out(row))
     return out
 
 
@@ -615,7 +615,7 @@ async def _attach_files(
         ):
             raise _unattachable()
         row.message_id = message.id
-        attached.append(FileOut.model_validate(row))
+        attached.append(storage.file_out(row))
     return attached
 
 
