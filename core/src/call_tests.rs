@@ -926,3 +926,66 @@ fn default_labels_cover_every_media_mline() {
         ]
     );
 }
+
+// ---- republish while a negotiation is in flight ----
+
+/// Screen share start then a quick stop: the stop's republish arrives while the start's
+/// offer is still unanswered. It must not be lost: once that publish settles, one more
+/// offer goes out, carrying the engine's latest state.
+#[tokio::test]
+async fn republish_during_a_negotiation_is_queued_not_refused() {
+    let mut call = join(true, |_| {}).await;
+    let first = call.recv_type("call.publish").await;
+    call.answer_publish(&first).await;
+    call.handle.republish().await.unwrap(); // the share: offer 2
+    let second = call.recv_type("call.publish").await;
+    assert_eq!(second["data"]["sdp"], "offer-2");
+    // The stop, while offer 2 is still unanswered.
+    call.handle.republish().await.expect("queued, not refused");
+    call.answer_publish(&second).await;
+    let third = call.recv_type("call.publish").await;
+    assert_eq!(
+        third["data"]["sdp"], "offer-3",
+        "the queued renegotiation never happened"
+    );
+}
+
+/// Several requests while one negotiation is in flight collapse into one more offer.
+#[tokio::test]
+async fn queued_republishes_collapse_into_one_offer() {
+    let mut call = join(true, |_| {}).await;
+    let first = call.recv_type("call.publish").await;
+    call.handle.republish().await.unwrap();
+    call.handle.republish().await.unwrap();
+    call.answer_publish(&first).await;
+    let second = call.recv_type("call.publish").await;
+    call.answer_publish(&second).await;
+    call.assert_nothing_before_leave().await;
+}
+
+/// A listen-only call has nothing to renegotiate.
+#[tokio::test]
+async fn republish_without_publishing_is_refused() {
+    let call = join(false, |_| {}).await;
+    assert!(call.handle.republish().await.is_err());
+}
+
+/// Asked while the socket is down (publish settled): the offer goes out after resume.
+#[tokio::test]
+async fn republish_while_disconnected_goes_out_after_resume() {
+    let mut call = join(true, |_| {}).await;
+    let first = call.recv_type("call.publish").await;
+    call.answer_publish(&first).await;
+    call.peer.close(1000, "drop").await;
+    call.wait_status(|s| *s == CallStatus::Reconnecting).await;
+    call.handle
+        .republish()
+        .await
+        .expect("queued while disconnected");
+    call.peer = call.server.accept().await;
+    call.peer.accept_auth().await;
+    let resume = call.recv_type("call.resume").await;
+    call.peer.send(joined(&resume["id"], "t2")).await;
+    let again = call.recv_type("call.publish").await;
+    assert_eq!(again["data"]["sdp"], "offer-2");
+}
