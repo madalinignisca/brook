@@ -134,8 +134,15 @@ BROOK_SECRET_PRIMARY_KEY_ID=2
 - Held as pydantic `SecretStr`, so `repr`, validation errors and settings dumps never print
   it. `BROOK_JWT_SIGNING_KEY` should become `SecretStr` at the same time.
 - Startup logs the **primary key id only**, never material.
+- **Key ids are canonical decimal**: 1 to 10 ASCII digits and no leading zero. Id `0` is
+  reserved for the dev escape hatch's well-known key, and a configured ring may not use it.
 - `make init` generates `1:<random>` with `BROOK_SECRET_PRIMARY_KEY_ID=1`, as it already does
   for `BROOK_JWT_SIGNING_KEY`.
+
+> **Deferred, deliberately (keyring PR, 2026-09-25):** `BROOK_SECRET_KEYS_FILE` is not
+> implemented yet. Compose passes the ring through `environment:` (the exposure described
+> above), and so does the native deploy's root-only `.env`. `BROOK_JWT_SIGNING_KEY` is
+> still a plain `str`, not `SecretStr`. Both are tracked as follow-ups, not silent gaps.
 
 > **Revised:** the first draft derived the primary as "highest id present". A key added with
 > a lower id would then be silently ignored while the operator believed rotation had

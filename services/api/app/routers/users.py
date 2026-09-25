@@ -19,7 +19,8 @@ from ..models import User
 from ..ratelimit import AuthLimiter, client_ip, enforce, get_limiter
 from ..schemas import AdminPasswordIn, UserOut
 from ..security import hash_password, verify_password
-from .auth import lock_user, revoke_all_refresh_tokens
+from .auth import lock_user, sign_out_everywhere
+from .ws import revoke_sessions
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -94,5 +95,7 @@ async def reset_password(
             detail={"code": "authz.forbidden", "message": "Admins change their own password"},
         )
     target.password_hash = hash_password(body.new_password)
-    await revoke_all_refresh_tokens(session, target.id)
+    # Always a full sign-out: an admin reset is how a lost or stolen device is cut off.
+    cutoff_ms = await sign_out_everywhere(session, target)
     await session.commit()
+    await revoke_sessions(target.id, cutoff_ms)

@@ -55,9 +55,22 @@ def create_access_token(settings: Settings, user_id: uuid.UUID, role: str) -> st
         "role": role,
         "type": "access",
         "iat": int(now.timestamp()),
+        # iat is whole seconds; a sign-out-everywhere must also catch a token minted
+        # earlier in the same second as the change (models.User.session_revoked).
+        "iat_ms": int(now.timestamp() * 1000),
         "exp": int((now + timedelta(seconds=settings.access_ttl_seconds)).timestamp()),
     }
     return jwt.encode(payload, settings.jwt_signing_key, algorithm=settings.jwt_algorithm)
+
+
+def issued_at_ms(payload: dict[str, Any]) -> int:
+    """When a decoded access token was issued, in ms. Tokens minted before
+    ``iat_ms`` existed fall back to ``iat * 1000``: that rounds DOWN, so an old
+    token is only ever treated as older than it is, i.e. revoked, never spared."""
+    ms = payload.get("iat_ms")
+    if isinstance(ms, int) and not isinstance(ms, bool):
+        return ms
+    return int(payload["iat"]) * 1000
 
 
 def decode_access_token(settings: Settings, token: str) -> dict[str, Any]:

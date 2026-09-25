@@ -15,9 +15,23 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app import config, db, ratelimit
+from app import config, db, ratelimit, secretbox
 from app.main import create_app
 from app.models import Base
+
+# A throwaway test keyring (never used outside tests): key 1, 32 zero-ish bytes.
+TEST_SECRET_KEYS = "1:" + "dGVzdC1zZWNyZXQta2V5LTMyLWJ5dGVzLWxvbmchISE"
+
+
+@pytest.fixture(autouse=True)
+def _test_secret_keyring(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Every test boots with a valid (throwaway) secret keyring (§5.7 startup guard),
+    and builds its own SecretBox from it (never one cached by an earlier test)."""
+    monkeypatch.setenv("BROOK_SECRET_KEYS", TEST_SECRET_KEYS)
+    monkeypatch.setenv("BROOK_SECRET_PRIMARY_KEY_ID", "1")
+    secretbox.get_secret_box.cache_clear()
+    yield
+    secretbox.get_secret_box.cache_clear()
 
 
 @pytest.fixture(autouse=True)
