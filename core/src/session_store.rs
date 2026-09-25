@@ -11,9 +11,13 @@
 //! Every mutation is compare-and-set against what the caller read, so a slow refresh
 //! (success *or* failure) can never overwrite or erase a newer login.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
+use serde_json::json;
+use tokio::runtime::Handle;
 use tokio::sync::{watch, RwLock};
+use url::Url;
 
 use crate::{AuthState, Session};
 
@@ -28,6 +32,17 @@ pub(crate) struct Revision {
 struct Cell {
     rev: Revision,
     session: Option<Session>,
+    /// The current login attempt. `login` reserves one before it waits for anything; `logout`,
+    /// a newer login and `close` move past it, so a stale login installs nothing.
+    login_gen: u64,
+}
+
+/// Revoking refresh tokens core stops holding, from anywhere, including a `Drop` on a thread
+/// outside the runtime: spawned through a handle captured on the runtime, never ambiently.
+#[derive(Default)]
+struct Detached {
+    runtime: OnceLock<Handle>,
+    http: OnceLock<(reqwest::Client, Url)>,
 }
 
 /// Outcome of applying a refresh result.
@@ -49,7 +64,11 @@ pub(crate) struct SessionStore {
     /// one that got the 429, so queued refreshes do not each try again at once).
     pub(crate) refresh_not_before: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
     rev_tx: Arc<watch::Sender<Revision>>,
-    state_tx: Arc<watch::Sender<AuthState>>,
+    pub(crate) state_tx: Arc<watch::Sender<AuthState>>,
+    detached: Arc<Detached>,
+    /// Set synchronously when the client is dropped, and read inside every install or commit's
+    /// write section: nothing lands in an abandoned store, even before its cleanup task runs.
+    closed: Arc<AtomicBool>,
 }
 
 impl SessionStore {
@@ -61,7 +80,149 @@ impl SessionStore {
             refresh_not_before: Arc::default(),
             rev_tx: Arc::new(rev_tx),
             state_tx,
+            detached: Arc::default(),
+            closed: Arc::default(),
         }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Where detached revokes go (set once, by the client).
+    pub(crate) fn set_revoke_target(&self, http: reqwest::Client, base: Url) {
+        let _ = self.detached.http.set((http, base));
+    }
+
+    /// Capture the runtime this store's work runs on. Called from the client's async entry
+    /// points (they always run inside a runtime: reqwest needs one); a store that never saw
+    /// one never held a session, so it never has anything to revoke.
+    pub(crate) fn note_runtime(&self) {
+        if self.detached.runtime.get().is_none() {
+            if let Ok(handle) = Handle::try_current() {
+                let _ = self.detached.runtime.set(handle);
+            }
+        }
+    }
+
+    /// Best-effort `POST /auth/logout` for a refresh token core will not keep, in its own task
+    /// (bounded by the client's request timeout); errors are logged by kind only.
+    pub(crate) fn revoke_detached(&self, refresh_token: String) {
+        let (Some(runtime), Some((http, base))) =
+            (self.detached.runtime.get(), self.detached.http.get())
+        else {
+            return;
+        };
+        let (http, base) = (http.clone(), base.clone());
+        runtime.spawn(async move {
+            let Ok(url) = base.join("api/v1/auth/logout") else {
+                return;
+            };
+            let sent = http
+                .post(url)
+                .json(&json!({ "refresh_token": refresh_token }))
+                .send()
+                .await;
+            if let Err(err) = sent {
+                tracing::warn!(
+                    timeout = err.is_timeout(),
+                    connect = err.is_connect(),
+                    "revoking a refresh token failed"
+                );
+            }
+        });
+    }
+
+    /// Start a login attempt; any earlier one becomes stale.
+    pub(crate) async fn reserve_login(&self) -> u64 {
+        let mut cell = self.cell.write().await;
+        cell.login_gen += 1;
+        cell.login_gen
+    }
+
+    /// Publish a failed login, only if attempt `gen` is still current, under the same lock
+    /// that sign-out takes: a sign-out's `LoggedOut` is never overwritten by a stale failure.
+    pub(crate) async fn publish_failed_if_current(&self, gen: u64, message: String) {
+        let cell = self.cell.write().await;
+        if !self.is_closed() && cell.login_gen == gen {
+            let _ = self.state_tx.send(AuthState::Failed(message));
+        }
+    }
+
+    /// For login attempt `gen`: take the current session out (a new epoch) and return it, or
+    /// `Err` if the attempt is stale. The caller revokes what it took.
+    pub(crate) async fn take_out_for_login(&self, gen: u64) -> Result<Option<Session>, ()> {
+        let (rev, old) = {
+            let mut cell = self.cell.write().await;
+            if self.is_closed() || cell.login_gen != gen {
+                return Err(());
+            }
+            let old = cell.session.take();
+            cell.rev.epoch += 1;
+            cell.rev.credential_rev = 0;
+            (cell.rev, old)
+        };
+        *self.refresh_not_before.lock().unwrap() = None;
+        self.rev_tx.send_replace(rev);
+        Ok(old)
+    }
+
+    /// Install login attempt `gen`'s session and publish `LoggedIn`, in the same write that
+    /// checks the attempt is still current (a sign-out can't slip between install and publish).
+    /// False: stale; the caller revokes the pair.
+    pub(crate) async fn install_for_login(&self, gen: u64, session: Session) -> bool {
+        let rev = {
+            let mut cell = self.cell.write().await;
+            if self.is_closed() || cell.login_gen != gen {
+                return false;
+            }
+            let user = session.user.clone();
+            cell.session = Some(session);
+            cell.rev.epoch += 1;
+            cell.rev.credential_rev = 0;
+            let _ = self.state_tx.send(AuthState::LoggedIn(user));
+            cell.rev
+        };
+        *self.refresh_not_before.lock().unwrap() = None;
+        self.rev_tx.send_replace(rev);
+        true
+    }
+
+    /// Sign out (or, with `close`, the client is gone): end any login attempt, take the
+    /// session out and publish `LoggedOut`. Never waits for the refresh lock. Returns the
+    /// session taken, for the caller to revoke.
+    pub(crate) async fn sign_out(&self, close: bool) -> Option<Session> {
+        let (rev, old) = {
+            let mut cell = self.cell.write().await;
+            cell.login_gen += 1;
+            if close {
+                self.closed.store(true, Ordering::SeqCst);
+            }
+            let old = cell.session.take();
+            cell.rev.epoch += 1;
+            cell.rev.credential_rev = 0;
+            let _ = self.state_tx.send(AuthState::LoggedOut); // under the lock (see install)
+            (cell.rev, old)
+        };
+        *self.refresh_not_before.lock().unwrap() = None;
+        self.rev_tx.send_replace(rev);
+        old
+    }
+
+    /// The client is being dropped: fence the store and revoke what it held, in a task on the
+    /// captured runtime (a `Drop` may run on any thread, outside the runtime).
+    pub(crate) fn close_detached(&self) {
+        // The fence first, synchronously: from here on nothing installs or commits.
+        self.closed.store(true, Ordering::SeqCst);
+        let Some(runtime) = self.detached.runtime.get() else {
+            return; // never ran on a runtime: never held a session
+        };
+        let store = self.clone();
+        runtime.spawn(async move {
+            if let Some(old) = store.sign_out(true).await {
+                store.revoke_detached(old.refresh_token);
+            }
+        });
     }
 
     /// Observe epoch / credential changes.
@@ -88,7 +249,9 @@ impl SessionStore {
         self.cell.read().await.session.as_ref().map(f)
     }
 
-    /// Login (Some) or logout (None): always a new epoch.
+    /// Swap the session in one step (a new epoch): tests use it to stand in for another sign-in.
+    /// Production goes through `take_out_for_login` / `install_for_login` / `sign_out`.
+    #[cfg(test)]
     pub(crate) async fn replace(&self, session: Option<Session>) {
         let rev = {
             let mut cell = self.cell.write().await;
@@ -111,6 +274,9 @@ impl SessionStore {
     ) -> RefreshApplied {
         let rev = {
             let mut cell = self.cell.write().await;
+            if self.is_closed() {
+                return RefreshApplied::Discarded;
+            }
             match cell.session.as_mut() {
                 Some(s) if s.refresh_token == rotated_from => {
                     s.access_token = access_token;
@@ -137,13 +303,15 @@ impl SessionStore {
                     cell.session = None;
                     cell.rev.epoch += 1;
                     cell.rev.credential_rev = 0;
+                    // Under the lock, like every publish: a login installing right after this
+                    // clear publishes its LoggedIn after, never before, this LoggedOut.
+                    let _ = self.state_tx.send(AuthState::LoggedOut);
                     cell.rev
                 }
                 _ => return false,
             }
         };
         self.rev_tx.send_replace(rev);
-        let _ = self.state_tx.send(AuthState::LoggedOut);
         true
     }
 }
@@ -169,6 +337,42 @@ mod tests {
     fn store() -> (SessionStore, watch::Receiver<AuthState>) {
         let (tx, rx) = watch::channel(AuthState::LoggedIn(session(0).user));
         (SessionStore::new(Arc::new(tx)), rx)
+    }
+
+    /// An install and a sign-out queued back to back on the store (the lock is fair): the
+    /// sign-out comes second, so the published state must end `LoggedOut`. If the install
+    /// published after releasing the lock, its stale `LoggedIn` would land last.
+    #[tokio::test]
+    async fn a_sign_out_right_after_an_install_is_the_last_state_published() {
+        let (store, state) = store();
+        let gen = store.reserve_login().await;
+        let held = store.cell.write().await;
+        let s = store.clone();
+        let install = tokio::spawn(async move { s.install_for_login(gen, session(1)).await });
+        tokio::task::yield_now().await; // the install waits on the lock
+        let s = store.clone();
+        let out = tokio::spawn(async move { s.sign_out(false).await });
+        tokio::task::yield_now().await; // the sign-out waits behind it
+        drop(held);
+        assert!(install.await.unwrap());
+        out.await.unwrap();
+        assert!(store.snapshot().await.1.is_none());
+        assert_eq!(*state.borrow(), AuthState::LoggedOut);
+    }
+
+    /// The drop fence is synchronous: even with no runtime to run the cleanup on (and before
+    /// any cleanup task runs), nothing commits into a closed store.
+    #[tokio::test]
+    async fn the_close_fence_holds_before_any_cleanup_runs() {
+        let (store, _) = store();
+        store.replace(Some(session(1))).await;
+        store.close_detached(); // no runtime captured: the cleanup task never exists
+        assert_eq!(
+            store
+                .commit_refresh("refresh-1", "access-2".into(), "refresh-2".into())
+                .await,
+            RefreshApplied::Discarded
+        );
     }
 
     #[tokio::test]

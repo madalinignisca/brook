@@ -5,15 +5,17 @@ struct SignedInView: View {
     let user: FfiUser
     let client: any FfiBrookClientProtocol
     let calls: CallCenter
+    let signOut: () -> Void
     @State private var channels: ChannelsModel
     @State private var selection: String?
     @State private var changingPassword = false
     @State private var resettingPassword = false
 
-    init(user: FfiUser, client: any FfiBrookClientProtocol, calls: CallCenter) {
+    init(user: FfiUser, client: any FfiBrookClientProtocol, calls: CallCenter, signOut: @escaping () -> Void) {
         self.user = user
         self.client = client
         self.calls = calls
+        self.signOut = signOut
         _channels = State(initialValue: ChannelsModel(client: client))
     }
     @Environment(\.openWindow) private var openWindow
@@ -61,6 +63,8 @@ struct SignedInView: View {
                     if user.globalRole == "admin" {
                         Button("Reset a User's Password…") { resettingPassword = true }
                     }
+                    Divider()
+                    Button("Sign Out", action: signOut)
                 } label: {
                     Label("Account", systemImage: "person.crop.circle")
                 }

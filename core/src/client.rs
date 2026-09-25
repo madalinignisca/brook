@@ -43,6 +43,18 @@ pub struct BrookClient {
     transport: std::sync::Mutex<Option<Transport>>,
     /// Bound on a password change's locked section (tests shorten it).
     pub(crate) locked_bound: std::time::Duration,
+    /// Dropped with the client: the background loops end on it, from whatever wait.
+    shutdown: watch::Sender<()>,
+    /// The background loops (refresh, realtime), for tests to observe that they end.
+    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for BrookClient {
+    /// No session is persisted, so a dropped client is a signed-out one: fence the store (work
+    /// still in flight commits nothing) and revoke what it held. Safe on any thread.
+    fn drop(&mut self) {
+        self.session.close_detached();
+    }
 }
 
 impl BrookClient {
@@ -60,10 +72,13 @@ impl BrookClient {
         let state_tx = Arc::new(state_tx);
         let (commands, transport) = ws::command_channel();
         let (events_tx, _) = broadcast::channel(256);
+        let session = SessionStore::new(state_tx.clone());
+        session.set_revoke_target(http.clone(), config.base_url.clone());
+        let (shutdown, _) = watch::channel(());
         Ok(Self {
             base: config.base_url,
             http,
-            session: SessionStore::new(state_tx.clone()),
+            session,
             state_tx,
             state_rx,
             events_tx,
@@ -71,7 +86,25 @@ impl BrookClient {
             commands,
             transport: std::sync::Mutex::new(Some(transport)),
             locked_bound: std::time::Duration::from_secs(30),
+            shutdown,
+            tasks: std::sync::Mutex::default(),
         })
+    }
+
+    /// Sign out: the session ends at once (never waiting for a refresh or login in flight;
+    /// whatever they bring back is revoked), `LoggedOut` is published, and the server is
+    /// asked to revoke the refresh token, best-effort. No session: only the publish.
+    pub async fn logout(&self) {
+        self.session.note_runtime();
+        if let Some(old) = self.session.sign_out(false).await {
+            self.session.revoke_detached(old.refresh_token);
+        }
+    }
+
+    /// The background loops' handles (tests: to see them end).
+    #[cfg(test)]
+    pub(crate) fn take_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        std::mem::take(&mut *self.tasks.lock().unwrap())
     }
 
     /// A receiver the UI can watch for [`AuthState`] transitions.
@@ -81,55 +114,50 @@ impl BrookClient {
 
     /// Log in with a local handle + password, publishing state transitions.
     pub async fn login(&self, handle: &str, password: &str) -> Result<Session> {
+        self.session.note_runtime();
         // `send` only fails if all receivers are dropped; `self` holds `state_rx`,
         // so it can never fail here. Ignoring the result is safe.
         let _ = self.state_tx.send(AuthState::Authenticating);
-        // The refresh lock: a password change in flight revokes every refresh token of the user
-        // when its server call commits; a login in between would install a pair it then revokes.
-        // Every holder's requests are bounded by the client's request timeout.
-        let _flight = self.session.refresh_lock.lock().await;
-        // Drop any prior session up front so a failed attempt can never leave the
-        // previous user's token usable by chat calls.
-        self.session.replace(None).await;
-        let result = self.do_login(handle, password).await;
-        let next = match &result {
-            Ok(session) => AuthState::LoggedIn(session.user.clone()),
-            Err(err) => AuthState::Failed(err.to_string()),
-        };
-        let _ = self.state_tx.send(next);
-        result
-    }
-
-    async fn do_login(&self, handle: &str, password: &str) -> Result<Session> {
-        let url = self.base.join("api/v1/auth/login")?;
-        let resp = self
-            .http
-            .post(url)
-            .json(&json!({ "handle": handle, "password": password }))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(api_error(resp).await);
-        }
-        let tokens: TokenPair = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
-        let user = self.fetch_me(&tokens.access_token).await?;
-        let session = Session {
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            user,
-        };
-        // Retain the session so chat calls and the WS can authorize.
-        self.session.replace(Some(session.clone())).await;
-        Ok(session)
-    }
-
-    async fn fetch_me(&self, access_token: &str) -> Result<User> {
-        let url = self.base.join("api/v1/auth/me")?;
-        let resp = self.http.get(url).bearer_auth(access_token).send().await?;
-        if !resp.status().is_success() {
-            return Err(api_error(resp).await);
-        }
-        resp.json().await.map_err(|_| Error::UnexpectedResponse)
+        // Reserved before waiting for anything: a sign-out (or a newer login) while this one
+        // is still queued makes it stale, and a stale login installs nothing.
+        let gen = self.session.reserve_login().await;
+        let (session, http, base) = (self.session.clone(), self.http.clone(), self.base.clone());
+        let (handle, password) = (handle.to_string(), password.to_string());
+        // Its own task, holding its own lock: a cancelled caller cannot stop it between the
+        // server issuing a pair and core installing (or revoking) it.
+        let task = tokio::spawn(async move {
+            // The refresh lock: a password change in flight revokes every refresh token of the
+            // user when its server call commits; a login in between would install a pair it
+            // then revokes. Every holder's requests are bounded by the request timeout.
+            let _flight = session.refresh_lock.clone().lock_owned().await;
+            // Take any prior session out up front so a failed attempt can never leave the
+            // previous user's token usable by chat calls; its refresh token is revoked now,
+            // whatever this login's outcome.
+            let displaced = session
+                .take_out_for_login(gen)
+                .await
+                .map_err(|()| Error::NotAuthenticated)?;
+            if let Some(old) = displaced {
+                session.revoke_detached(old.refresh_token);
+            }
+            match do_login(&http, &base, &handle, &password).await {
+                Ok(new) => {
+                    if session.install_for_login(gen, new.clone()).await {
+                        Ok(new) // LoggedIn published by the install, under its lock
+                    } else {
+                        session.revoke_detached(new.refresh_token); // superseded meanwhile
+                        Err(Error::NotAuthenticated)
+                    }
+                }
+                Err(err) => {
+                    session
+                        .publish_failed_if_current(gen, err.to_string())
+                        .await;
+                    Err(err)
+                }
+            }
+        });
+        task.await.map_err(|_| Error::UnexpectedResponse)?
     }
 
     /// The current access token, or [`Error::NotAuthenticated`] if logged out.
@@ -425,14 +453,28 @@ impl BrookClient {
             base: self.base.clone(),
             session: self.session.clone(),
         };
-        tokio::spawn(ws::run(
+        // Each loop races its client's shutdown, so it ends from whatever wait it is in.
+        // Neither mints anything itself (refreshes run in their own tasks), so cancelling a
+        // loop never interrupts a pair between the server and core.
+        let until_dropped = |mut shutdown: watch::Receiver<()>| async move {
+            let _ = shutdown.changed().await; // Err once the client (the sender) is dropped
+        };
+        let ws_loop = ws::run(
             url,
             self.session.clone(),
             self.events_tx.clone(),
             transport,
             refresher.clone(),
-        ));
-        tokio::spawn(refresh_loop(refresher));
+        );
+        let stop = until_dropped(self.shutdown.subscribe());
+        let ws_task = tokio::spawn(async move {
+            tokio::select! { _ = ws_loop => {}, _ = stop => {} }
+        });
+        let stop = until_dropped(self.shutdown.subscribe());
+        let refresh_task = tokio::spawn(async move {
+            tokio::select! { _ = refresh_loop(refresher) => {}, _ = stop => {} }
+        });
+        self.tasks.lock().unwrap().extend([ws_task, refresh_task]);
         Ok(())
     }
 
@@ -535,6 +577,51 @@ async fn api_error(resp: reqwest::Response) -> Error {
     }
 }
 
+/// Password login: the new session, not installed (the caller installs or revokes it).
+async fn do_login(
+    http: &reqwest::Client,
+    base: &Url,
+    handle: &str,
+    password: &str,
+) -> Result<Session> {
+    let url = base.join("api/v1/auth/login")?;
+    let resp = http
+        .post(url)
+        .json(&json!({ "handle": handle, "password": password }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(api_error(resp).await);
+    }
+    let tokens: TokenPair = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
+    let user = match fetch_me(http, base, &tokens.access_token).await {
+        Ok(user) => user,
+        Err(err) => {
+            // Issued but never held: not left live.
+            let _ = http
+                .post(base.join("api/v1/auth/logout")?)
+                .json(&json!({ "refresh_token": tokens.refresh_token }))
+                .send()
+                .await;
+            return Err(err);
+        }
+    };
+    Ok(Session {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        user,
+    })
+}
+
+async fn fetch_me(http: &reqwest::Client, base: &Url, access_token: &str) -> Result<User> {
+    let url = base.join("api/v1/auth/me")?;
+    let resp = http.get(url).bearer_auth(access_token).send().await?;
+    if !resp.status().is_success() {
+        return Err(api_error(resp).await);
+    }
+    resp.json().await.map_err(|_| Error::UnexpectedResponse)
+}
+
 /// Periodically rotate the access token so a long-lived session keeps REST calls
 /// and the socket authorized. While there is no session it idles and polls.
 async fn refresh_loop(refresher: Refresher) {
@@ -576,17 +663,25 @@ impl Refresher {
     /// Single-flight refresh. `seen` is the revision the caller considers stale: if another
     /// refresh (or a login) already moved past it while we waited for the lock, nothing is
     /// sent and the caller just uses the current credentials.
+    ///
+    /// The whole operation, lock included, runs in its own task: a cancelled caller (a dropped
+    /// loop, a cancelled account call) leaves it to finish, so the lock is never released
+    /// between the server's rotation and core's commit (or revoke).
     pub(crate) async fn refresh(&self, seen: Revision) -> Result<RefreshOutcome> {
-        let _flight = self.session.refresh_lock.lock().await;
-        let now = self.session.snapshot().await.0;
-        if now != seen {
-            return Ok(if now.epoch == seen.epoch {
-                RefreshOutcome::Committed
-            } else {
-                RefreshOutcome::Discarded
-            });
-        }
-        refresh_once(&self.http, &self.base, &self.session).await
+        let me = self.clone();
+        let task = tokio::spawn(async move {
+            let _flight = me.session.refresh_lock.clone().lock_owned().await;
+            let now = me.session.snapshot().await.0;
+            if now != seen {
+                return Ok(if now.epoch == seen.epoch {
+                    RefreshOutcome::Committed
+                } else {
+                    RefreshOutcome::Discarded
+                });
+            }
+            refresh_once(&me.http, &me.base, &me.session).await
+        });
+        task.await.map_err(|_| Error::UnexpectedResponse)?
     }
 }
 
@@ -671,13 +766,17 @@ pub(crate) async fn refresh_once(
         return Err(api_error(resp).await); // 5xx → transient
     }
     let tokens: TokenPair = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
+    let fresh = tokens.refresh_token.clone();
     Ok(
         match session
             .commit_refresh(&refresh_token, tokens.access_token, tokens.refresh_token)
             .await
         {
             RefreshApplied::Committed => RefreshOutcome::Committed,
-            RefreshApplied::Discarded => RefreshOutcome::Discarded,
+            RefreshApplied::Discarded => {
+                session.revoke_detached(fresh); // rotated for a session no longer held
+                RefreshOutcome::Discarded
+            }
         },
     )
 }

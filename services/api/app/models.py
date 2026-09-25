@@ -11,7 +11,16 @@ import time
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, Text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -69,6 +78,19 @@ class User(Base):
     sessions_valid_after: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
+
+    # When the password last changed (self change or admin reset). A TOTP pending
+    # token minted by proving an older password dies with it, even when the change
+    # left other sessions signed in (spec 2026-09-25-totp §2.2).
+    password_changed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+
+    def password_changed_since(self, issued_at_ms: int) -> bool:
+        """True if the password changed after a token issued at ``issued_at_ms``."""
+        if self.password_changed_at is None:
+            return False
+        return issued_at_ms < int(ensure_utc(self.password_changed_at).timestamp() * 1000)
 
     def session_revoked(self, issued_at_ms: int) -> bool:
         """True if a token issued at ``issued_at_ms`` predates a sign-out-everywhere."""
@@ -173,4 +195,58 @@ class Reaction(Base):
         ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
     emoji: Mapped[str] = mapped_column(String(32), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Totp(Base):
+    """A user's TOTP secret (spec 2026-09-25-totp §3). One row per user; a new row
+    (new ``id``) per enrolment, so a re-enrolled secret never reuses an AAD."""
+
+    __tablename__ = "totp"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), unique=True
+    )
+    # SecretBox ciphertext (purpose TOTP_SECRET, row_pk = id). Never plaintext.
+    secret: Mapped[str] = mapped_column(Text)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    pending_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # Replay guard (RFC 6238 §5.2): a code for a step <= this is refused everywhere.
+    last_used_step: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RecoveryCode(Base):
+    """One-time recovery code: public ``lookup`` + Argon2id hash of the secret part."""
+
+    __tablename__ = "recovery_codes"
+    __table_args__ = (UniqueConstraint("user_id", "lookup"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    lookup: Mapped[str] = mapped_column(String(4))
+    code_hash: Mapped[str] = mapped_column(Text)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class AuthEvent(Base):
+    """Append-only record of account-security events (spec §3). No IP, no user agent:
+    GDPR minimisation. ``actor_id`` NULL = the user themselves or the host CLI."""
+
+    __tablename__ = "auth_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), default=None
+    )
+    kind: Mapped[str] = mapped_column(String(40))
+    via: Mapped[str] = mapped_column(String(16), default="api")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

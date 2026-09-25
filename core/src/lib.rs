@@ -23,6 +23,8 @@ mod error;
 mod log_secrecy_tests;
 mod session;
 mod session_store;
+#[cfg(test)]
+mod signout_tests;
 mod state;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
