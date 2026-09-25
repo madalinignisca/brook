@@ -11,14 +11,18 @@ Spec: `2026-09-25-offline-ffi-spec.md`. One PR, three commits, each green on its
      new or resumed user and starts a state forwarder for that generation, which copies
      the cache's `state()` watch with `send_if_modified(|s| gen == mine && {*s = new; true})`.
      `signed_out`, `close_active` and `forget` bump the generation, then `send_replace(default)`.
+     A **same-user sign-in at a new epoch** does the same before resuming: the watcher only
+     sees the newest snapshot, so a sign-out and sign-in of one user can arrive as a single
+     change, and `signed_out` never runs (review round 1). `Active` records its epoch; any
+     epoch change resets the feed and starts a new forwarder.
    - The pump's notice forwarder, and the state forwarder, stop through a drop guard owned
      by the pump task: abort or return, both end.
-   - Losses: `Offline` keeps `lost: Mutex<(u64 /*newest*/, bool /*unacked*/)>`; every place
-     that sends `OutboxLost` (open_user's report, `enable_local_data`'s reconcile) goes
-     through one `record_loss()` that bumps and sets, then sends the event.
-     `outbox_lost() -> Option<u64>`, `acknowledge_outbox_lost(n)` clears only on a match.
-     The flag lives on the client (it must survive `Offline` being absent: a loss found in
-     `enable_local_data` before `Offline` exists).
+   - Losses: one client-owned `Arc<Mutex<Losses { newest: u64, unacked: bool }>>`, created
+     with the client and shared into `Offline` (never reset with it, so an old number can
+     never match a newer loss). Every place that sends `OutboxLost` (open_user's report,
+     `enable_local_data`'s reconcile, before `Offline` exists) goes through one
+     `record_loss()` that bumps and sets, then sends the event. `outbox_lost() ->
+     Option<u64>`; `acknowledge_outbox_lost(n)` clears only if `n == newest`.
    - `cached_channels` / `cached_messages` count rows that failed to parse and log it at
      debug.
    - `send_queued(channel, body, client_id: String)` stays `Option` in core (GTK passes
@@ -26,7 +30,8 @@ Spec: `2026-09-25-offline-ffi-spec.md`. One PR, three commits, each green on its
 2. **FFI: records, methods, listeners** (`bindings/apple/src`).
    - `types.rs`: `FfiCachedChannel`, `FfiMember`, `FfiMessage`, `FfiCachedMessages`,
      `FfiPendingMessage`, `FfiPendingState`, `FfiDeleted`, `FfiCacheEvent`,
-     `FfiCacheState`, with `From` impls from core types.
+     `FfiCacheState`, `FfiLocalUser { origin, user_id }` (UniFFI carries no tuples), with
+     `From` impls from core types.
    - `client.rs`: one method per core call, errors through the existing `LoginError` map.
    - `listener.rs`: `CacheEventListener` (broadcast; `Lagged` → `Reset`), and
      `CacheStateListener` via the existing `subscribe_watch`.
@@ -44,6 +49,11 @@ Spec: `2026-09-25-offline-ffi-spec.md`. One PR, three commits, each green on its
   never hold the offline lock; the state forwarder only touches the watch. A Swift callback
   that calls back into the client (e.g. `cached_messages`) takes the lock after the
   delivery returns control; no lock is held across the FFI.
+- **A key-slot callback re-entering the client.** The one exception: wipes and opens call
+  the Swift `FfiKeySlot` synchronously while the offline lock (or the session's write lock)
+  is held. Changing that boundary is out of scope; instead the contract is written on
+  `FfiKeySlot`: its methods must not call back into `BrookClient` or wait on anything that
+  does. `KeychainSlot` only calls `SecItem*`, which satisfies it.
 - **UniFFI and `SystemTime`.** Mapped to `Option<i64>` unix ms to avoid a timestamp type in
   the Swift surface.
 - **Swift regeneration drift.** The generated bindings are gitignored and made by
