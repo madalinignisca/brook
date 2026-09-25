@@ -76,15 +76,22 @@ def _stamp(session: Session, _ctx: Any, _instances: Any) -> None:
     if not (changed or reactions or dead_files or ended or dead_channels):
         return
     seq = _take_seq(session)
-    channels, users = session.info.setdefault(_HINT, (set(), set()))
+    # sync.hint only for changes with no live event of their own. Messages, reactions
+    # and channel edits already have one; hinting those too would just make every
+    # client run /sync after every message.
+    #   channels: membership changed (joined, left): hint every member;
+    #   users:    that user only (their read marker, moved on another device);
+    #   sharers:  a profile change: everyone who shares a channel with them.
+    channels, users, sharers = session.info.setdefault(_HINT, (set(), set(), set()))
     for obj in changed:
-        if isinstance(obj, Message | Membership):
-            channels.add(obj.channel_id)
-        elif isinstance(obj, Channel):
-            channels.add(obj.id)
-        elif isinstance(obj, User):
-            users.add(obj.id)  # a profile change: everyone sharing a channel with them
-    channels.update(f.channel_id for f in dead_files)
+        if isinstance(obj, Membership):
+            if obj in session.new:
+                channels.add(obj.channel_id)
+                users.add(obj.user_id)
+            else:
+                users.add(obj.user_id)  # last_read moved: only their other devices care
+        elif isinstance(obj, User) and obj not in session.new:
+            sharers.add(obj.id)
     channels.update(m.channel_id for m in ended)
     users.update(m.user_id for m in ended)  # the removed member hears it too
     for obj in changed:
@@ -99,9 +106,6 @@ def _stamp(session: Session, _ctx: Any, _instances: Any) -> None:
     touched = {r.message_id for r in reactions} | {f.message_id for f in dead_files}
     if touched:
         session.execute(update(Message).where(Message.id.in_(touched)).values(seq=seq))
-        channels.update(
-            session.execute(select(Message.channel_id).where(Message.id.in_(touched))).scalars()
-        )
     for m in ended:
         session.add(SyncTombstone(channel_id=m.channel_id, user_id=m.user_id, seq=seq))
     for ch in dead_channels:
@@ -112,7 +116,7 @@ def _stamp(session: Session, _ctx: Any, _instances: Any) -> None:
         )
         for user_id in members:
             session.add(SyncTombstone(channel_id=ch.id, user_id=user_id, seq=seq))
-            users.add(user_id)  # the channel is gone: membership can't find them later
+            # channel.delete already tells them live; no hint needed
 
 
 def transaction_seq(session: Session) -> int:
@@ -129,21 +133,24 @@ def _hint_after_commit(session: Session) -> None:
     learn of those on its next reconnect. Fire-and-forget: a commit never waits on it."""
     seq = session.info.get(_KEY)
     hint = session.info.pop(_HINT, None)
-    if seq is None or hint is None:
+    if seq is None or hint is None or not any(hint) or not HINTS_ENABLED:
         return
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return  # no event loop (the host CLI): nobody is connected to this process
-    task = loop.create_task(_send_hints(int(seq), set(hint[0]), set(hint[1])))
+    task = loop.create_task(_send_hints(int(seq), set(hint[0]), set(hint[1]), set(hint[2])))
     _pending.add(task)  # keep a reference until it finishes
     task.add_done_callback(_pending.discard)
 
 
 _pending: set[asyncio.Task[None]] = set()
+# Tests turn hints off by default (tests/conftest.py): a hint from setup can land ahead of
+# the frame a test is waiting for. The hint tests turn it back on.
+HINTS_ENABLED = True
 
 
-async def _send_hints(seq: int, channels: set[Any], users: set[Any]) -> None:
+async def _send_hints(seq: int, channels: set[Any], users: set[Any], sharers: set[Any]) -> None:
     from .db import get_sessionmaker  # local: db imports this module
     from .hub import get_hub
 
@@ -158,9 +165,9 @@ async def _send_hints(seq: int, channels: set[Any], users: set[Any]) -> None:
                         )
                     ).all()
                 )
-            if users:
+            if sharers:
                 # A profile change reaches everyone who shares a channel with its owner.
-                shared = select(Membership.channel_id).where(Membership.user_id.in_(users))
+                shared = select(Membership.channel_id).where(Membership.user_id.in_(sharers))
                 recipients |= set(
                     (
                         await session.scalars(

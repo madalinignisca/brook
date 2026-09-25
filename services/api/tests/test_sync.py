@@ -6,6 +6,7 @@ from __future__ import annotations
 import uuid
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select, update
 
@@ -364,9 +365,14 @@ def test_reaction_and_channel_events_carry_a_fresh_seq(sync_client: TestClient) 
         assert seen["channel.update"]["seq"] > seen["reaction.update"]["seq"]
 
 
-def test_being_added_to_a_channel_hints_a_sync(sync_client: TestClient) -> None:
+def test_being_added_to_a_channel_hints_a_sync(
+    sync_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """No other live event says "you were added"; sync.hint does, to the right people
     only, so a connected client runs /sync now instead of on its next reconnect."""
+    from app import sync as sync_module
+
+    monkeypatch.setattr(sync_module, "HINTS_ENABLED", True)
     http = sync_client
     http.post(f"{AUTH}/register", json={"handle": "alice", "display_name": "A", "password": PW})
     a = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
@@ -411,3 +417,47 @@ def _wait_for_hints() -> None:
     while sync_module._pending and time.monotonic() < deadline:
         time.sleep(0.01)
     assert not sync_module._pending
+
+
+def test_a_message_hints_only_the_senders_other_devices(
+    sync_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Messages have their own live event: other members get message.new, not a hint
+    (no /sync after every message). The sender's read marker moved, so the sender's
+    other devices get a hint to pick that up."""
+    from app import sync as sync_module
+
+    monkeypatch.setattr(sync_module, "HINTS_ENABLED", True)
+    http = sync_client
+    http.post(f"{AUTH}/register", json={"handle": "alice", "display_name": "A", "password": PW})
+    a = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
+    ha = _h(a["access_token"])
+    http.post(
+        f"{AUTH}/register", json={"handle": "bob", "display_name": "B", "password": PW}, headers=ha
+    )
+    b1 = http.post(f"{AUTH}/login", json={"handle": "bob", "password": PW}).json()
+    b2 = http.post(f"{AUTH}/login", json={"handle": "bob", "password": PW}).json()
+    ch = http.post("/api/v1/channels", json={"kind": "channel", "name": "g"}, headers=ha).json()
+    http.post(f"/api/v1/channels/{ch['id']}/members", json={"handle": "bob"}, headers=ha)
+    _wait_for_hints()
+    with http.websocket_connect("/ws") as alice_ws, http.websocket_connect("/ws") as bob_phone:
+        for ws, tok in ((alice_ws, a), (bob_phone, b2)):
+            ws.send_json({"type": "auth", "data": {"access_token": tok["access_token"]}})
+            assert ws.receive_json()["type"] == "ready"
+        http.post(
+            f"/api/v1/channels/{ch['id']}/messages",
+            json={"body": "hi"},
+            headers=_h(b1["access_token"]),
+        )
+        _wait_for_hints()
+
+        def drain(ws):  # type: ignore[no-untyped-def]
+            ws.send_json({"type": "probe.unknown", "id": "p"})
+            got = []
+            while (ev := ws.receive_json())["type"] != "error":
+                got.append(ev["type"])
+            return got
+
+        alice_saw = drain(alice_ws)
+        assert "message.new" in alice_saw and "sync.hint" not in alice_saw
+        assert "sync.hint" in drain(bob_phone)
