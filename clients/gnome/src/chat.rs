@@ -2334,10 +2334,14 @@ fn report_outbox_lost(chat: &Rc<Chat>) {
     );
     alert.add_response("ok", "OK");
     alert.connect_response(None, {
-        let client = chat.client.clone();
+        let chat = Rc::downgrade(chat);
         move |_, _| {
-            client.acknowledge_outbox_lost(n);
+            let Some(chat) = chat.upgrade() else { return };
+            chat.client.acknowledge_outbox_lost(n);
             SHOWING.with(|s| s.set(false));
+            // A newer loss that came in while this alert was up is reported now, not
+            // at the next event.
+            report_outbox_lost(&chat);
         }
     });
     alert.present(Some(&chat.message_list));
