@@ -249,9 +249,9 @@ impl Outbox {
         for t in tasks {
             let _ = t.await;
         }
-        if let Ok(outbox) = Arc::try_unwrap(self) {
-            outbox.db.close().await;
-        }
+        // Closed through this handle, whoever else holds one (a Retry or Delete in flight
+        // gets `Closed`): nothing reaches the file after this returns.
+        self.db.close().await;
     }
 
     /// Start the senders of every channel with rows waiting (at startup, after `open`).
@@ -438,6 +438,7 @@ impl Outbox {
 
     /// Put a failed message back in line.
     pub(crate) async fn retry(self: &Arc<Self>, client_id: &str) -> Result<(), OutboxError> {
+        self.check_open()?;
         let Some(channel) = self.row_channel(client_id).await? else {
             return Ok(());
         };
@@ -465,6 +466,7 @@ impl Outbox {
         self: &Arc<Self>,
         client_id: &str,
     ) -> Result<Deleted, OutboxError> {
+        self.check_open()?;
         let Some(channel) = self.row_channel(client_id).await? else {
             return Ok(Deleted::NotFound);
         };
@@ -571,7 +573,7 @@ impl Outbox {
     }
 
     fn current(&self, epoch: u64) -> bool {
-        *self.session.borrow() == Some(epoch)
+        self.session.has_changed().is_ok() && *self.session.borrow() == Some(epoch)
     }
 
     /// One send of the channel's first row. `accepted`: the server already took it (only its
@@ -669,6 +671,9 @@ impl Outbox {
     async fn signed_in(&self) -> Option<u64> {
         let mut s = self.session.clone();
         loop {
+            // The session's source is gone (the client was dropped): stop, whatever its last
+            // value said. A closed channel keeps its last `Some(epoch)` forever otherwise.
+            s.has_changed().ok()?;
             if let Some(epoch) = *s.borrow_and_update() {
                 return Some(epoch);
             }

@@ -51,6 +51,10 @@ pub(crate) struct Offline {
     active: Option<Active>,
     /// One notice stream for the app, whoever is signed in.
     events: broadcast::Sender<CacheEvent>,
+    /// The last "Remove this device's data": that user at that session epoch or earlier
+    /// never gets stores again (a sign-in event still queued from before the wipe would
+    /// otherwise recreate them). The next sign-in is a later epoch.
+    forgotten: Option<(String, String, u64)>,
 }
 
 impl Offline {
@@ -65,6 +69,7 @@ impl Offline {
             local,
             active: None,
             events,
+            forgotten: None,
         }
     }
 
@@ -73,8 +78,18 @@ impl Offline {
         self.events.subscribe()
     }
 
+    #[cfg(test)]
     pub(crate) fn active(&self) -> Option<&Active> {
         self.active.as_ref()
+    }
+
+    /// The open stores, if they are `(origin, user_id)`'s: callers pass the session's
+    /// user, so one user never reads or queues into another's stores while the switch is
+    /// still on its way.
+    pub(crate) fn active_for(&self, origin: &str, user_id: &str) -> Option<&Active> {
+        self.active
+            .as_ref()
+            .filter(|a| a.origin == origin && a.user_id == user_id)
     }
 
     /// `user_id` at `origin` is signed in (session `epoch`). Opens their stores if they
@@ -88,6 +103,11 @@ impl Offline {
         net: Net,
         raw: broadcast::Receiver<(String, Value)>,
     ) -> Result<bool, StoreError> {
+        if let Some((o, u, e)) = &self.forgotten {
+            if o == origin && u == user_id && epoch <= *e {
+                return Ok(false);
+            }
+        }
         if let Some(a) = &self.active {
             if a.origin == origin && a.user_id == user_id {
                 a.session.send_replace(Some(epoch));
@@ -136,7 +156,8 @@ impl Offline {
         }
     }
 
-    async fn close_active(&mut self) {
+    /// Close the open stores (a user switch, a wipe, or the client going away).
+    pub(crate) async fn close_active(&mut self) {
         if let Some(a) = self.active.take() {
             a.session.send_replace(None);
             a.pump.abort();
@@ -146,20 +167,26 @@ impl Offline {
         }
     }
 
-    /// "Remove this device's data": close and erase the active user's stores, locally and
-    /// first (the caller signs out of the server afterwards, whether or not that works).
-    pub(crate) async fn forget_active(&mut self) -> Result<(), StoreError> {
-        let Some(a) = &self.active else {
-            return Ok(());
-        };
-        let (origin, user_id) = (a.origin.clone(), a.user_id.clone());
-        self.close_active().await;
-        self.local.wipe(&origin, &user_id).await
+    /// "Remove this device's data" for `(origin, user_id)`, signed in at `epoch`: close
+    /// their stores if open and erase them, locally and first (the caller signs out of the
+    /// server afterwards, whether or not that works). Stores that never opened (locked,
+    /// damaged) are erased too: nothing is read to erase them.
+    pub(crate) async fn forget(
+        &mut self,
+        origin: &str,
+        user_id: &str,
+        epoch: u64,
+    ) -> Result<(), StoreError> {
+        self.forgotten = Some((origin.to_string(), user_id.to_string(), epoch));
+        if self.active_for(origin, user_id).is_some() {
+            self.close_active().await;
+        }
+        self.local.wipe(origin, user_id).await
     }
 
-    /// Unsent messages of the active user (the sign-out warning).
-    pub(crate) async fn unsent(&self) -> u64 {
-        match &self.active {
+    /// Unsent messages of `(origin, user_id)` if their stores are open (the sign-out warning).
+    pub(crate) async fn unsent(&self, origin: &str, user_id: &str) -> u64 {
+        match self.active_for(origin, user_id) {
             Some(a) => a.outbox.unsent_count().await.unwrap_or(0),
             None => 0,
         }

@@ -72,9 +72,11 @@ async fn an_open_store_cant_be_wiped_under_its_user() {
     local.wipe("https://a", "u1").await.unwrap();
 }
 
-/// A wipe works on a store whose key can't be read: nothing is read, the files still go.
+/// The key store refuses to delete a key: the files still go, the wipe says it's
+/// incomplete, and the row stays doomed. The next sign-in of that user finishes the erase
+/// first and gets fresh stores (the old keys are never reused).
 #[tokio::test]
-async fn a_locked_store_is_still_wiped() {
+async fn a_key_that_wont_go_keeps_the_wipe_pending() {
     let root = tempfile::tempdir().unwrap();
     let slot = Arc::new(InMemoryKeySlot::default());
     let local = open(root.path(), &slot).await;
@@ -83,8 +85,24 @@ async fn a_locked_store_is_still_wiped() {
     ready(stores.cache).close().await;
     ready(stores.outbox).close().await;
     slot.fail_next("delete", KeySlotError::Unavailable);
-    local.wipe("https://a", "u1").await.unwrap();
-    assert!(!root.path().join(&id).exists());
+    assert!(
+        local.wipe("https://a", "u1").await.is_err(),
+        "reported complete"
+    );
+    assert!(!root.path().join(&id).exists(), "the files stayed");
+    assert!(
+        slot.contains(&format!("cache:{id}")),
+        "sanity: that key couldn't go"
+    );
+    let again = local.open_user("https://a", "u1").await.unwrap();
+    assert_ne!(
+        again.store_id, id,
+        "the doomed store's id (and keys) came back"
+    );
+    assert!(
+        !slot.contains(&format!("cache:{id}")),
+        "the old key outlived the retry"
+    );
 }
 
 #[tokio::test]
@@ -159,8 +177,13 @@ async fn a_lost_index_key_orphans_every_store() {
     ready(s.outbox).close().await;
     local.close().await;
     slot.put("index", vec![5; 32]);
-    let _local = open(root.path(), &slot).await;
+    let local = open(root.path(), &slot).await;
     assert!(dirs(root.path()).is_empty(), "{:?}", dirs(root.path()));
+    assert!(
+        local.take_lost_unsent(),
+        "an erased outbox went unmentioned"
+    );
+    assert!(!local.take_lost_unsent(), "said twice");
 }
 
 #[tokio::test]

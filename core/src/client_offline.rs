@@ -15,7 +15,7 @@ use crate::cache_http::Http;
 use crate::local::LocalData;
 use crate::offline::{Net, Offline};
 use crate::outbox::{Deleted, OutboxError, PendingMessage};
-use crate::{AuthState, BrookClient, Channel, Error, KeySlot, Message, Result};
+use crate::{BrookClient, Channel, Error, KeySlot, Message, Result};
 
 /// A page of cached messages, newest first.
 #[derive(Debug, Clone)]
@@ -93,38 +93,52 @@ impl BrookClient {
         if local.reconcile().await.is_err() {
             return false;
         }
+        if local.take_lost_unsent() {
+            let _ = self.cache_events.send(CacheEvent::OutboxLost);
+        }
         *self.offline.lock().await = Some(Offline::with_events(local, self.cache_events.clone()));
         self.session.note_runtime();
         let (offline, net, origin) = (self.offline.clone(), self.net(), self.origin());
-        let (mut state, session) = (self.state(), self.session.clone());
+        let session = self.session.clone();
+        let mut revisions = session.watch();
         let raw = self.commands.raw_events_sender();
         let mut shutdown = self.shutdown_signal();
         let task = tokio::spawn(async move {
             loop {
-                let now = state.borrow_and_update().clone();
+                revisions.borrow_and_update();
                 {
+                    // The session is read under the lock, not taken from the change that woke
+                    // this: a sign-out or switch since then is what counts. User and epoch
+                    // come from one snapshot, so the outbox never sends under another user.
                     let mut guard = offline.lock().await;
                     if let Some(off) = guard.as_mut() {
-                        match &now {
-                            AuthState::LoggedIn(user) => {
-                                let epoch = session.snapshot().await.0.epoch;
+                        match session.snapshot().await {
+                            (rev, Some(s)) => {
                                 let _ = off
                                     .signed_in(
                                         &origin,
-                                        &user.id,
-                                        epoch,
+                                        &s.user.id,
+                                        rev.epoch,
                                         net.clone(),
                                         raw.subscribe(),
                                     )
                                     .await;
                             }
-                            _ => off.signed_out(),
+                            (_, None) => off.signed_out(),
                         }
                     }
                 }
-                tokio::select! {
-                    changed = state.changed() => if changed.is_err() { return },
-                    _ = shutdown.changed() => return,
+                let stop = tokio::select! {
+                    changed = revisions.changed() => changed.is_err(),
+                    _ = shutdown.changed() => true, // the client is gone
+                };
+                if stop {
+                    // Close the stores (their threads joined) rather than leave them to
+                    // whenever the last handle drops.
+                    if let Some(off) = offline.lock().await.as_mut() {
+                        off.close_active().await;
+                    }
+                    return;
                 }
             }
         });
@@ -141,9 +155,12 @@ impl BrookClient {
     /// Sign out, first erasing this user's local data ("Remove this device's data", #46
     /// §8). The erase is local and happens first, whether or not the server can be reached.
     pub async fn sign_out_and_forget(&self) -> Result<()> {
-        let erased = match self.offline.lock().await.as_mut() {
-            Some(off) => off.forget_active().await.map_err(|_| store_error()),
-            None => Ok(()),
+        let erased = match (self.offline.lock().await.as_mut(), self.who().await) {
+            (Some(off), Some((user, epoch))) => off
+                .forget(&self.origin(), &user, epoch)
+                .await
+                .map_err(|_| store_error()),
+            _ => Ok(()),
         };
         self.logout().await;
         erased
@@ -157,9 +174,9 @@ impl BrookClient {
 
     /// Unsent messages (the sign-out warning: "2 messages haven't been sent").
     pub async fn unsent_count(&self) -> u64 {
-        match self.offline.lock().await.as_ref() {
-            Some(off) => off.unsent().await,
-            None => 0,
+        match (self.offline.lock().await.as_ref(), self.who().await) {
+            (Some(off), Some((user, _))) => off.unsent(&self.origin(), &user).await,
+            _ => 0,
         }
     }
 
@@ -168,22 +185,21 @@ impl BrookClient {
     pub async fn other_local_users(&self) -> Result<Vec<(String, String)>> {
         let guard = self.offline.lock().await;
         let off = guard.as_ref().ok_or_else(unavailable)?;
-        let Some(active) = off.active() else {
-            return Err(unavailable());
-        };
-        off.others(&active.origin, &active.user_id)
+        let (user, _) = self.who().await.ok_or_else(unavailable)?;
+        off.others(&self.origin(), &user)
             .await
             .map_err(|_| store_error())
     }
 
-    /// Erase every other user's data on this device.
+    /// Erase every other user's data on this device (everyone but whoever is signed in
+    /// now, whether or not their own stores have opened yet).
     pub async fn wipe_other_local_users(&self) -> Result<()> {
         let mut guard = self.offline.lock().await;
         let off = guard.as_mut().ok_or_else(unavailable)?;
-        let Some((o, u)) = off.active().map(|a| (a.origin.clone(), a.user_id.clone())) else {
-            return Err(unavailable());
-        };
-        off.wipe_others(&o, &u).await.map_err(|_| store_error())
+        let (user, _) = self.who().await.ok_or_else(unavailable)?;
+        off.wipe_others(&self.origin(), &user)
+            .await
+            .map_err(|_| store_error())
     }
 
     /// The cached channels the signed-in user is in, with unread counts computed locally.
@@ -278,21 +294,31 @@ impl BrookClient {
             .map_err(outbox_error)
     }
 
-    async fn active_cache(&self) -> Result<Arc<crate::cache::Cache>> {
+    /// Who the session is signed in as, and its epoch, from one snapshot.
+    async fn who(&self) -> Option<(String, u64)> {
+        match self.session.snapshot().await {
+            (rev, Some(s)) => Some((s.user.id, rev.epoch)),
+            (_, None) => None,
+        }
+    }
+
+    /// The open stores, only if they are the signed-in user's: between a switch and the
+    /// watcher catching up, the previous user's stores are still open and must not answer.
+    async fn active(&self) -> Result<(Arc<crate::cache::Cache>, Arc<crate::outbox::Outbox>)> {
         let guard = self.offline.lock().await;
+        let (user, _) = self.who().await.ok_or_else(unavailable)?;
         guard
             .as_ref()
-            .and_then(|off| off.active())
-            .map(|a| a.cache.clone())
+            .and_then(|off| off.active_for(&self.origin(), &user))
+            .map(|a| (a.cache.clone(), a.outbox.clone()))
             .ok_or_else(unavailable)
     }
 
+    async fn active_cache(&self) -> Result<Arc<crate::cache::Cache>> {
+        Ok(self.active().await?.0)
+    }
+
     async fn active_outbox(&self) -> Result<Arc<crate::outbox::Outbox>> {
-        let guard = self.offline.lock().await;
-        guard
-            .as_ref()
-            .and_then(|off| off.active())
-            .map(|a| a.outbox.clone())
-            .ok_or_else(unavailable)
+        Ok(self.active().await?.1)
     }
 }

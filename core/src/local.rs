@@ -32,6 +32,9 @@ pub(crate) struct LocalData {
     root: PathBuf,
     keys: KeyStore<dyn KeySlot>,
     index: Db,
+    /// Reconciliation erased a store that held an outbox (its owner was unknown): unsent
+    /// messages on this device were lost. Said once.
+    lost_unsent: std::sync::atomic::AtomicBool,
 }
 
 impl LocalData {
@@ -53,10 +56,16 @@ impl LocalData {
             Opened::Ready { db, rebuilt } => (db, rebuilt),
             _ => return Ok(None),
         };
-        let local = Self { root, keys, index };
+        let local = Self {
+            root,
+            keys,
+            index,
+            lost_unsent: std::sync::atomic::AtomicBool::new(false),
+        };
         if rebuilt == Some(Rebuilt::KeyMissing) {
             // The index's key is gone: nobody knows which directory is whose any more, so
-            // every store is an orphan. `reconcile` erases them.
+            // every store is an orphan. Guessing an owner could show one user's data to
+            // another, so `reconcile` erases them, and says so if an outbox was among them.
             local.reconcile().await?;
         }
         Ok(Some(local))
@@ -72,6 +81,11 @@ impl LocalData {
         origin: &str,
         user_id: &str,
     ) -> Result<UserStores, StoreError> {
+        // A wipe that couldn't destroy the keys left its row doomed: finish it before this
+        // user gets stores again (reusing that id would reuse the old keys).
+        if self.doomed_id(origin, user_id).await?.is_some() {
+            self.wipe(origin, user_id).await?;
+        }
         let store_id = store::store_id(&self.index, origin, user_id).await?;
         let dir = self.dir(&store_id);
         let keys = KeyStore::new(self.keys.slots());
@@ -104,30 +118,59 @@ impl LocalData {
         })
     }
 
-    /// Erase `(origin, user_id)`'s stores. Their handles must be closed first. The key slots
-    /// go first (crypto-erase), then the files, then the index row, so a crash part-way
-    /// leaves at worst an orphan that `reconcile` finishes. Works on a locked or damaged
-    /// store too: nothing is read.
+    async fn doomed_id(&self, origin: &str, user_id: &str) -> Result<Option<String>, StoreError> {
+        let (o, u) = (origin.to_string(), user_id.to_string());
+        self.index
+            .call(move |c| {
+                use rusqlite::OptionalExtension;
+                c.query_row(
+                    "SELECT store_id FROM stores WHERE origin = ?1 AND user_id = ?2 AND doomed = 1",
+                    [&o, &u],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+    }
+
+    /// Erase `(origin, user_id)`'s stores. Their handles must be closed first. The row is
+    /// marked doomed first; then the key slots go (crypto-erase), then the files; the row goes
+    /// only once every key is destroyed. A key store that refused keeps the row doomed and
+    /// this reports an error: the next open of that user, or `reconcile`, finishes it (the
+    /// old keys are never reused). Works on a locked or damaged store: nothing is read.
     pub(crate) async fn wipe(&self, origin: &str, user_id: &str) -> Result<(), StoreError> {
         let (o, u) = (origin.to_string(), user_id.to_string());
         let found: Option<String> = self
             .index
             .call(move |c| {
                 use rusqlite::OptionalExtension;
-                c.query_row(
-                    "SELECT store_id FROM stores WHERE origin = ?1 AND user_id = ?2",
-                    [&o, &u],
-                    |r| r.get(0),
-                )
-                .optional()
+                let id: Option<String> = c
+                    .query_row(
+                        "SELECT store_id FROM stores WHERE origin = ?1 AND user_id = ?2",
+                        [&o, &u],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(id) = &id {
+                    c.execute("UPDATE stores SET doomed = 1 WHERE store_id = ?1", [id])?;
+                }
+                Ok(id)
             })
             .await?;
         let Some(store_id) = found else {
             return Ok(());
         };
-        self.erase(&store_id).await?;
+        self.erase_row(&store_id).await
+    }
+
+    /// Erase a doomed row's store; the row goes only if every key was destroyed.
+    async fn erase_row(&self, store_id: &str) -> Result<(), StoreError> {
+        if !self.erase(store_id).await? {
+            return Err(StoreError::Io); // a key survived: the row stays doomed
+        }
+        let id = store_id.to_string();
         self.index
-            .call(move |c| c.execute("DELETE FROM stores WHERE store_id = ?1", [&store_id]))
+            .call(move |c| c.execute("DELETE FROM stores WHERE store_id = ?1", [&id]))
             .await?;
         Ok(())
     }
@@ -151,18 +194,23 @@ impl LocalData {
             .await
     }
 
-    async fn erase(&self, store_id: &str) -> Result<(), StoreError> {
+    /// Every step is attempted, whatever failed before it (a partial erase leaves no more
+    /// than it must). `Ok(true)` only if both keys were destroyed and the files are gone.
+    async fn erase(&self, store_id: &str) -> Result<bool, StoreError> {
         let dir = self.dir(store_id);
         let keys = KeyStore::new(self.keys.slots());
         let id = store_id.to_string();
         tokio::task::spawn_blocking(move || {
-            store::reset(&dir, Kind::Cache, &id, &keys)?;
-            store::reset(&dir, Kind::Outbox, &id, &keys)?;
-            match std::fs::remove_dir_all(&dir) {
+            let cache = store::reset(&dir, Kind::Cache, &id, &keys);
+            let outbox = store::reset(&dir, Kind::Outbox, &id, &keys);
+            let files = match std::fs::remove_dir_all(&dir) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(_) => Err(StoreError::Io),
-            }
+            };
+            let keys_gone = cache? & outbox?; // both attempted before either error returns
+            files?;
+            Ok(keys_gone)
         })
         .await
         .map_err(|_| StoreError::Io)?
@@ -171,6 +219,17 @@ impl LocalData {
     /// At startup, once the index opened and was read cleanly: erase store directories no
     /// index row names (a wipe cut short, or an index whose key was lost).
     pub(crate) async fn reconcile(&self) -> Result<(), StoreError> {
+        let doomed: Vec<String> = self
+            .index
+            .call(|c| {
+                c.prepare("SELECT store_id FROM stores WHERE doomed = 1")?
+                    .query_map([], |r| r.get(0))?
+                    .collect()
+            })
+            .await?;
+        for id in doomed {
+            let _ = self.erase_row(&id).await; // still locked: try again next time
+        }
         let known: std::collections::HashSet<String> = self
             .index
             .call(|c| {
@@ -191,10 +250,21 @@ impl LocalData {
             // Store ids are 32 hex characters: nothing else here is ours to erase.
             let ours = name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit());
             if kind.is_dir() && ours && !known.contains(&name) {
+                if entry.path().join("outbox.db").exists() {
+                    self.lost_unsent
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 self.erase(&name).await?;
             }
         }
         Ok(())
+    }
+
+    /// Whether a store with an outbox was erased for want of an owner (then cleared): the app
+    /// says once that unsent messages were lost.
+    pub(crate) fn take_lost_unsent(&self) -> bool {
+        self.lost_unsent
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // tests reopen the index

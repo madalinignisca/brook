@@ -230,12 +230,39 @@ impl Cache {
         match result {
             Ok(Synced::Done(_)) => Ok(()),
             Ok(Synced::Reset) => {
-                // The rebuild itself is C5's (it needs the store wipe); say so meanwhile.
+                // The server's history no longer matches ours: drop every synced row, then
+                // sync from 0. A server that answers 410 to `since=0` too gets no second
+                // round here (the next scheduled sync tries again).
+                let was = self.reset_rows().await.map_err(SyncError::Store)?;
                 let _ = self.events.send(CacheEvent::Reset);
+                if was != "0" {
+                    self.again.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 Ok(())
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Empty the synced tables and start the cursor over, in one transaction; bumps the
+    /// generation so a history page requested before this can't land after it. Returns the
+    /// cursor it replaced. (`files` and `deletions` stay: the file cache keys on content
+    /// and its journal must survive whatever the rows do.)
+    async fn reset_rows(&self) -> Result<String, StoreError> {
+        self.db
+            .call(|c| {
+                let tx = c.transaction()?;
+                let was: String =
+                    tx.query_row("SELECT cursor FROM meta WHERE id = 1", [], |r| r.get(0))?;
+                tx.execute_batch(
+                    "DELETE FROM channels; DELETE FROM removed; DELETE FROM memberships;
+                     DELETE FROM users; DELETE FROM messages; DELETE FROM coverage;
+                     UPDATE meta SET cursor = '0', generation = generation + 1 WHERE id = 1;",
+                )?;
+                tx.commit()?;
+                Ok(was)
+            })
+            .await
     }
 
     /// Ask for a sync in `HINT_DEBOUNCE`; asks meanwhile join it.
@@ -277,9 +304,9 @@ impl Cache {
             let _ = t.await;
         }
         drop(self.running.lock().await); // a run in progress finishes first
-        if let Ok(cache) = Arc::try_unwrap(self) {
-            cache.db.close().await;
-        }
+                                         // Closed through this handle, whoever else holds one: a history load or read still
+                                         // in flight gets `Closed`, and nothing reaches the file after this returns.
+        self.db.close().await;
     }
 
     /// `sync.hint {seq}`: nothing to do if the cache is already there.
@@ -483,11 +510,11 @@ impl Cache {
         // The channel's removal floor as of now: a removal while this request is out makes
         // its answer stale, and `apply` drops it (`Batch::history_floors`).
         let id = channel_id.to_string();
-        let floor = self
+        let (floor, asked_at) = self
             .db
             .call(move |c| {
                 let tx = c.transaction()?;
-                floor_at(&tx, &id)
+                Ok((floor_at(&tx, &id)?, generation(&tx)?))
             })
             .await
             .map_err(|_| crate::Error::UnexpectedResponse)?;
@@ -505,6 +532,9 @@ impl Cache {
             .db
             .call(move |c| {
                 let tx = c.transaction()?;
+                if generation(&tx)? != asked_at {
+                    return Ok(Applied::default()); // the cache was reset meanwhile: stale
+                }
                 // Coverage only from a page that could land: no removal since the request
                 // started, and the channel is here (history for a channel not yet synced
                 // is dropped by `apply`, so it proves nothing).
@@ -548,4 +578,8 @@ impl Cache {
         self.notify(applied);
         Ok(())
     }
+}
+
+fn generation(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<i64> {
+    tx.query_row("SELECT generation FROM meta WHERE id = 1", [], |r| r.get(0))
 }

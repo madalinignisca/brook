@@ -172,7 +172,7 @@ async fn signed_out_the_outbox_waits_and_the_next_sign_in_sends() {
         s.fake.sent.lock().unwrap().is_empty(),
         "sent while signed out"
     );
-    assert_eq!(s.offline.unsent().await, 1);
+    assert_eq!(s.offline.unsent("https://a", "u1").await, 1);
     sign_in(&mut s, "u1", 2).await; // the same user again: same stores, new session
     let fake = s.fake.clone();
     eventually("the send", move || !fake.sent.lock().unwrap().is_empty()).await;
@@ -183,7 +183,7 @@ async fn signed_out_the_outbox_waits_and_the_next_sign_in_sends() {
 async fn forgetting_erases_the_users_stores() {
     let mut s = setup().await;
     sign_in(&mut s, "u1", 1).await;
-    s.offline.forget_active().await.unwrap();
+    s.offline.forget("https://a", "u1", 1).await.unwrap();
     assert!(s.offline.active().is_none());
     let dirs: Vec<_> = std::fs::read_dir(s.root.path())
         .unwrap()
@@ -191,6 +191,37 @@ async fn forgetting_erases_the_users_stores() {
         .filter(|e| e.file_type().unwrap().is_dir())
         .collect();
     assert!(dirs.is_empty(), "a store directory survived");
+}
+
+/// A sign-in still queued from before "Remove this device's data" doesn't bring the stores
+/// back; the next sign-in (a later epoch) does.
+#[tokio::test]
+async fn a_forgotten_user_stays_forgotten_until_a_new_sign_in() {
+    let mut s = setup().await;
+    sign_in(&mut s, "u1", 3).await;
+    s.offline.forget("https://a", "u1", 3).await.unwrap();
+    assert!(
+        !sign_in(&mut s, "u1", 3).await,
+        "the wiped stores came back"
+    );
+    assert!(s.offline.active().is_none());
+    assert!(sign_in(&mut s, "u1", 5).await);
+}
+
+/// Forgetting a user whose stores never opened here still erases them.
+#[tokio::test]
+async fn forgetting_erases_stores_that_are_not_open() {
+    let mut s = setup().await;
+    sign_in(&mut s, "u1", 1).await;
+    sign_in(&mut s, "u2", 2).await; // u1's stores closed, still on disk
+    s.offline.forget("https://a", "u1", 2).await.unwrap();
+    assert!(s
+        .offline
+        .others("https://a", "u2")
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(s.offline.active().unwrap().user_id, "u2");
 }
 
 /// Another user signs in: the first user's stores close and are listed, then wiped.
@@ -292,5 +323,65 @@ mod client {
             "the user's data survived \"Remove this device's data\""
         );
         assert!(c.cached_channels().await.is_err());
+    }
+
+    /// Between a switch of user and the watcher catching up, the previous user's stores are
+    /// still open: they answer nobody else. (tokio's mutex is FIFO, so the read below gets
+    /// the lock before the watcher does.)
+    #[tokio::test]
+    async fn open_stores_answer_only_their_own_user() {
+        let server = TestServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let slot: Arc<dyn KeySlot> = Arc::new(InMemoryKeySlot::default());
+        let c = Arc::new(BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap());
+        assert!(c.enable_local_data(slot, dir.path().to_path_buf()).await);
+        c.login("alice", "pw").await.unwrap();
+        assert!(active(&c).await);
+        let held = c.offline.lock().await;
+        let read = tokio::spawn({
+            let c = c.clone();
+            async move { c.cached_channels().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut other = c.session.snapshot().await.1.unwrap();
+        other.user.id = "someone-else".into();
+        c.session.replace(Some(other)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(held);
+        assert!(
+            read.await.unwrap().is_err(),
+            "another user read the open stores"
+        );
+    }
+
+    /// Dropping the client closes the open stores: their files can be opened again at once.
+    #[tokio::test]
+    async fn dropping_the_client_closes_the_stores() {
+        let server = TestServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let slot: Arc<dyn KeySlot> = Arc::new(InMemoryKeySlot::default());
+        let c = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        assert!(
+            c.enable_local_data(slot.clone(), dir.path().to_path_buf())
+                .await
+        );
+        c.login("alice", "pw").await.unwrap();
+        assert!(active(&c).await);
+        let offline = c.offline.clone();
+        drop(c);
+        let mut closed = false;
+        for _ in 0..300 {
+            if offline
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|off| off.active().is_none())
+            {
+                closed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(closed, "the stores stayed open after the client went away");
     }
 }
