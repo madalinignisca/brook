@@ -14,6 +14,40 @@ Conventions:
 
 ---
 
+## 2026-09-25
+
+### Calls acceptance, macOS <-> Linux, overnight (test server)
+
+All on the LAN test server (server `main` frozen for the runs; calls in the
+`calltest` channel), with the headless Linux participant
+(`clients/gst-media/examples/call_participant.rs`) against the macOS engine.
+
+- **Audio + video, both ways (synthetic media):** Linux decoded the Mac's
+  H.264 video at ~30 fps and its Opus audio in every run (e.g. 434-515 frames
+  over 14-17 s), each ending with a clean leave. The Mac decoded the Linux
+  H.264 (42e01f) via VideoToolbox at ~30 fps and played its audio.
+- **Real Mac app (owner present):** Linux received the real camera and mic;
+  mute and camera-off reached the Linux roster, camera-off really stopped the
+  video (frame count frozen), and video resumed at full rate on camera-on.
+- **Echo check (automated, built-in speakers + mic):** "no echo detected":
+  peak envelope correlation 0.068 vs chance 0.044 (the positive control reads
+  0.96); the received level rose ~19 dB while the clip played, uncorrelated
+  with it (not audible echo; cause not isolated). A first run on a USB
+  headset was discarded as meaningless for speaker echo.
+- **Screen share, both ways (contract labels via `call.publish` `tracks`):**
+  the Mac decoded the Linux share (source `screen`, ~10 fps) next to the Linux
+  camera; Linux decoded the Mac's (`Video:Screen`, ~12 fps) and the stop
+  re-offer removed it before the leave. The server side reported 6 DTLS
+  completions, 0 Janus errors, 0 API warnings for the window.
+- Found and fixed along the way: the server treated `m=... 0` + `a=bundle-only`
+  (webrtcbin's BUNDLE shape) as inactive (fixed server-side); a fresh screen
+  transceiver's kind read `unknown` right after the offer (fixed in the Linux
+  engine); `republish` during a negotiation was refused (now queued in core);
+  a republish error after a share toggle was dropped in the GNOME window.
+
+Still open for the owner: the real Mac app <-> real GNOME app call with
+video and screen share (each desktop's picker needs consent).
+
 ## 2026-09-24
 
 ### P4 calls: GNOME joins real calls through core, reviewed by Vibe
