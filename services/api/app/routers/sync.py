@@ -157,9 +157,18 @@ async def sync(
     # A channel new to me: all of its members and the channel itself, whatever their seq.
     # joined_seq, not seq: my own row's seq moves with every read-marker update (every
     # send), and re-sending the whole member list each time would be pointless.
-    new_to_me = {
-        m.channel_id for m in memberships if m.user_id == user.id and cursor < m.joined_seq <= upper
-    }
+    # Its own query, not a filter over `memberships`: by the time I sync, my row's seq may
+    # already be past `upper` (joined at 30, read marker at 60, page ends at 40), and then
+    # neither page would hold it inside the window and the channel would never arrive.
+    new_to_me = set(
+        (
+            await session.scalars(
+                select(Membership.channel_id).where(
+                    Membership.user_id == user.id, window(Membership.joined_seq)
+                )
+            )
+        ).all()
+    )
     if new_to_me:
         extra = (
             await session.scalars(select(Membership).where(Membership.channel_id.in_(new_to_me)))
