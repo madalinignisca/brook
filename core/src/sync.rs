@@ -59,6 +59,9 @@ pub(crate) async fn run(db: &Db, me: &str, fetch: &dyn Fetch) -> Result<Synced, 
                 let applied = apply(&tx, &me, &batch)?;
                 // With the rows, or not at all.
                 tx.execute("UPDATE meta SET cursor = ?1 WHERE id = 1", [&next])?;
+                if !more {
+                    crate::coverage::settle_tops(&tx)?; // caught up: ranges reach the top
+                }
                 tx.commit()?;
                 Ok(applied)
             })

@@ -188,3 +188,35 @@ fn events_without_rows_ask_for_a_sync_instead() {
         "no seq: not applied"
     );
 }
+
+/// When a sync run catches up, a covered channel's range reaches its newest message.
+#[tokio::test]
+async fn a_completed_sync_settles_coverage() {
+    let (db, _dir) = open();
+    sync::run(&db, ME, &Pages::new(vec![page("7", false, vec![])]))
+        .await
+        .unwrap();
+    db.call(|c| {
+        let t = c.transaction()?;
+        crate::coverage::record_head(&t, "c", &["m5".to_string()], 50)?;
+        t.commit()
+    })
+    .await
+    .unwrap();
+    let fetch = Pages::new(vec![
+        page("30", true, vec![msg("m8", 30, "eight")]),
+        page("40", false, vec![msg("m7", 40, "seven")]),
+    ]);
+    sync::run(&db, ME, &fetch).await.unwrap();
+    let top: String = db
+        .call(|c| {
+            c.query_row(
+                "SELECT newest_id FROM coverage WHERE channel_id = 'c'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(top, "m8");
+}

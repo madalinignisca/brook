@@ -334,10 +334,10 @@ async fn a_departure_keeps_its_seq_against_an_older_membership_row() {
     );
 }
 
-/// A member row the cache still holds when the caller rejoins (a leftover the removal
-/// didn't cover) but that isn't in the rejoin page's complete member list: marked left.
+/// A page that holds only the caller's own membership (its read marker moved) is not a
+/// member list: nobody else is marked left by it.
 #[tokio::test]
-async fn a_rejoin_reconciles_members_who_left_meanwhile() {
+async fn a_page_is_never_taken_as_the_complete_member_list() {
     let cache = joined().await;
     cache
         .apply(Batch {
@@ -346,23 +346,158 @@ async fn a_rejoin_reconciles_members_who_left_meanwhile() {
         })
         .await;
     cache
-        .db
-        .call(|c| {
-            c.execute(
-                "INSERT INTO memberships(channel_id, user_id, seq, left, json) VALUES ('c', 'ghost', 12, 0, '{}')",
-                [],
-            )
-        })
-        .await
-        .unwrap();
-    cache
         .apply(Batch {
-            channels: vec![channel("c", 40, "general")],
-            memberships: vec![member("c", ME, 40), member("c", "carol", 12)],
+            channels: vec![channel("c", 50, "general")],
+            memberships: vec![member("c", "bob", 50), member("c", ME, 30)],
             ..Batch::default()
         })
         .await;
-    assert_eq!(cache.active_members("c").await, vec!["carol", ME]);
+    cache
+        .apply(Batch {
+            memberships: vec![member("c", ME, 60)],
+            ..Batch::default()
+        })
+        .await;
+    assert_eq!(cache.active_members("c").await, vec!["bob", ME]);
+}
+
+/// A message version from before the caller's removal is never current once they're back:
+/// a delayed ack or page for it can't bring back words edited away meanwhile.
+#[tokio::test]
+async fn a_stale_row_after_a_rejoin_stays_out() {
+    let cache = joined().await; // m1 "hello" at seq 10
+    cache
+        .apply(Batch {
+            removed: vec![("c".into(), 20)],
+            ..Batch::default()
+        })
+        .await;
+    cache
+        .apply(Batch {
+            channels: vec![channel("c", 30, "general")],
+            memberships: vec![member("c", ME, 30)],
+            ..Batch::default()
+        })
+        .await;
+    cache
+        .apply(Batch {
+            messages: vec![message("m1", "c", 10, "hello")],
+            ..Batch::default()
+        })
+        .await;
+    assert_eq!(
+        cache.body("m1").await,
+        None,
+        "a pre-removal version came back"
+    );
+    // History (seq 0) brings the current version; a new row lands too.
+    cache
+        .apply(Batch {
+            messages: vec![
+                message("m1", "c", 0, "edited while away"),
+                message("m2", "c", 35, "new"),
+            ],
+            ..Batch::default()
+        })
+        .await;
+    assert_eq!(cache.body("m1").await.as_deref(), Some("edited while away"));
+    assert_eq!(cache.body("m2").await.as_deref(), Some("new"));
+}
+
+/// A live delete that arrives before the message: a partial tombstone keeps the older
+/// version out, and the server's own tombstone (same seq) replaces the partial one.
+#[tokio::test]
+async fn a_delete_before_the_message_keeps_its_content_out() {
+    let cache = joined().await;
+    cache
+        .apply(Batch {
+            tombstones: vec![("m7".into(), "c".into(), 30)],
+            ..Batch::default()
+        })
+        .await;
+    for (seq, body) in [(20, "secret"), (0, "secret from history")] {
+        cache
+            .apply(Batch {
+                messages: vec![message("m7", "c", seq, body)],
+                ..Batch::default()
+            })
+            .await;
+        assert_eq!(cache.body("m7").await.as_deref(), Some(""), "{body}");
+    }
+    let mut server_tombstone = message("m7", "c", 30, "");
+    server_tombstone.json["author_handle"] = json!("bob");
+    server_tombstone.json["deleted_at"] = json!("2026-09-25T12:00:00Z");
+    cache
+        .apply(Batch {
+            messages: vec![server_tombstone],
+            ..Batch::default()
+        })
+        .await;
+    assert_eq!(
+        cache
+            .one(
+                "SELECT json_extract(json, '$.author_handle') FROM messages WHERE id = ?1",
+                "m7"
+            )
+            .await
+            .as_deref(),
+        Some("bob"),
+        "the server's tombstone didn't replace the partial one"
+    );
+}
+
+/// Replies quote their target. Deleting the target leaves "(deleted)" in every cached reply,
+/// and editing it updates the quote; mentions go with a live delete.
+#[tokio::test]
+async fn replies_follow_their_target() {
+    let cache = joined().await;
+    let mut reply = message("r1", "c", 12, "agreed");
+    reply.json["reply_to_id"] = json!("m1");
+    reply.json["reply_to"] = json!({ "id": "m1", "body": "hello" });
+    cache
+        .apply(Batch {
+            messages: vec![reply],
+            ..Batch::default()
+        })
+        .await;
+    let quote = || {
+        cache.one(
+            "SELECT json_extract(json, '$.reply_to.body') FROM messages WHERE id = ?1",
+            "r1",
+        )
+    };
+    cache
+        .apply(Batch {
+            messages: vec![message("m1", "c", 20, &"x".repeat(200))],
+            ..Batch::default()
+        })
+        .await;
+    assert_eq!(quote().await, Some("x".repeat(140)));
+    let mut with_mentions = message("m1", "c", 25, "hi @bob");
+    with_mentions.json["mentions"] = json!(["bob"]);
+    cache
+        .apply(Batch {
+            messages: vec![with_mentions],
+            ..Batch::default()
+        })
+        .await;
+    cache
+        .apply(Batch {
+            tombstones: vec![("m1".into(), "c".into(), 30)],
+            ..Batch::default()
+        })
+        .await;
+    assert_eq!(quote().await.as_deref(), Some("(deleted)"));
+    assert_eq!(
+        cache
+            .one(
+                "SELECT coalesce(json_type(json, '$.mentions'), 'absent') FROM messages WHERE id = ?1",
+                "m1"
+            )
+            .await,
+        Some("absent".to_string()),
+        "a deleted message kept its mentions"
+    );
 }
 
 #[tokio::test]

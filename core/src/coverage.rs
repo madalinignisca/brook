@@ -49,18 +49,32 @@ pub(crate) fn record_head(
             )
             .map(|_| ());
     };
-    // A range we already hold may reach further down; the head page is contiguous with
-    // everything newer, so keep the lower of the two bottoms only if they overlap.
+    // A range we already hold may reach further down: keep the lower bottom, but only if the
+    // two ranges overlap. A head page wholly older than the held range (a delayed fetch)
+    // doesn't touch it.
     let existing = range(tx, channel_id)?;
+    if let Some(Range {
+        oldest_id: Some(held_oldest),
+        ..
+    }) = &existing
+    {
+        if newest.as_str() < held_oldest.as_str() {
+            return Ok(());
+        }
+    }
     let (oldest, complete) = match existing {
         Some(Range {
             newest_id: Some(held_newest),
             oldest_id: Some(held_oldest),
             complete_to_start,
-        }) if held_newest.as_str() >= oldest.as_str() => (
-            held_oldest.min(oldest.clone()),
-            complete_to_start || complete,
-        ),
+        }) if held_newest.as_str() >= oldest.as_str()
+            && newest.as_str() >= held_oldest.as_str() =>
+        {
+            (
+                held_oldest.min(oldest.clone()),
+                complete_to_start || complete,
+            )
+        }
         _ => (oldest.clone(), complete),
     };
     tx.execute(
@@ -96,17 +110,19 @@ pub(crate) fn record_older(
     Ok(())
 }
 
-/// `/sync` and live messages extend the top of a covered channel: the cache has followed it
-/// continuously since its range was set. An uncovered channel stays uncovered.
-pub(crate) fn extend_top(
-    tx: &Transaction<'_>,
-    channel_id: &str,
-    message_id: &str,
-) -> rusqlite::Result<()> {
+/// A sync run just caught up (its last page is in this transaction): every message created
+/// since the last sync is now cached, whatever order the pages delivered them in (they come
+/// by latest `seq`, not by creation). So each covered channel's range reaches its newest
+/// cached message. Live messages alone never move the top: one could have been missed.
+pub(crate) fn settle_tops(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute(
-        "UPDATE coverage SET newest_id = ?2, oldest_id = coalesce(oldest_id, ?2)
-         WHERE channel_id = ?1 AND (newest_id IS NULL OR newest_id < ?2)",
-        params![channel_id, message_id],
+        "UPDATE coverage SET
+             newest_id = (SELECT max(id) FROM messages WHERE channel_id = coverage.channel_id),
+             oldest_id = coalesce(oldest_id,
+                                  (SELECT max(id) FROM messages WHERE channel_id = coverage.channel_id))
+         WHERE (SELECT max(id) FROM messages WHERE channel_id = coverage.channel_id)
+               > coalesce(newest_id, '')",
+        [],
     )?;
     Ok(())
 }

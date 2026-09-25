@@ -154,39 +154,67 @@ async fn only_a_contiguous_older_page_extends_the_range() {
     assert!(r.complete_to_start);
 }
 
+/// Only a completed sync moves the top: pages deliver by latest seq, not creation order,
+/// and a live message alone could follow a missed one.
 #[tokio::test]
-async fn synced_messages_extend_the_top_of_a_covered_channel() {
+async fn only_a_completed_sync_extends_the_top() {
     let (db, _d) = open();
     joined(&db).await;
     tx(&db, |t| {
         coverage::record_head(t, "c", &ids(&["m5", "m6"]), 2)
     })
     .await;
+    // m8 arrives (live, or on a page that ends before m7's latest version).
     tx(&db, |t| {
         apply(
             t,
             "me",
             &Batch {
-                messages: vec![msg("m7", 7)],
+                messages: vec![msg("m8", 30)],
                 ..Batch::default()
             },
         )
     })
     .await;
-    assert_eq!(range(&db).await.unwrap().newest_id.as_deref(), Some("m7"));
-    // A history row (seq 0) is not "followed live": it doesn't move the top.
+    assert_eq!(
+        range(&db).await.unwrap().newest_id.as_deref(),
+        Some("m6"),
+        "a gap was covered"
+    );
+    // The run completes (m7 came on the last page): now the top is settled.
     tx(&db, |t| {
         apply(
             t,
             "me",
             &Batch {
-                messages: vec![msg("m8", 0)],
+                messages: vec![msg("m7", 40)],
                 ..Batch::default()
             },
-        )
+        )?;
+        coverage::settle_tops(t)
     })
     .await;
-    assert_eq!(range(&db).await.unwrap().newest_id.as_deref(), Some("m7"));
+    assert_eq!(range(&db).await.unwrap().newest_id.as_deref(), Some("m8"));
+}
+
+/// A delayed head page, wholly older than the range held now, doesn't join the two.
+#[tokio::test]
+async fn a_stale_head_page_does_not_bridge_a_gap() {
+    let (db, _d) = open();
+    joined(&db).await;
+    tx(&db, |t| {
+        coverage::record_head(t, "c", &ids(&["m10", "m11"]), 2)
+    })
+    .await;
+    tx(&db, |t| {
+        coverage::record_head(t, "c", &ids(&["m01", "m02"]), 2)
+    })
+    .await;
+    let r = range(&db).await.unwrap();
+    assert_eq!(
+        (r.oldest_id.as_deref(), r.newest_id.as_deref()),
+        (Some("m10"), Some("m11"))
+    );
 }
 
 #[tokio::test]
@@ -202,7 +230,8 @@ async fn an_empty_covered_channel_gets_its_first_message() {
                 messages: vec![msg("m1", 3)],
                 ..Batch::default()
             },
-        )
+        )?;
+        coverage::settle_tops(t)
     })
     .await;
     let r = range(&db).await.unwrap();
