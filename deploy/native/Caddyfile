@@ -18,7 +18,7 @@ BROOK_DOMAIN {
 	# run" on downloads, in case a response ever left the api without its headers.
 	@filecontent path_regexp ^/api/v1/files/[^/]+/content$
 	request_body @filecontent {
-		max_size 100MB
+		max_size 100MiB
 	}
 	header @filecontent {
 		X-Content-Type-Options nosniff

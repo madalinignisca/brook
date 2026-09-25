@@ -309,3 +309,23 @@ async def test_sweep(client: httpx.AsyncClient) -> None:
     assert left == {uuid.UUID(attached["id"])}
     assert fresh_part.exists() and not orphan.exists()
     assert storage.final_path(uuid.UUID(attached["id"])).exists()
+
+
+async def test_upload_whose_part_was_swept_asks_for_a_retry(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A part removed by the sweep mid-commit (an upload stalled past 1 h): a clean
+    409 file.upload_expired and the file stays pending, never a 500."""
+    ha, _hb, ch = await _setup(client)
+    created = (await _create(client, ha, ch, b"slow")).json()
+
+    def vanished(self: storage.PartWriter, final: Path) -> None:
+        self.path.unlink()
+        raise FileNotFoundError(self.path)
+
+    monkeypatch.setattr(storage.PartWriter, "commit_to", vanished)
+    r = await client.put(created["upload_url"], content=b"slow", headers=ha)
+    assert r.status_code == 409 and r.json()["error"]["code"] == "file.upload_expired"
+    async with db.get_sessionmaker()() as s:
+        row = await s.get(File, uuid.UUID(created["file"]["id"]))
+        assert row is not None and row.status == "pending"

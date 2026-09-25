@@ -208,7 +208,15 @@ async def upload_content(
             )
         # Rename inside the winning transaction: a crash between the rename and the
         # commit leaves a pending row plus the file, which the sweep removes.
-        await run_in_threadpool(part.commit_to, storage.final_path(file_id))
+        try:
+            await run_in_threadpool(part.commit_to, storage.final_path(file_id))
+        except FileNotFoundError:
+            # The part vanished: an upload stalled past the sweep's 1 h window and its
+            # part was removed. Undo the status flip and ask for a fresh upload.
+            await session.rollback()
+            raise _error(
+                status.HTTP_409_CONFLICT, "file.upload_expired", "The upload took too long; retry"
+            ) from None
         await session.commit()
         committed = await session.get(File, file_id, populate_existing=True)
         assert committed is not None  # noqa: S101 - we just committed it

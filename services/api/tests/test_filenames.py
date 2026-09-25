@@ -59,3 +59,8 @@ def test_original_name_keeps_unicode_but_not_invisibles() -> None:
     assert original_name("Ștefan–raport.pdf") == "Ștefan–raport.pdf"
     assert original_name("invoice\u202efdp.exe") == "invoicefdp.exe"
     assert original_name("\x00\u200b") == "file"
+
+
+def test_long_tar_gz_keeps_both_extensions() -> None:
+    name = safe_filename("backup-" + "x" * 300 + ".tar.gz")
+    assert len(name.encode()) <= 255 and name.endswith(".tar.gz")

@@ -29,6 +29,7 @@ _INVISIBLE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u2069\u061c\ufeff]"
 _RESERVED = re.compile(r'[<>:"|?*]')
 _SPACES = re.compile(r"\s+")
 # Windows device names, reserved with any extension: "CON", "con.txt", "COM1.log".
+_DOUBLE_EXT_INNER = frozenset({"tar"})
 _DEVICE = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$", re.IGNORECASE)
 
 
@@ -66,6 +67,10 @@ def _cap(name: str) -> str:
     stem, dot, ext = name.rpartition(".")
     if not dot or not stem or len(ext) > 16:
         stem, ext = name, ""
+    # Double extensions people rely on (report.tar.gz): keep both parts.
+    inner_stem, inner_dot, inner = stem.rpartition(".")
+    if ext and inner_dot and inner_stem and inner.lower() in _DOUBLE_EXT_INNER:
+        stem, ext = inner_stem, f"{inner}.{ext}"
     suffix = f".{ext}" if ext else ""
     room = MAX_BYTES - len(suffix.encode())
     stem = stem.encode()[:room].decode("ascii", "ignore").rstrip(" .") or FALLBACK
