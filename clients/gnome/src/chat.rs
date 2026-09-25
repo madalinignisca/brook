@@ -438,6 +438,10 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     let widgets = chat.message_rows.borrow().get(&message.id).cloned();
                     if let Some(widgets) = widgets {
                         widgets.body.set_markup(&markdown_to_pango(&message.body));
+                        // A caption added to a file-only message by an edit becomes visible.
+                        if !message.body.trim().is_empty() {
+                            widgets.body.set_visible(true);
+                        }
                         widgets.edited.set_visible(true);
                     }
                 }
