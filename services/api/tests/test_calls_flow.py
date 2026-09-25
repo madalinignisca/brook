@@ -722,3 +722,47 @@ def test_unlabelled_republish_keeps_a_live_screen_a_screen(
         assert _pub(wa, call_id, share, None)["type"] == "call.publish.answer"
         who = of(collect(wb), "call.participant")[-1]["participant"]
         assert sorted(x["source"] for x in who["publishing"]) == ["camera", "mic", "screen"]
+
+
+def test_share_then_immediate_stop_settles_without_the_screen(
+    sync_client: TestClient, fake: FakeJanus
+) -> None:
+    """core queues a publish that arrives while one is in flight (#29), so a quick
+    share-then-stop sends two call.publish back to back. The reconcile started by
+    the first may still be subscribing peers to the screen when the second lands;
+    the subscriber must end up WITHOUT the screen, and nothing may error."""
+    a, b, _c, ch = _setup(sync_client)
+    with _ws(sync_client, a) as wa, _ws(sync_client, b) as wb:
+        ja = cmd(wa, "call.join", {"channel_id": ch})["data"]
+        call_id, pa = ja["call_id"], ja["self"]["participant_id"]
+        cmd(wb, "call.join", {"channel_id": ch})
+        assert _pub(wa, call_id, AV, AV_TRACKS)["type"] == "call.publish.answer"
+        sync_client.portal.call(fake.fire, _participant(call_id, pa).pub_hid, {"janus": "webrtcup"})
+
+        # keep bob answering every offer, as a real client does
+        def drain_and_answer() -> list[dict[str, Any]]:
+            frames = collect(wb)
+            for o in of(frames, "call.subscribe.offer"):
+                cmd(
+                    wb,
+                    "call.subscribe.answer",
+                    {"call_id": call_id, "version": o["version"], "sdp": "a"},
+                )
+            return frames
+
+        drain_and_answer()
+        tracks = [*AV_TRACKS, {"mid": "2", **SCREEN}]
+        on = _pub(wa, call_id, (*AV, ("video", "2", True)), tracks)
+        off = _pub(wa, call_id, (*AV, ("video", "2", False)), tracks)  # immediately
+        assert (on["type"], off["type"]) == ("call.publish.answer", "call.publish.answer")
+        offers: list[dict[str, Any]] = []
+        for _ in range(4):  # let the deferred reconciles replay and settle
+            offers += of(drain_and_answer(), "call.subscribe.offer")
+        assert offers, "expected at least one re-offer"
+        assert sorted(s["source"] for s in offers[-1]["streams"]) == ["camera", "mic"]
+        p_b = next(
+            q
+            for q in calls.manager.by_id[call_id].participants.values()
+            if q is not _participant(call_id, pa)
+        )
+        assert all(mid != "2" for _feed, mid in p_b.sub_streams)  # server state agrees
