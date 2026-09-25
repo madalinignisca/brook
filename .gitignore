@@ -42,3 +42,9 @@ bindings/apple/swift/BrookCore/BrookCoreFFI.xcframework/
 bindings/apple/swift/BrookCore/Sources/BrookCore/Generated/
 bindings/apple/swift/BrookCore/.build/
 bindings/apple/swift/BrookCore/.swiftpm/
+
+# macOS client: generated project and build output
+clients/macos/Brook.xcodeproj/
+clients/macos/build/
+clients/macos/Brook/Info.plist
+clients/macos/Brook/Brook.entitlements
