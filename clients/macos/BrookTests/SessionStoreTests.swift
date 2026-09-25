@@ -252,4 +252,76 @@ final class SessionStoreTests: XCTestCase {
         try? await Task.sleep(for: .milliseconds(20))
         XCTAssertEqual(store.phase, .signedIn(alice))
     }
+
+    // MARK: TOTP second step (spec 2026-09-25-totp-clients §5)
+
+    private func atCodeStep() async -> (SessionStore, FakeClient) {
+        let fake = FakeClient(result: .success(.totpRequired(challenge: FakeChallenge())))
+        fake.setCoreState(.authenticating)
+        let (store, _) = store(fake)
+        await store.signIn(server: "https://h", handle: "alice", password: "pw")
+        return (store, fake)
+    }
+
+    func testThePasswordAloneLeadsToTheCodeStep() async {
+        let (store, _) = await atCodeStep()
+        XCTAssertEqual(store.phase, .needsCode(error: nil))
+        XCTAssertNil(store.client, "signed in with the password alone")
+    }
+
+    func testTheRightCodeSignsIn() async {
+        let (store, fake) = await atCodeStep()
+        await store.submitCode("123 456")
+        XCTAssertEqual(fake.totpCalls, ["code:123456"])
+        XCTAssertEqual(store.phase, .signedIn(alice))
+        XCTAssertNotNil(store.client)
+    }
+
+    func testAWrongCodeStaysOnTheCodeStepAndSaysSo() async {
+        let (store, fake) = await atCodeStep()
+        fake.setTotpResult(.failure(.Api(code: "auth.invalid_code", message: "x")))
+        await store.submitCode("000000")
+        XCTAssertEqual(store.phase, .needsCode(error: SessionStore.Message.wrongCode))
+        await store.submitRecovery("aaaa-bbbb")
+        XCTAssertEqual(store.phase, .needsCode(error: SessionStore.Message.wrongRecoveryCode))
+    }
+
+    func testAnExpiredChallengeGoesBackToThePassword() async {
+        let (store, fake) = await atCodeStep()
+        fake.setTotpResult(.failure(.Api(code: "auth.totp_expired", message: "x")))
+        await store.submitCode("123456")
+        XCTAssertEqual(store.phase, .signedOut(error: SessionStore.Message.codeStepExpired))
+    }
+
+    func testBackCancelsTheChallenge() async {
+        let (store, fake) = await atCodeStep()
+        store.back()
+        XCTAssertEqual(store.phase, .signedOut(error: nil))
+        for _ in 0 ..< 500 where fake.cancels == 0 { try? await Task.sleep(for: .milliseconds(2)) }
+        XCTAssertEqual(fake.cancels, 1)
+    }
+
+    func testASupersededChallengeChangesNothing() async {
+        let (store, fake) = await atCodeStep()
+        fake.setTotpResult(.failure(.ChallengeSuperseded))
+        await store.submitCode("123456")
+        XCTAssertEqual(store.phase, .needsCode(error: nil))
+    }
+
+    func testAMalformedCodeNeverReachesTheClient() async {
+        let (store, fake) = await atCodeStep()
+        await store.submitCode("12345")
+        XCTAssertEqual(store.phase, .needsCode(error: SessionStore.Message.codeFormat))
+        await store.submitRecovery("   ")
+        XCTAssertEqual(store.phase, .needsCode(error: SessionStore.Message.recoveryFormat))
+        XCTAssertTrue(fake.totpCalls.isEmpty)
+    }
+
+    func testFewRecoveryCodesLeftAreFlagged() async {
+        let (store, fake) = await atCodeStep()
+        fake.setTotpResult(.success(2))
+        await store.submitRecovery("aaaa-bbbb-cccc-dddd-eeee")
+        XCTAssertEqual(store.phase, .signedIn(alice))
+        XCTAssertEqual(store.recoveryCodesLeft, 2)
+    }
 }

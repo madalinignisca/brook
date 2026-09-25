@@ -17,6 +17,9 @@ final class FakeClient: FfiBrookClient, @unchecked Sendable {
         var listener: AuthStateListener?
         var logouts = 0
         var coreState: FfiAuthState = .loggedIn(user: alice)
+        var totpCalls: [String] = []
+        var totpResult: Result<UInt32?, LoginError> = .success(nil)
+        var cancels = 0
     }
 
     private let result: Result<LoginResult, LoginError>
@@ -84,6 +87,32 @@ final class FakeClient: FfiBrookClient, @unchecked Sendable {
 
     override func authState() -> FfiAuthState { state.withLock { $0.coreState } }
 
+    // MARK: TOTP second step
+
+    var totpCalls: [String] { state.withLock { $0.totpCalls } }
+    var cancels: Int { state.withLock { $0.cancels } }
+    func setTotpResult(_ r: Result<UInt32?, LoginError>) { state.withLock { $0.totpResult = r } }
+
+    override func completeTotp(challenge _: FfiTotpChallenge, code: String) async throws -> UInt32? {
+        try state.withLock { s in
+            s.totpCalls.append("code:\(code)")
+            if case .success = s.totpResult { s.coreState = .loggedIn(user: alice) }
+            return try s.totpResult.get()
+        }
+    }
+
+    override func completeRecovery(challenge _: FfiTotpChallenge, recoveryCode: String) async throws -> UInt32? {
+        try state.withLock { s in
+            s.totpCalls.append("recovery:\(recoveryCode)")
+            if case .success = s.totpResult { s.coreState = .loggedIn(user: alice) }
+            return try s.totpResult.get()
+        }
+    }
+
+    override func cancelTotp(challenge _: FfiTotpChallenge) async {
+        state.withLock { $0.cancels += 1 }
+    }
+
     override func logout() async {
         state.withLock { $0.logouts += 1 }
     }
@@ -111,3 +140,10 @@ final class FactoryRecorder: @unchecked Sendable {
 
 let alice = FfiUser(id: "u1", handle: "alice", displayName: "Alice", globalRole: "admin")
 let aliceSession = FfiSession(accessToken: "a", refreshToken: "r", user: alice)
+
+/// A challenge with no Rust side (the store only passes it back to the client).
+final class FakeChallenge: FfiTotpChallenge, @unchecked Sendable {
+    init() { super.init(noHandle: NoHandle()) }
+    required init(unsafeFromHandle _: UInt64) { fatalError("never lifted from Rust") }
+    override func secondsLeft() -> UInt64 { 300 }
+}

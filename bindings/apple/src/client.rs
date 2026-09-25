@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use brook_core::{BrookClient, CoreConfig};
+use brook_core::{BrookClient, CoreConfig, LoginOutcome};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,7 +14,10 @@ use crate::call::{
 };
 use crate::listener::{subscribe_receiver, AuthStateListener, Subscription};
 use crate::runtime::runtime;
-use crate::types::{FfiChannel, FfiUserSummary, LoginError, LoginResult};
+use crate::types::{
+    FfiChannel, FfiMe, FfiSecondFactor, FfiTotpChallenge, FfiTotpEnrollment, FfiUserSummary,
+    LoginError, LoginResult,
+};
 
 /// Swift-facing wrapper around [`BrookClient`].
 #[derive(uniffi::Object)]
@@ -166,12 +169,110 @@ impl FfiBrookClient {
         let inner = Arc::clone(&self.inner);
         let task = runtime().spawn(async move { inner.login(&handle, &password).await });
         match task.await {
-            Ok(result) => Ok(LoginResult::LoggedIn {
-                session: result?.into(),
+            Ok(result) => Ok(match result? {
+                LoginOutcome::LoggedIn(session) => LoginResult::LoggedIn {
+                    session: session.into(),
+                },
+                LoginOutcome::TotpRequired(challenge) => LoginResult::TotpRequired {
+                    challenge: Arc::new(FfiTotpChallenge { inner: challenge }),
+                },
             }),
             // A panic inside core must not cross the FFI as a crash.
             Err(_) => Err(LoginError::UnexpectedResponse),
         }
+    }
+
+    /// Finish a TOTP sign-in with a 6-digit code. `Api{auth.invalid_code}` keeps the challenge;
+    /// `Api{auth.totp_expired}` ends it; `ChallengeSuperseded`: change nothing.
+    pub async fn complete_totp(
+        &self,
+        challenge: Arc<FfiTotpChallenge>,
+        code: String,
+    ) -> Result<Option<u32>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.complete_totp(&challenge.inner, &code).await }).await
+    }
+
+    /// Finish a TOTP sign-in with a recovery code; returns how many are left.
+    pub async fn complete_recovery(
+        &self,
+        challenge: Arc<FfiTotpChallenge>,
+        recovery_code: String,
+    ) -> Result<Option<u32>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move {
+            inner
+                .complete_recovery(&challenge.inner, &recovery_code)
+                .await
+        })
+        .await
+    }
+
+    /// Back from the code step (only ends that challenge; idempotent).
+    pub async fn cancel_totp(&self, challenge: Arc<FfiTotpChallenge>) {
+        let inner = Arc::clone(&self.inner);
+        let _ = run(async move {
+            inner.cancel_totp(&challenge.inner).await;
+            Ok::<(), brook_core::Error>(())
+        })
+        .await;
+    }
+
+    /// The signed-in user and their second-factor state.
+    pub async fn me(&self) -> Result<FfiMe, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        Ok(run(async move { inner.me().await }).await?.into())
+    }
+
+    /// Start turning TOTP on (the password is re-checked).
+    pub async fn totp_enroll(
+        &self,
+        password: String,
+    ) -> Result<Arc<FfiTotpEnrollment>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let enrollment = run(async move { inner.totp_enroll(&password).await }).await?;
+        Ok(Arc::new(FfiTotpEnrollment { inner: enrollment }))
+    }
+
+    /// Finish turning TOTP on; returns the recovery codes (show them once).
+    pub async fn totp_activate(&self, code: String) -> Result<Vec<String>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.totp_activate(&code).await }).await
+    }
+
+    /// Turn TOTP off: the password and a second factor.
+    pub async fn totp_disable(
+        &self,
+        password: String,
+        factor: FfiSecondFactor,
+    ) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.totp_disable(&password, factor.into()).await }).await
+    }
+
+    /// Replace every recovery code with ten new ones (show them once).
+    pub async fn totp_regenerate_recovery_codes(
+        &self,
+        password: String,
+        factor: FfiSecondFactor,
+    ) -> Result<Vec<String>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move {
+            inner
+                .totp_regenerate_recovery_codes(&password, factor.into())
+                .await
+        })
+        .await
+    }
+
+    /// Admin: turn off another (non-admin) user's TOTP; they are signed out everywhere.
+    pub async fn admin_reset_totp(
+        &self,
+        user_id: String,
+        admin_password: String,
+    ) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.admin_reset_totp(&user_id, &admin_password).await }).await
     }
 }
 
@@ -232,7 +333,10 @@ mod tests {
         let client = FfiBrookClient::new(server.uri(), false).unwrap();
 
         let LoginResult::LoggedIn { session } =
-            client.login("alice".into(), "pw".into()).await.unwrap();
+            client.login("alice".into(), "pw".into()).await.unwrap()
+        else {
+            panic!("expected a session");
+        };
 
         assert_eq!(session.access_token, ACCESS);
         assert_eq!(session.refresh_token, REFRESH);

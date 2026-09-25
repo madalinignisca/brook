@@ -38,6 +38,11 @@ pub enum Error {
     #[error("not authenticated")]
     NotAuthenticated,
 
+    /// A TOTP challenge that is no longer the current sign-in attempt (Back, a newer login, a
+    /// sign-out, or it was already completed). Nothing was changed; the UI stays as it is.
+    #[error("that sign-in attempt is no longer current")]
+    ChallengeSuperseded,
+
     /// A WebSocket transport error (boxed — tungstenite's error is large).
     #[error("websocket error: {0}")]
     WebSocket(Box<tokio_tungstenite::tungstenite::Error>),

@@ -36,8 +36,18 @@ final class SignOutIntegrationTests: XCTestCase {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: ["refresh_token": session.refreshToken])
-        let (_, response) = try await URLSession.shared.data(for: req)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        // A 429 is the shared rate limit answering before the token is looked at (so it
+        // consumes nothing): wait as asked and ask again. Any other answer is the verdict.
+        var status = 429
+        for _ in 0 ..< 10 where status == 429 {
+            let (_, response) = try await URLSession.shared.data(for: req)
+            let http = response as? HTTPURLResponse
+            status = http?.statusCode ?? 0
+            if status == 429 {
+                let wait = http?.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init) ?? 10
+                try await Task.sleep(for: .seconds(min(max(wait, 1), 70)))
+            }
+        }
         XCTAssertEqual(status, 401, "the signed-out refresh token still works on the server")
     }
 }

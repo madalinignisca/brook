@@ -44,4 +44,14 @@ final class RedactionTests: XCTestCase {
     func testRedactedRenderingStillIdentifiesTheUser() {
         XCTAssertTrue("\(session)".contains("alice"))
     }
+
+    /// Recovery codes and authenticator codes never render either.
+    func testSecondFactorsNeverRenderTheirCode() {
+        for factor in [FfiSecondFactor.code(code: "481516"), .recovery(code: "rcode-sentinel-X")] {
+            for (how, text) in renderings(of: factor) {
+                XCTAssertFalse(text.contains("481516") || text.contains("rcode-sentinel-X"),
+                               "\(how) leaked a code: \(text)")
+            }
+        }
+    }
 }
