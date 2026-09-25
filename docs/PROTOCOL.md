@@ -105,7 +105,8 @@ contract:
   **signs out every other session**; commit its pair like `/auth/password`'s.
   `409 auth.totp_enrollment_expired` means scan again; `409 conflict` means TOTP is
   already on, or nothing is pending.
-- **`disable`** and **`recovery-codes`** take `{password, code | recovery_code}`.
+- **`disable`** and **`recovery-codes`** take `{password, code}`, where `code` may be a
+  TOTP code or a recovery code (`recovery_code` as its own field works too).
   Regenerating replaces every old code.
 - **`GET /auth/me`** adds `totp_enabled` and `recovery_codes_left` (null when off).
 - **Recovery codes** look like `iiii-xxxx-xxxx-xxxx-xxxx`; case, dashes and spaces

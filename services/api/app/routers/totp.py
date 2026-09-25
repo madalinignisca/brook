@@ -378,9 +378,14 @@ async def _manage(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "conflict", "message": "TOTP is not active"},
         )
+    code, recovery = body.code, body.recovery_code
+    # Spec §2.3: here `code` may also be a recovery code (one field in the app's form).
+    # Six digits is a TOTP code; anything else is tried as a recovery code.
+    if code is not None and not _looks_like_totp(code):
+        code, recovery = None, code
     try:
         await verify_second_factor(
-            session, limiter, ip, user, row, code=body.code, recovery_code=body.recovery_code
+            session, limiter, ip, user, row, code=code, recovery_code=recovery
         )
     except HTTPException as exc:
         if exc.status_code == status.HTTP_403_FORBIDDEN:
@@ -388,6 +393,11 @@ async def _manage(
         raise
     limiter.code_reset(user.handle)
     return user, row
+
+
+def _looks_like_totp(text: str) -> bool:
+    digits = text.strip().replace(" ", "")
+    return len(digits) == totp_core.DIGITS and digits.isascii() and digits.isdigit()
 
 
 @router.post("/disable", status_code=status.HTTP_204_NO_CONTENT)

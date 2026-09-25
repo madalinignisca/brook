@@ -546,3 +546,18 @@ async def test_a_signed_non_pending_token_is_refused_by_type(
     )
     r = await client.post(TOTP, json={"totp_token": forged, "code": "000000"})
     assert r.status_code == 403 and r.json()["error"]["code"] == "auth.totp_expired"
+
+
+async def test_disable_accepts_a_recovery_code_in_the_code_field(
+    client: httpx.AsyncClient, clock: Clock
+) -> None:
+    """Spec §2.3: disable/recovery-codes take {password, code}, where code may be a
+    recovery code (the app has one field)."""
+    pair = await _setup(client)
+    _secret, activated = await _enable(client, pair, clock)
+    r = await client.post(
+        f"{TOTP}/disable",
+        json={"password": PW, "code": activated["recovery_codes"][0]},
+        headers=_h(activated["access_token"]),
+    )
+    assert r.status_code == 204
