@@ -115,6 +115,11 @@ Each task ends in a check; tests are written first and seen failing under a name
   include in `Signing.xcconfig`; `build.sh release` refuses to run without it. No
   `disable-library-validation`.
 
+- **After review (Linux client), camera failure.** The plan had a camera that fails to start
+  fail the operation; core answers an offer error by ending the call, so a busy or missing camera
+  dropped a working audio call. A camera problem is now reported to the UI (camera shown off, with
+  the reason) and the call goes on; only the close fence still aborts the offer.
+
 ## Where this fails
 
 | Point | Failure | Response |

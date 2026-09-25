@@ -279,7 +279,7 @@ final class EngineContractTests: XCTestCase {
     func testNoSecondStartAfterATimedOutStart() async throws {
         let capture = ScriptedCapture(.never)
         let e = engine(capture: capture, timeout: .milliseconds(200))
-        await XCTAssertThrowsAsync { _ = try await e.createPublishOffer() }
+        _ = try await e.createPublishOffer()  // the call goes on without the camera
         try e.setLocalMedia(audio: true, video: false)
         try e.setLocalMedia(audio: true, video: true)
         try? await Task.sleep(for: .milliseconds(500))
@@ -287,12 +287,47 @@ final class EngineContractTests: XCTestCase {
         await e.close()
     }
 
-    func testCaptureThatNeverStartsFailsWithinTheBound() async throws {
+    /// A camera that never starts is given up on within the bound, and the offer goes out
+    /// without it: a camera problem must not end a working audio call (core would end the call
+    /// on an offer error). The UI is told the camera is unavailable.
+    func testCameraThatNeverStartsIsReportedAndTheCallGoesOn() async throws {
         let capture = ScriptedCapture(.never)
         let e = engine(capture: capture, timeout: .milliseconds(300))
+        let problems = Locked([String]())
+        e.onCameraProblem { m in problems.withLock { $0.append(m) } }
         let started = Date()
-        await XCTAssertThrowsAsync { _ = try await e.createPublishOffer() }
+        let offer = try await e.createPublishOffer()
         XCTAssertLessThan(Date().timeIntervalSince(started), 2, "not bounded")
+        XCTAssertTrue(offer.contains("m=audio") && offer.contains("m=video"))
+        await eventually("camera problem reported") { problems.withLock { $0.count } == 1 }
+        await e.close()
+    }
+
+    /// A camera problem from before the UI registered is replayed to it.
+    func testEarlyCameraProblemIsReplayed() async throws {
+        let e = engine(capture: ScriptedCapture(.never), timeout: .milliseconds(200))
+        _ = try await e.createPublishOffer()
+        let problems = Locked([String]())
+        e.onCameraProblem { m in problems.withLock { $0.append(m) } }
+        await eventually("replayed", timeout: 2) { problems.withLock { $0.count } == 1 }
+        await e.close()
+    }
+
+    /// Turning a broken camera on later is a camera problem, not an engine failure (which core
+    /// answers by ending the call).
+    func testFailedCameraOnIsNotAnEngineFailure() async throws {
+        let capture = ScriptedCapture(.never)
+        let e = engine(capture: capture, timeout: .milliseconds(200))
+        let events = RecordingEvents()
+        e.attach(events)
+        let problems = Locked([String]())
+        e.onCameraProblem { m in problems.withLock { $0.append(m) } }
+        try e.setLocalMedia(audio: true, video: false)
+        _ = try await e.createPublishOffer()
+        try e.setLocalMedia(audio: true, video: true)
+        try? await Task.sleep(for: .milliseconds(600))
+        XCTAssertFalse(events.entries.contains { $0.hasPrefix("failed:") }, "\(events.entries)")
+        XCTAssertEqual(problems.withLock { $0.count }, 1)
         await e.close()
     }
 
