@@ -109,6 +109,11 @@ impl<S: KeySlot + ?Sized> KeyStore<S> {
         }
     }
 
+    /// The slot store underneath (to build another `KeyStore` over the same slots).
+    pub(crate) fn slots(&self) -> std::sync::Arc<S> {
+        self.slots.clone()
+    }
+
     /// Destroy `slot`'s key (crypto-erase of what it encrypts).
     pub fn destroy(&self, slot: &str) -> Result<(), KeySlotError> {
         self.slots.delete(slot.to_string())

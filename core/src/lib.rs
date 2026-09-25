@@ -34,6 +34,10 @@ mod coverage;
 mod coverage_tests;
 mod error;
 mod keyslot;
+#[allow(dead_code)] // wired into the client with stores_enabled() (C5)
+mod local;
+#[cfg(test)]
+mod local_tests;
 #[cfg(test)]
 mod log_secrecy_tests;
 #[allow(dead_code)] // wired into the client once stores turn on (C5)

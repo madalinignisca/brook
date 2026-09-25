@@ -887,3 +887,29 @@ mod post_http {
         ));
     }
 }
+
+/// A closed cache takes no more syncs, and its store can be reset right after.
+#[tokio::test]
+async fn a_closed_cache_releases_its_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let keys = KeyStore::new(slot.clone() as Arc<dyn KeySlot>);
+    let db = match store::open(dir.path(), Kind::Cache, "s", &keys).unwrap() {
+        Opened::Ready { db, .. } => db,
+        other => panic!("{other:?}"),
+    };
+    let server = Arc::new(Server {
+        pages: Mutex::new(vec![page(9, None, vec![], vec![])]),
+        calls: AtomicUsize::new(0),
+        gate: None,
+    });
+    let cache = Cache::new(db, ME.into(), server.clone(), Arc::new(no_history()));
+    cache.schedule_sync(); // pending when the close comes
+    cache.close().await;
+    tokio::time::sleep(crate::cache::HINT_DEBOUNCE * 2).await;
+    assert_eq!(server.calls.load(Ordering::SeqCst), 0, "synced after close");
+    assert!(
+        store::reset(dir.path(), Kind::Cache, "s", &keys).is_ok(),
+        "still open"
+    );
+}

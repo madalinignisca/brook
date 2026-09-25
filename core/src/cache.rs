@@ -90,6 +90,9 @@ pub(crate) struct Cache {
     /// Asked for while a run was going: that run may have fetched past the change, so it
     /// goes round once more.
     again: std::sync::atomic::AtomicBool,
+    /// Closing: no new syncs, and the debounced ones are aborted.
+    closed: std::sync::atomic::AtomicBool,
+    scheduled_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Cache {
@@ -111,6 +114,8 @@ impl Cache {
             running: Mutex::new(()),
             scheduled: std::sync::atomic::AtomicBool::new(false),
             again: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            scheduled_tasks: std::sync::Mutex::default(),
         })
     }
 
@@ -160,6 +165,9 @@ impl Cache {
     /// once more instead (it may already have fetched past the change that asked).
     pub(crate) async fn sync_now(&self) -> Result<(), SyncError> {
         use std::sync::atomic::Ordering;
+        if self.closed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         // The request is recorded before trying the lock: either the owner sees it (it
         // checks after every run and again after letting go), or the lock is free and this
         // caller runs it. No moment exists where neither happens.
@@ -227,15 +235,45 @@ impl Cache {
     /// Ask for a sync in `HINT_DEBOUNCE`; asks meanwhile join it.
     pub(crate) fn schedule_sync(self: &Arc<Self>) {
         use std::sync::atomic::Ordering;
-        if self.scheduled.swap(true, Ordering::SeqCst) {
+        if self.closed.load(Ordering::SeqCst) || self.scheduled.swap(true, Ordering::SeqCst) {
             return;
         }
         let me = Arc::clone(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             tokio::time::sleep(HINT_DEBOUNCE).await;
             me.scheduled.store(false, Ordering::SeqCst);
             let _ = me.sync_now().await;
         });
+        let mut tasks = self
+            .scheduled_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task);
+    }
+
+    /// Stop syncing and close the store, for a wipe or shutdown: debounced syncs are aborted,
+    /// a run in progress is waited for (its page commits whole or not at all), then the
+    /// database closes. Afterwards the store may be reset.
+    pub(crate) async fn close(self: Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        self.closed.store(true, Ordering::SeqCst);
+        let tasks: Vec<_> = std::mem::take(
+            &mut *self
+                .scheduled_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for t in &tasks {
+            t.abort();
+        }
+        for t in tasks {
+            let _ = t.await;
+        }
+        drop(self.running.lock().await); // a run in progress finishes first
+        if let Ok(cache) = Arc::try_unwrap(self) {
+            cache.db.close().await;
+        }
     }
 
     /// `sync.hint {seq}`: nothing to do if the cache is already there.
