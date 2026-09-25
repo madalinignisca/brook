@@ -85,11 +85,10 @@ pub enum ServerEvent {
     },
 }
 
-/// How long the server has to answer a command, counted from when it was written.
 /// Minimum wait before reconnecting after a `rate_limited` close (the close carries no
 /// `Retry-After`).
 const RATE_LIMIT_BACKOFF_SECS: u64 = 5;
-
+/// How long the server has to answer a command, counted from when it was written.
 pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Client frames above this are refused locally (the server closes with 1009).
 const MAX_FRAME_BYTES: usize = 64 * 1024;
