@@ -80,9 +80,11 @@ file browsing. Not from: other apps you run."
 
 ## 5. No secret service at all (bare sway)
 
-The Secret portal and the Secret Service both need a backend running
-(gnome-keyring, KWallet, or the standalone `oo7-daemon`). On a bare sway session
-often none runs, and a Flatpak's portal then has nothing to hand out.
+Both need a backend running. The Secret Service is provided by gnome-keyring,
+KWallet or the standalone `oo7-daemon`; the Secret **portal** by gnome-keyring or
+`oo7-portal` (KWallet as a portal backend is unverified, so don't rely on it).
+On a bare sway session often none runs, and a Flatpak's portal then has nothing
+to hand out.
 
 Detection probes **capability**, not the desktop name (`XDG_CURRENT_DESKTOP` says
 nothing about what runs): try the portal (under Flatpak) or the Secret Service.
