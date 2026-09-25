@@ -23,6 +23,7 @@ from .models import Channel, File, Membership, Message, Reaction, SyncCounter, S
 
 _STAMPED = (Message, Channel, Membership, User)
 _KEY = "brook_sync_seq"
+_TX = "brook_sync_seq_tx"  # the (sub)transaction that took it
 
 
 def _take_seq(session: Session) -> int:
@@ -40,6 +41,7 @@ def _take_seq(session: Session) -> int:
         session.execute(insert(SyncCounter).values(id=1, seq=2, floor=0))
         seq = 2
     session.info[_KEY] = seq
+    session.info[_TX] = session.get_nested_transaction() or session.get_transaction()
     return int(seq)
 
 
@@ -86,3 +88,19 @@ def transaction_seq(session: Session) -> int:
 def _forget(session: Session, transaction: Any) -> None:
     if transaction.parent is None:  # the outermost transaction ended: next one bumps again
         session.info.pop(_KEY, None)
+        session.info.pop(_TX, None)
+
+
+@event.listens_for(Session, "after_soft_rollback")
+def _forget_on_rollback(session: Session, previous_transaction: Any) -> None:
+    """A rollback of the savepoint that took the seq (or of anything above it) undid the
+    counter bump and released its row lock. Reusing the cached number afterwards would
+    stamp later writes without the lock, breaking commit order: take a fresh one."""
+    taken_in = session.info.get(_TX)
+    tx = taken_in
+    while tx is not None:
+        if tx is previous_transaction:
+            session.info.pop(_KEY, None)
+            session.info.pop(_TX, None)
+            return
+        tx = tx.parent

@@ -236,3 +236,24 @@ async def test_a_send_does_not_resend_the_member_list(client: httpx.AsyncClient)
     me = (await client.get(f"{AUTH}/me", headers=ha)).json()["id"]
     assert [m["user_id"] for m in page["memberships"]] == [me]  # only my read marker
     assert page["users"] == [] and page["channels"] == []
+
+
+async def test_a_rolled_back_savepoint_forgets_its_seq(client: httpx.AsyncClient) -> None:
+    """The savepoint that took the seq rolled back (e.g. a duplicate client_id): the
+    counter bump and its lock are gone, so the cached number must not be reused."""
+    from app.models import Message
+    from app.sync import transaction_seq
+
+    ha, _hb, ch = await _setup(client)
+    me = uuid.UUID((await client.get(f"{AUTH}/me", headers=ha)).json()["id"])
+    async with db.get_sessionmaker()() as s:
+        nested = await s.begin_nested()
+        s.add(Message(channel_id=uuid.UUID(ch), author_id=me, body="x"))
+        await s.flush()
+        assert transaction_seq(s.sync_session) > 0  # taken inside the savepoint
+        await nested.rollback()
+        assert transaction_seq(s.sync_session) == 0  # forgotten with the savepoint
+        s.add(Message(channel_id=uuid.UUID(ch), author_id=me, body="y"))
+        await s.flush()  # takes (and locks) a fresh one
+        assert transaction_seq(s.sync_session) > 0
+        await s.rollback()
