@@ -228,3 +228,33 @@ async def test_concurrent_resends_store_one_message(client: httpx.AsyncClient) -
     assert first.json()["id"] == second.json()["id"]
     history = (await client.get(url, headers=h)).json()
     assert [m["body"] for m in history] == ["once"]
+
+
+async def test_sync_cannot_lose_a_change_committed_late(client: httpx.AsyncClient) -> None:
+    """Sync spec §2, the lost-change interleaving: T1 takes a seq and stays open; T2
+    must wait (the counter row is locked until T1 commits), so a /sync in between
+    can't hand out a cursor past T1's change, and nothing is lost after both commit."""
+    from app.models import Message
+
+    user_id, pair = await _alice(client)
+    h = {"Authorization": f"Bearer {pair['access_token']}"}
+    ch = (
+        await client.post("/api/v1/channels", json={"kind": "channel", "name": "g"}, headers=h)
+    ).json()
+    cursor = (await client.get("/api/v1/sync", params={"since": "0"}, headers=h)).json()["next"]
+
+    async with db.get_sessionmaker()() as t1:
+        t1.add(Message(channel_id=uuid.UUID(ch["id"]), author_id=user_id, body="T1"))
+        await t1.flush()  # stamps: takes the counter's row lock, not committed
+        t2 = asyncio.create_task(
+            client.post(f"/api/v1/channels/{ch['id']}/messages", json={"body": "T2"}, headers=h)
+        )
+        await asyncio.sleep(SETTLE)
+        assert not t2.done()  # T2 waits for the counter
+        between = (await client.get("/api/v1/sync", params={"since": cursor}, headers=h)).json()
+        assert between["messages"] == [] and between["next"] == cursor
+        await t1.commit()
+    assert (await t2).status_code == 201
+    after = (await client.get("/api/v1/sync", params={"since": cursor}, headers=h)).json()
+    bodies = [m["body"] for m in after["messages"]]
+    assert bodies == ["T1", "T2"]  # commit order is seq order; T1 not lost

@@ -41,6 +41,7 @@ from ..schemas import (
     ReplyExcerpt,
     UserSummary,
 )
+from ..sync import transaction_seq
 
 # Quoted-reply previews are truncated to this many characters.
 _REPLY_EXCERPT_LEN = 140
@@ -121,6 +122,7 @@ def _channel_out(channel: Channel, members: list[User], unread_count: int = 0) -
         unread_count=unread_count,
         public=channel.public,
         archived=channel.archived_at is not None,
+        seq=channel.seq,
     )
 
 
@@ -395,8 +397,12 @@ async def delete_channel(
     channel = await _require_channel_admin(session, channel_id, user)
     member_ids = [m.id for m in await _members(session, channel_id)]
     await session.delete(channel)  # cascades to memberships, messages, reactions
+    await session.flush()  # writes every member's sync tombstone (app/sync.py)
+    seq = transaction_seq(session.sync_session)
     await session.commit()
-    await hub.send_to_users(member_ids, _envelope("channel.delete", {"id": str(channel_id)}))
+    await hub.send_to_users(
+        member_ids, _envelope("channel.delete", {"id": str(channel_id), "seq": seq})
+    )
     # A deleted channel has no members, so nobody is authorized to stay in its call.
     from ..calls import manager  # local import: calls pulls in the ws router
 
@@ -726,6 +732,8 @@ async def delete_message(
     )
     if file_ids:
         await session.execute(delete(File).where(File.id.in_(file_ids)))
+    await session.flush()  # stamps the tombstone's seq (app/sync.py)
+    seq = transaction_seq(session.sync_session)
     await session.commit()
     for file_id in file_ids:
         await run_in_threadpool(storage.remove, file_id)
@@ -733,7 +741,10 @@ async def delete_message(
     member_ids = [m.id for m in await _members(session, channel_id)]
     await hub.send_to_users(
         member_ids,
-        _envelope("message.delete", {"id": str(message_id), "channel_id": str(channel_id)}),
+        _envelope(
+            "message.delete",
+            {"id": str(message_id), "channel_id": str(channel_id), "seq": seq},
+        ),
     )
 
 
@@ -883,8 +894,10 @@ def _message_out(
         deleted_at=message.deleted_at,
         reply_to_id=message.reply_to_id,
         reply_to=reply,
-        reactions=reactions or [],
+        # A tombstone carries no reactions (sync spec §2).
+        reactions=[] if message.deleted_at is not None else (reactions or []),
         client_id=message.client_id,
+        seq=message.seq,
         # A tombstone carries no attachments (their files are removed with it).
         attachments=[] if message.deleted_at is not None else (attachments or []),
         mentions=mentions or [],
