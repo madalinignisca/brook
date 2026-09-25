@@ -64,8 +64,12 @@ multipart).
 - When the stream ends: `422 file.size_mismatch` if the count differs from `size`.
   Otherwise it fsyncs, then **under the file row's lock and only while `status ==
   pending`**, atomically renames its part to `<id>` and marks the file `committed`.
-- The answer is `200 FileOut`. A concurrent PUT that finishes second finds the file
-  committed, deletes its own part, and gets `409 conflict`.
+- The answer is `200 FileOut`.
+- A PUT that finishes second (or arrives after the commit) finds the file committed,
+  deletes its own part, and gets `409 {code: "file.already_committed", details: FileOut}`.
+  - Why the body: an outbox retry that lost to its own earlier attempt must confirm its
+    bytes won, by comparing `details.sha256` with its own. It is the one error body the
+    client is meant to read. It carries no user input, so it is safe to read, unlike a 422.
 - Caddy caps the request body at 100 MB on this path, a second limit in front of the api.
 - A second PUT to a committed file is `409 conflict`. Uploads don't resume: a failed upload
   is restarted with PUT (the part is overwritten).
@@ -78,7 +82,8 @@ files).
 - `MessageOut`, `message.new` and `message.update` carry `attachments: [FileOut]`. `PATCH`
   can't change attachments in MVP+.
 
-**Download:** `GET /files/{id}/content`, by a member of the file's channel, with the normal
+**Download:** `GET /files/{id}/content` (the §5 headers are set on this route by the api,
+and Caddy adds nosniff and the CSP on `/api/v1/files/*/content` as a second layer), by a member of the file's channel, with the normal
 bearer token. A `pending` file is `404`, since it doesn't exist yet for anyone. Auth is checked
 when the request starts, so a long download outlives token expiry, and a resume is just a
 new `Range` request with a fresh token. The api streams the file (Starlette `FileResponse`), and **`Range` is
@@ -179,7 +184,8 @@ With an index on `(status, created_at)` and on `uploader_id`.
 2. **Streaming cap:** a body over the declared size gives 413 and leaves no part file behind;
    a short body gives 422; memory stays bounded (a large upload through a test client).
 2a. **Overlapping PUTs** to one pending file: exactly one commits, the stored bytes and
-    sha256 are exactly that body's, the other gets 409, and no part files remain.
+    sha256 are exactly that body's, the other gets `409 file.already_committed` whose
+    `details` is the committed FileOut, and no part files remain.
 3. **Atomic commit:** a crash before the rename leaves no committed row and no final file;
    the sha256 is stored.
 4. **Attach rules:** another user's file, another channel's file, a pending file and an
