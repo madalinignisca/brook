@@ -15,6 +15,9 @@
 | `POST /auth/ldap` | LDAP bind credentials → tokens |
 | `POST /auth/refresh` | refresh → new access token (rotates refresh token) |
 | `POST /auth/logout` | revoke refresh token |
+| `POST /auth/password` | change own password `{current_password, new_password}` → fresh `{access_token, refresh_token}`; see §1.1 |
+| `GET  /users` · `?handle=` | **admin**: all users by handle · exact handle (404 `not_found` if none) |
+| `POST /users/{id}/password` | **admin**: set a member's password `{admin_password, new_password}` → 204; see §1.1 |
 | `GET  /health` | liveness/readiness (also on `sfu`; unauthenticated) |
 | `GET  /me` · `PATCH /me` | current user · update profile/avatar |
 | `GET  /channels` | channels/DMs the user belongs to |
@@ -34,6 +37,32 @@
 | `POST /channels/{id}/bots` · `DELETE /channels/{id}/bots/{bot}` | add / remove bot from channel |
 | `POST /bots/{id}/webhook` | **inbound** webhook: external posts as bot (HMAC-signed) |
 
+### 1.1 Password changes and sessions
+
+- `POST /auth/password` needs a full access token and the current password.
+  On success **every** refresh token of the user is revoked (all devices signed
+  out), and the response carries a new pair for the calling client.
+- **The old refresh token is dead the moment the server commits.** A client that
+  loses the response (timeout, dropped connection) still holds revoked tokens: its
+  next `/auth/refresh` gets 401 `auth.invalid_token`, it looks signed out, and
+  signing in with the **new** password works. There is no idempotent retry.
+- Access tokens already issued are stateless JWTs and stay valid until they expire
+  (≤ `access_ttl_seconds`, 15 min), on every device. Revoking refresh tokens is
+  what ends the sessions; open WebSockets end at their next re-auth.
+- Wrong current password: **403** `auth.invalid_credentials`, deliberately not 401,
+  so clients do not mistake it for an expired access token and refresh-and-retry.
+  New password outside 8–256 characters, or equal to the current one: 422.
+- `POST /users/{id}/password` (admin) revokes the target's refresh tokens the same
+  way. The admin re-authenticates with `admin_password` (wrong: 403
+  `auth.invalid_credentials`), so a stolen admin access token alone cannot hand
+  the thief lasting logins. It only works on **members**: the admin's own account
+  is 400 `invalid`, another admin is 403 `authz.forbidden`. An admin password only
+  ever changes through `POST /auth/password`. Non-admin caller: 403
+  `authz.forbidden`; unknown id: 404 `not_found`.
+- Token issue and revocation are serialised per user (the server locks the user
+  row in login, refresh, password change and admin reset), so a refresh racing a
+  password change cannot mint a token that outlives it.
+
 ## 2. WebSocket (realtime plane) — `wss://<host>/ws`
 
 **Authentication** (matches `core/src/ws.rs` and `services/api/app/routers/ws.py`):
@@ -45,6 +74,11 @@
   **closes with `1008`**; the close *reason* says which: `auth_failed`,
   `auth_timeout`. The client's remedy is the same for all: refresh over REST, then
   reconnect.
+- `1008` / `rate_limited`: the server refused to examine the token because this
+  client IP has been failing authentication (REST logins, refreshes and WS `auth`
+  frames share one budget). The token may still be valid. Wait; do not refresh in a
+  loop, since `/auth/refresh` answers the same condition with `429` +
+  `Retry-After`. Then reconnect.
 - The socket also closes with `1008` / `token_expired` when its access token
   expires. To avoid that, the client may send the same `auth` frame **again on the
   open socket** with a fresh token for the same user; the server answers another

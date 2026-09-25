@@ -13,7 +13,7 @@ from . import __version__, calls
 from .config import get_settings
 from .db import init_models
 from .errors import register_error_handlers
-from .routers import auth, channels, health, ws
+from .routers import auth, channels, health, users, ws
 
 
 @asynccontextmanager
@@ -35,6 +35,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(auth.router, prefix="/api/v1")
     app.include_router(channels.router, prefix="/api/v1")
+    app.include_router(users.router, prefix="/api/v1")
     app.include_router(ws.router)  # /ws at the root, not under /api/v1
     # Importing app.calls registers the call.* WebSocket commands; holding the
     # manager on app.state makes that dependency explicit, so no tool (or person)

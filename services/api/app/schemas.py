@@ -16,17 +16,34 @@ class RegisterIn(BaseModel):
     password: str = Field(min_length=8, max_length=256)
 
 
-class LoginIn(BaseModel):
-    """Login payload."""
+class PasswordChangeIn(BaseModel):
+    """Change the caller's own password (re-authenticates with the current one)."""
 
-    handle: str
-    password: str
+    # No min length on the current password: it is checked against the hash, and
+    # accounts may predate the policy. The cap bounds argon2 work per request.
+    current_password: str = Field(max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
+
+class AdminPasswordIn(BaseModel):
+    """An admin sets another user's password, re-authenticating with their own."""
+
+    admin_password: str = Field(max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
+
+class LoginIn(BaseModel):
+    """Login payload. Bounded like RegisterIn: oversized input is a 422 before the
+    database, the rate limiter (which keys on the handle) or Argon2 sees it."""
+
+    handle: str = Field(max_length=64)
+    password: str = Field(max_length=256)
 
 
 class RefreshIn(BaseModel):
     """Refresh payload."""
 
-    refresh_token: str
+    refresh_token: str = Field(max_length=512)
 
 
 class TokenPair(BaseModel):
