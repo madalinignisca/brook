@@ -95,7 +95,7 @@ deletes local data (snapshots), and changes the outbox format.
       the snapshot files are removed after that commit (journalled like cache deletions:
       the design's `deletions` table in outbox.db).
 5. **Failures:**
-   - transient (network, 5xx including `507 file.no_space`, 408/409 in progress, 429, and
+   - transient (network, 5xx including `507 file.no_space` with its `Retry-After: 600`, #126, 408/409 in progress, 429, and
      **401 / `NotAuthenticated`**, which waits for the session's refresh or the next
      sign-in, as a text row does): retried with backoff; the row stays pending, and the
      file's transfer events say `Retrying`, never `Failed`;
@@ -129,10 +129,9 @@ deletes local data (snapshots), and changes the outbox format.
    source file would break "the bytes you queued are the bytes sent". With **no** outbox
    (its key locked or damaged), files can't be sent at all; that's the design's §5.7
    rule, unchanged here.
-7a. **A message with files and no text:** the server requires a non-empty body today
-   (`schemas.py`). Pending its answer, `send_queued_with_files` refuses an empty body with
-   `outbox.empty_body` before anything is copied; if the server lifts the rule, this
-   check goes.
+7a. **A message with files and no text** is a normal message: the server allows an empty
+   body when attachments are present (#126). Only a message with neither text nor files
+   is refused locally (`outbox.empty_message`), as the server would refuse it.
 8. **Wipes** (sign-out with "Remove this device's data", other users, a lost key) remove the
    snapshot directory with the store, as they already do for everything under it.
 9. **Outbox format 3**: the `outbox_files` table as used here, the `deletions` journal, and
@@ -171,7 +170,8 @@ Taken: epoch-bound uploads and cancel on sign-out (4); 401 and 507 transient (5)
 verification before upload (3); fsync before commit, size from the copy, a key per write,
 fixed-width AAD (2, 3); reconciliation before enqueue (6); a repeat call returns the stored
 receipt (2); an empty body refused until the server says otherwise (7a); cancel per file
-state and Delete cancelling first (5); a per-file error (5); `Retrying` rather than
+state and Delete cancelling first (5); a per-file error (5); the empty body, first refused
+locally and then allowed once the server took files-only messages (#126) (7a); `Retrying` rather than
 `Failed` events for retried uploads (5); head-of-line blocking stated (4); the 24 h sweep
 (4.3a, added from the server's facts while the review ran).
 

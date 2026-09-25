@@ -85,7 +85,7 @@ rounds are at the end.
    - `Outgoing` gains `attachments: Vec<String>`; `send_body` puts it in the JSON only when
      non-empty.
    - `enqueue_with_files` does, in order:
-     1. limits and the empty body;
+     1. limits, and neither text nor files (`outbox.empty_message`);
      2. a stored `client_id` returns its receipt;
      3. snapshots via `spawn_blocking`, with `Preparing` progress;
      4. one transaction for the row and its files;
@@ -108,7 +108,8 @@ rounds are at the end.
      3. check that the ids are distinct;
      4. POST with the ids in order. A first `file.not_attachable` clears the `file_id`s
         and repeats 2 in the same attempt; a second fails the row.
-   - **Transient, by code:** network errors, 5xx, `file.no_space`, 408, 429, the
+   - **Transient, by code:** network errors, 5xx, `file.no_space` (added to
+     `transfer::is_transient` in step 2), 408, 429, the
      in-progress, expired and stalled upload codes, `transfer.paused`,
      `NotAuthenticated`/401, and `UnexpectedResponse` (as in `Post::send`).
    - **Cancel:** via the row map (step 2). Checked before each create, between chunks, and
@@ -141,7 +142,8 @@ rounds are at the end.
        at the next open;
      - ack and Delete leave no snapshot files; an unreadable key deletes none;
      - 10 files are accepted, 11 refused, a file over 100 MiB refused, and an empty body
-       refused, with nothing written.
+       refused, and a message with neither text nor files refused, with nothing written;
+       a files-only message (empty body) is sent.
 5. **Core API:** `send_queued_with_files`, `OutgoingFile`, `SendReceipt`, `QueuedFile`,
    `PendingFile`, the consts, and `Error::Api` codes for the local refusals.
 6. **FFI:**
