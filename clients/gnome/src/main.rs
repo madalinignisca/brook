@@ -9,6 +9,7 @@
 //! back by hand. All GTK widgets are captured by **weak** reference inside async
 //! tasks and signal handlers so nothing keeps the window graph alive (no cycles).
 
+mod account;
 mod call;
 mod chat;
 mod prefs;
