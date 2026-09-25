@@ -11,6 +11,10 @@
 mod account;
 #[cfg(test)]
 mod account_tests;
+#[allow(dead_code)] // wired up by the sync loop (C2) and the read API (C3)
+mod apply;
+#[cfg(test)]
+mod apply_tests;
 mod call;
 #[cfg(test)]
 mod call_tests;
@@ -18,6 +22,10 @@ mod call_types;
 mod chat;
 mod client;
 mod config;
+#[allow(dead_code)] // read by cached_messages (C3)
+mod coverage;
+#[cfg(test)]
+mod coverage_tests;
 mod error;
 mod keyslot;
 #[cfg(test)]
@@ -34,6 +42,10 @@ mod state;
 mod store;
 #[cfg(test)]
 mod store_tests;
+#[allow(dead_code)] // wired into the client with the read API (C3)
+mod sync;
+#[cfg(test)]
+mod sync_tests;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;

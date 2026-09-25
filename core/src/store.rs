@@ -58,7 +58,10 @@ impl Kind {
     /// Bumped on any schema change: pre-1.0 there are no migrations (a cache rebuilds; an
     /// outbox is surfaced first).
     fn format(self) -> i64 {
-        1
+        match self {
+            Kind::Cache => 2, // 2: `removed.active` (the removal floor)
+            Kind::Outbox | Kind::Index => 1,
+        }
     }
 
     fn schema(self) -> &'static str {
@@ -74,7 +77,8 @@ const CACHE_V1: &str = "
 CREATE TABLE meta(id INTEGER PRIMARY KEY CHECK (id = 1), format INTEGER NOT NULL,
                   cursor TEXT NOT NULL DEFAULT '0', generation INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE channels(id TEXT PRIMARY KEY, seq INTEGER NOT NULL, json TEXT NOT NULL);
-CREATE TABLE removed(channel_id TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+CREATE TABLE removed(channel_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,
+                     active INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE memberships(channel_id TEXT NOT NULL, user_id TEXT NOT NULL, seq INTEGER NOT NULL,
                          left INTEGER NOT NULL DEFAULT 0, json TEXT NOT NULL,
                          PRIMARY KEY (channel_id, user_id));
