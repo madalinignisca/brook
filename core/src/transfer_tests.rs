@@ -439,3 +439,116 @@ async fn attachments_arrive_on_messages() {
     assert_eq!(message.attachments.len(), 1);
     assert_eq!(message.attachments[0].original_name, "Ștefan–raport.pdf");
 }
+
+#[tokio::test]
+async fn an_over_long_body_is_refused_before_it_is_written() {
+    let server = MockServer::start().await;
+    let client = signed_in(&server).await;
+    let digest = sha(BYTES);
+    let mut long = BYTES.to_vec();
+    long.extend(std::iter::repeat_n(b'x', 1 << 20)); // a megabyte more than declared
+    Mock::given(method("GET"))
+        .and(path("/api/v1/files/f1/content"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", format!("\"{digest}\"").as_str())
+                .set_body_bytes(long),
+        )
+        .mount(&server)
+        .await;
+    let restarts = Arc::new(Mutex::new(0));
+    let mut sink = MemSink {
+        held: Vec::new(),
+        restarts,
+    };
+    let err = client
+        .download_file(
+            TransferId::new(),
+            "f1",
+            &digest,
+            BYTES.len() as u64,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Api { ref code, .. } if code == "transfer.integrity"),
+        "{err:?}"
+    );
+    assert!(
+        sink.held.len() as u64 <= BYTES.len() as u64,
+        "wrote {} bytes past the size",
+        sink.held.len()
+    );
+}
+
+#[tokio::test]
+async fn a_weak_etag_on_a_resume_starts_over_without_a_range() {
+    let server = MockServer::start().await;
+    let client = signed_in(&server).await;
+    let digest = sha(BYTES);
+    // With a Range: a proxy answers 206 with a weak ETag (bytes not trustworthy).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/files/f1/content"))
+        .and(header_exists("range"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("etag", format!("W/\"{digest}\"").as_str())
+                .insert_header("content-range", "bytes 6-21/22")
+                .set_body_bytes(&BYTES[6..]),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Without one: the whole file.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/files/f1/content"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(BYTES))
+        .mount(&server)
+        .await;
+    let restarts = Arc::new(Mutex::new(0));
+    let mut sink = MemSink {
+        held: BYTES[..6].to_vec(),
+        restarts: restarts.clone(),
+    };
+    client
+        .download_file(
+            TransferId::new(),
+            "f1",
+            &digest,
+            BYTES.len() as u64,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sink.held, BYTES);
+    assert_eq!(*restarts.lock().unwrap(), 1);
+}
+
+#[test]
+fn transient_errors_are_the_retryable_ones() {
+    let api = |code: &str| Error::Api {
+        code: code.into(),
+        message: String::new(),
+    };
+    for code in [
+        "file.upload_stalled",
+        "file.upload_in_progress",
+        "rate_limited",
+        "transfer.network",
+        "http_502",
+    ] {
+        assert!(is_transient(&api(code)), "{code}");
+    }
+    for code in [
+        "file.already_committed",
+        "file.too_large",
+        "file.no_space",
+        "transfer.integrity",
+        "transfer.cancelled",
+        "http_404",
+    ] {
+        assert!(!is_transient(&api(code)), "{code}");
+    }
+    assert!(!is_transient(&Error::NotAuthenticated));
+}

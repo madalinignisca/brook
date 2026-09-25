@@ -69,7 +69,7 @@ pub use keyslot::{InMemoryKeySlot, KeySlot, KeySlotError, KeyStore};
 pub use session::{Session, User};
 pub use state::AuthState;
 pub use transfer::{
-    DownloadSink, FileInfo, FileSink, FileSource, SinkError, TransferEvent, TransferId,
-    TransferState, UploadSource,
+    is_transient, DownloadSink, FileInfo, FileSink, FileSource, SinkError, TransferEvent,
+    TransferId, TransferState, UploadSource,
 };
 pub use ws::ServerEvent;

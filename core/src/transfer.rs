@@ -231,6 +231,25 @@ fn integrity_error() -> Error {
     }
 }
 
+/// Whether a transfer error is worth retrying later (the outbox keeps the row pending) or
+/// final (the row fails with the code). One list for transfers and the outbox (C4).
+pub fn is_transient(err: &Error) -> bool {
+    match err {
+        Error::Http(_) | Error::Timeout | Error::Disconnected => true,
+        Error::Api { code, .. } => {
+            matches!(
+                code.as_str(),
+                "file.upload_stalled"
+                    | "file.upload_in_progress"
+                    | "rate_limited"
+                    | "auth.rate_limited"
+                    | "transfer.network"
+            ) || code.starts_with("http_5")
+        }
+        _ => false,
+    }
+}
+
 /// `Retry-After` in whole seconds, within 1..=60 (default 2).
 fn retry_after(resp: &reqwest::Response) -> u64 {
     resp.headers()
@@ -294,6 +313,9 @@ impl BrookClient {
     /// Upload an attachment to `channel_id`. `client_id` (a UUID the caller keeps for this
     /// file, e.g. in its outbox) makes a retry after a lost response find the same file.
     /// Returns the committed file, to attach to a message.
+    ///
+    /// A `401` is returned as [`Error::NotAuthenticated`]: the caller owns refreshing and
+    /// retrying (with the same `client_id`, the retry finds the same file).
     pub async fn upload_file(
         &self,
         id: TransferId,
@@ -477,7 +499,8 @@ impl BrookClient {
     }
 
     /// Download attachment `file_id` into `sink`, resuming from what it already holds.
-    /// `sha256` and `size` come from the message's [`FileInfo`].
+    /// `sha256` and `size` come from the message's [`FileInfo`]. A `401` is returned as
+    /// [`Error::NotAuthenticated`]: the caller refreshes and calls again (it resumes).
     pub async fn download_file(
         &self,
         id: TransferId,
@@ -511,6 +534,7 @@ impl BrookClient {
         let url = self.base.join(&format!("api/v1/files/{file_id}/content"))?;
         let validator = format!("\"{sha256}\"");
         let mut attempt = 0u32;
+        let mut no_range = false;
         loop {
             if cancel.load(Ordering::SeqCst) {
                 return Err(cancelled_error());
@@ -531,7 +555,7 @@ impl BrookClient {
                 .get(url.clone())
                 .bearer_auth(token)
                 .timeout(TRANSFER_TIMEOUT);
-            if offset > 0 {
+            if offset > 0 && !no_range {
                 request = request
                     .header(RANGE, format!("bytes={offset}-"))
                     .header(IF_RANGE, &validator);
@@ -550,7 +574,16 @@ impl BrookClient {
                             // The server's ETag is the sha256 we expect: a different one
                             // means a different file, never "almost this one".
                             let etag = resp.headers().get(ETAG).and_then(|v| v.to_str().ok());
-                            if etag.is_some_and(|e| e != validator) {
+                            // A weak ETag (W/"…", a compressing proxy) promises nothing about
+                            // bytes: a range can't be trusted, so start over without one and
+                            // let the final sha256 decide.
+                            if etag.is_some_and(|e| e.starts_with("W/")) {
+                                if status == StatusCode::PARTIAL_CONTENT || offset > 0 {
+                                    sink.restart().await.map_err(|e| io_error(&e))?;
+                                    no_range = true;
+                                    continue;
+                                }
+                            } else if etag.is_some_and(|e| e != validator) {
                                 return Err(integrity_error());
                             }
                             if status == StatusCode::OK && offset > 0 {
@@ -571,6 +604,7 @@ impl BrookClient {
                                 }
                                 Err(Streamed::Cancelled) => return Err(cancelled_error()),
                                 Err(Streamed::Sink(err)) => return Err(io_error(&err)),
+                                Err(Streamed::TooLong) => return Err(integrity_error()),
                                 Err(Streamed::Network) if attempt < MAX_ATTEMPTS => {
                                     backoff(attempt) // resume from what the sink holds
                                 }
@@ -623,6 +657,11 @@ impl BrookClient {
                 return Err(Streamed::Cancelled);
             }
             let chunk = chunk.map_err(|_| Streamed::Network)?;
+            // Never write past the declared size: an over-long body would otherwise fill
+            // the disk before the sha256 check at the end could refuse it.
+            if sink.resume_offset() + chunk.len() as u64 > size {
+                return Err(Streamed::TooLong);
+            }
             sink.write_chunk(&chunk).await.map_err(Streamed::Sink)?;
             if last.elapsed() >= PROGRESS_EVERY {
                 last = Instant::now();
@@ -652,6 +691,8 @@ enum Streamed {
     Cancelled,
     Network,
     Sink(io::Error),
+    /// More bytes than the file's size.
+    TooLong,
 }
 
 fn content_range_starts_at(resp: &reqwest::Response, offset: u64) -> bool {
