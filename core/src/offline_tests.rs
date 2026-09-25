@@ -266,6 +266,95 @@ async fn cache_notices_reach_the_app() {
     assert_eq!(got, "c");
 }
 
+// ---- The client-level state feed and lost messages ----
+
+async fn synced(rx: &mut tokio::sync::watch::Receiver<crate::cache::CacheState>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while rx.borrow_and_update().last_synced.is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the feed never showed a sync"
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(50), rx.changed()).await;
+    }
+}
+
+/// Signed in, the feed follows the cache; signed out, it's the default at once; signed in
+/// again, it follows again.
+#[tokio::test]
+async fn the_state_feed_follows_the_signed_in_user() {
+    let mut s = setup().await;
+    let mut feed = s.offline.state_feed();
+    sign_in(&mut s, "u1", 1).await;
+    synced(&mut feed).await;
+    s.offline.signed_out();
+    assert_eq!(
+        *feed.borrow(),
+        crate::cache::CacheState::default(),
+        "signed out, the feed still showed the user's state"
+    );
+    sign_in(&mut s, "u1", 2).await;
+    synced(&mut feed).await;
+}
+
+/// A sign-out and sign-in of one user that reach the watcher as one change (no
+/// `signed_out` between) still reset the feed.
+#[tokio::test]
+async fn a_new_epoch_for_the_same_user_resets_the_feed() {
+    let mut s = setup().await;
+    let mut feed = s.offline.state_feed();
+    sign_in(&mut s, "u1", 1).await;
+    synced(&mut feed).await;
+    feed.borrow_and_update();
+    sign_in(&mut s, "u1", 3).await;
+    assert!(
+        feed.has_changed().unwrap(),
+        "the feed carried on across the new session"
+    );
+}
+
+/// A forwarder whose generation has passed writes nothing, even while its cache still
+/// changes (the window between a switch and the old forwarder stopping).
+#[tokio::test]
+async fn a_stale_forwarder_never_overwrites_the_reset() {
+    let mut s = setup().await;
+    sign_in(&mut s, "u1", 1).await;
+    let cache = s.offline.active().unwrap().cache.clone();
+    let feed = crate::offline::StateFeed::new(
+        tokio::sync::watch::channel(crate::cache::CacheState::default()).0,
+    );
+    let rx = feed.subscribe();
+    let _old = feed.follow(&cache); // kept running on purpose
+    feed.reset();
+    tokio::time::sleep(Duration::from_millis(700)).await; // past the sign-in's sync
+    cache.sync_now().await.unwrap();
+    assert_eq!(
+        *rx.borrow(),
+        crate::cache::CacheState::default(),
+        "the old cache's state reached the feed after the reset"
+    );
+}
+
+/// Losses are numbered: acknowledging one clears it, but a loss that happened after the
+/// app read the number stays reported.
+#[test]
+fn acknowledging_a_loss_keeps_a_newer_one() {
+    let losses = std::sync::Mutex::new(crate::offline::Losses::default());
+    let (events, _) = broadcast::channel(4);
+    assert_eq!(losses.lock().unwrap().current(), None);
+    crate::offline::record_loss(&losses, &events);
+    let seen = losses.lock().unwrap().current().unwrap();
+    crate::offline::record_loss(&losses, &events); // meanwhile
+    losses.lock().unwrap().acknowledge(seen);
+    let newer = losses.lock().unwrap().current();
+    assert!(
+        newer.is_some_and(|n| n > seen),
+        "the newer loss was cleared"
+    );
+    losses.lock().unwrap().acknowledge(newer.unwrap());
+    assert_eq!(losses.lock().unwrap().current(), None);
+}
+
 // ---- Through BrookClient (the auth watcher wiring) ----
 
 mod client {
@@ -352,6 +441,47 @@ mod client {
             read.await.unwrap().is_err(),
             "another user read the open stores"
         );
+    }
+
+    /// Unsent messages lost while the local data was being opened (before any listener
+    /// existed) are still reported afterwards, until acknowledged.
+    #[tokio::test]
+    async fn a_loss_found_while_enabling_is_kept_for_the_app() {
+        let server = TestServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let slot = Arc::new(InMemoryKeySlot::default());
+        let stores = dir.path().join("stores");
+        {
+            let local = crate::local::LocalData::open(&stores, slot.clone() as Arc<dyn KeySlot>)
+                .await
+                .unwrap()
+                .unwrap();
+            let u = local.open_user("https://a", "u1").await.unwrap();
+            if let crate::store::Opened::Ready { db, .. } = u.cache {
+                db.close().await;
+            }
+            let crate::store::Opened::Ready { db: outbox, .. } = u.outbox else {
+                panic!("outbox not ready");
+            };
+            outbox
+                .call(|c| {
+                    c.execute(
+                        "INSERT INTO outbox(client_id, channel_id, body, state, created_at)
+                         VALUES ('x', 'c', 'hi', 'queued', 'now')",
+                        [],
+                    )
+                })
+                .await
+                .unwrap();
+            outbox.close().await;
+            local.close().await;
+        }
+        slot.put("index", vec![5; 32]); // the index key is lost
+        let c = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        assert!(c.enable_local_data(slot, dir.path().to_path_buf()).await);
+        let n = c.outbox_lost().expect("the loss wasn't kept");
+        c.acknowledge_outbox_lost(n);
+        assert_eq!(c.outbox_lost(), None);
     }
 
     /// Dropping the client closes the open stores and the index: once it has, every file

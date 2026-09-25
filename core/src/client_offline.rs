@@ -94,9 +94,14 @@ impl BrookClient {
             return false;
         }
         if local.take_lost_unsent() {
-            let _ = self.cache_events.send(CacheEvent::OutboxLost);
+            crate::offline::record_loss(&self.losses, &self.cache_events);
         }
-        *self.offline.lock().await = Some(Offline::with_events(local, self.cache_events.clone()));
+        *self.offline.lock().await = Some(Offline::with_events(
+            local,
+            self.cache_events.clone(),
+            crate::offline::StateFeed::new(self.cache_state.clone()),
+            self.losses.clone(),
+        ));
         self.session.note_runtime();
         let (offline, net, origin) = (self.offline.clone(), self.net(), self.origin());
         let session = self.session.clone();
@@ -154,6 +159,29 @@ impl BrookClient {
         self.cache_events.subscribe()
     }
 
+    /// The signed-in user's sync state, following sign-ins and switches: the default
+    /// while nobody's stores are open or nobody is signed in.
+    pub fn subscribe_cache_state(&self) -> tokio::sync::watch::Receiver<crate::cache::CacheState> {
+        self.cache_state.subscribe()
+    }
+
+    /// The newest loss of unsent messages the app hasn't acknowledged (say "some messages
+    /// couldn't be kept"), or `None`. Read at start and after `OutboxLost` or `Reset`.
+    pub fn outbox_lost(&self) -> Option<u64> {
+        self.losses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current()
+    }
+
+    /// The app told the user about loss `n`. A newer loss stays reported.
+    pub fn acknowledge_outbox_lost(&self, n: u64) {
+        self.losses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .acknowledge(n);
+    }
+
     /// Sign out, first erasing this user's local data ("Remove this device's data", #46
     /// §8). The erase is local and happens first, whether or not the server can be reached.
     pub async fn sign_out_and_forget(&self) -> Result<()> {
@@ -208,14 +236,22 @@ impl BrookClient {
     pub async fn cached_channels(&self) -> Result<Vec<Channel>> {
         let cache = self.active_cache().await?;
         let rows = cache.cached_channels().await.map_err(|_| store_error())?;
-        Ok(rows
+        let total = rows.len();
+        let channels: Vec<Channel> = rows
             .into_iter()
             .filter_map(|row| {
                 let mut ch: Channel = serde_json::from_value(row.json).ok()?;
                 ch.unread_count = i64::from(row.unread);
                 Some(ch)
             })
-            .collect())
+            .collect();
+        if channels.len() < total {
+            tracing::debug!(
+                dropped = total - channels.len(),
+                "unreadable cached channels"
+            );
+        }
+        Ok(channels)
     }
 
     /// Cached messages, **newest first** (unlike `channel_history`, which is oldest first).
@@ -231,12 +267,20 @@ impl BrookClient {
             .cached_messages(channel_id, before, limit)
             .await
             .map_err(|_| store_error())?;
+        let total = page.messages.len();
+        let messages: Vec<Message> = page
+            .messages
+            .into_iter()
+            .filter_map(|m| serde_json::from_value(m).ok())
+            .collect();
+        if messages.len() < total {
+            tracing::debug!(
+                dropped = total - messages.len(),
+                "unreadable cached messages"
+            );
+        }
         Ok(CachedMessages {
-            messages: page
-                .messages
-                .into_iter()
-                .filter_map(|m| serde_json::from_value(m).ok())
-                .collect(),
+            messages,
             needs_network: page.needs_network,
         })
     }

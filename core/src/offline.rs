@@ -13,13 +13,14 @@
 //! - **Another user signed in before** (#46 §8): their stores are listed with their unsent
 //!   count, for the app to say so, and wiped on `wipe_others`.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
 use tokio::sync::{broadcast, watch};
 
-use crate::cache::{Cache, CacheEvent, History};
+use crate::cache::{Cache, CacheEvent, CacheState, History};
 use crate::local::LocalData;
 use crate::outbox::{Outbox, Post};
 use crate::store::{Opened, StoreError};
@@ -36,6 +37,49 @@ pub(crate) struct Net {
     pub(crate) post: Arc<dyn Post>,
 }
 
+/// Lost unsent messages: `newest` numbers every loss (it never restarts), `unacked` holds
+/// until the app acknowledges that number.
+#[derive(Debug, Default)]
+pub(crate) struct Losses {
+    newest: u64,
+    unacked: bool,
+}
+
+impl Losses {
+    /// The newest loss the app hasn't acknowledged.
+    pub(crate) fn current(&self) -> Option<u64> {
+        self.unacked.then_some(self.newest)
+    }
+
+    /// Clears only if `n` is still the newest: a loss after the app read `n` stays.
+    pub(crate) fn acknowledge(&mut self, n: u64) {
+        if n == self.newest {
+            self.unacked = false;
+        }
+    }
+}
+
+/// Record a loss, then say so (the notice is a hint to re-read `current`).
+pub(crate) fn record_loss(losses: &Mutex<Losses>, events: &broadcast::Sender<CacheEvent>) {
+    {
+        let mut l = losses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        l.newest += 1;
+        l.unacked = true;
+    }
+    let _ = events.send(CacheEvent::OutboxLost);
+}
+
+/// Aborts its task when dropped, however the owner ends.
+pub(crate) struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// One user's open stores and the tasks feeding them.
 pub(crate) struct Active {
     pub(crate) origin: String,
@@ -43,7 +87,63 @@ pub(crate) struct Active {
     pub(crate) cache: Arc<Cache>,
     pub(crate) outbox: Arc<Outbox>,
     session: watch::Sender<Option<u64>>,
+    /// The session epoch the state feed follows: a new one restarts it.
+    epoch: u64,
     pump: tokio::task::JoinHandle<()>,
+    /// Copies the cache's state to the client's feed while this user is signed in.
+    state_feed: Option<AbortOnDrop>,
+}
+
+/// The client-level state feed: per-user forwarders write it only while their generation
+/// is current, checked inside the watch's lock, so a reset (generation bumped, then
+/// default sent through the same lock) is never overwritten by the previous user's cache.
+#[derive(Clone)]
+pub(crate) struct StateFeed {
+    out: watch::Sender<CacheState>,
+    generation: Arc<AtomicU64>,
+}
+
+impl StateFeed {
+    pub(crate) fn new(out: watch::Sender<CacheState>) -> Self {
+        Self {
+            out,
+            generation: Arc::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subscribe(&self) -> watch::Receiver<CacheState> {
+        self.out.subscribe()
+    }
+
+    /// Back to the default state; forwarders started before this write nothing more.
+    pub(crate) fn reset(&self) -> u64 {
+        let mine = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.out.send_replace(CacheState::default());
+        mine
+    }
+
+    /// Follow `cache`'s state from now on (after a reset).
+    pub(crate) fn follow(&self, cache: &Arc<Cache>) -> AbortOnDrop {
+        let mine = self.reset();
+        let (out, generation) = (self.out.clone(), self.generation.clone());
+        let mut rx = cache.state();
+        AbortOnDrop(tokio::spawn(async move {
+            loop {
+                let now = rx.borrow_and_update().clone();
+                out.send_if_modified(|s| {
+                    if generation.load(Ordering::SeqCst) != mine || *s == now {
+                        return false;
+                    }
+                    *s = now;
+                    true
+                });
+                if rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        }))
+    }
 }
 
 pub(crate) struct Offline {
@@ -51,6 +151,8 @@ pub(crate) struct Offline {
     active: Option<Active>,
     /// One notice stream for the app, whoever is signed in.
     events: broadcast::Sender<CacheEvent>,
+    state: StateFeed,
+    losses: Arc<Mutex<Losses>>,
     /// The last "Remove this device's data": that user at that session epoch or earlier
     /// never gets stores again (a sign-in event still queued from before the wipe would
     /// otherwise recreate them). The next sign-in is a later epoch.
@@ -60,17 +162,35 @@ pub(crate) struct Offline {
 impl Offline {
     #[cfg(test)]
     pub(crate) fn new(local: LocalData) -> Self {
-        Self::with_events(local, broadcast::channel(512).0)
+        Self::with_events(
+            local,
+            broadcast::channel(512).0,
+            StateFeed::new(watch::channel(CacheState::default()).0),
+            Arc::default(),
+        )
     }
 
-    /// Notices go to `events` (the client's, which outlives any one user's stores).
-    pub(crate) fn with_events(local: LocalData, events: broadcast::Sender<CacheEvent>) -> Self {
+    /// Notices go to `events`, the state to `state` and losses to `losses`: the client's,
+    /// which outlive any one user's stores.
+    pub(crate) fn with_events(
+        local: LocalData,
+        events: broadcast::Sender<CacheEvent>,
+        state: StateFeed,
+        losses: Arc<Mutex<Losses>>,
+    ) -> Self {
         Self {
             local,
             active: None,
             events,
+            state,
+            losses,
             forgotten: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_feed(&self) -> watch::Receiver<CacheState> {
+        self.state.out.subscribe()
     }
 
     #[cfg(test)]
@@ -108,8 +228,14 @@ impl Offline {
                 return Ok(false);
             }
         }
-        if let Some(a) = &self.active {
+        if let Some(a) = &mut self.active {
             if a.origin == origin && a.user_id == user_id {
+                // A new epoch restarts the feed: a sign-out and sign-in of this user can
+                // reach the watcher as one change, with no `signed_out` in between.
+                if a.epoch != epoch {
+                    a.epoch = epoch;
+                    a.state_feed = Some(self.state.follow(&a.cache));
+                }
                 a.session.send_replace(Some(epoch));
                 return Ok(true);
             }
@@ -117,7 +243,7 @@ impl Offline {
         self.close_active().await;
         let stores = self.local.open_user(origin, user_id).await?;
         if stores.outbox_lost {
-            let _ = self.events.send(CacheEvent::OutboxLost);
+            record_loss(&self.losses, &self.events);
         }
         let (cache_db, outbox_db) = match (stores.cache, stores.outbox) {
             (Opened::Ready { db: c, .. }, Opened::Ready { db: o, .. }) => (c, o),
@@ -138,28 +264,36 @@ impl Offline {
         outbox.set_events(self.events.clone());
         let _ = outbox.resume().await;
         let pump = tokio::spawn(pump(cache.clone(), self.events.clone(), raw));
+        let state_feed = Some(self.state.follow(&cache));
         self.active = Some(Active {
             origin: origin.to_string(),
             user_id: user_id.to_string(),
             cache,
             outbox,
             session,
+            epoch,
             pump,
+            state_feed,
         });
         Ok(true)
     }
 
-    /// Signed out, keeping the data: the outbox pauses, the stores stay open for reads.
-    pub(crate) fn signed_out(&self) {
-        if let Some(a) = &self.active {
+    /// Signed out, keeping the data: the outbox pauses, the stores stay open for reads,
+    /// and the state feed goes back to default until this user signs in again.
+    pub(crate) fn signed_out(&mut self) {
+        if let Some(a) = &mut self.active {
             a.session.send_replace(None);
+            a.state_feed = None;
         }
+        self.state.reset();
     }
 
     /// Close the open stores (a user switch, a wipe, or the client going away).
     pub(crate) async fn close_active(&mut self) {
+        self.state.reset();
         if let Some(a) = self.active.take() {
             a.session.send_replace(None);
+            drop(a.state_feed);
             a.pump.abort();
             let _ = a.pump.await;
             a.outbox.close().await;
@@ -235,9 +369,10 @@ async fn pump(
     mut raw: broadcast::Receiver<(String, Value)>,
 ) {
     let mut notices = cache.events();
-    let forward = {
+    // Stopped however the pump ends, an abort included.
+    let _forward = {
         let events = events.clone();
-        tokio::spawn(async move {
+        AbortOnDrop(tokio::spawn(async move {
             loop {
                 match notices.recv().await {
                     Ok(e) => {
@@ -249,7 +384,7 @@ async fn pump(
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
-        })
+        }))
     };
     let mut tick = tokio::time::interval(PERIODIC_SYNC);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -272,5 +407,4 @@ async fn pump(
             _ = tick.tick() => cache.schedule_sync(),
         }
     }
-    forward.abort();
 }
