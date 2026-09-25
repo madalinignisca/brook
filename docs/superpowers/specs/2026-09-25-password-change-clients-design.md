@@ -161,11 +161,11 @@ the target out this way, so its sheet gets no checkbox.
   device's old access token is refused on REST at once, and its already-open socket is closed with
   `session_revoked`, well inside the 15-minute access lifetime; this device keeps working.
   **Unchecked:** the other device's access token, open socket and refresh all keep working.
-- Limit: an older server ignores the field, so it signs others out within 15 minutes whichever
-  way the box is set, and the success text would be wrong both ways. There is no released server
-  and no capability mechanism in the protocol yet; **this PR merges only after #45 is deployed to
-  the test and production servers**. A capability or version check is a protocol-wide decision
-  (it concerns every addition, not this one), raised with the server side.
+- Older servers (resolved by the server, #45): `/auth/password` answers
+  `other_devices_signed_out: bool`, saying what it did. Core returns it (`None` when absent: a
+  server from before the option), and the Mac words the confirmation from it, not from the box:
+  true → "…are signed out."; false → "…stay signed in."; absent → "…will be signed out within 15
+  minutes." (what such a server does). Tested with a fake that omits the field.
 
 **Amendment review, round 1 — Codex + Vibe (Heavy).** Accepted: tests for the socket closed
 before and after the commit and for an old-token REST call (all three seen red with the
@@ -174,3 +174,5 @@ that unchecked keeps the other device working (also Vibe's point). Rejected with
 capability check before showing the box (no released server; merge gated on #45's deployment;
 versioning is a protocol-wide decision, not this checkbox's).
 **Amendment review, round 2 — Codex + Vibe.** Both: none. Nothing disputed; the gate closes.
+**Follow-up (server answer), 2026-09-25.** The point rejected in round 1 was resolved on the server
+side by the echoed outcome; the client now uses it. Reviewed as a delta by Codex + Vibe.

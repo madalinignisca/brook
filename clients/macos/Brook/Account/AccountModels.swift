@@ -4,7 +4,7 @@ import Observation
 
 /// The account calls the password sheets need (the Rust client; a fake in tests).
 protocol AccountClient: AnyObject, Sendable {
-    func changePassword(current: String, new: String, signOutOtherDevices: Bool) async throws
+    func changePassword(current: String, new: String, signOutOtherDevices: Bool) async throws -> Bool?
     func adminResetPassword(userId: String, adminPassword: String, new: String) async throws
     func listUsers() async throws -> [FfiUserSummary]
 }
@@ -73,11 +73,12 @@ final class ChangePasswordModel {
     var signOutOtherDevices = true
     private(set) var busy = false
     private(set) var error: String?
-    /// What happened, once it has (the text follows what was sent, not the box now).
+    /// What happened, once it has (worded from the server's answer).
     private(set) var done: String?
 
     static let signedOthersOut = "Password changed. Your other devices are signed out."
     static let keptOthersSignedIn = "Password changed. Your other devices stay signed in."
+    static let olderServer = "Password changed. Your other devices will be signed out within 15 minutes."
     static let wrongCurrent = "The current password is wrong."
     static let sameAsCurrent = "The new password is the same as the current one."
 
@@ -100,10 +101,16 @@ final class ChangePasswordModel {
         error = nil
         defer { busy = false }
         do {
-            let signOut = signOutOtherDevices
-            try await client.changePassword(current: current, new: new, signOutOtherDevices: signOut)
+            // Worded from what the server says it did, not from the box: an older server ignores
+            // the box and answers nil (it signs the others out when their access tokens expire).
+            let signedOut = try await client.changePassword(
+                current: current, new: new, signOutOtherDevices: signOutOtherDevices)
             clear()
-            done = signOut ? Self.signedOthersOut : Self.keptOthersSignedIn
+            switch signedOut {
+            case true?: done = Self.signedOthersOut
+            case false?: done = Self.keptOthersSignedIn
+            case nil: done = Self.olderServer
+            }
         } catch {
             // Fields stay: a typo can be fixed without retyping everything.
             self.error = AccountMessage.text(for: error, wrongPassword: Self.wrongCurrent)

@@ -53,15 +53,15 @@ impl FfiBrookClient {
         Ok(channels.into_iter().map(Into::into).collect())
     }
 
-    /// Change the signed-in user's password. This device keeps a fresh token pair; every
-    /// other session of the user is signed out (within the access-token lifetime). A wrong
-    /// current password is `Api { code: "auth.invalid_credentials" }`.
+    /// Change the signed-in user's password; this device keeps a fresh token pair. Returns
+    /// whether the server signed the other devices out (nil: an older server that does not say).
+    /// A wrong current password is `Api { code: "auth.invalid_credentials" }`.
     pub async fn change_password(
         &self,
         current: String,
         new: String,
         sign_out_other_devices: bool,
-    ) -> Result<(), LoginError> {
+    ) -> Result<Option<bool>, LoginError> {
         let inner = Arc::clone(&self.inner);
         run(async move {
             inner

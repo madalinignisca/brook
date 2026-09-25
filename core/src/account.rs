@@ -29,6 +29,16 @@ pub struct UserSummary {
     pub global_role: String,
 }
 
+/// `POST /auth/password`'s answer: the new pair, and what the server did about the other
+/// devices. Absent on a server from before `sign_out_other_devices` (it revoked their refresh
+/// tokens; their access tokens lived out their 15 minutes).
+#[derive(Deserialize)]
+struct PasswordChangeOut {
+    #[serde(flatten)]
+    pair: TokenPair,
+    other_devices_signed_out: Option<bool>,
+}
+
 /// How a 401 on an account call refreshes before its single retry.
 enum OnExpired {
     /// The caller holds the refresh lock: refresh directly (the single-flight path would wait
@@ -112,7 +122,7 @@ impl Ctx {
         current: String,
         new: String,
         sign_out_other_devices: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<bool>> {
         let url = self.base.join("api/v1/auth/password")?;
         // Always explicit: the server's default must not decide what the checkbox said.
         let body = json!({
@@ -128,7 +138,8 @@ impl Ctx {
         if !resp.status().is_success() {
             return Err(account_error(resp).await);
         }
-        let pair: TokenPair = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
+        let out: PasswordChangeOut = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
+        let pair = out.pair;
         // Against the token the successful attempt used: after a 401 retry that is the rotated
         // one, not the one held at the start.
         match self
@@ -136,7 +147,7 @@ impl Ctx {
             .commit_refresh(&used_refresh, pair.access_token, pair.refresh_token)
             .await
         {
-            RefreshApplied::Committed => Ok(()),
+            RefreshApplied::Committed => Ok(out.other_devices_signed_out),
             RefreshApplied::Discarded => Err(Error::NotAuthenticated),
         }
     }
@@ -151,16 +162,19 @@ impl BrookClient {
         }
     }
 
-    /// Change the signed-in user's password. On success this device keeps a fresh token pair
-    /// (the realtime socket re-authenticates with it); every other session of the user loses its
-    /// refresh token, and with `sign_out_other_devices` also its access token and open socket at
-    /// once (this device's socket is closed too and reconnects with the new pair). A wrong current password is `Api { code: "auth.invalid_credentials" }`.
+    /// Change the signed-in user's password. On success this device keeps a fresh token pair.
+    /// With `sign_out_other_devices`, every other session loses its refresh token, access token
+    /// and open socket at once (this device's socket is closed too and reconnects with the new
+    /// pair); without it, the other sessions stay signed in.
+    /// Returns whether the server signed the other devices out (`None`: an older server that
+    /// does not say; word the confirmation from this, not from what was asked).
+    /// A wrong current password is `Api { code: "auth.invalid_credentials" }`.
     pub async fn change_password(
         &self,
         current: &str,
         new: &str,
         sign_out_other_devices: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<bool>> {
         let epoch = self.session.snapshot().await.0.epoch;
         let lock: OwnedMutexGuard<()> = self.session.refresh_lock.clone().lock_owned().await;
         let ctx = self.ctx();

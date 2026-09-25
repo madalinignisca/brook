@@ -78,10 +78,11 @@ async fn change_commits_the_fresh_pair_and_revokes_the_old_one() {
     let old = refresh_token(&client).await;
     let rev_before = client.session.snapshot().await.0;
 
-    client
+    let outcome = client
         .change_password("old-pass-1", "new-pass-2", true)
         .await
         .unwrap();
+    assert_eq!(outcome, Some(true), "the server's answer was not returned");
 
     let new = refresh_token(&client).await;
     assert_ne!(new, old);
@@ -123,10 +124,11 @@ async fn change_commits_the_fresh_pair_and_revokes_the_old_one() {
 async fn keeping_other_devices_signed_in_is_sent_explicitly() {
     let server = strict().await;
     let client = signed_in(&server, "alice").await;
-    client
+    let outcome = client
         .change_password("old-pass-1", "new-pass-2", false)
         .await
         .unwrap();
+    assert_eq!(outcome, Some(false), "the server's answer was not returned");
     let sent = password_requests(&server, "/auth/password");
     assert_eq!(
         sent[0].1,
@@ -798,4 +800,24 @@ async fn own_rest_call_with_the_revoked_access_token_retries_with_the_new_pair()
     );
     assert!(matches!(*client.state().borrow(), AuthState::LoggedIn(_)));
     assert_eq!(server.refresh_calls(), 0);
+}
+
+/// A server from before the option answers without `other_devices_signed_out`: the change
+/// still commits, and the outcome is unknown (None), so the app never claims what it cannot know.
+#[tokio::test]
+async fn an_older_server_reports_no_outcome() {
+    let server = strict().await;
+    server.set_password_mode(PasswordMode::Legacy);
+    let client = signed_in(&server, "alice").await;
+    let old = refresh_token(&client).await;
+    let outcome = client
+        .change_password("old-pass-1", "new-pass-2", false)
+        .await
+        .unwrap();
+    assert_eq!(outcome, None);
+    assert_ne!(
+        refresh_token(&client).await,
+        old,
+        "the new pair was not committed"
+    );
 }

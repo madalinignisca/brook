@@ -9,10 +9,13 @@ final class FakeAccount: AccountClient, @unchecked Sendable {
     let calls = Mutex<[String]>([])
     var failure: LoginError?
     var users: [FfiUserSummary] = []
+    /// What the server says it did about other devices; by default, what was asked.
+    var outcome: Bool?? = .none
 
-    func changePassword(current: String, new: String, signOutOtherDevices: Bool) async throws {
+    func changePassword(current: String, new: String, signOutOtherDevices: Bool) async throws -> Bool? {
         calls.withLock { $0.append("change:\(current)>\(new):\(signOutOtherDevices ? "out" : "keep")") }
         if let failure { throw failure }
+        return outcome ?? signOutOtherDevices
     }
     func adminResetPassword(userId: String, adminPassword: String, new: String) async throws {
         calls.withLock { $0.append("reset:\(userId):\(adminPassword)>\(new)") }
@@ -98,6 +101,28 @@ final class ChangePasswordModelTests: XCTestCase {
         model.clear()
         XCTAssertTrue(model.signOutOtherDevices, "left unchecked for the next change")
         XCTAssertNil(model.done)
+    }
+
+    /// The confirmation says what the server did, not what the box asked: an older server
+    /// (nil) is worded as its 15-minute behaviour, and a server's own answer wins over the box.
+    func testTheConfirmationFollowsTheServersAnswer() async {
+        let cases: [(box: Bool, answer: Bool?, text: String)] = [
+            (true, nil, ChangePasswordModel.olderServer),
+            (false, nil, ChangePasswordModel.olderServer),
+            (true, false, ChangePasswordModel.keptOthersSignedIn),
+            (false, true, ChangePasswordModel.signedOthersOut),
+        ]
+        for (box, answer, text) in cases {
+            let account = FakeAccount()
+            account.outcome = .some(answer)
+            let model = ChangePasswordModel(client: account)
+            model.current = "old-pass-1"
+            model.new = "new-pass-2"
+            model.confirm = "new-pass-2"
+            model.signOutOtherDevices = box
+            await model.submit()
+            XCTAssertEqual(model.done, text, "box \(box), server answered \(String(describing: answer))")
+        }
     }
 
     func testRefusalKeepsTheFieldsAndSaysWhy() async {

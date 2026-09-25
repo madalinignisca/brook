@@ -48,6 +48,9 @@ pub enum PasswordMode {
     SelfTarget,
     /// 404 `not_found`.
     NotFound,
+    /// A server from before `sign_out_other_devices`: ignores it, always revokes the refresh
+    /// tokens (never the access tokens), and answers a plain TokenPair.
+    Legacy,
 }
 
 struct ServerState {
@@ -282,12 +285,20 @@ async fn change_password(
             PasswordMode::Echo422 => return echo_422(&body),
             _ => {}
         }
-        revoke_refresh_tokens(&mut state, &handle);
-        if body["sign_out_other_devices"] == true {
+        let legacy = state.password_mode == PasswordMode::Legacy;
+        let sign_out = legacy || body["sign_out_other_devices"] != false;
+        if sign_out {
+            revoke_refresh_tokens(&mut state, &handle);
+        }
+        if sign_out && !legacy {
             // Server PR #45: every access token issued before the change is refused at once.
             state.tokens.retain(|_, h| *h != handle);
         }
-        (issue(&mut state, &handle), state.password_gate.clone())
+        let mut pair = issue(&mut state, &handle);
+        if !legacy {
+            pair["other_devices_signed_out"] = json!(sign_out); // what the server did
+        }
+        (pair, state.password_gate.clone())
     };
     after_commit(gate).await;
     Json(pair).into_response()
