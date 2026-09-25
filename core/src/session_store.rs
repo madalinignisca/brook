@@ -166,14 +166,19 @@ impl SessionStore {
 
     /// Best-effort `POST /auth/logout` for a refresh token core will not keep, in its own task
     /// (bounded by the client's request timeout); errors are logged by kind only.
-    pub(crate) fn revoke_detached(&self, refresh_token: String) {
+    /// Returns the task, for a caller that wants to wait on it a while (dropping the handle
+    /// leaves it running).
+    pub(crate) fn revoke_detached(
+        &self,
+        refresh_token: String,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let (Some(runtime), Some((http, base))) =
             (self.detached.runtime.get(), self.detached.http.get())
         else {
-            return;
+            return None;
         };
         let (http, base) = (http.clone(), base.clone());
-        runtime.spawn(async move {
+        Some(runtime.spawn(async move {
             let Ok(url) = base.join("api/v1/auth/logout") else {
                 return;
             };
@@ -189,7 +194,7 @@ impl SessionStore {
                     "revoking a refresh token failed"
                 );
             }
-        });
+        }))
     }
 
     /// Start a login attempt; any earlier one becomes stale.

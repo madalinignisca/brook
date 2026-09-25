@@ -106,6 +106,8 @@ pub struct BrookClient {
     transport: std::sync::Mutex<Option<Transport>>,
     /// Bound on a password change's locked section (tests shorten it).
     pub(crate) locked_bound: std::time::Duration,
+    /// How long `logout` waits for the server to hear the revoke (tests shorten it).
+    pub(crate) revoke_wait: std::time::Duration,
     /// Attachment transfers: progress events and cancel flags (transfer.rs).
     pub(crate) transfers: crate::transfer::Transfers,
     /// Dropped with the client: the background loops end on it, from whatever wait.
@@ -162,6 +164,7 @@ impl BrookClient {
             commands,
             transport: std::sync::Mutex::new(Some(transport)),
             locked_bound: std::time::Duration::from_secs(30),
+            revoke_wait: std::time::Duration::from_secs(3),
             transfers: crate::transfer::Transfers::new(),
             shutdown,
             tasks: std::sync::Mutex::default(),
@@ -178,7 +181,13 @@ impl BrookClient {
     pub async fn logout(&self) {
         self.session.note_runtime();
         if let Some(old) = self.session.sign_out(false).await {
-            self.session.revoke_detached(old.refresh_token);
+            // Signed out locally already. Wait a moment for the server to hear it: an app
+            // that quits right after (Sign Out, then Quit) would otherwise kill the request
+            // and leave the refresh token live on the server until it expires. Past the
+            // bound the request carries on detached; the sign-out never waits longer.
+            if let Some(revoke) = self.session.revoke_detached(old.refresh_token) {
+                let _ = tokio::time::timeout(self.revoke_wait, revoke).await;
+            }
         }
     }
 
