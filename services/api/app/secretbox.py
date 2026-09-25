@@ -97,7 +97,11 @@ def parse_keyring(spec: str) -> dict[int, bytes]:
         raise KeyringError("BROOK_SECRET_KEYS is empty")
     for entry in spec.split(","):
         key_id_text, sep, material = entry.partition(":")
-        if not sep or not key_id_text.isdigit() or key_id_text != key_id_text.strip():
+        if (
+            not sep
+            or not (key_id_text.isascii() and key_id_text.isdigit())
+            or key_id_text != key_id_text.strip()
+        ):
             raise KeyringError("each key must be <id>:<base64url>")
         key_id = int(key_id_text)
         if key_id in keys:
@@ -174,7 +178,7 @@ class SecretBox:
         version, key_id_text, nonce_text, ct_text = parts
         if version != FORMAT:
             raise DecryptError("unknown_version")
-        if not key_id_text.isdigit():
+        if not (key_id_text.isascii() and key_id_text.isdigit()):
             raise DecryptError("malformed")
         try:
             nonce, ct = _b64d(nonce_text), _b64d(ct_text)

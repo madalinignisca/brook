@@ -116,6 +116,9 @@ def test_the_key_id_is_authenticated() -> None:
         (lambda s: "v1.1.AAAA." + s.split(".")[3], "malformed"),  # 3-byte nonce
         (lambda s: s.replace(s.split(".")[3], "not+base64/"), "malformed"),
         (lambda s: "v1.1." + "A" * 20000, "malformed"),
+        # Non-ASCII digits: isdigit() alone accepts them; int() then raises or reads "1".
+        (lambda s: "v1.\u00b2." + s.split(".", 2)[2], "malformed"),  # superscript two
+        (lambda s: "v1.\uff11." + s.split(".", 2)[2], "malformed"),  # fullwidth one
     ],
 )
 def test_decrypt_failures_fail_closed_with_a_reason(mutate, reason) -> None:  # type: ignore[no-untyped-def]
@@ -176,6 +179,8 @@ def test_parse_keyring() -> None:
         f" 1:{b64(os.urandom(32))}",  # whitespace
         f"1:{b64(os.urandom(32))}\n",  # trailing newline
         "1:not+base64/==",
+        f"\u00b2:{b64(os.urandom(32))}",  # superscript two: int() raises ValueError
+        f"\uff11:{b64(os.urandom(32))}",  # fullwidth one: int() would read it as 1
     ],
 )
 def test_parse_keyring_is_strict(spec: str) -> None:
