@@ -75,7 +75,8 @@ class SecondFactorIn(BaseModel):
     the password plus exactly one of a code or a recovery code."""
 
     password: str = Field(max_length=256)
-    code: str | None = Field(default=None, max_length=16)
+    # A TOTP code or a recovery code (iiii-xxxx-xxxx-xxxx-xxxx, 24 chars): spec §2.3.
+    code: str | None = Field(default=None, max_length=64)
     recovery_code: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
