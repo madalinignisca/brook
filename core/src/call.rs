@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::call_types::{
     CallState, CallStatus, EndReason, EngineError, IceCandidate, IceServer, MediaEngine,
-    Participant, PcKind, SubStream,
+    Participant, PcKind, PublishOffer, SubStream,
 };
 use crate::session_store::Revision;
 use crate::ws::{CallFrame, CallRoute, CommandError, Commands, Conn, Reply, Routes};
@@ -136,6 +136,7 @@ pub(crate) async fn join(
         epoch,
         publish_wanted: publish,
         publish: Publish::Idle,
+        republish_pending: false,
         pub_seq: 0,
         unsent_offer: None,
         pub_candidates: Vec::new(),
@@ -181,7 +182,7 @@ enum Input {
 enum Done {
     PublishOffer {
         seq: u64,
-        res: std::result::Result<String, EngineError>,
+        res: std::result::Result<PublishOffer, EngineError>,
     },
     PublishAnswer {
         seq: u64,
@@ -273,9 +274,11 @@ struct Task {
     epoch: u64,
     publish_wanted: bool,
     publish: Publish,
+    /// A renegotiation asked for while one was in flight: one more offer once it settles.
+    republish_pending: bool,
     pub_seq: u64,
     /// An offer that completed while the socket was down; sent after resume.
-    unsent_offer: Option<(u64, String)>,
+    unsent_offer: Option<(u64, PublishOffer)>,
     /// Local publish candidates held until `call.publish` for the current offer is written.
     pub_candidates: Vec<Option<IceCandidate>>,
     sub: Subscribe,
@@ -406,6 +409,8 @@ impl Task {
     // ---- publish ----
 
     fn start_publish_offer(&mut self) {
+        // An offer started now sees the engine's latest state: nothing is left pending.
+        self.republish_pending = false;
         self.pub_seq += 1;
         let seq = self.pub_seq;
         self.publish = Publish::Offering(seq);
@@ -413,18 +418,20 @@ impl Task {
         let engine = self.engine.clone();
         let done = self.done_tx.clone();
         tokio::spawn(async move {
-            let res = engine.create_publish_offer().await;
+            let res = engine.create_labelled_offer().await;
             let _ = done.send(Input::Done(Done::PublishOffer { seq, res }));
         });
     }
 
-    fn send_publish(&mut self, seq: u64, sdp: String) {
+    fn send_publish(&mut self, seq: u64, offer: PublishOffer) {
         if !self.connected {
-            self.unsent_offer = Some((seq, sdp));
+            self.unsent_offer = Some((seq, offer));
             return;
         }
-        let frame =
-            json!({ "type": "call.publish", "data": { "call_id": self.call_id, "sdp": sdp } });
+        // Always labelled: the server pins each live mid's source, and an unlabelled
+        // re-publish would otherwise fall back to the defaults (PROTOCOL.md §3.3).
+        let frame = json!({ "type": "call.publish", "data": {
+            "call_id": self.call_id, "sdp": offer.sdp, "tracks": offer.tracks } });
         match self
             .commands
             .start(self.generation, frame, "call.publish.answer", None)
@@ -438,7 +445,7 @@ impl Task {
                 self.await_reply(rx, move |res| Done::PublishAnswer { seq, res });
             }
             Err(_) => {
-                self.unsent_offer = Some((seq, sdp));
+                self.unsent_offer = Some((seq, offer));
             }
         }
     }
@@ -590,11 +597,18 @@ impl Task {
                 reply,
             } => self.set_media(audio, video, reply),
             Input::Republish(reply) => {
-                if self.publish == Publish::Stable && self.connected {
+                if !self.publish_wanted {
+                    // Listen-only: there is no publish connection to renegotiate.
+                    let _ = reply.send(Err(Error::Busy));
+                } else if self.publish == Publish::Stable && self.connected {
                     self.start_publish_offer();
                     let _ = reply.send(Ok(()));
                 } else {
-                    let _ = reply.send(Err(Error::Busy));
+                    // An offer may already be in flight from before the engine changed (a
+                    // share stopped just after it started): refusing would lose this change.
+                    // One more offer follows once the current publish settles.
+                    self.republish_pending = true;
+                    let _ = reply.send(Ok(()));
                 }
             }
             Input::Leave(reply) => {
@@ -709,7 +723,7 @@ impl Task {
                     return;
                 }
                 match res {
-                    Ok(sdp) => self.send_publish(seq, sdp),
+                    Ok(offer) => self.send_publish(seq, offer),
                     Err(err) => self.finish(EndReason::EngineFailed(err.0), true),
                 }
             }
@@ -744,6 +758,9 @@ impl Task {
                         self.publish = Publish::Stable;
                         self.flush_remote(PcKind::Publish);
                         self.reannounce_media();
+                        if self.republish_pending && self.connected && !self.ended {
+                            self.start_publish_offer();
+                        }
                     }
                     Err(err) => self.finish(EndReason::EngineFailed(err.0), true),
                 }
@@ -900,11 +917,12 @@ impl Task {
     fn after_resume(&mut self) {
         match self.publish {
             Publish::NeedsRestart | Publish::AwaitingAnswer(_) => self.start_publish_offer(),
+            Publish::Stable if self.republish_pending => self.start_publish_offer(),
             _ => {}
         }
-        if let Some((seq, sdp)) = self.unsent_offer.take() {
+        if let Some((seq, offer)) = self.unsent_offer.take() {
             if self.publish == Publish::Offering(seq) {
-                self.send_publish(seq, sdp);
+                self.send_publish(seq, offer);
             }
         }
         self.send_retained_answer();

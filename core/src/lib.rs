@@ -28,8 +28,9 @@ mod ws;
 
 pub use call::CallHandle;
 pub use call_types::{
-    CallState, CallStatus, EndReason, EngineError, IceCandidate, IceServer, MediaEngine, MediaKind,
-    MediaSource, Participant, PcKind, Publishing, SubStream,
+    default_labels, CallState, CallStatus, EndReason, EngineError, IceCandidate, IceServer,
+    MediaEngine, MediaKind, MediaSource, Participant, PcKind, PublishOffer, Publishing, SubStream,
+    TrackLabel,
 };
 pub use chat::{Channel, ChannelMember, Message, ReactionSummary, ReplyExcerpt};
 pub use client::BrookClient;
