@@ -47,7 +47,10 @@ services:
       # `expose`d on the compose network, never published, so Caddy is its only
       # HTTP peer, and Caddy (2.5+, no trusted_proxies) replaces any client-sent
       # X-Forwarded-For with the real client address. The native deploy keeps
-      # uvicorn's default (Caddy is on 127.0.0.1 there).
+      # uvicorn's default (Caddy is on 127.0.0.1 there). If the Caddyfile ever
+      # gets `trusted_proxies` (a CDN in front), Caddy would pass the client's own
+      # X-Forwarded-For through, and "*" would then trust it: narrow this to the
+      # CDN's ranges at the same time.
       FORWARDED_ALLOW_IPS: "*"
     depends_on:
       postgres:
