@@ -30,7 +30,7 @@ jobs:
         run: |
           flatpak remote-add --user --if-not-exists flathub \
             https://dl.flathub.org/repo/flathub.flatpakrepo
-          flatpak-builder --user --install-deps-from=flathub --force-clean \
+          flatpak-builder --user --install-deps-from=flathub --force-clean --disable-rofiles-fuse \
             --repo=repo build clients/gnome/packaging/flatpak/dev.brook.Brook.yml
 
       - name: Elements a call needs, inside the sandbox
