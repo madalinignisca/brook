@@ -106,6 +106,8 @@ pub struct BrookClient {
     transport: std::sync::Mutex<Option<Transport>>,
     /// Bound on a password change's locked section (tests shorten it).
     pub(crate) locked_bound: std::time::Duration,
+    /// Attachment transfers: progress events and cancel flags (transfer.rs).
+    pub(crate) transfers: crate::transfer::Transfers,
     /// Dropped with the client: the background loops end on it, from whatever wait.
     shutdown: watch::Sender<()>,
     /// The background loops (refresh, realtime), for tests to observe that they end.
@@ -149,6 +151,7 @@ impl BrookClient {
             commands,
             transport: std::sync::Mutex::new(Some(transport)),
             locked_bound: std::time::Duration::from_secs(30),
+            transfers: crate::transfer::Transfers::new(),
             shutdown,
             tasks: std::sync::Mutex::default(),
         })
@@ -429,7 +432,7 @@ impl BrookClient {
     }
 
     /// The current access token, or [`Error::NotAuthenticated`] if logged out.
-    async fn access_token(&self) -> Result<String> {
+    pub(crate) async fn access_token(&self) -> Result<String> {
         self.session
             .access_token()
             .await
