@@ -14,6 +14,7 @@ the change can't matter to a client's cache.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 APP = Path(__file__).resolve().parent.parent / "app"
@@ -22,6 +23,11 @@ APP = Path(__file__).resolve().parent.parent / "app"
 # their message (a reaction; a deleted file that was attached).
 WATCHED = {"Message", "Channel", "Membership", "User", "Reaction", "File"}
 BULK = {"update", "delete", "insert"}
+# The same writes as raw SQL, e.g. text("UPDATE messages ..."): the hook can't see those either.
+RAW = re.compile(
+    r"\b(?:UPDATE|DELETE\s+FROM|INSERT\s+INTO)\s+(messages|channels|memberships|users|reactions|files)\b",
+    re.IGNORECASE,
+)
 
 # (file relative to app/, enclosing function, table) -> why it's safe.
 ALLOWED = {
@@ -47,15 +53,22 @@ def _bulk_writes() -> set[tuple[str, str, str]]:
             if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
                 continue
             for node in ast.walk(fn):
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Name)
-                    and node.func.id in BULK
-                    and node.args
-                    and isinstance(node.args[0], ast.Name)
-                    and node.args[0].id in WATCHED
-                ):
-                    found.add((rel, fn.name, node.args[0].id))
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    for table in RAW.findall(node.value):
+                        found.add((rel, fn.name, f"sql:{table.lower()}"))
+                if not (isinstance(node, ast.Call) and node.args):
+                    continue
+                # update(...) and sa.update(...) / sqlalchemy.update(...) alike
+                name = (
+                    node.func.id
+                    if isinstance(node.func, ast.Name)
+                    else node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else None
+                )
+                table = node.args[0]
+                if name in BULK and isinstance(table, ast.Name) and table.id in WATCHED:
+                    found.add((rel, fn.name, table.id))
     return found
 
 
