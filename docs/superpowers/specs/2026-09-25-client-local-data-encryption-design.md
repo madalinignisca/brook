@@ -99,8 +99,11 @@ Brook detects this on first run and **asks once, never silently degrading**:
    wrapped with Argon2id(passphrase), and Brook asks for the passphrase when it
    starts: effectively an app lock. Forgetting it costs only the local copy (§3.4).
 2. **No protection.** The data key sits in a 0600 file in
-   `$XDG_DATA_HOME/brook/`. Settings show a persistent "Local data is not
-   encrypted" notice with a one-click switch to option 1.
+   `$XDG_DATA_HOME/brook/`. This is offered, but never pre-selected: the user must
+   tick an explicit "Allow storing without a keyring (local data will not be
+   protected)" confirmation before it can be chosen (owner decision, 2026-09-25).
+   Settings then show a persistent "Local data is not encrypted" notice with a
+   one-click switch to option 1.
 
 A hint is shown in both cases: installing `oo7-daemon` or `gnome-keyring` enables
 the no-prompt mode. If a secret service appears later, Brook offers to move the
@@ -124,10 +127,11 @@ key there.
 - End-to-end encryption of messages is a different problem (keys shared across
   devices) and is out of scope here.
 
-## 8. Open questions for the owner
+## 8. Owner decisions (2026-09-25)
 
-1. On sign-out, should local data be wiped by default, or kept until the next
-   sign-in as the same user? (Proposed: wiped when a *different* user signs in;
-   kept otherwise.)
-2. §5 first-run choice: acceptable, or should "local passphrase" be the only
-   option on a machine with no secret service?
+1. **Sign-out** shows a "Remove this device's data" checkbox, **ticked by default**.
+   Ticked: the local store and the data key are deleted. Unticked: they are kept
+   (the next sign-in of the same user reuses them; a *different* user signing in
+   still gets a wiped store, since one device's cache never crosses accounts).
+2. **No keyring:** "no protection" is allowed, but only after the explicit
+   confirmation in §5 option 2. It is never the default and never silent.
