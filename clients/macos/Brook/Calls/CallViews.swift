@@ -119,8 +119,9 @@ struct CallView: View {
     }
 }
 
-/// The call window. Its close button is disabled: leaving (⌘W or Leave) is the only way out,
-/// so closing always awaits `leave()` and the engine's `closed` before the window goes.
+/// The call window. While a call is live its close button is disabled: leaving (⌘W or Leave)
+/// is the only way out, so closing always awaits `leave()` and the engine's `closed` first.
+/// Without a call it closes normally, and the window closes itself once the call is gone.
 struct CallWindow: View {
     let center: CallCenter
     @Environment(\.dismissWindow) private var dismissWindow
@@ -130,7 +131,6 @@ struct CallWindow: View {
             if let call = center.call {
                 CallView(call: call) {
                     await center.leave()
-                    dismissWindow(id: "call")
                 }
             } else if center.joining {
                 ProgressView("Joining…")
@@ -139,17 +139,24 @@ struct CallWindow: View {
             }
         }
         .frame(minWidth: 560, minHeight: 420)
-        .background(WindowCloseDisabler())
+        .background(WindowCloseControl(disabled: center.call != nil))
+        // Dismissing goes through the close button, so it must be enabled first (the control
+        // above updates in the same pass); dismiss on the next turn of the run loop.
+        .onChange(of: center.call == nil) { _, gone in
+            if gone { DispatchQueue.main.async { dismissWindow(id: "call") } }
+        }
     }
 }
 
-struct WindowCloseDisabler: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
+struct WindowCloseControl: NSViewRepresentable {
+    let disabled: Bool
+
+    func makeNSView(context: Context) -> NSView { NSView() }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        let disabled = disabled
         DispatchQueue.main.async {
-            view.window?.standardWindowButton(.closeButton)?.isEnabled = false
+            view.window?.standardWindowButton(.closeButton)?.isEnabled = !disabled
         }
-        return view
     }
-    func updateNSView(_ nsView: NSView, context: Context) {}
 }
