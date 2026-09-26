@@ -263,7 +263,7 @@ pub fn save_error_text(err: &brook_core::Error) -> String {
             "transfer.cancelled" => "Cancelled".into(),
             "transfer.integrity" => "Damaged in transfer, not saved".into(),
             "transfer.io" => "Couldn't write the file".into(),
-            "not_found" => "No longer available".into(),
+            "file.gone" | "not_found" => "No longer available".into(),
             _ => "Couldn't save".into(),
         },
         brook_core::Error::NotAuthenticated => "Signed out".into(),
