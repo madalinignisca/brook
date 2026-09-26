@@ -8,6 +8,7 @@ protocol AccountClient: AnyObject, Sendable {
     func adminResetPassword(userId: String, adminPassword: String, new: String) async throws
     func listUsers() async throws -> [FfiUserSummary]
     func me() async throws -> FfiMe
+    func updateProfile(displayName: String?, statusText: String?) async throws -> FfiMe
     func totpEnroll(password: String) async throws -> FfiTotpEnrollment
     func totpActivate(code: String) async throws -> [String]
     func totpDisable(password: String, factor: FfiSecondFactor) async throws

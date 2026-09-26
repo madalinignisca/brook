@@ -25,6 +25,12 @@ struct SignedInView: View {
     @State private var timeline: TimelineModel?
     @State private var pending: PendingModel?
     @State private var signingOut = false
+    @State private var editingProfile = false
+    /// The name `updateProfile` answered with: the session's stored user keeps the old one
+    /// until the next sign-in (#184).
+    @State private var shownName: String?
+    @State private var leaving: ChannelRow?
+    @State private var showingMembers = false
 
     init(
         user: FfiUser, client: any FfiBrookClientProtocol, calls: CallCenter,
@@ -60,6 +66,11 @@ struct SignedInView: View {
                             .accessibilityLabel("\(unread) unread")
                     }
                 }
+                .contextMenu {
+                    if channel.canLeave, client is any MembershipClient {
+                        Button("Leave Channel…") { leaving = channel }
+                    }
+                }
             }
             .navigationSplitViewColumnWidth(min: 200, ideal: 240)
         } detail: {
@@ -85,10 +96,22 @@ struct SignedInView: View {
                                 || calls.joining)
                             .help(calls.joinError ?? (channels.ready ? "Join the call" : "Connecting…"))
                         }
+                        if channel.canLeave, let membership = client as? any MembershipClient {
+                            ToolbarItem {
+                                Button { showingMembers = true } label: {
+                                    Label("Members", systemImage: "person.2")
+                                }
+                                .help("Members")
+                                .popover(isPresented: $showingMembers) {
+                                    MembersView(title: channels.title(channel), powers: powers(channel),
+                                                model: MembersModel(channelId: channel.id, client: membership))
+                                }
+                            }
+                        }
                     }
             } else {
                 ContentUnavailableView {
-                    Label("Signed in as \(user.displayName)", systemImage: "person.crop.circle.badge.checkmark")
+                    Label("Signed in as \(shownName ?? user.displayName)", systemImage: "person.crop.circle.badge.checkmark")
                 } description: {
                     Text(channels.error ?? "Choose a channel.")
                 }
@@ -123,6 +146,7 @@ struct SignedInView: View {
         .toolbar {
             ToolbarItem {
                 Menu {
+                    Button("Edit Profile…") { editingProfile = true }
                     Button("Change Password…") { changingPassword = true }
                     if user.globalRole == "admin" {
                         Button("Reset a User's Password…") { resettingPassword = true }
@@ -144,6 +168,17 @@ struct SignedInView: View {
                 } label: {
                     Label("Account", systemImage: "person.crop.circle")
                 }
+            }
+        }
+        .sheet(isPresented: $editingProfile) {
+            if let account = client as? any AccountClient {
+                ProfileSheet(client: account) { shownName = $0.displayName }
+            }
+        }
+        .sheet(item: $leaving) { row in
+            if let membership = client as? any MembershipClient {
+                LeaveSheet(model: LeaveModel(channelId: row.id, title: channels.title(row),
+                                             powers: powers(row), client: membership))
             }
         }
         .sheet(isPresented: $changingPassword) {
@@ -184,6 +219,10 @@ struct SignedInView: View {
 }
 
 extension SignedInView {
+    fileprivate func powers(_ channel: ChannelRow) -> ChannelPowers {
+        ChannelPowers(me: user.id, isAdmin: user.globalRole == "admin", members: channel.members)
+    }
+
     /// A new conversation for the selected channel, handed to the channel list, which
     /// forwards it the message events (the previous one stops receiving them).
     fileprivate func openTimeline(_ channelId: String?) {
