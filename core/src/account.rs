@@ -9,7 +9,6 @@
 use reqwest::{RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::OwnedMutexGuard;
 use url::Url;
 
 use crate::client::{refresh_once, RefreshOutcome, Refresher, TokenPair};
@@ -215,7 +214,7 @@ impl Ctx {
         // one, not the one held at the start.
         match self
             .session
-            .commit_refresh(&used_refresh, pair.access_token, pair.refresh_token)
+            .commit_refresh(&used_refresh, pair.access_token, pair.refresh_token, false)
             .await
         {
             RefreshApplied::Committed => Ok(out.other_devices_signed_out),
@@ -255,7 +254,12 @@ impl Ctx {
         let fresh = out.pair.refresh_token.clone();
         match self
             .session
-            .commit_refresh(&used_refresh, out.pair.access_token, out.pair.refresh_token)
+            .commit_refresh(
+                &used_refresh,
+                out.pair.access_token,
+                out.pair.refresh_token,
+                false,
+            )
             .await
         {
             RefreshApplied::Committed => Ok(out.recovery_codes),
@@ -292,7 +296,7 @@ impl BrookClient {
         sign_out_other_devices: bool,
     ) -> Result<Option<bool>> {
         let epoch = self.session.snapshot().await.0.epoch;
-        let lock: OwnedMutexGuard<()> = self.session.refresh_lock.clone().lock_owned().await;
+        let lock = self.session.flight().await;
         let ctx = self.ctx();
         let (current, new) = (current.to_string(), new.to_string());
         let bound = self.locked_bound;
@@ -394,7 +398,7 @@ impl BrookClient {
     /// next code; `auth.totp_enrollment_expired`: enrol again (a new QR code).
     pub async fn totp_activate(&self, code: &str) -> Result<Vec<String>> {
         let epoch = self.session.snapshot().await.0.epoch;
-        let lock: OwnedMutexGuard<()> = self.session.refresh_lock.clone().lock_owned().await;
+        let lock = self.session.flight().await;
         let ctx = self.ctx();
         let code = code.to_string();
         let bound = self.locked_bound;
