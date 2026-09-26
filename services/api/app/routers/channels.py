@@ -540,7 +540,7 @@ async def send_message(
                     "message": "The message being replied to no longer exists",
                 },
             )
-        reply = _excerpt(quoted, await session.get(User, quoted.author_id))
+        reply = await _quote(session, quoted)
 
     message = Message(
         channel_id=channel_id,
@@ -673,7 +673,7 @@ async def _stored_send(
     if message.reply_to_id is not None:
         quoted = await session.get(Message, message.reply_to_id)
         if quoted is not None:
-            reply = _excerpt(quoted, await session.get(User, quoted.author_id))
+            reply = await _quote(session, quoted)
     reactions = await _reactions_for(session, [message.id], user.id)
     files = await _attachments_for(session, [message.id])
     return _message_out(
@@ -725,7 +725,7 @@ async def edit_message(
     if message.reply_to_id is not None:
         quoted = await session.get(Message, message.reply_to_id)
         if quoted is not None:
-            reply = _excerpt(quoted, await session.get(User, quoted.author_id))
+            reply = await _quote(session, quoted)
     reactions = (await _reactions_for(session, [message_id], user.id)).get(message_id, [])
 
     # Edits don't re-resolve/re-notify mentions (mentions fire on the original send).
@@ -960,15 +960,36 @@ async def _reactions_for(
     return out
 
 
-def _excerpt(message: Message, author: User | None) -> ReplyExcerpt:
+def _excerpt(message: Message, author: User | None, files: int = 0) -> ReplyExcerpt:
     """A compact, truncated preview of a quoted message."""
-    body = message.body if message.deleted_at is None else "(deleted)"
+    deleted = message.deleted_at is not None
+    body = "(deleted)" if deleted else message.body
     return ReplyExcerpt(
         id=message.id,
         author_handle=author.handle if author else None,
         author_display_name=author.display_name if author else None,
         body=body[:_REPLY_EXCERPT_LEN],
+        deleted=deleted,
+        attachments=0 if deleted else files,
     )
+
+
+async def _file_counts(session: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UUID, int]:
+    """Committed attachments per message, for reply excerpts (one query)."""
+    if not ids:
+        return {}
+    rows = await session.execute(
+        select(File.message_id, func.count())
+        .where(File.message_id.in_(ids), File.status == "committed")
+        .group_by(File.message_id)
+    )
+    return {message_id: n for message_id, n in rows.all() if message_id is not None}
+
+
+async def _quote(session: AsyncSession, quoted: Message) -> ReplyExcerpt:
+    """The excerpt of one quoted message, with its author and file count."""
+    counts = await _file_counts(session, {quoted.id})
+    return _excerpt(quoted, await session.get(User, quoted.author_id), counts.get(quoted.id, 0))
 
 
 async def _reply_excerpts(
@@ -985,7 +1006,8 @@ async def _reply_excerpts(
             .where(Message.id.in_(ids))
         )
     ).all()
-    return {msg.id: _excerpt(msg, author) for msg, author in rows}
+    counts = await _file_counts(session, ids)
+    return {msg.id: _excerpt(msg, author, counts.get(msg.id, 0)) for msg, author in rows}
 
 
 def _envelope(event_type: str, data: Any) -> dict[str, Any]:
