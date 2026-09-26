@@ -596,6 +596,8 @@ extension FakeRealtime {
     func unpinFile(fileId: String) async throws { throw unused }
     func pinnedBytes() async throws -> UInt64 { throw unused }
     func previewFile(transferId: UInt64, fileId: String) async throws -> FfiImagePreview { throw unused }
+    func cachedUsers(ids: [String]) async throws -> [FfiMember] { throw unused }
+    func closeLocalData() async {}
     func unsentCount() async -> UInt64 { 0 }
     func wipeOtherLocalUsers() async throws { throw unused }
 }

@@ -205,6 +205,18 @@ impl BrookClient {
             .acknowledge(n);
     }
 
+    /// Close this client's local data, stores and index, and switch it off, done when this
+    /// returns. After a sign-out that keeps the data, the app awaits it before another
+    /// client (the next sign-in) opens the same directory. Dropping the client closes them
+    /// too, but in the background, with nothing to await. Local data stays off afterwards
+    /// (cached calls answer `local.unavailable`); a second call does nothing.
+    pub async fn close_local_data(&self) {
+        let off = self.offline.lock().await.take();
+        if let Some(off) = off {
+            off.close().await;
+        }
+    }
+
     /// Sign out, first erasing this user's local data ("Remove this device's data", #46
     /// §8). The erase is local and happens first, whether or not the server can be reached.
     pub async fn sign_out_and_forget(&self) -> Result<()> {
