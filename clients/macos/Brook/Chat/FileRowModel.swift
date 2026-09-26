@@ -36,7 +36,11 @@ final class FileRowModel {
     private(set) var message: String?
     private(set) var preview: Preview = .none
     /// On screen: a preview request of a row that went is dropped.
-    var onScreen = false
+    var onScreen = false {
+        didSet { visible.set(onScreen) }
+    }
+    /// `onScreen`, readable from any thread: the decoder's queue asks from its own actor.
+    private let visible = Flag()
 
     private let client: any OfflineClient
     private let opener: (URL) -> Bool
@@ -163,7 +167,7 @@ final class FileRowModel {
 
     /// Fetch into the cache, decode in the sandboxed broker, show; any failure: no preview.
     func showPreview() async {
-        guard hasLocalData, previewable else { return }
+        guard hasLocalData, previewable, onScreen else { return }
         preview = .loading
         let bytes: FfiImagePreview
         do {
@@ -172,9 +176,8 @@ final class FileRowModel {
             preview = .none
             return
         }
-        let image = await decode(bytes, { [weak self] in
-            MainActor.assumeIsolated { self?.onScreen ?? false }
-        })
+        let visible = self.visible
+        let image = await decode(bytes, { visible.value })
         preview = image.map(Preview.shown) ?? .none
     }
 
@@ -188,6 +191,14 @@ final class FileRowModel {
         return await ImageDecoder.shared.thumbnail(bytes: p.bytes, kind: kind,
                                                    header: (Int(p.width), Int(p.height)), alive: alive)
     }
+}
+
+/// A flag any thread may read.
+final class Flag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = false
+    var value: Bool { lock.withLock { current } }
+    func set(_ v: Bool) { lock.withLock { current = v } }
 }
 
 /// Opens a file in its default app (the system picks by type).

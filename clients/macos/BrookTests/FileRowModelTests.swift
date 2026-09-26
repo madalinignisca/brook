@@ -14,14 +14,21 @@ final class FileRowModelTests: XCTestCase {
     }
 
     private final class Opened: @unchecked Sendable { var urls: [URL] = []; var result = true }
-    private final class Decoded: @unchecked Sendable { var calls = 0; var image: CGImage? }
+    private final class Decoded: @unchecked Sendable { var calls = 0; var image: CGImage?; var aliveSeen: Bool? }
 
     private func model(_ chat: FakeChat, file: FfiFileInfo? = nil, exists: Bool = true, expensive: Bool = false,
                        opened: Opened = Opened(), decoded: Decoded = Decoded()) -> FileRowModel {
-        FileRowModel(file: file ?? info(), client: chat,
-                     opener: { opened.urls.append($0); return opened.result },
-                     exists: { _ in exists }, expensive: { expensive },
-                     decode: { _, _ in decoded.calls += 1; return decoded.image })
+        let m = FileRowModel(file: file ?? info(), client: chat,
+                             opener: { opened.urls.append($0); return opened.result },
+                             exists: { _ in exists }, expensive: { expensive },
+                             decode: { _, alive in
+                                 decoded.calls += 1
+                                 // As the decoder's queue does: from another thread.
+                                 decoded.aliveSeen = await Task.detached { alive() }.value
+                                 return decoded.image
+                             })
+        m.onScreen = true
+        return m
     }
 
     private func local() -> FakeChat {
@@ -226,5 +233,20 @@ final class FileRowModelTests: XCTestCase {
         await n.reloadKeep()
         await n.startPreview()
         guard case .none = n.preview else { return XCTFail("a failed decode showed something") }
+    }
+
+    func testTheDecodersAliveCheckIsSafeOffTheMainThreadAndFollowsTheRow() async {
+        let decoded = Decoded()
+        decoded.image = Self.image
+        let chat = local()
+        chat.previewResult = .success(imageBytes())
+        let m = model(chat, file: info("image/png"), decoded: decoded)
+        await m.reloadKeep()
+        await m.showPreview()
+        XCTAssertEqual(decoded.aliveSeen, true)
+        m.onScreen = false
+        await m.showPreview() // an off-screen row asks for nothing
+        XCTAssertEqual(decoded.calls, 1)
+        XCTAssertFalse(chat.cacheCalls.withLock { $0 }.filter { $0 == "preview" }.count > 1)
     }
 }
