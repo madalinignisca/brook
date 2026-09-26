@@ -408,6 +408,29 @@ impl From<CacheEvent> for FfiCacheEvent {
     }
 }
 
+/// Where a file stands in this device's encrypted cache.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiFileCacheState {
+    NotCached,
+    /// Downloading, or stopped part way (it resumes).
+    Partial {
+        done: u64,
+        size: u64,
+    },
+    /// Complete: opens and saves with no connection.
+    Cached,
+}
+
+impl From<brook_core::FileCacheState> for FfiFileCacheState {
+    fn from(s: brook_core::FileCacheState) -> Self {
+        match s {
+            brook_core::FileCacheState::NotCached => Self::NotCached,
+            brook_core::FileCacheState::Partial { done, size } => Self::Partial { done, size },
+            brook_core::FileCacheState::Cached => Self::Cached,
+        }
+    }
+}
+
 /// The signed-in user's sync state (the default while nobody's cache feeds it).
 #[derive(Debug, Clone, PartialEq, Eq, Default, uniffi::Record)]
 pub struct FfiCacheState {
@@ -623,6 +646,60 @@ impl FfiBrookClient {
     /// resumes it).
     pub fn cancel_transfer(&self, transfer_id: u64) {
         self.inner.cancel_transfer(TransferId(transfer_id));
+    }
+
+    /// Download `file_id` into this device's encrypted cache (resuming a partial), or join
+    /// the download already running. Progress and cancel under `transfer_id`.
+    pub async fn cache_file(&self, transfer_id: u64, file_id: String) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.cache_file(TransferId(transfer_id), &file_id).await }).await
+    }
+
+    /// Cache `file_id`, then decrypt it into a private copy and return its path, for
+    /// `NSWorkspace` to open. `file.open_refused`: a kind that is Save only.
+    pub async fn open_file(&self, transfer_id: u64, file_id: String) -> Result<String, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let path =
+            run(async move { inner.open_file(TransferId(transfer_id), &file_id).await }).await?;
+        // Never lossy: core builds the path from a hex directory and the server's filename,
+        // both Rust strings, under a UTF-8 base.
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    /// Save `file_id` from the cache, if it's complete there (works offline). `false`: not
+    /// cached, so download it (`download_file`). `destination` is truncated first and removed
+    /// on failure: to replace a file, pass a temporary path and swap it in afterwards.
+    pub async fn save_cached_file(
+        &self,
+        file_id: String,
+        destination: String,
+    ) -> Result<bool, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move {
+            inner
+                .save_cached_file(&file_id, std::path::Path::new(&destination))
+                .await
+        })
+        .await
+    }
+
+    /// Where `file_id` stands in the cache (`NotCached` for an id no cached message lists).
+    pub async fn file_state(&self, file_id: String) -> Result<FfiFileCacheState, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        Ok(run(async move { inner.file_state(&file_id).await })
+            .await?
+            .into())
+    }
+
+    /// Remove the plaintext copies Open made. The app calls this when it quits; a crash's
+    /// copies go at the next open.
+    pub async fn clear_open_copies(&self) {
+        let inner = Arc::clone(&self.inner);
+        let _ = run(async move {
+            inner.clear_open_copies().await;
+            Ok::<(), brook_core::Error>(())
+        })
+        .await;
     }
 
     /// A channel's messages that haven't gone out, in the order they will.

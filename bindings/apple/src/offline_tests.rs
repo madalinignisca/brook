@@ -386,3 +386,20 @@ fn message_events_cross_and_others_are_skipped() {
     );
     assert_eq!(map_event(ServerEvent::Ready), Some(FfiServerEvent::Ready));
 }
+
+#[test]
+fn file_cache_states_cross_with_their_progress() {
+    use brook_core::FileCacheState as S;
+    assert_eq!(
+        FfiFileCacheState::from(S::NotCached),
+        FfiFileCacheState::NotCached
+    );
+    assert_eq!(
+        FfiFileCacheState::from(S::Partial { done: 3, size: 7 }),
+        FfiFileCacheState::Partial { done: 3, size: 7 }
+    );
+    assert_eq!(
+        FfiFileCacheState::from(S::Cached),
+        FfiFileCacheState::Cached
+    );
+}

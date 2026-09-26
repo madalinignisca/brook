@@ -65,6 +65,26 @@ final class OfflineAPITests: XCTestCase {
         client.cancelTransfer(transferId: 1) // an unknown id is a no-op
     }
 
+    /// The file cache crosses, and answers `local.unavailable` while local data is off.
+    func testTheFileCacheNeedsLocalData() async throws {
+        let client = try FfiBrookClient(baseUrl: "https://brook.invalid", allowInsecureHttp: false)
+        let calls: [(String, () async throws -> Void)] = [
+            ("cacheFile", { try await client.cacheFile(transferId: 1, fileId: "f") }),
+            ("openFile", { _ = try await client.openFile(transferId: 2, fileId: "f") }),
+            ("saveCachedFile", { _ = try await client.saveCachedFile(fileId: "f", destination: "/dev/null") }),
+            ("fileState", { _ = try await client.fileState(fileId: "f") }),
+        ]
+        for (name, call) in calls {
+            do {
+                try await call()
+                XCTFail("\(name) worked with local data off")
+            } catch LoginError.Api(let code, _) {
+                XCTAssertEqual(code, "local.unavailable", name)
+            }
+        }
+        await client.clearOpenCopies() // nothing to clear: a no-op
+    }
+
     /// The chat calls cross, and answer "not signed in" without a session.
     func testChatCallsNeedASession() async throws {
         let client = try FfiBrookClient(baseUrl: "https://brook.invalid", allowInsecureHttp: false)
