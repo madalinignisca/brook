@@ -51,6 +51,7 @@ pub struct FfiCachedChannel {
     pub archived: bool,
     pub unread_count: i64,
     pub members: Vec<FfiMember>,
+    pub owner_offers: Vec<crate::types::FfiOwnerOffer>,
 }
 
 impl From<brook_core::Channel> for FfiCachedChannel {
@@ -62,6 +63,7 @@ impl From<brook_core::Channel> for FfiCachedChannel {
             archived: c.archived,
             unread_count: c.unread_count,
             members: c.members.into_iter().map(Into::into).collect(),
+            owner_offers: c.owner_offers.into_iter().map(Into::into).collect(),
         }
     }
 }

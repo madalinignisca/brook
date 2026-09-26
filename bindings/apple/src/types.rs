@@ -260,6 +260,27 @@ pub struct FfiChannel {
     pub archived: bool,
     /// Current members (Members, and who Remove is offered for).
     pub members: Vec<crate::offline::FfiMember>,
+    /// Pending ownership offers: one to you highlights the channel and asks when opened.
+    pub owner_offers: Vec<FfiOwnerOffer>,
+}
+
+/// A pending offer to make `user_id` a channel owner, from `offered_by`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiOwnerOffer {
+    pub user_id: String,
+    pub offered_by: String,
+    /// RFC 3339.
+    pub created_at: String,
+}
+
+impl From<brook_core::OwnerOffer> for FfiOwnerOffer {
+    fn from(o: brook_core::OwnerOffer) -> Self {
+        Self {
+            user_id: o.user_id,
+            offered_by: o.offered_by,
+            created_at: o.created_at,
+        }
+    }
 }
 
 impl From<brook_core::Channel> for FfiChannel {
@@ -270,6 +291,7 @@ impl From<brook_core::Channel> for FfiChannel {
             name: c.name,
             archived: c.archived,
             members: c.members.into_iter().map(Into::into).collect(),
+            owner_offers: c.owner_offers.into_iter().map(Into::into).collect(),
         }
     }
 }

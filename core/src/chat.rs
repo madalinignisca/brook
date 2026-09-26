@@ -41,6 +41,29 @@ pub struct Channel {
     /// Whether the channel is archived (read-only).
     #[serde(default)]
     pub archived: bool,
+    /// Pending offers to make a member an owner. The recipient's app highlights the channel
+    /// and asks Accept or Decline when it's opened. Part of the channel object, so an offer
+    /// reaches an offline member through `/sync` and the cache, as a role does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_offers: Vec<OwnerOffer>,
+}
+
+/// A pending offer to make `user_id` a channel owner, from `offered_by`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OwnerOffer {
+    /// Who is offered ownership.
+    pub user_id: String,
+    /// The owner or admin who offered it.
+    pub offered_by: String,
+    /// When (RFC 3339).
+    pub created_at: String,
+}
+
+impl Channel {
+    /// The pending ownership offer to `user_id`, if any.
+    pub fn owner_offer_for(&self, user_id: &str) -> Option<&OwnerOffer> {
+        self.owner_offers.iter().find(|o| o.user_id == user_id)
+    }
 }
 
 impl Channel {

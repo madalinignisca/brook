@@ -4,7 +4,7 @@ import XCTest
 @testable import Brook
 
 func cachedChannel(_ id: String, _ name: String, unread: Int64 = 0) -> FfiCachedChannel {
-    FfiCachedChannel(id: id, kind: "public", name: name, archived: false, unreadCount: unread, members: [])
+    FfiCachedChannel(id: id, kind: "public", name: name, archived: false, unreadCount: unread, members: [], ownerOffers: [])
 }
 
 /// The channel list offline (#62 spec item 1): network first, the cache when it fails, the

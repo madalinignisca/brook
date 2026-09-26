@@ -245,6 +245,48 @@ impl FfiBrookClient {
         run(async move { inner.remove_member(&channel_id, &user_id).await }).await
     }
 
+    /// Offer to make the member `handle` an owner (an owner or an admin). Answers the channel,
+    /// its `ownerOffers` including the new one. Errors: `authz.forbidden`,
+    /// `channel.not_member`, `channel.already_owner`, `channel.dm`, `not_found`.
+    pub async fn offer_ownership(
+        &self,
+        channel_id: String,
+        handle: String,
+    ) -> Result<FfiChannel, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        Ok(
+            run(async move { inner.offer_ownership(&channel_id, &handle).await })
+                .await?
+                .into(),
+        )
+    }
+
+    /// Withdraw the pending offer to `user_id`. `offer.not_found`: already answered.
+    pub async fn withdraw_ownership_offer(
+        &self,
+        channel_id: String,
+        user_id: String,
+    ) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.withdraw_ownership_offer(&channel_id, &user_id).await }).await
+    }
+
+    /// Accept your pending offer: you become an owner. `offer.not_found`: there's none.
+    pub async fn accept_ownership(&self, channel_id: String) -> Result<FfiChannel, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        Ok(
+            run(async move { inner.accept_ownership(&channel_id).await })
+                .await?
+                .into(),
+        )
+    }
+
+    /// Decline your pending offer. `offer.not_found`: there's none.
+    pub async fn decline_ownership(&self, channel_id: String) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.decline_ownership(&channel_id).await }).await
+    }
+
     /// Leave a channel (`remove_member` with yourself).
     pub async fn leave_channel(&self, channel_id: String) -> Result<(), LoginError> {
         let inner = Arc::clone(&self.inner);

@@ -549,3 +549,23 @@ fn channel_events_cross_with_their_members() {
         })
     );
 }
+
+#[test]
+fn owner_offers_cross_on_live_and_cached_channels() {
+    let channel: brook_core::Channel = serde_json::from_value(json!({
+        "id": "c1", "kind": "channel", "name": "general", "topic": null,
+        "created_by": "u1", "created_at": "2026-06-18T00:00:00Z", "members": [],
+        "owner_offers": [{"user_id": "u2", "offered_by": "u1", "created_at": "2026-09-26T10:00:00Z"}]
+    }))
+    .unwrap();
+    let offer = crate::types::FfiOwnerOffer {
+        user_id: "u2".into(),
+        offered_by: "u1".into(),
+        created_at: "2026-09-26T10:00:00Z".into(),
+    };
+    assert_eq!(
+        crate::types::FfiChannel::from(channel.clone()).owner_offers,
+        vec![offer.clone()]
+    );
+    assert_eq!(FfiCachedChannel::from(channel).owner_offers, vec![offer]);
+}
