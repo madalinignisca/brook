@@ -168,6 +168,12 @@ final class ChannelsModel {
 
     func canJoin(_ channel: ChannelRow) -> Bool { ready }
 
+    /// The pending offer to make this user an owner of `channel` (#190), while `me` is known.
+    func offerToMe(_ channel: ChannelRow) -> FfiOwnerOffer? {
+        guard let me, !me.isEmpty else { return nil }
+        return channel.ownerOffers.first { $0.userId == me }
+    }
+
     func title(_ channel: ChannelRow) -> String { channel.name ?? "Direct message" }
 
     /// "● Call · N" in the sidebar, or nil when no call is live.

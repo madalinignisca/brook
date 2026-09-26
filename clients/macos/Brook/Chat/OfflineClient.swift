@@ -51,22 +51,26 @@ struct ChannelRow: Identifiable, Equatable {
     let archived: Bool
     var unread: Int64
     let members: [FfiMember]
+    let ownerOffers: [FfiOwnerOffer]
 
     init(_ channel: FfiChannel, unread: Int64 = 0) {
         (id, kind, name, archived) = (channel.id, channel.kind, channel.name, channel.archived)
         self.unread = unread
         members = channel.members
+        ownerOffers = channel.ownerOffers
     }
 
     init(_ channel: FfiCachedChannel) {
         (id, kind, name, archived) = (channel.id, channel.kind, channel.name, channel.archived)
         unread = channel.unreadCount
         members = channel.members
+        ownerOffers = channel.ownerOffers
     }
 
     init(id: String, kind: String = "public", name: String?, archived: Bool = false, unread: Int64 = 0,
-         members: [FfiMember] = []) {
+         members: [FfiMember] = [], ownerOffers: [FfiOwnerOffer] = []) {
         (self.id, self.kind, self.name, self.archived, self.unread) = (id, kind, name, archived, unread)
         self.members = members
+        self.ownerOffers = ownerOffers
     }
 }
