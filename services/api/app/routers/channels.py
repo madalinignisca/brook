@@ -367,6 +367,67 @@ async def add_member(
         await _emit_channel_update(hub, session, channel)
 
 
+@router.delete("/{channel_id}/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_member(
+    channel_id: uuid.UUID, user_id: uuid.UUID, user: CurrentUser, session: Session, hub: HubDep
+) -> None:
+    """Leave a channel (``user_id`` is yourself) or remove someone from it.
+
+    Owner decision, 2026-09-26: anyone may leave; a channel owner or a global admin may
+    remove others; only a global admin may remove an owner; the last owner can't go
+    (409 ``channel.last_owner``: no channel is left without one; delete it instead); a
+    DM can't be left (422 ``channel.dm``: delete it instead). A non-member who isn't an
+    admin gets 404, as everywhere else, so channel existence isn't revealed.
+
+    The sync hook does the rest: it tombstones the membership (the removed user's
+    ``/sync`` shows ``removed_channels``, everyone else's ``left_members``), re-stamps the
+    channel and hints them all. Live, the remaining members get ``channel.update`` and
+    the removed user ``channel.delete`` (core fences the channel on it, as for a
+    deleted one)."""
+    channel = await session.get(Channel, channel_id)
+    if channel is None:
+        raise _not_found()
+    caller = await _membership(session, channel_id, user.id)
+    is_admin = user.global_role == "admin"
+    if caller is None and not is_admin:
+        raise _not_found()
+    leaving = user_id == user.id
+    if channel.kind == "dm":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "channel.dm", "message": "A DM can't be left; delete it instead"},
+        )
+    if not leaving and not is_admin and (caller is None or caller.role != "owner"):
+        raise _forbidden("Only an admin or the channel owner can remove members")
+    target = await _membership(session, channel_id, user_id)
+    if target is None:
+        raise _not_found()
+    if target.role == "owner":
+        if not leaving and not is_admin:
+            raise _forbidden("Only an admin can remove a channel owner")
+        owners = await session.scalar(
+            select(func.count())
+            .select_from(Membership)
+            .where(Membership.channel_id == channel_id, Membership.role == "owner")
+        )
+        if (owners or 0) <= 1:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "channel.last_owner",
+                    "message": "The last owner can't leave; delete the channel instead",
+                },
+            )
+    await session.delete(target)
+    await session.flush()  # stamps the tombstone's seq (app/sync.py)
+    seq = transaction_seq(session.sync_session)
+    await session.commit()
+    await hub.send_to_users(
+        [user_id], _envelope("channel.delete", {"id": str(channel_id), "seq": seq})
+    )
+    await _emit_channel_update(hub, session, channel)
+
+
 @router.patch("/{channel_id}", response_model=ChannelOut)
 async def update_channel(
     channel_id: uuid.UUID, body: ChannelPatch, user: CurrentUser, session: Session, hub: HubDep

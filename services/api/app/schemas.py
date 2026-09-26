@@ -154,7 +154,18 @@ class UserOut(BaseModel):
     display_name: str
     global_role: str
     status: str
+    status_text: str = ""
     created_at: datetime
+
+
+class ProfilePatch(BaseModel):
+    """``PATCH /auth/me``: change your own profile. Omitted fields stay as they are.
+
+    ``display_name`` 1..64 characters, ``status_text`` 0..100 ("" clears it), both after
+    trimming; control characters and bidirectional overrides are refused (routers/auth)."""
+
+    display_name: str | None = Field(default=None, max_length=256)
+    status_text: str | None = Field(default=None, max_length=400)
 
 
 class MeOut(UserOut):

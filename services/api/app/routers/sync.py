@@ -57,6 +57,7 @@ class SyncUser(BaseModel):
     handle: str
     display_name: str
     status: str
+    status_text: str = ""
     seq: int
 
 
@@ -271,7 +272,12 @@ def _membership_out(m: Membership, me: uuid.UUID) -> SyncMembership:
 
 def _user_out(u: User) -> SyncUser:
     return SyncUser(
-        id=u.id, handle=u.handle, display_name=u.display_name, status=u.status, seq=u.seq
+        id=u.id,
+        handle=u.handle,
+        display_name=u.display_name,
+        status=u.status,
+        status_text=u.status_text,
+        seq=u.seq,
     )
 
 

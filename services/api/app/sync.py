@@ -50,7 +50,7 @@ def _take_seq(session: Session) -> int:
     return int(seq)
 
 
-_PROFILE = ("handle", "display_name", "status")
+_PROFILE = ("handle", "display_name", "status", "status_text")
 
 
 def _profile_changed(user: User) -> bool:

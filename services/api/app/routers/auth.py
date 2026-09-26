@@ -5,6 +5,7 @@ OIDC and LDAP (docs/AUTH.md) arrive in Phase 0b; this is the local-account path.
 
 from __future__ import annotations
 
+import unicodedata
 import uuid
 from datetime import datetime, timedelta
 from typing import Annotated, Any, cast
@@ -26,6 +27,7 @@ from ..schemas import (
     MeOut,
     PasswordChangeIn,
     PasswordChangeOut,
+    ProfilePatch,
     RefreshIn,
     RegisterIn,
     TokenPair,
@@ -483,6 +485,52 @@ async def me(
 ) -> MeOut:
     """The current user, with their second-factor state (so the app shows Enable or
     Disable, and warns when recovery codes run low)."""
+    return await _me_out(session, user)
+
+
+# Characters a name or status line may not contain: C0/C1 controls, and the
+# bidirectional overrides, isolates and marks used to spoof names (an RLO makes
+# "evil\u202egnp.exe" read as "evilexe.png"). Zero-width joiners stay allowed:
+# emoji sequences need them.
+_BIDI = frozenset("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200e\u200f\u061c")
+
+
+def _clean_profile_text(value: str, field: str, low: int, high: int) -> str:
+    text = value.strip()
+    if any(unicodedata.category(c) == "Cc" or c in _BIDI for c in text):
+        raise _profile_invalid(field, "control or text-direction characters aren't allowed")
+    if not low <= len(text) <= high:
+        raise _profile_invalid(field, f"must be {low} to {high} characters")
+    return text
+
+
+def _profile_invalid(field: str, why: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={"code": "profile.invalid", "message": f"{field}: {why}"},
+    )
+
+
+@router.patch("/me", response_model=MeOut)
+async def update_me(
+    body: ProfilePatch,
+    user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> MeOut:
+    """Change your own display name and status line (the handle, which signs in, stays).
+
+    The sync hook stamps the change (profile fields only) and hints everyone who shares a
+    channel with you, so their apps show the new name without waiting."""
+    if body.display_name is not None:
+        user.display_name = _clean_profile_text(body.display_name, "display_name", 1, 64)
+    if body.status_text is not None:
+        user.status_text = _clean_profile_text(body.status_text, "status_text", 0, 100)
+    await session.commit()
+    await session.refresh(user)
+    return await _me_out(session, user)
+
+
+async def _me_out(session: AsyncSession, user: User) -> MeOut:
     enabled = (
         await session.scalar(
             select(Totp.id).where(Totp.user_id == user.id, Totp.activated_at.is_not(None))
