@@ -12,11 +12,17 @@ enum NotificationPlanner {
         return !(m.channelId == openChannel && appActive)
     }
 
+    /// Someone else's live message naming you or everyone (`@channel`, `@here`): the
+    /// server's, core's and GTK's rule, whole here even though `counts` also checks the first
+    /// two, so no caller can count your own `@channel` from another device.
+    static func mentions(_ m: FfiMessage, me: String) -> Bool {
+        !me.isEmpty && m.authorId != me && !m.deleted && (m.mentionEveryone || m.mentions.contains(me))
+    }
+
     static func body(_ m: FfiMessage, me: String) -> String {
         let author = m.authorDisplayName ?? m.authorHandle ?? "Someone"
         if m.body.isEmpty, !m.attachments.isEmpty { return "\(author) sent a file" }
-        let mentioned = m.mentionEveryone || m.mentions.contains(me)
-        return mentioned ? "\(author) mentioned you: \(m.body)" : "\(author): \(m.body)"
+        return mentions(m, me: me) ? "\(author) mentioned you: \(m.body)" : "\(author): \(m.body)"
     }
 }
 

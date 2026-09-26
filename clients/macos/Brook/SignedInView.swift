@@ -68,6 +68,12 @@ struct SignedInView: View {
                         Text("Owner?").font(.caption.bold()).foregroundStyle(.tint)
                             .help("You've been offered ownership of this channel")
                     }
+                    if let mentions = channels.mentions(channel) {
+                        Text("@\(mentions)").font(.caption.bold()).monospacedDigit()
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .foregroundStyle(.white).background(.tint, in: Capsule())
+                            .accessibilityLabel("\(mentions) unread mention\(mentions == 1 ? "" : "s")")
+                    }
                     if let unread = channels.unread(channel) {
                         Text("\(unread)").font(.caption.bold()).monospacedDigit()
                             .padding(.horizontal, 6).padding(.vertical, 1)

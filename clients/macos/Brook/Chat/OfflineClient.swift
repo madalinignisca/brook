@@ -50,12 +50,16 @@ struct ChannelRow: Identifiable, Equatable {
     let name: String?
     let archived: Bool
     var unread: Int64
+    /// Of the unread, those mentioning you or everyone (#195).
+    var unreadMentions: Int64
     let members: [FfiMember]
     let ownerOffers: [FfiOwnerOffer]
 
-    init(_ channel: FfiChannel, unread: Int64 = 0) {
+    /// `mentions`: this device's count, when it has one; else the server's (`GET /channels`).
+    init(_ channel: FfiChannel, unread: Int64 = 0, mentions: Int64? = nil) {
         (id, kind, name, archived) = (channel.id, channel.kind, channel.name, channel.archived)
         self.unread = unread
+        unreadMentions = mentions ?? channel.unreadMentions
         members = channel.members
         ownerOffers = channel.ownerOffers
     }
@@ -63,13 +67,15 @@ struct ChannelRow: Identifiable, Equatable {
     init(_ channel: FfiCachedChannel) {
         (id, kind, name, archived) = (channel.id, channel.kind, channel.name, channel.archived)
         unread = channel.unreadCount
+        unreadMentions = channel.unreadMentions
         members = channel.members
         ownerOffers = channel.ownerOffers
     }
 
     init(id: String, kind: String = "public", name: String?, archived: Bool = false, unread: Int64 = 0,
-         members: [FfiMember] = [], ownerOffers: [FfiOwnerOffer] = []) {
+         unreadMentions: Int64 = 0, members: [FfiMember] = [], ownerOffers: [FfiOwnerOffer] = []) {
         (self.id, self.kind, self.name, self.archived, self.unread) = (id, kind, name, archived, unread)
+        self.unreadMentions = unreadMentions
         self.members = members
         self.ownerOffers = ownerOffers
     }
