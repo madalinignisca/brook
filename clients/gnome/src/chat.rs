@@ -98,6 +98,9 @@ struct Chat {
     /// This user's local stores answered a cached call: `unsent_count` can be trusted (it
     /// answers 0 while they're closed).
     local_open: Rc<Cell<bool>>,
+    /// Current names of authors whose profile changed this session (from `cached_users`),
+    /// used for every row drawn afterwards too: stored message rows keep the old name.
+    author_names: Rc<RefCell<HashMap<String, String>>>,
 }
 
 /// The widgets of a rendered message we may mutate after an edit/delete/reaction.
@@ -268,6 +271,7 @@ pub fn build(
         cancelled_chip: Rc::default(),
         text_draft: Rc::default(),
         local_open: Rc::default(),
+        author_names: Rc::default(),
     });
     chat.progress.listen(&chat.client);
 
@@ -1185,9 +1189,10 @@ fn is_safe_link(uri: &str) -> bool {
 
 /// Append a message row and scroll to the bottom.
 fn append_message(chat: &Rc<Chat>, message: &Message) {
-    let author = message
-        .author_display_name
-        .clone()
+    // A name that changed since the message was stored wins.
+    let current = chat.author_names.borrow().get(&message.author_id).cloned();
+    let author = current
+        .or_else(|| message.author_display_name.clone())
         .or_else(|| message.author_handle.clone())
         .unwrap_or_else(|| "Unknown".to_string());
 
@@ -2664,6 +2669,8 @@ fn redraw_authors(chat: &Rc<Chat>, ids: Vec<String>) {
                 widgets.author.set_label(name);
             }
         }
+        // Rows drawn later (an older page, a redraw after a reset) use them too.
+        chat.author_names.borrow_mut().extend(names);
     });
 }
 
