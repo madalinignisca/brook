@@ -236,6 +236,9 @@ class ChannelOut(BaseModel):
     # Pending ownership offers (members' view: who has been offered, by whom).
     owner_offers: list[OwnerOfferOut] = Field(default_factory=list)
     unread_count: int = 0
+    # Of those, how many mention you (by @handle, or @channel/@here). Like unread_count,
+    # only in GET /channels; an offline cache counts it from its stored messages.
+    unread_mentions: int = 0
     public: bool = False
     archived: bool = False
     # Change sequence (sync spec §3): the cache keeps the highest per row.
