@@ -31,6 +31,11 @@ struct SignedInView: View {
     @State private var shownName: String?
     @State private var leaving: ChannelRow?
     @State private var showingMembers = false
+    /// The open channel's ownership question (#190): when it shows, and its answer's state
+    /// (kept here so an error and "Ask Me Later" survive redraws). Keyed by channel and offer.
+    @State private var prompt = OfferPrompt()
+    @State private var answering: OfferAnswerModel?
+    @State private var answeringFor: String?
 
     init(
         user: FfiUser, client: any FfiBrookClientProtocol, calls: CallCenter,
@@ -58,6 +63,10 @@ struct SignedInView: View {
                     Spacer()
                     if let badge = channels.badge(channel) {
                         Text(badge).font(.caption).foregroundStyle(.green)
+                    }
+                    if channels.offerToMe(channel) != nil {
+                        Text("Owner?").font(.caption.bold()).foregroundStyle(.tint)
+                            .help("You've been offered ownership of this channel")
                     }
                     if let unread = channels.unread(channel) {
                         Text("\(unread)").font(.caption.bold()).monospacedDigit()
@@ -139,7 +148,27 @@ struct SignedInView: View {
         .alert(item: Binding(get: { feed?.alert }, set: { if $0 == nil { feed?.dismiss() } })) { alert in
             Alert(title: Text(alert.text))
         }
-        .onChange(of: selection, initial: true) { _, channelId in openTimeline(channelId) }
+        .onChange(of: selection, initial: true) { _, channelId in
+            openTimeline(channelId)
+            prompt.opened()
+            syncAnswering()
+        }
+        .onChange(of: channels.channels) { _, _ in syncAnswering() } // an offer came or went
+        .sheet(isPresented: Binding(
+            get: {
+                prompt.shows(channelId: selection, offer: selectedOffer?.offer,
+                             answered: answering?.done ?? true)
+            },
+            // Not a deferral: the sheet can't be dismissed, so SwiftUI only closes it itself,
+            // once the offer is gone or answered. "Ask Me Later" is the one way to put it off.
+            set: { _ in }
+        )) {
+            if let answering {
+                OfferAnswerSheet(model: answering) {
+                    if let selection, let offer = selectedOffer?.offer { prompt.later(selection, offer) }
+                }
+            }
+        }
         .onChange(of: channels.closed) { _, closed in
             if let closed, selection == closed { selection = nil } // removed from it (#62)
         }
@@ -219,6 +248,29 @@ struct SignedInView: View {
 }
 
 extension SignedInView {
+    /// The open channel and the pending offer to this user on it.
+    fileprivate var selectedOffer: (row: ChannelRow, offer: FfiOwnerOffer)? {
+        guard let row = channels.channels.first(where: { $0.id == selection }),
+              let offer = channels.offerToMe(row) else { return nil }
+        return (row, offer)
+    }
+
+    /// A question model for the open channel's offer, new when the channel or the offer
+    /// changes; none without an offer.
+    fileprivate func syncAnswering() {
+        guard let (row, offer) = selectedOffer, let membership = client as? any MembershipClient else {
+            answering = nil
+            answeringFor = nil
+            return
+        }
+        let key = "\(row.id)|\(offer.createdAt)"
+        guard key != answeringFor else { return }
+        answeringFor = key
+        answering = OfferAnswerModel(
+            channelId: row.id, title: channels.title(row),
+            offerer: OfferAnswerModel.offererName(offer, members: row.members), client: membership)
+    }
+
     fileprivate func powers(_ channel: ChannelRow) -> ChannelPowers {
         ChannelPowers(me: user.id, isAdmin: user.globalRole == "admin", members: channel.members)
     }
