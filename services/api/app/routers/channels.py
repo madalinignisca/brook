@@ -736,6 +736,29 @@ async def edit_message(
     return out
 
 
+async def broadcast_message_update(
+    session: AsyncSession, hub: Hub, message_id: uuid.UUID, viewer_id: uuid.UUID
+) -> None:
+    """Fan out a message's current state as `message.update` (after a change that isn't
+    an edit, e.g. one of its files deleted). Call after the change is committed, so the
+    frame carries the seq the sync hook stamped. Reactions are as `viewer_id` sees them,
+    as for an edit."""
+    message = await session.get(Message, message_id, populate_existing=True)
+    if message is None or message.deleted_at is not None:
+        return  # a tombstone has its own event, message.delete
+    author = await session.get(User, message.author_id) if message.author_id else None
+    reply = None
+    if message.reply_to_id is not None:
+        quoted = await session.get(Message, message.reply_to_id)
+        if quoted is not None:
+            reply = await _quote(session, quoted)
+    reactions = (await _reactions_for(session, [message_id], viewer_id)).get(message_id, [])
+    files = await _attachments_for(session, [message_id])
+    out = _message_out(message, author, reply, reactions, attachments=files.get(message_id))
+    member_ids = [m.id for m in await _members(session, message.channel_id)]
+    await hub.send_to_users(member_ids, _envelope("message.update", jsonable_encoder(out)))
+
+
 @router.delete("/{channel_id}/messages/{message_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_message(
     channel_id: uuid.UUID,

@@ -32,7 +32,7 @@
 | `PATCH /messages/{id}` · `DELETE /messages/{id}` | edit / soft-delete (author or channel owner) |
 | `POST /channels/{id}/files` | `{filename, size, content_type, client_id?}` → `{file, upload_url}` (state `pending`); `413 file.too_large` / `file.quota_exceeded`, `507 file.no_space` (the server's disk is nearly full: **try later**, `Retry-After: 600`; keep the upload) |
 | `PUT  /files/{id}/content` | the raw bytes (not multipart), streamed with a hard cap at `size` → `200 FileOut` (`committed`, `sha256`); `409 file.already_committed` with `details: FileOut` if another upload won |
-| `GET  /files/{id}/content` · `DELETE /files/{id}` | download (bearer auth, `Range` + `If-Range: "<sha256>"`; always `Content-Disposition: attachment`) · delete (the uploader or a channel owner) |
+| `GET  /files/{id}/content` · `DELETE /files/{id}` | download (bearer auth, `Range` + `If-Range: "<sha256>"`; always `Content-Disposition: attachment`) · delete (the uploader or a channel owner). Deleting an **attached** file removes it from its message: the message is restamped (a higher `seq`, so `/sync` brings the shorter `attachments` list) and members online get `message.update`. A message's list only ever shrinks this way. A captionless message can end up with no text and no files; it is still not a tombstone (`deleted_at` stays null) |
 | ~~`POST /channels/{id}/calls`~~ | superseded: calls are joined over the WS with `call.join` (§3), one path, no REST step |
 | `POST /devices` · `DELETE /devices/{id}` | register/unregister an APNs/FCM push token (mobile) |
 | `GET  /bots` · `POST /bots` | list / register bots (returns signing secret once) |

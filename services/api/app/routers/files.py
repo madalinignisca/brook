@@ -30,7 +30,7 @@ from ..deps import get_current_user
 from ..filenames import original_name, safe_filename
 from ..models import File, User, utcnow
 from ..schemas import FileCreate, FileCreated, FileOut
-from .channels import _membership, _require_member
+from .channels import HubDep, _membership, _require_member, broadcast_message_update
 
 log = logging.getLogger(__name__)
 
@@ -369,9 +369,11 @@ async def delete_file(
     file_id: uuid.UUID,
     user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
+    hub: HubDep,
 ) -> None:
     """Remove a file (the uploader, or an owner of its channel). An attached file
-    leaves its message showing it was removed."""
+    leaves its message without it: the sync hook restamps the message, and members
+    online get a `message.update` with the shorter attachments list."""
     row = await session.get(File, file_id)
     if row is None:
         raise _not_found()
@@ -380,6 +382,11 @@ async def delete_file(
         raise _not_found()
     if row.uploader_id != user.id and membership.role != "owner":
         raise _error(status.HTTP_403_FORBIDDEN, "authz.forbidden", "Not your file")
+    message_id = row.message_id
+    user_id = user.id  # read before the commit expires it
     await session.delete(row)
     await session.commit()
     await run_in_threadpool(storage.remove, file_id)
+    if message_id is not None:
+        # Without this, members online only noticed at their next /sync.
+        await broadcast_message_update(session, hub, message_id, user_id)
