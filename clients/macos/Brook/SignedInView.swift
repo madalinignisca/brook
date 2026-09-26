@@ -16,6 +16,8 @@ struct SignedInView: View {
     @State private var selection: String?
     @State private var changingPassword = false
     @State private var resettingPassword = false
+    /// The open channel's conversation (made when the selection changes, never in `body`).
+    @State private var timeline: TimelineModel?
 
     init(
         user: FfiUser, client: any FfiBrookClientProtocol, calls: CallCenter,
@@ -44,9 +46,8 @@ struct SignedInView: View {
             .navigationSplitViewColumnWidth(min: 200, ideal: 240)
         } detail: {
             if let channel = channels.channels.first(where: { $0.id == selection }),
-               let chat = client as? any ChatClient {
-                ChatView(channelId: channel.id, me: user.id, client: chat,
-                         timeline: timeline(for: channel.id, chat))
+               let chat = client as? any ChatClient, let timeline, timeline.channelId == channel.id {
+                ChatView(channelId: channel.id, me: user.id, client: chat, timeline: timeline)
                     .id(channel.id)  // a new conversation per channel
                     .navigationTitle(channels.title(channel))
                     .toolbar {
@@ -75,6 +76,7 @@ struct SignedInView: View {
             }
         }
         .task { await channels.start() }
+        .onChange(of: selection, initial: true) { _, channelId in openTimeline(channelId) }
         .toolbar {
             ToolbarItem {
                 Menu {
@@ -137,13 +139,17 @@ struct SignedInView: View {
 }
 
 extension SignedInView {
-    /// The open channel's timeline, made once per selection and handed to the channel list,
-    /// which forwards it the message events.
-    fileprivate func timeline(for channelId: String, _ chat: any ChatClient) -> TimelineModel {
-        if let open = channels.timeline, open.channelId == channelId { return open }
+    /// A new conversation for the selected channel, handed to the channel list, which
+    /// forwards it the message events (the previous one stops receiving them).
+    fileprivate func openTimeline(_ channelId: String?) {
+        guard let channelId, let chat = client as? any ChatClient else {
+            timeline = nil
+            channels.timeline = nil
+            return
+        }
         let model = TimelineModel(channelId: channelId, client: chat)
+        timeline = model
         channels.timeline = model
-        return model
     }
 
     /// Whether two-factor sign-in is on decides which menu items show.

@@ -26,8 +26,14 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     }
     func deleteMessage(channelId: String, messageId: String) async throws {}
     func markRead(channelId: String, messageId: String?) async throws { read.append(messageId) }
+    var downloadFailure: Error?
+    var downloadBytes = Data("new".utf8)
     func downloadFile(transferId: UInt64, fileId: String, sha256: String, size: UInt64,
-                      destination: String) async throws {}
+                      destination: String) async throws {
+        // As core: a failed download leaves nothing at its destination.
+        if let downloadFailure { throw downloadFailure }
+        try downloadBytes.write(to: URL(fileURLWithPath: destination))
+    }
     func cancelTransfer(transferId: UInt64) {}
     func subscribeTransfers(listener: TransferListener) -> Subscription {
         fatalError("not used by these tests")
@@ -135,5 +141,40 @@ final class ComposerModelTests: XCTestCase {
         c.text = "new"
         await c.send()
         XCTAssertEqual(chat.sent.withLock { $0 }, ["edit:m1:new"])
+    }
+}
+
+@MainActor
+final class SaveModelTests: XCTestCase {
+    private func file() -> FfiFileInfo {
+        FfiFileInfo(id: "f", filename: "a.txt", originalName: "a.txt", size: 3,
+                    contentType: "text/plain", sha256: "ab")
+    }
+
+    /// Saving over an existing file ("Replace") that then fails leaves the old file as it was.
+    func testAFailedSaveKeepsTheFileItWouldHaveReplaced() async throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dest = dir.appending(path: "a.txt")
+        try Data("old".utf8).write(to: dest)
+        let chat = FakeChat()
+        chat.downloadFailure = LoginError.Api(code: "file.gone", message: "")
+        let saves = SaveModel(client: chat)
+        await saves.save(file(), to: dest)
+        XCTAssertEqual(try Data(contentsOf: dest), Data("old".utf8), "the old copy was lost")
+        XCTAssertEqual(saves.states["f"], .failed("No longer available."))
+    }
+
+    func testASaveReplacesTheFile() async throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dest = dir.appending(path: "a.txt")
+        try Data("old".utf8).write(to: dest)
+        let saves = SaveModel(client: FakeChat())
+        await saves.save(file(), to: dest)
+        XCTAssertEqual(try Data(contentsOf: dest), Data("new".utf8))
+        XCTAssertEqual(saves.states["f"], .saved)
     }
 }

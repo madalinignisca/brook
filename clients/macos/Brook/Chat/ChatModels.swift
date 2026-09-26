@@ -234,9 +234,19 @@ final class SaveModel {
         let transfer = UInt64.random(in: 1 ... UInt64.max)
         transfers[file.id] = transfer
         states[file.id] = .saving(done: 0, total: file.size)
+        // Into a temporary file first, then moved over the destination: saving over an
+        // existing file ("Replace") must not destroy it if the download then fails.
+        let temp = FileManager.default.temporaryDirectory
+            .appending(path: "brook-save-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temp) }
         do {
             try await client.downloadFile(transferId: transfer, fileId: file.id, sha256: sha,
-                                          size: file.size, destination: destination.path)
+                                          size: file.size, destination: temp.path)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temp)
+            } else {
+                try FileManager.default.moveItem(at: temp, to: destination)
+            }
             states[file.id] = .saved
         } catch let LoginError.Api(code, _) where code == "file.gone" {
             states[file.id] = .failed("No longer available.")
