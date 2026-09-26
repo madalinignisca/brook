@@ -44,10 +44,23 @@ final class TimelineModel {
 
     private let client: any ChatClient
     static let pageSize: UInt32 = 50
+    /// Whether the user can be looking at it: the app is active (#145's note, as GTK #177).
+    private let isActive: @MainActor () -> Bool
+    /// Messages arrived while the app was in the background: read when it's active again.
+    private(set) var readOwed = false
 
-    init(channelId: String, client: any ChatClient) {
+    init(channelId: String, client: any ChatClient,
+         isActive: @escaping @MainActor () -> Bool = { AppActivity.isActive }) {
         self.channelId = channelId
         self.client = client
+        self.isActive = isActive
+    }
+
+    /// The app became active: what arrived meanwhile is read now.
+    func appBecameActive() {
+        guard readOwed, let newest = messages.last else { return }
+        readOwed = false
+        Task { try? await client.markRead(channelId: channelId, messageId: newest.id) }
     }
 
     private var cache: (any OfflineClient)? { client as? any OfflineClient }
@@ -141,7 +154,11 @@ final class TimelineModel {
             guard message.channelId == channelId else { return }
             merge([message])
             if case .messageNew = event {
-                Task { try? await client.markRead(channelId: channelId, messageId: message.id) }
+                if isActive() {
+                    Task { try? await client.markRead(channelId: channelId, messageId: message.id) }
+                } else {
+                    readOwed = true // shown, not seen yet
+                }
             }
         case let .messageDelete(channel, messageId):
             guard channel == channelId else { return }

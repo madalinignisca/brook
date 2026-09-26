@@ -131,7 +131,9 @@ final class ChannelsModel {
 
     /// The unread count, when there is one (the open channel's is always 0).
     func unread(_ channel: ChannelRow) -> Int64? {
-        channel.unread > 0 && channel.id != openChannel ? channel.unread : nil
+        // The open channel's count shows only while what arrived there isn't seen yet.
+        let seen = channel.id == openChannel && timeline?.readOwed != true
+        return channel.unread > 0 && !seen ? channel.unread : nil
     }
 }
 
