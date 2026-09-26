@@ -74,6 +74,9 @@ targets:
         com.apple.security.network.server: true
         com.apple.security.device.camera: true
         com.apple.security.device.audio-input: true
+        # Save… (NSSavePanel) and attaching files (NSOpenPanel): a sandboxed app can't show
+        # either panel without it. Only what the user picks in a panel, nothing wider.
+        com.apple.security.files.user-selected.read-write: true
     postBuildScripts:
       # SwiftPM's WebRTC.framework is universal. Ship arm64 only: thin the EMBEDDED copy (never
       # the downloaded artifact) and re-sign it, before Xcode signs the app around it.
