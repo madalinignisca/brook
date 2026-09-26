@@ -144,14 +144,8 @@ pub(crate) fn write(
             };
             let last = m == 0;
             digest.update(&current[..n]);
-            let mut sealed = current[..n].to_vec();
-            sealing
-                .seal_in_place_append_tag(
-                    nonce(index),
-                    Aad::from(aad(&id, index, last)),
-                    &mut sealed,
-                )
-                .map_err(|_| WriteError::Store)?;
+            let sealed =
+                seal_chunk(&sealing, &id, index, last, &current[..n]).ok_or(WriteError::Store)?;
             out.write_all(&sealed).map_err(|_| WriteError::Store)?;
             size += n as u64;
             // Checked on the bytes copied, not only a size read before: a file still being
@@ -188,14 +182,30 @@ pub(crate) fn write(
     result
 }
 
+/// Seal one chunk: the one sealing step every writer shares (the snapshot copy, the cache's
+/// downloads), so both produce the same format.
+fn seal_chunk(
+    key: &LessSafeKey,
+    id: &[u8; 16],
+    index: u64,
+    last: bool,
+    plain: &[u8],
+) -> Option<Vec<u8>> {
+    let mut sealed = plain.to_vec();
+    key.seal_in_place_append_tag(nonce(index), Aad::from(aad(id, index, last)), &mut sealed)
+        .ok()?;
+    Some(sealed)
+}
+
 /// How a snapshot of `size` bytes is laid out: the chunk count and each chunk's sealed length.
-struct Layout {
-    chunk: usize,
-    size: u64,
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Layout {
+    pub(crate) chunk: usize,
+    pub(crate) size: u64,
 }
 
 impl Layout {
-    fn chunks(&self) -> u64 {
+    pub(crate) fn chunks(&self) -> u64 {
         self.size.div_ceil(self.chunk as u64)
     }
     fn plain_len(&self, index: u64) -> usize {
@@ -205,9 +215,81 @@ impl Layout {
     fn sealed_len(&self, index: u64) -> usize {
         self.plain_len(index) + TAG
     }
-    fn file_len(&self) -> u64 {
+    pub(crate) fn file_len(&self) -> u64 {
         self.size + self.chunks() * TAG as u64
     }
+    /// Where chunk `index` starts in the sealed file (every chunk before it is full).
+    pub(crate) fn sealed_offset(&self, index: u64) -> u64 {
+        index * (self.chunk + TAG) as u64
+    }
+}
+
+/// Seals a stream whose total size is known up front (a download: `FileOut.size`), chunk by
+/// chunk as the bytes arrive, so what's on disk is always ciphertext. The last-chunk flag
+/// comes from the size, not from reading ahead. It can start at any chunk boundary (a resumed
+/// download) under the key the earlier chunks were sealed with: the caller guarantees the
+/// bytes it pushes are the same file's (the resume invariant: a `206` to `If-Range` with the
+/// file's sha256).
+pub(crate) struct Sealer {
+    key: LessSafeKey,
+    id: [u8; 16],
+    layout: Layout,
+    index: u64,
+    buf: Vec<u8>,
+}
+
+impl Sealer {
+    /// Start sealing at chunk `index` (0 for a new file).
+    pub(crate) fn new(key: &[u8; 32], id: [u8; 16], layout: Layout, index: u64) -> Self {
+        Self {
+            key: sealing_key(key),
+            id,
+            layout,
+            index,
+            buf: Vec::with_capacity(layout.chunk),
+        }
+    }
+
+    /// Take the next plaintext bytes; returns the sealed bytes of every chunk they completed
+    /// (possibly none). More bytes than the size allows is an error.
+    pub(crate) fn push(&mut self, mut bytes: &[u8]) -> Result<Vec<u8>, SealError> {
+        let mut out = Vec::new();
+        while !bytes.is_empty() {
+            if self.index >= self.layout.chunks() {
+                return Err(SealError::TooLong);
+            }
+            let want = self.layout.plain_len(self.index) - self.buf.len();
+            let take = want.min(bytes.len());
+            self.buf.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.buf.len() == self.layout.plain_len(self.index) {
+                let last = self.index + 1 == self.layout.chunks();
+                let sealed = seal_chunk(&self.key, &self.id, self.index, last, &self.buf)
+                    .ok_or(SealError::Crypto)?;
+                out.extend_from_slice(&sealed);
+                self.buf.clear();
+                self.index += 1;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Chunks sealed so far (the next one's index).
+    pub(crate) fn sealed_chunks(&self) -> u64 {
+        self.index
+    }
+
+    /// Every chunk is sealed, the last one flagged.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.index == self.layout.chunks()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SealError {
+    /// More bytes than the declared size.
+    TooLong,
+    Crypto,
 }
 
 /// Open one sealed chunk in place; its plaintext length on success.
