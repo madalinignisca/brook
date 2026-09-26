@@ -95,10 +95,10 @@ chose itself.
      decodes are serial.
 5. **Tests:**
    - The validator (pure Swift):
-     - exact sizes pass;
+     - exact sizes pass, and so does a reply rotated by EXIF (sides swapped) within the
+       header's sides;
      - each of these is refused: a short buffer, one extra byte, a zero or negative side, a
-       side over 720, a size near `Int.max` (overflow), a reply bigger than the header, and
-       a rotated reply within the header's sides.
+       side over 720, a size near `Int.max` (overflow), and a reply bigger than the header.
    - **Tests hosted in the app** (a service name only resolves inside its own bundle):
      - two decodes in a row run in **different pids**, and each reply arrives (not only
        the pid change);
