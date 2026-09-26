@@ -219,6 +219,7 @@ final class CallModel {
         case .left: "You left the call."
         case .sfuRestart: "The call was interrupted by a server restart."
         case .removed: "You were removed from the call."
+        case .leftChannel: "You left this channel, so its call ended."
         case .replaced: "You joined this call from another window or device."
         case .expired: "The connection was lost for too long."
         case .sessionChanged: "You signed out."

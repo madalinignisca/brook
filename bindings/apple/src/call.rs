@@ -94,6 +94,7 @@ pub enum FfiEndReason {
     Left,
     SfuRestart,
     Removed,
+    LeftChannel,
     Replaced,
     Expired,
     SessionChanged,
@@ -257,6 +258,7 @@ impl From<EndReason> for FfiEndReason {
             EndReason::Left => Self::Left,
             EndReason::SfuRestart => Self::SfuRestart,
             EndReason::Removed => Self::Removed,
+            EndReason::LeftChannel => Self::LeftChannel,
             EndReason::Replaced => Self::Replaced,
             EndReason::Expired => Self::Expired,
             EndReason::SessionChanged => Self::SessionChanged,
@@ -470,6 +472,15 @@ pub(crate) async fn run<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn leaving_the_channel_is_its_own_end_reason() {
+        assert_eq!(
+            FfiEndReason::from(EndReason::LeftChannel),
+            FfiEndReason::LeftChannel
+        );
+        assert_eq!(FfiEndReason::from(EndReason::Left), FfiEndReason::Left);
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;

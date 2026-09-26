@@ -251,6 +251,8 @@ pub enum EndReason {
     SfuRestart,
     /// We were removed from the channel.
     Removed,
+    /// We left the channel (maybe from another device), so its call ended for us.
+    LeftChannel,
     /// Another socket of the same user took this participant over.
     Replaced,
     /// The server no longer knows this participant (resume came too late).

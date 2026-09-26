@@ -372,6 +372,8 @@ impl Task {
                 let reason = match data["reason"].as_str().unwrap_or_default() {
                     "sfu_restart" => EndReason::SfuRestart,
                     "removed" => EndReason::Removed,
+                    // Not `Left` (our own hang-up): the channel was left, perhaps elsewhere.
+                    "left" => EndReason::LeftChannel,
                     "replaced" => EndReason::Replaced,
                     other => EndReason::Server(other.to_string()),
                 };

@@ -747,6 +747,18 @@ async fn replaced_by_another_socket_ends_the_call() {
         .await;
 }
 
+/// Leaving the channel (#183), perhaps from another device, ends its call for us with its
+/// own reason: not our hang-up, and not a removal.
+#[tokio::test]
+async fn leaving_the_channel_ends_the_call() {
+    let mut call = join(false, |_| {}).await;
+    call.peer
+        .send(json!({ "type": "call.ended", "data": { "call_id": "k1", "reason": "left" } }))
+        .await;
+    call.wait_status(|s| *s == CallStatus::Ended(EndReason::LeftChannel))
+        .await;
+}
+
 #[tokio::test]
 async fn signing_in_as_someone_else_ends_the_call() {
     let call = join(false, |_| {}).await;
