@@ -44,6 +44,8 @@ pub(crate) enum WriteError {
     Source,
     Store,
     Stopped,
+    /// The source grew past the limit while it was being copied.
+    TooLarge,
 }
 
 /// A snapshot that can't be trusted: not uploaded, never retried (`outbox.snapshot_damaged`).
@@ -111,6 +113,7 @@ pub(crate) fn write(
     dst: &Path,
     id: [u8; 16],
     chunk: usize,
+    max: u64,
     progress: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<Written, WriteError> {
     let mut input = File::open(src).map_err(|_| WriteError::Source)?;
@@ -151,6 +154,11 @@ pub(crate) fn write(
                 .map_err(|_| WriteError::Store)?;
             out.write_all(&sealed).map_err(|_| WriteError::Store)?;
             size += n as u64;
+            // Checked on the bytes copied, not only a size read before: a file still being
+            // written (a log, a download) can't grow a snapshot past the limit.
+            if size > max {
+                return Err(WriteError::TooLarge);
+            }
             if !progress(size, total.max(size)) {
                 return Err(WriteError::Stopped);
             }

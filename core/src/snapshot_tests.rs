@@ -16,7 +16,7 @@ fn write(dir: &Path, name: &str, bytes: &[u8], chunk: usize) -> (std::path::Path
     let src = dir.join(format!("{name}.src"));
     std::fs::write(&src, bytes).unwrap();
     let dst = dir.join(format!("{name}.snap"));
-    let w = snapshot::write(&src, &dst, id(), chunk, &mut |_, _| true).unwrap();
+    let w = snapshot::write(&src, &dst, id(), chunk, u64::MAX, &mut |_, _| true).unwrap();
     (dst, w)
 }
 
@@ -174,6 +174,7 @@ fn progress_follows_the_copy_and_empty_is_refused() {
         &dir.path().join("p.snap"),
         id(),
         SMALL,
+        u64::MAX,
         &mut |d, t| {
             seen.push((d, t));
             true
@@ -188,7 +189,7 @@ fn progress_follows_the_copy_and_empty_is_refused() {
     let empty = dir.path().join("e.src");
     std::fs::write(&empty, b"").unwrap();
     let dst = dir.path().join("e.snap");
-    assert!(snapshot::write(&empty, &dst, id(), SMALL, &mut |_, _| true).is_err());
+    assert!(snapshot::write(&empty, &dst, id(), SMALL, u64::MAX, &mut |_, _| true).is_err());
     assert!(!dst.exists(), "a partial snapshot was left");
 }
 
@@ -198,9 +199,9 @@ fn a_write_never_replaces_or_makes_directories() {
     let dir = tempfile::tempdir().unwrap();
     let (path, _) = write(dir.path(), "n", b"first", SMALL);
     let src = dir.path().join("n.src");
-    assert!(snapshot::write(&src, &path, id(), SMALL, &mut |_, _| true).is_err());
+    assert!(snapshot::write(&src, &path, id(), SMALL, u64::MAX, &mut |_, _| true).is_err());
     let gone = dir.path().join("no-such-dir").join("x.snap");
-    assert!(snapshot::write(&src, &gone, id(), SMALL, &mut |_, _| true).is_err());
+    assert!(snapshot::write(&src, &gone, id(), SMALL, u64::MAX, &mut |_, _| true).is_err());
     assert!(!dir.path().join("no-such-dir").exists());
 }
 
@@ -212,4 +213,23 @@ fn a_wrong_stored_checksum_is_damage() {
     let (path, mut w) = write(dir.path(), "h", b"checked twice", SMALL);
     w.sha256 = "0".repeat(64);
     assert_eq!(check(&path, &w, SMALL), Err(Damaged));
+}
+
+/// A source that grows past the limit while it's copied is stopped at the limit (a size read
+/// before the copy can't vouch for it), and nothing is left.
+#[test]
+fn a_source_over_the_limit_is_stopped_mid_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("g.src");
+    std::fs::write(&src, [1u8; SMALL * 4]).unwrap();
+    let dst = dir.path().join("g.snap");
+    let got = snapshot::write(&src, &dst, id(), SMALL, (SMALL * 2) as u64, &mut |_, _| {
+        true
+    });
+    assert!(
+        matches!(got, Err(snapshot::WriteError::TooLarge)),
+        "{:?}",
+        got.err()
+    );
+    assert!(!dst.exists());
 }

@@ -54,7 +54,7 @@ final class OfflineAPITests: XCTestCase {
         XCTAssertEqual(maxFilesPerMessage(), 10)
         XCTAssertEqual(maxFileBytes(), 100 * 1024 * 1024)
         let client = try FfiBrookClient(baseUrl: "https://brook.invalid", allowInsecureHttp: false)
-        let file = FfiOutgoingFile(path: "/dev/null", filename: "a.txt", contentType: "text/plain")
+        let file = FfiOutgoingFile(path: "/dev/null", filename: "a.txt", contentType: "text/plain", transferId: 5)
         do {
             _ = try await client.sendQueuedWithFiles(
                 channelId: "c", body: "", replyToId: nil, clientId: UUID().uuidString, files: [file])

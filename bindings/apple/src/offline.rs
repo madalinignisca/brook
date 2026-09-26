@@ -148,6 +148,9 @@ pub struct FfiOutgoingFile {
     pub filename: String,
     /// Declared, untrusted.
     pub content_type: String,
+    /// Your id for its progress and cancel (make one before calling, so the copy can be
+    /// followed and cancelled while the call runs); nil: core makes one (see the receipt).
+    pub transfer_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -537,6 +540,7 @@ impl FfiBrookClient {
                 path: std::path::PathBuf::from(f.path),
                 filename: f.filename,
                 content_type: f.content_type,
+                transfer_id: f.transfer_id.map(TransferId),
             })
             .collect();
         let receipt = run(async move {

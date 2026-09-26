@@ -52,6 +52,10 @@ pub struct OutgoingFile {
     pub filename: String,
     /// Declared, untrusted.
     pub content_type: String,
+    /// The id its progress (`Preparing`, then the upload) arrives under and that cancels it,
+    /// chosen by the caller (`TransferId::new()`) so the UI can follow and cancel the copy
+    /// while this call is still running. `None`: core makes one (it's in the receipt).
+    pub transfer_id: Option<TransferId>,
 }
 
 /// What `send_queued_with_files` queued: the message's id and each file's, with the transfer
@@ -788,7 +792,28 @@ impl Outbox {
     /// changed or lost by what happens to its source afterwards. The same `client_id` again
     /// returns the stored row's receipt (checked before copying). Files need the outbox: if
     /// it can't be written, this fails (`Store`) rather than sending anything directly.
+    ///
+    /// The copy and the commit run as their own task: a caller that goes away (a cancelled
+    /// Swift task, a closed window) doesn't strand half-made snapshots; the send completes
+    /// and is queued, as a finished call would have been.
     pub(crate) async fn enqueue_with_files(
+        self: &Arc<Self>,
+        channel_id: &str,
+        body: &str,
+        reply_to_id: Option<String>,
+        client_id: Option<String>,
+        files: Vec<OutgoingFile>,
+    ) -> Result<SendReceipt, OutboxError> {
+        let (me, ch, b) = (self.clone(), channel_id.to_string(), body.to_string());
+        tokio::spawn(async move {
+            me.enqueue_files_task(&ch, &b, reply_to_id, client_id, files)
+                .await
+        })
+        .await
+        .map_err(|_| OutboxError::Store)?
+    }
+
+    async fn enqueue_files_task(
         self: &Arc<Self>,
         channel_id: &str,
         body: &str,
@@ -811,10 +836,18 @@ impl Outbox {
                 files: vec![],
             });
         }
-        for f in &files {
-            let len = std::fs::metadata(&f.path)
-                .map_err(|_| OutboxError::FileUnreadable)?
-                .len();
+        // Off the runtime's workers: a portal (FUSE) or network path can be slow to answer.
+        let paths: Vec<PathBuf> = files.iter().map(|f| f.path.clone()).collect();
+        let sizes = tokio::task::spawn_blocking(move || {
+            paths
+                .iter()
+                .map(|p| std::fs::metadata(p).map(|m| m.len()).ok())
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|_| OutboxError::Store)?;
+        for len in sizes {
+            let len = len.ok_or(OutboxError::FileUnreadable)?;
             if len == 0 {
                 return Err(OutboxError::EmptyFile);
             }
@@ -842,16 +875,26 @@ impl Outbox {
         // (a live row with this id, from a racing first call, may be using them).
         let made_flags = !lock(&self.row_flags).contains_key(&client_id);
         let row_flags = self.flags(&client_id);
+        // Every file's id and transfer id before the first copy starts, registered under the
+        // row's flags: a cancel through any of them stops the copy too.
+        let planned: Vec<(OutgoingFile, String, TransferId)> = files
+            .into_iter()
+            .map(|f| {
+                let fcid = new_client_id();
+                let tid = f.transfer_id.unwrap_or_default();
+                lock(&self.ids).insert(fcid.clone(), tid);
+                self.transfers.register(&[tid], &row_flags);
+                (f, fcid, tid)
+            })
+            .collect();
         let mut made: Vec<(OutgoingFile, String, snapshot::Written)> = vec![];
         let mut failed = None;
-        for f in files {
-            let fcid = new_client_id();
-            let tid = self.transfer_id(&client_id, &fcid);
+        for (f, fcid, tid) in planned.iter().cloned() {
             let (src, dst) = (f.path.clone(), self.snap_dir.join(&fcid));
             let id = snapshot::id_bytes(&fcid).expect("a canonical id");
             let (transfers, flags) = (self.transfers.clone(), row_flags.clone());
             let written = tokio::task::spawn_blocking(move || {
-                snapshot::write(&src, &dst, id, chunk, &mut |done, total| {
+                snapshot::write(&src, &dst, id, chunk, MAX_FILE_BYTES, &mut |done, total| {
                     transfers.emit(tid, done, total, TransferState::Preparing);
                     // A cancel while copying stops it: nothing is queued.
                     !flags.cancel.load(Ordering::SeqCst)
@@ -868,6 +911,10 @@ impl Outbox {
                     failed = Some(OutboxError::Cancelled);
                     break;
                 }
+                Ok(Err(snapshot::WriteError::TooLarge)) => {
+                    failed = Some(OutboxError::FileTooLarge);
+                    break;
+                }
                 // Our side: a full disk, a store that can't be written.
                 Ok(Err(snapshot::WriteError::Store)) | Err(_) => {
                     failed = Some(OutboxError::Store);
@@ -876,9 +923,10 @@ impl Outbox {
             }
         }
         let names: Vec<String> = made.iter().map(|(_, n, _)| n.clone()).collect();
+        let all: Vec<String> = planned.iter().map(|(_, n, _)| n.clone()).collect();
         if let Some(err) = failed {
             self.remove_snapshots(&names).await;
-            self.drop_ids(&names);
+            self.drop_ids(&all);
             if made_flags {
                 lock(&self.row_flags).remove(&client_id); // nothing was queued under this id
             }
@@ -930,12 +978,12 @@ impl Outbox {
             Ok(_) => {
                 // A first call with this id committed meanwhile: its row wins.
                 self.remove_snapshots(&names).await;
-                self.drop_ids(&names);
+                self.drop_ids(&all);
                 return self.receipt_of(&client_id).await;
             }
             Err(_) => {
                 self.remove_snapshots(&names).await;
-                self.drop_ids(&names);
+                self.drop_ids(&all);
                 return Err(OutboxError::Store);
             }
         }
@@ -1061,7 +1109,11 @@ impl Outbox {
         // Its uploads stop first (at the next chunk, or out of a backoff), so a Delete never
         // waits behind hours of upload for the lock. The flags are atomics behind a std
         // mutex, never held across an await: no deadlock with the sender.
-        self.flags(client_id).cancel.store(true, Ordering::SeqCst);
+        // Only flags that exist (an upload in flight always has them): making them here could
+        // leave a cancelled entry behind for a row the ack removed meanwhile.
+        if let Some(flags) = lock(&self.row_flags).get(client_id) {
+            flags.cancel.store(true, Ordering::SeqCst);
+        }
         let sender = self.sender(&channel)?;
         let _held = sender.lock.lock().await; // an attempt in flight finishes first
         let found = self

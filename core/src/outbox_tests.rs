@@ -1410,6 +1410,7 @@ mod files {
             path,
             filename: name.into(),
             content_type: "application/octet-stream".into(),
+            transfer_id: None,
         }
     }
 
@@ -1518,6 +1519,7 @@ mod files {
             path: big,
             filename: "big".into(),
             content_type: "x".into(),
+            transfer_id: None,
         };
         assert_eq!(
             s.outbox
@@ -2017,5 +2019,38 @@ mod files {
             s.files.uploaded.lock().unwrap()[0].1,
             b"twenty-one bytes long"
         );
+    }
+
+    /// The caller's transfer id carries the copy's progress and cancels it mid-copy, before
+    /// the call has returned anything.
+    #[tokio::test]
+    async fn a_caller_chosen_id_follows_and_cancels_the_copy() {
+        let s = setup().await;
+        s.session.send_replace(None);
+        let tid = TransferId::new();
+        let mut events = s.transfers.events_for_tests();
+        let transfers = s.transfers.clone();
+        let watcher = tokio::spawn(async move {
+            while let Ok(e) = events.recv().await {
+                if e.id == tid && e.state == crate::transfer::TransferState::Preparing {
+                    transfers.flag(tid).cancel.store(true, Ordering::SeqCst);
+                    return true;
+                }
+            }
+            false
+        });
+        let mut big = file(&s, "big", &vec![7u8; 8 * 64]);
+        big.transfer_id = Some(tid);
+        let got = s
+            .outbox
+            .enqueue_with_files("c1", "x", None, None, vec![big])
+            .await;
+        let seen = tokio::time::timeout(Duration::from_secs(2), watcher).await;
+        assert!(
+            matches!(seen, Ok(Ok(true))),
+            "no Preparing event under the caller's id"
+        );
+        assert_eq!(got, Err(OutboxError::Cancelled));
+        assert_eq!(snaps(&s), 0);
     }
 }

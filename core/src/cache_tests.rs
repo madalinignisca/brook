@@ -908,7 +908,7 @@ mod post_http {
         let fcid = "0190a000-0000-7000-8000-00000000cafe";
         let id = crate::snapshot::id_bytes(fcid).unwrap();
         let snap = dir.path().join(fcid);
-        let w = crate::snapshot::write(&src, &snap, id, 8, &mut |_, _| true).unwrap();
+        let w = crate::snapshot::write(&src, &snap, id, 8, u64::MAX, &mut |_, _| true).unwrap();
         let source = crate::snapshot::SnapshotSource {
             path: snap,
             key: w.key,
