@@ -19,8 +19,9 @@ codesign --verify --deep --strict "$app" || fail "the bundle's signature doesn't
 
 if [[ "${2:-}" == "release" ]]; then
   for bin in "$broker" "$worker"; do
-    # The test kinds' names and the probe's report keys must not be in a Release binary.
-    if strings -a "$bin" | grep -Ec 'probeReport|brokerClient|writeHome|reaped=|group=' >/dev/null; then
+    # The Debug-only kinds and reports (hang, probe, linger, the broker's rusage report)
+    # must not be in a Release binary: an #if slip would ship them.
+    if strings -a "$bin" | grep -Ec 'probeReport|brokerClient|writeHome|ownGroup=|reaped=|maxrss=|brokerPid=' >/dev/null; then
       fail "a Debug test hook is in $(basename "$bin")"
     fi
   done
