@@ -105,7 +105,8 @@ the wrong start, and a `200` after a partial, both give a new key.
     that can't be resumed: the sink `restart`s (a new key), and the attempt counts toward
     `MAX_ATTEMPTS` as a transient error.
 - A `404` becomes `Error::Api { code: "file.gone" }` (was: `api(404)`). `download_file`
-  keeps returning it, and `Save` shows it as today's "not found" text in the apps.
+  keeps returning it. GTK's Save error text keys on `file.gone` ("No longer available")
+  in the same PR's GTK follow-up, since today it matches the old `not_found`/`http_404`.
 
 ### 6. `Files` (files.rs), per signed-in user, next to the outbox
 - `Files::open(cache_db, &store_dir, session_rx, transfers, net)`, called in
@@ -148,6 +149,20 @@ the wrong start, and a `200` after a partial, both give a new key.
     decrypting, and `abort` (remove) on mismatch;
   - else the `Downloader` straight into `dest` (today's path, via `download_file`
     semantics).
+- **`Files::close()`**:
+  - marks it closed, so new calls fail with `local.unavailable`;
+  - sets `cancel` on every in-flight download's flags and **awaits** their tasks before it
+    returns (as the outbox's `close` aborts and joins its senders);
+  - a cancelled download keeps its partial for a later session, since it's this user's
+    cache.
+
+  `Offline::close_active` calls it **before** the cache and the outbox close. A wipe erases
+  only after `close_active`, so no download is still streaming into, or holding open a blob
+  in, a directory being erased.
+- **No directory is ever created by the sink.** Blobs are opened only inside the `files/`
+  that `Files::open` made, with `OpenOptions::create` on the file alone and never
+  `create_dir_all` (the snapshot writer's rule). A write that comes too late then fails
+  with NotFound instead of recreating a wiped store directory.
 - **`clear_open_copies()`**: removes this store's Open directory contents. It's public on
   `BrookClient`, and also run at `enable_local_data` and on sign-out with data removal.
 - **The Open directory:**
@@ -173,6 +188,8 @@ the wrong start, and a `200` after a partial, both give a new key.
   2. then `complete` by `last_used`.
 
   The file just finished is excluded.
+- A partial counts at its full `size`, not at `done`. That's deliberately conservative, since
+  it will be that big, and keeps the sum a plain `SUM(size)`.
 
 ### 9. Tests (PR 1)
 - **Sealer:** chunk-for-chunk equality with today's `write`; a resume at chunk k gives the
@@ -199,6 +216,9 @@ the wrong start, and a `200` after a partial, both give a new key.
 - **Open:** refuses ELF, `MZ`, `#!` and `.desktop`, and allows a PDF; the copy lands in the
   per-store dir with the right modes; `clear_open_copies` and reconciliation empty it.
 - **Save:** from cache while the server is down.
+- **Close and wipe:** `close()` during a held download cancels and joins it, and nothing is
+  written afterwards. A sign-out with data removal during a held download leaves no store
+  directory behind. A late sink write after the wipe fails and recreates nothing.
 - **Eviction:** the order and the cap, and the file just finished stays.
 - **Reconciliation:** orphan blobs, the journal, a short partial, and a leftover `files/`
   after a format rebuild.
