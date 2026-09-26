@@ -75,3 +75,23 @@ Rebutted:
   its count already includes them and is authoritative.
 
 Closed.
+
+## Implementation review, round 1 (vibe; Standard)
+
+Taken:
+- **Opening a channel removes its pending notifications too,** not only delivered ones.
+- **The permission is asked again only while still undecided** (a request that failed). A
+  decision, either way, stays the user's.
+
+Rebutted:
+- **"A nil author passes."** `authorId` is a non-optional `String` in `FfiMessage`.
+- **"The badge double-counts when a notification is replaced."** The badge counts
+  messages, not notifications. Each unseen message adds one, as GTK does.
+- **"Make the delegate `@MainActor`."** A `nonisolated` delegate that hops to the main
+  actor is the pattern `UNUserNotificationCenterDelegate` needs under Swift 6's strict
+  checks.
+
+Not unit-tested: `MacNotifier` itself (the system notification centre). The planner, the
+channel model and the posting rules are tested through `Notifying`.
+
+Measured: 7 mutants, each caught. 210 Mac tests pass.
