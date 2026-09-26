@@ -73,6 +73,8 @@ pub(crate) trait History: Send + Sync {
 pub struct CachedChannel {
     pub json: Value,
     pub unread: u32,
+    /// Of those, the ones naming this user (`mentions`) or everyone (`mention_everyone`).
+    pub unread_mentions: u32,
 }
 
 /// A page of cached messages, newest first.
@@ -419,26 +421,38 @@ impl Cache {
         self.db
             .call(move |c| {
                 let mut stmt = c.prepare(
+                    // The unread rule, then the same rule for messages that mention this
+                    // user: the server's `unread_mentions` (#195), counted offline.
                     "SELECT ch.json,
                        (SELECT count(*) FROM messages m
                         WHERE m.channel_id = ch.id
                           AND m.id > coalesce(json_extract(my.json, '$.last_read_message_id'), '')
                           AND coalesce(json_extract(m.json, '$.author_id'), '') != ?1
                           AND json_extract(m.json, '$.deleted') IS NOT 1
-                          AND json_type(m.json, '$.deleted_at') IS NOT 'text')
+                          AND json_type(m.json, '$.deleted_at') IS NOT 'text'),
+                       (SELECT count(*) FROM messages m
+                        WHERE m.channel_id = ch.id
+                          AND m.id > coalesce(json_extract(my.json, '$.last_read_message_id'), '')
+                          AND coalesce(json_extract(m.json, '$.author_id'), '') != ?1
+                          AND json_extract(m.json, '$.deleted') IS NOT 1
+                          AND json_type(m.json, '$.deleted_at') IS NOT 'text'
+                          AND (json_extract(m.json, '$.mention_everyone') = 1
+                               OR EXISTS (SELECT 1 FROM json_each(m.json, '$.mentions')
+                                          WHERE value = ?1)))
                      FROM channels ch
                      JOIN memberships my ON my.channel_id = ch.id AND my.user_id = ?1 AND my.left = 0
                      ORDER BY ch.id",
                 )?;
                 let rows = stmt.query_map([&me], |r| {
                     let json: String = r.get(0)?;
-                    Ok((json, r.get::<_, u32>(1)?))
+                    Ok((json, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?))
                 })?;
                 rows.map(|row| {
-                    let (json, unread) = row?;
+                    let (json, unread, unread_mentions) = row?;
                     Ok(CachedChannel {
                         json: serde_json::from_str(&json).unwrap_or(Value::Null),
                         unread,
+                        unread_mentions,
                     })
                 })
                 .collect()

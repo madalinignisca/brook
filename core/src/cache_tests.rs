@@ -168,6 +168,50 @@ async fn unread_counts_others_messages_after_my_read_marker() {
     );
 }
 
+fn mentioning(mut m: Value, mentions: &[&str], everyone: bool) -> Value {
+    m["mentions"] = json!(mentions);
+    m["mention_everyone"] = json!(everyone);
+    m
+}
+
+/// The server's `unread_mentions` rule (#195), counted from cached rows: unread, not mine,
+/// not deleted, and naming me or everyone.
+#[tokio::test]
+async fn unread_mentions_count_what_names_me_under_the_unread_rule() {
+    let s = setup(
+        vec![page(
+            9,
+            Some("m2"),
+            vec![
+                mentioning(msg("m1", "c", 4, "bob", "read"), &[ME], false),
+                msg("m2", "c", 5, "bob", "marker"),
+                mentioning(msg("m3", "c", 6, "bob", "@me"), &[ME], false),
+                mentioning(msg("m4", "c", 7, "bob", "@channel"), &[], true),
+                mentioning(msg("m5", "c", 8, "bob", "@someone"), &["someone"], false),
+                mentioning(msg("m6", "c", 9, ME, "mine @channel"), &[], true),
+                mentioning(msg("m7", "c", 10, "bob", "deleted @me"), &[ME], false),
+                msg("m8", "c", 11, "bob", "plain"),
+            ],
+            vec![],
+        )],
+        no_history(),
+        None,
+    );
+    s.cache.sync_now().await.unwrap();
+    s.cache
+        .live_event(
+            "message.delete",
+            &json!({ "id": "m7", "channel_id": "c", "seq": 12 }),
+        )
+        .await;
+    let channels = s.cache.cached_channels().await.unwrap();
+    assert_eq!(
+        channels[0].unread_mentions, 2,
+        "m3 (me) and m4 (everyone): not the read m1, not m5 (someone else), not my own m6, not the deleted m7"
+    );
+    assert_eq!(channels[0].unread, 4, "m3, m4, m5 and m8");
+}
+
 #[tokio::test]
 async fn change_notices_follow_the_commit() {
     let s = setup(
