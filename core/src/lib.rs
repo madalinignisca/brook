@@ -82,7 +82,7 @@ pub use call_types::{
     MediaEngine, MediaKind, MediaSource, Participant, PcKind, PublishOffer, Publishing, SubStream,
     TrackLabel,
 };
-pub use chat::{Channel, ChannelMember, Message, ReactionSummary, ReplyExcerpt};
+pub use chat::{Channel, ChannelMember, Message, OwnerOffer, ReactionSummary, ReplyExcerpt};
 pub use client::{BrookClient, LoginOutcome, RestoreOutcome, TotpChallenge};
 pub use client_offline::{CachedMessages, OtherLocalUser};
 pub use config::CoreConfig;

@@ -653,6 +653,64 @@ impl BrookClient {
         Ok(())
     }
 
+    /// Offer to make the member `handle` an owner (an owner or a global admin). They accept
+    /// or decline when they next open the channel; accepting adds an owner, and the one who
+    /// offered stays one. Offering again while one is pending answers the same channel.
+    /// Refused: `authz.forbidden` (403), `channel.not_member` / `channel.dm` (422),
+    /// `channel.already_owner` (409), `not_found` (404).
+    pub async fn offer_ownership(&self, channel_id: &str, handle: &str) -> Result<Channel> {
+        let token = self.access_token().await?;
+        let url = self
+            .base
+            .join(&format!("api/v1/channels/{channel_id}/owner-offers"))?;
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .json(&json!({ "handle": handle }))
+            .send()
+            .await?;
+        self.parse(resp).await
+    }
+
+    /// Withdraw the pending offer to `user_id` (an owner or a global admin).
+    /// `offer.not_found`: it was already answered or withdrawn.
+    pub async fn withdraw_ownership_offer(&self, channel_id: &str, user_id: &str) -> Result<()> {
+        let token = self.access_token().await?;
+        let url = self.base.join(&format!(
+            "api/v1/channels/{channel_id}/owner-offers/{user_id}"
+        ))?;
+        let resp = self.http.delete(url).bearer_auth(token).send().await?;
+        if !resp.status().is_success() {
+            return Err(api_error(resp).await);
+        }
+        Ok(())
+    }
+
+    /// Accept your pending offer: you become an owner. `offer.not_found`: there's none
+    /// (withdrawn meanwhile, or the offerer left).
+    pub async fn accept_ownership(&self, channel_id: &str) -> Result<Channel> {
+        let token = self.access_token().await?;
+        let url = self
+            .base
+            .join(&format!("api/v1/channels/{channel_id}/owner-offers/accept"))?;
+        let resp = self.http.post(url).bearer_auth(token).send().await?;
+        self.parse(resp).await
+    }
+
+    /// Decline your pending offer: only the offer goes. `offer.not_found`: there's none.
+    pub async fn decline_ownership(&self, channel_id: &str) -> Result<()> {
+        let token = self.access_token().await?;
+        let url = self.base.join(&format!(
+            "api/v1/channels/{channel_id}/owner-offers/decline"
+        ))?;
+        let resp = self.http.post(url).bearer_auth(token).send().await?;
+        if !resp.status().is_success() {
+            return Err(api_error(resp).await);
+        }
+        Ok(())
+    }
+
     /// Leave a channel ([`BrookClient::remove_member`] with yourself).
     pub async fn leave_channel(&self, channel_id: &str) -> Result<()> {
         let me = self
@@ -1339,6 +1397,118 @@ mod tests {
         let client = client_for(server).await;
         client.login("alice", "supersecret").await.unwrap();
         client
+    }
+
+    fn channel_json(offers: serde_json::Value) -> serde_json::Value {
+        json!({
+            "id": "c1", "kind": "channel", "name": "general", "topic": null,
+            "created_by": "u1", "created_at": "2026-06-18T00:00:00Z",
+            "members": [{"id": "u2", "handle": "bob", "display_name": "Bob", "role": "member"}],
+            "owner_offers": offers
+        })
+    }
+
+    #[tokio::test]
+    async fn offer_ownership_names_the_member_and_answers_the_channel() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/channels/c1/owner-offers"))
+            .and(wiremock::matchers::body_json(json!({ "handle": "bob" })))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(channel_json(json!([{
+                    "user_id": "u2", "offered_by": "u1", "created_at": "2026-09-26T10:00:00Z"
+                }]))),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let channel = client.offer_ownership("c1", "bob").await.unwrap();
+        let offer = channel.owner_offer_for("u2").expect("the offer");
+        assert_eq!(offer.offered_by, "u1");
+        assert!(channel.owner_offer_for("u1").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_channel_from_before_offers_has_none() {
+        let mut body = channel_json(json!([]));
+        body.as_object_mut().unwrap().remove("owner_offers");
+        let channel: Channel = serde_json::from_value(body).unwrap();
+        assert!(channel.owner_offers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn offer_refusals_carry_the_server_code() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/channels/c1/owner-offers"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": { "code": "channel.already_owner", "message": "already" }
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client.offer_ownership("c1", "bob").await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Api { code, .. } if code == "channel.already_owner"),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn withdraw_deletes_that_members_offer() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/channels/c1/owner-offers/u2"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client.withdraw_ownership_offer("c1", "u2").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accept_answers_the_channel_and_decline_answers_nothing() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/channels/c1/owner-offers/accept"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(channel_json(json!([]))))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/channels/c2/owner-offers/decline"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(client.accept_ownership("c1").await.unwrap().id, "c1");
+        client.decline_ownership("c2").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_answered_offer_is_offer_not_found() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/channels/c1/owner-offers/decline"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "offer.not_found", "message": "none" }
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client.decline_ownership("c1").await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Api { code, .. } if code == "offer.not_found"),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

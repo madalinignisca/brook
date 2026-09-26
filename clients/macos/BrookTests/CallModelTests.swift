@@ -190,7 +190,7 @@ struct GrantedNothing: AuthorizationSource {
 }
 
 func channel(_ id: String, _ name: String) -> FfiChannel {
-    FfiChannel(id: id, kind: "public", name: name, archived: false, members: [])
+    FfiChannel(id: id, kind: "public", name: name, archived: false, members: [], ownerOffers: [])
 }
 
 /// Let main-queue deliveries (the event/state bridges hop through it) run.
@@ -592,6 +592,10 @@ extension FakeRealtime {
     func markRead(channelId: String, messageId: String?) async throws { throw unused }
     func removeMember(channelId: String, userId: String) async throws { throw unused }
     func leaveChannel(channelId: String) async throws { throw unused }
+    func offerOwnership(channelId: String, handle: String) async throws -> FfiChannel { throw unused }
+    func withdrawOwnershipOffer(channelId: String, userId: String) async throws { throw unused }
+    func acceptOwnership(channelId: String) async throws -> FfiChannel { throw unused }
+    func declineOwnership(channelId: String) async throws { throw unused }
     func updateProfile(displayName: String?, statusText: String?) async throws -> FfiMe { throw unused }
     func otherLocalUsers() async throws -> [FfiLocalUser] { throw unused }
     func outboxLost() -> UInt64? { nil }
