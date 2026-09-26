@@ -46,6 +46,25 @@ final class CacheFeed {
     }
     weak var pending: PendingModel?
 
+    /// Attachment rows on screen, by file id (held weakly; gone rows drop out).
+    private var fileRows: [String: [WeakRow]] = [:]
+    private struct WeakRow { weak var model: FileRowModel? }
+
+    func register(_ row: FileRowModel) {
+        purgeRows()
+        fileRows[row.file.id, default: []].append(WeakRow(model: row))
+    }
+
+    private func purgeRows() {
+        fileRows = fileRows.compactMapValues { rows in
+            let live = rows.filter { $0.model != nil }
+            return live.isEmpty ? nil : live
+        }
+    }
+
+    /// Rows registered and still alive (tests).
+    var registeredRows: Int { purgeRows(); return fileRows.values.reduce(0) { $0 + $1.count } }
+
     private let client: any OfflineClient
     private var subscriptions: [Subscription] = []
     /// Other accounts' data: once per feed, retried at the next sync after a failure.
@@ -100,8 +119,13 @@ final class CacheFeed {
             if let p = pending, p.channelId == channelId { Task { await p.reload() } }
         case .outboxLost:
             checkLost()
-        case .files:
-            break // the Mac's file cache UI comes after #79
+        case let .files(ids):
+            purgeRows()
+            for id in ids {
+                for row in fileRows[id] ?? [] {
+                    if let model = row.model { Task { await model.reloadKeep() } }
+                }
+            }
         }
     }
 

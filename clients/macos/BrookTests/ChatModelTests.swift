@@ -25,6 +25,15 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     let queuedFiles = Mutex<[String]>([])
     var filesGate: Gate?
     let cancelled = Mutex<[UInt64]>([])
+    // The file cache (FileRowModel tests).
+    var openResult: Result<String, Error> = .success("/private/brook/open/abc/report.pdf")
+    /// `fileState` answers, handed out in order (the last one repeats); a gate holds one.
+    var states: [FfiFileCacheState] = [.notCached]
+    var stateGate: Gate?
+    var pinFailure: Error?
+    var pinGate: Gate?
+    let pins = Mutex<[String]>([])
+    var previewResult: Result<FfiImagePreview, Error> = .failure(LoginError.Api(code: "file.preview_refused", message: ""))
     let queued = Mutex<[String]>([]) // "clientId|body|reply"
     var unsent: UInt64 = 0
     var lost: UInt64?
