@@ -34,8 +34,8 @@ struct ChatView: View {
                                 .onAppear { Task { await timeline.loadOlder() } }
                         }
                         ForEach(timeline.messages, id: \.id) { message in
-                            MessageRow(message: message, mine: message.authorId == me,
-                                       saves: saves, composer: composer)
+                            MessageRow(message: message, author: timeline.authorName(message),
+                                       mine: message.authorId == me, saves: saves, composer: composer)
                                 .id(message.id)
                         }
                     }
@@ -45,7 +45,7 @@ struct ChatView: View {
                     if let newest { proxy.scrollTo(newest, anchor: .bottom) }
                 }
             }
-            if let error = timeline.error {
+            if let error = timeline.visibleError {
                 Text(error).foregroundStyle(.red).font(.caption).padding(.horizontal)
             }
             Divider()
@@ -61,6 +61,8 @@ struct ChatView: View {
 
 struct MessageRow: View {
     let message: FfiMessage
+    /// The author's current name (a rename reaches cached rows through the timeline).
+    let author: String
     let mine: Bool
     let saves: SaveModel
     let composer: ComposerModel
@@ -68,7 +70,7 @@ struct MessageRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(message.authorDisplayName ?? message.authorHandle ?? "Someone").bold()
+                Text(author).bold()
                 Text(Self.time(message.createdAt)).font(.caption).foregroundStyle(.secondary)
                 if message.editedAt != nil, !message.deleted {
                     Text("edited").font(.caption).foregroundStyle(.secondary)
