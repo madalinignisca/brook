@@ -87,6 +87,11 @@ struct Chat {
     progress: crate::outgoing::Progress,
     /// Transfer ids the pending bubbles show (forgotten when they're redrawn).
     pending_ids: Rc<RefCell<Vec<brook_core::TransferId>>>,
+    /// The staged message's outbox id, made at its first Send and kept until it's queued
+    /// or dropped: a second Send after an unclear failure can't make a second message.
+    draft_id: Rc<RefCell<Option<String>>>,
+    /// The chip whose button cancelled the copy: that file leaves, the others stay.
+    cancelled_chip: Rc<Cell<Option<brook_core::TransferId>>>,
 }
 
 /// The widgets of a rendered message we may mutate after an edit/delete/reaction.
@@ -246,6 +251,8 @@ pub fn build(
         preparing: Rc::default(),
         progress: crate::outgoing::Progress::default(),
         pending_ids: Rc::default(),
+        draft_id: Rc::default(),
+        cancelled_chip: Rc::default(),
     });
     chat.progress.listen(&chat.client);
 
@@ -898,7 +905,9 @@ fn redraw_staged(chat: &Rc<Chat>) {
             move || {
                 let Some(chat) = chat.upgrade() else { return };
                 if chat.preparing.get() {
-                    // Mid-copy: stop the whole send (nothing gets queued).
+                    // Mid-copy: stop the whole send (core's flags are per message, so
+                    // nothing gets queued); this file then leaves, the others stay.
+                    chat.cancelled_chip.set(Some(tid));
                     chat.client.cancel_transfer(tid);
                 } else {
                     chat.staged.borrow_mut().retain(|f| f.transfer_id != tid);
@@ -913,6 +922,7 @@ fn redraw_staged(chat: &Rc<Chat>) {
 }
 
 fn clear_staged(chat: &Rc<Chat>) {
+    chat.draft_id.replace(None);
     let ids: Vec<_> = chat
         .staged
         .borrow_mut()
@@ -932,6 +942,12 @@ fn send_with_files(chat: &Rc<Chat>) {
     let body = chat.composer.text().to_string();
     let reply_to = chat.replying_to.borrow().clone();
     let files: Vec<_> = chat.staged.borrow().iter().map(|f| f.outgoing()).collect();
+    let client_id = chat
+        .draft_id
+        .borrow_mut()
+        .get_or_insert_with(|| glib::uuid_string_random().to_string())
+        .clone();
+    chat.cancelled_chip.set(None);
     set_preparing(chat, true);
 
     let chat = chat.clone();
@@ -941,7 +957,7 @@ fn send_with_files(chat: &Rc<Chat>) {
             let body = body.clone();
             async move {
                 client
-                    .send_queued_with_files(&channel_id, &body, reply_to, None, files)
+                    .send_queued_with_files(&channel_id, &body, reply_to, Some(client_id), files)
                     .await
             }
         });
@@ -960,7 +976,15 @@ fn send_with_files(chat: &Rc<Chat>) {
                 render_pending(&chat);
             }
             Err(err) => {
-                // Nothing was queued: the files and text stay for another try.
+                // Nothing was queued: the files and text stay for another try, except a
+                // file whose own button cancelled the copy.
+                if let Some(tid) = chat.cancelled_chip.take() {
+                    chat.staged.borrow_mut().retain(|f| f.transfer_id != tid);
+                    chat.progress.forget([tid]);
+                    if chat.staged.borrow().is_empty() {
+                        chat.draft_id.replace(None);
+                    }
+                }
                 redraw_staged(&chat);
                 let code = match &err {
                     brook_core::Error::Api { code, .. } => code.as_str(),
