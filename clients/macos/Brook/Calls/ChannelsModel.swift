@@ -44,6 +44,8 @@ final class ChannelsModel {
             ready = true
         case let .channelCall(channelId, callId, count):
             liveCalls[channelId] = callId != nil && count > 0 ? count : nil
+        case .messageNew, .messageUpdate, .messageDelete, .resync:
+            break  // the timeline's (the chat view), not the channel list's
         }
     }
 
