@@ -53,6 +53,7 @@ final class OfflineAPITests: XCTestCase {
     func testFilesAreRefusedWithoutLocalDataAndTheLimitsCross() async throws {
         XCTAssertEqual(maxFilesPerMessage(), 10)
         XCTAssertEqual(maxFileBytes(), 100 * 1024 * 1024)
+        XCTAssertEqual(previewMaxBytes(), 16 * 1024 * 1024)
         let client = try FfiBrookClient(baseUrl: "https://brook.invalid", allowInsecureHttp: false)
         let file = FfiOutgoingFile(path: "/dev/null", filename: "a.txt", contentType: "text/plain", transferId: 5)
         do {
@@ -73,6 +74,10 @@ final class OfflineAPITests: XCTestCase {
             ("openFile", { _ = try await client.openFile(transferId: 2, fileId: "f") }),
             ("saveCachedFile", { _ = try await client.saveCachedFile(fileId: "f", destination: "/dev/null") }),
             ("fileState", { _ = try await client.fileState(fileId: "f") }),
+            ("pinFile", { try await client.pinFile(fileId: "f") }),
+            ("unpinFile", { try await client.unpinFile(fileId: "f") }),
+            ("pinnedBytes", { _ = try await client.pinnedBytes() }),
+            ("previewFile", { _ = try await client.previewFile(transferId: 3, fileId: "f") }),
         ]
         for (name, call) in calls {
             do {

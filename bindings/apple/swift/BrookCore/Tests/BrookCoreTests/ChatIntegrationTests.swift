@@ -129,6 +129,63 @@ final class ChatIntegrationTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: opened)), text)
         await client.clearOpenCopies()
         XCTAssertFalse(FileManager.default.fileExists(atPath: opened), "the Open copy stayed")
+
+        // Kept offline: pinned and complete, counted in pinnedBytes; unpinned, it's an
+        // ordinary cached file again.
+        try await client.pinFile(fileId: file.id)
+        var kept: FfiFileCacheState?
+        for _ in 0 ..< 100 {
+            kept = try await client.fileState(fileId: file.id)
+            if case .pinned(cached: true, _, _, _) = kept { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        guard case .pinned(cached: true, _, let size, _) = kept else {
+            return XCTFail("not kept offline: \(String(describing: kept))")
+        }
+        XCTAssertEqual(size, file.size)
+        let pinnedBytes = try await client.pinnedBytes()
+        XCTAssertEqual(pinnedBytes, file.size)
+        try await client.unpinFile(fileId: file.id)
+        let unpinned = try await client.fileState(fileId: file.id)
+        XCTAssertEqual(unpinned, .cached)
+        let afterUnpin = try await client.pinnedBytes()
+        XCTAssertEqual(afterUnpin, 0)
+
+        // A preview: the image's bytes and header size for a sandboxed decoder; anything
+        // that isn't an image is refused.
+        do {
+            _ = try await client.previewFile(transferId: 11, fileId: file.id)
+            XCTFail("a .bin file previewed")
+        } catch LoginError.Api(let code, _) {
+            XCTAssertEqual(code, "file.preview_refused")
+        }
+        let png = Data([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x7b, 0x40, 0xe8, 0xdd, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0xf8, 0xcf, 0x00, 0x04, 0xff, 0x01, 0x07, 0x00, 0x01, 0xff, 0xe2, 0x23,
+            0x9e, 0x59, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ])
+        let pngSource = dir.appending(path: "dot.png")
+        try png.write(to: pngSource)
+        let pngReceipt = try await client.sendQueuedWithFiles(
+            channelId: channel, body: "", replyToId: nil, clientId: UUID().uuidString,
+            files: [FfiOutgoingFile(path: pngSource.path, filename: "dot.png",
+                                    contentType: "image/png", transferId: nil)])
+        var pngMessage: FfiMessage?
+        for _ in 0 ..< 100 where pngMessage == nil {
+            try await Task.sleep(for: .milliseconds(200))
+            pngMessage = try await client.channelHistory(channelId: channel, before: nil)
+                .first { $0.clientId == pngReceipt.clientId }
+        }
+        let pngFile = try XCTUnwrap(pngMessage?.attachments.first, "the image never arrived")
+        try await client.loadHead(channelId: channel, limit: 50)
+        let preview = try await client.previewFile(transferId: 12, fileId: pngFile.id)
+        XCTAssertEqual(preview.kind, .png)
+        XCTAssertEqual(preview.width, 2)
+        XCTAssertEqual(preview.height, 1)
+        XCTAssertEqual(preview.bytes, png)
+        try await client.deleteMessage(channelId: channel, messageId: try XCTUnwrap(pngMessage).id)
         try await client.deleteMessage(channelId: channel, messageId: try XCTUnwrap(textMessage).id)
         try await client.deleteMessage(channelId: channel, messageId: first.id)
         try await client.deleteMessage(channelId: channel, messageId: message.id)
