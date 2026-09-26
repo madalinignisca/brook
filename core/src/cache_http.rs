@@ -16,6 +16,59 @@ pub(crate) struct Http {
     pub(crate) http: reqwest::Client,
     pub(crate) base: Url,
     pub(crate) session: SessionStore,
+    /// The client's transfer registry (progress events, and the flags that stop them).
+    pub(crate) transfers: std::sync::Arc<crate::transfer::Transfers>,
+}
+
+/// A token for the outbox's session `epoch` only: token and epoch come from one snapshot,
+/// and a session that isn't that one answers `NotAuthenticated` (nothing is sent as the
+/// next user).
+struct EpochToken<'a> {
+    session: &'a SessionStore,
+    epoch: u64,
+}
+
+#[async_trait::async_trait]
+impl crate::transfer::TokenSource for EpochToken<'_> {
+    async fn token(&self) -> crate::Result<String> {
+        match self.session.snapshot().await {
+            (rev, Some(s)) if rev.epoch == self.epoch => Ok(s.access_token),
+            _ => Err(crate::Error::NotAuthenticated),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::outbox::Upload for Http {
+    async fn upload(
+        &self,
+        id: crate::transfer::TransferId,
+        flags: &std::sync::Arc<crate::transfer::Flags>,
+        channel_id: &str,
+        file: &crate::outbox::FileRow,
+        source: &crate::snapshot::SnapshotSource,
+        epoch: u64,
+    ) -> Result<crate::transfer::FileInfo, crate::Error> {
+        crate::transfer::Uploader {
+            http: &self.http,
+            base: &self.base,
+            transfers: &self.transfers,
+            token: &EpochToken {
+                session: &self.session,
+                epoch,
+            },
+        }
+        .upload(
+            id,
+            flags,
+            channel_id,
+            &file.filename,
+            &file.content_type,
+            &file.file_client_id,
+            source,
+        )
+        .await
+    }
 }
 
 impl Http {
@@ -88,11 +141,14 @@ impl History for Http {
     }
 }
 
-/// The JSON a queued send posts: `reply_to_id` only when it's a reply.
+/// The JSON a queued send posts: `reply_to_id` only for a reply, `attachments` only with files.
 pub(crate) fn send_body(msg: &crate::outbox::Outgoing, client_id: &str) -> Value {
     let mut v = serde_json::json!({ "body": msg.body, "client_id": client_id });
     if let Some(r) = &msg.reply_to_id {
         v["reply_to_id"] = Value::from(r.as_str());
+    }
+    if !msg.attachments.is_empty() {
+        v["attachments"] = Value::from(msg.attachments.clone()); // in the user's order
     }
     v
 }

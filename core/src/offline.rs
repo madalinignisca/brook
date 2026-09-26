@@ -35,6 +35,8 @@ pub(crate) struct Net {
     pub(crate) fetch: Arc<dyn Fetch>,
     pub(crate) history: Arc<dyn History>,
     pub(crate) post: Arc<dyn Post>,
+    pub(crate) upload: Arc<dyn crate::outbox::Upload>,
+    pub(crate) transfers: Arc<crate::transfer::Transfers>,
 }
 
 /// Lost unsent messages: `newest` numbers every loss (it never restarts), `unacked` holds
@@ -253,6 +255,7 @@ impl Offline {
             record_loss(&self.losses, &self.events);
         }
         let stores = opened?;
+        let store_dir = stores.dir.clone();
         let (cache_db, outbox_db) = match (stores.cache, stores.outbox) {
             (Opened::Ready { db: c, .. }, Opened::Ready { db: o, .. }) => (c, o),
             (c, o) => {
@@ -268,7 +271,16 @@ impl Offline {
         };
         let cache = Cache::new(cache_db, user_id.to_string(), net.fetch, net.history);
         let (session, session_rx) = watch::channel(Some(epoch));
-        let outbox = Outbox::open(outbox_db, cache.clone(), net.post, session_rx).await?;
+        let outbox = Outbox::open(
+            outbox_db,
+            cache.clone(),
+            net.post,
+            net.upload,
+            net.transfers,
+            session_rx,
+            &store_dir,
+        )
+        .await?;
         outbox.set_events(self.events.clone());
         let _ = outbox.resume().await;
         let pump = tokio::spawn(pump(cache.clone(), self.events.clone(), raw));

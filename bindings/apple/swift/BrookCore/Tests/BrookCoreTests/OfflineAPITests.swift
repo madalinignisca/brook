@@ -48,4 +48,20 @@ final class OfflineAPITests: XCTestCase {
         let unsent = await client.unsentCount()
         XCTAssertEqual(unsent, 0)
     }
+
+    /// The file API crosses: its limits, and local data off answers as for any send.
+    func testFilesAreRefusedWithoutLocalDataAndTheLimitsCross() async throws {
+        XCTAssertEqual(maxFilesPerMessage(), 10)
+        XCTAssertEqual(maxFileBytes(), 100 * 1024 * 1024)
+        let client = try FfiBrookClient(baseUrl: "https://brook.invalid", allowInsecureHttp: false)
+        let file = FfiOutgoingFile(path: "/dev/null", filename: "a.txt", contentType: "text/plain", transferId: 5)
+        do {
+            _ = try await client.sendQueuedWithFiles(
+                channelId: "c", body: "", replyToId: nil, clientId: UUID().uuidString, files: [file])
+            XCTFail("queued files with local data off")
+        } catch LoginError.Api(let code, _) {
+            XCTAssertEqual(code, "local.unavailable")
+        }
+        client.cancelTransfer(transferId: 1) // an unknown id is a no-op
+    }
 }
