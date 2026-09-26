@@ -69,8 +69,10 @@ final class SessionStore {
 
     init(
         settings: Settings = Settings(), persistence: SessionPersistence = .off,
-        makeClient: @escaping ClientFactory = SessionStore.liveClient
+        makeClient: @escaping ClientFactory = SessionStore.liveClient,
+        localDataWait: Duration = .seconds(30)
     ) {
+        self.localDataWait = localDataWait
         self.settings = settings
         self.persistence = persistence
         self.makeClient = makeClient
@@ -188,7 +190,7 @@ final class SessionStore {
     @ObservationIgnored private var signOutTask: Task<Void, Never>?
     @ObservationIgnored private var enableTask: Task<Void, Never>?
     /// The longest a sign-in waits for them; after that it stays online-only.
-    nonisolated static let localDataWait: Duration = .seconds(30)
+    private let localDataWait: Duration
 
     /// Sign Out offers "Remove this device's data" (switched on, or switching on).
     var offersRemoval: Bool { localData == .on || localData == .enabling }
@@ -231,9 +233,10 @@ final class SessionStore {
     private func startLocalData(_ client: FfiBrookClient, slot: FfiKeySlot, dataDir: String) {
         let mine = attempt
         let previous = [signOutTask, enableTask].compactMap { $0 }
+        let limit = localDataWait
         localData = .enabling
         enableTask = Task { [weak self] in
-            let settled = await Self.waitAll(previous, upTo: Self.localDataWait)
+            let settled = await Self.waitAll(previous, upTo: limit)
             // A sign-out or a newer sign-in meanwhile decides first: nothing to log.
             guard let self, mine == self.attempt, !Task.isCancelled else { return }
             guard settled else {
