@@ -2534,6 +2534,9 @@ fn spawn_cache_loop(chat: &Rc<Chat>) {
                     report_outbox_lost(&chat);
                 }
                 Ok(CacheEvent::OutboxLost) => report_outbox_lost(&chat),
+                // Cached files changed (fetched, kept, evicted, gone): rows showing them
+                // re-read their state.
+                Ok(CacheEvent::Files(ids)) => crate::attachments::refresh_rows(&ids),
                 Ok(_) => {}
                 Err(RecvError::Closed) => break,
             }

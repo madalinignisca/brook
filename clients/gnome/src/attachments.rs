@@ -11,11 +11,14 @@
 //! temporary sibling, which a Flatpak's document portal wouldn't allow); a failed or
 //! cancelled save leaves nothing behind.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use adw::prelude::*;
-use brook_core::{BrookClient, FileInfo, FileSink, TransferId, TransferState};
+use brook_core::{BrookClient, FileCacheState, FileInfo, FileSink, TransferId, TransferState};
 use gtk::{gio, glib};
 use tokio::runtime::Handle;
 
@@ -124,6 +127,11 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
         .css_classes(["flat"])
         .visible(false)
         .build();
+    let keep = gtk::ToggleButton::builder()
+        .icon_name("folder-download-symbolic")
+        .tooltip_text("Keep available offline")
+        .css_classes(["flat"])
+        .build();
     for w in [
         icon.upcast_ref::<gtk::Widget>(),
         name.upcast_ref(),
@@ -132,6 +140,7 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
         progress.upcast_ref(),
         open.upcast_ref(),
         save.upcast_ref(),
+        keep.upcast_ref(),
         cancel.upcast_ref(),
     ] {
         row.append(w);
@@ -142,8 +151,101 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
         save.set_sensitive(false);
         save.set_tooltip_text(Some("Still uploading"));
         open.set_sensitive(false);
+        keep.set_sensitive(false);
         return row.upcast();
     };
+
+    // "Keep available offline": the row follows the cache's state for this file (pinned,
+    // fetching, gone), refreshed on `CacheEvent::Files`.
+    let refresh: Rc<dyn Fn()> = Rc::new({
+        let (client, runtime, file_id) = (client.clone(), runtime.clone(), file.id.clone());
+        let (keep, status, progress) = (keep.downgrade(), status.downgrade(), progress.downgrade());
+        let following = Rc::new(std::cell::Cell::new(None::<TransferId>));
+        move || {
+            let (client, file_id) = (client.clone(), file_id.clone());
+            let state = runtime.spawn({
+                let (client, file_id) = (client.clone(), file_id.clone());
+                async move { client.file_state(&file_id).await }
+            });
+            let (keep, status, progress, following) = (
+                keep.clone(),
+                status.clone(),
+                progress.clone(),
+                following.clone(),
+            );
+            glib::spawn_future_local(async move {
+                let Ok(Ok(state)) = state.await else { return };
+                let (Some(keep), Some(status), Some(progress)) =
+                    (keep.upgrade(), status.upgrade(), progress.upgrade())
+                else {
+                    return;
+                };
+                match keep_view(&state) {
+                    KeepView::Off => {
+                        set_active_quietly(&keep, false);
+                        if status.text() == "Available offline"
+                            || status.text() == "Downloading for offline"
+                        {
+                            status.set_visible(false);
+                        }
+                    }
+                    KeepView::Fetching(id) => {
+                        set_active_quietly(&keep, true);
+                        status.set_text("Downloading for offline");
+                        status.set_visible(true);
+                        if following.replace(id) != id {
+                            if let Some(id) = id {
+                                progress.set_visible(true);
+                                follow_progress(&client, id, &progress);
+                            }
+                        }
+                    }
+                    KeepView::Kept => {
+                        set_active_quietly(&keep, true);
+                        progress.set_visible(false);
+                        status.set_text("Available offline");
+                        status.set_visible(true);
+                    }
+                }
+            });
+        }
+    });
+    register_row(&file.id, &refresh);
+    refresh();
+    keep.connect_toggled({
+        let (client, runtime, file_id, status) = (
+            client.clone(),
+            runtime.clone(),
+            file.id.clone(),
+            status.clone(),
+        );
+        // The registry holds `refresh` weakly: this handler keeps it alive exactly as long
+        // as the row (it only captures widgets weakly, so there's no cycle).
+        let refresh = refresh.clone();
+        move |button| {
+            let _alive = &refresh;
+            if button.widget_name() == QUIET {
+                return; // set from the cache's state, not by the user
+            }
+            let pin = button.is_active();
+            let (client, file_id) = (client.clone(), file_id.clone());
+            let done = runtime.spawn(async move {
+                if pin {
+                    client.pin_file(&file_id).await
+                } else {
+                    client.unpin_file(&file_id).await
+                }
+            });
+            let (button, status) = (button.clone(), status.clone());
+            glib::spawn_future_local(async move {
+                if let Ok(Err(err)) = done.await {
+                    set_active_quietly(&button, !pin);
+                    status.set_text(&keep_error_text(&err));
+                    status.set_visible(true);
+                }
+            });
+        }
+    });
 
     // Open and Save each run under their own id; Cancel stops whichever is running.
     let transfer = TransferId::new();
@@ -320,6 +422,85 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
     row.upcast()
 }
 
+/// How the "keep offline" part of a row shows a cache state.
+#[derive(Debug, PartialEq, Eq)]
+enum KeepView {
+    Off,
+    /// Pinned, not complete yet: the background download's id, if it's running.
+    Fetching(Option<TransferId>),
+    Kept,
+}
+
+fn keep_view(state: &FileCacheState) -> KeepView {
+    match state {
+        FileCacheState::Pinned { cached: true, .. } => KeepView::Kept,
+        FileCacheState::Pinned { transfer, .. } => KeepView::Fetching(*transfer),
+        _ => KeepView::Off,
+    }
+}
+
+fn keep_error_text(err: &brook_core::Error) -> String {
+    match err {
+        brook_core::Error::Api { code, .. } if code == "local.unavailable" => {
+            "Keeping files offline needs this device's storage".into()
+        }
+        brook_core::Error::Api { code, .. } if code == "file.unknown" => {
+            "Not available yet. Try again in a moment".into()
+        }
+        other => save_error_text(other),
+    }
+}
+
+/// A toggle set from state, not a click: its handler checks this name and does nothing.
+const QUIET: &str = "brook-quiet";
+
+fn set_active_quietly(button: &gtk::ToggleButton, active: bool) {
+    if button.is_active() == active {
+        return;
+    }
+    let name = button.widget_name();
+    button.set_widget_name(QUIET);
+    button.set_active(active);
+    button.set_widget_name(&name);
+}
+
+/// A row's "re-read your state" callback, held weakly (the row owns it).
+type RowRefresh = Weak<dyn Fn()>;
+
+thread_local! {
+    /// The attachment rows on screen by file id, for `CacheEvent::Files`.
+    static ROWS: RefCell<HashMap<String, Vec<RowRefresh>>> = RefCell::default();
+}
+
+fn register_row(file_id: &str, refresh: &Rc<dyn Fn()>) {
+    ROWS.with(|rows| {
+        let mut rows = rows.borrow_mut();
+        let entry = rows.entry(file_id.to_string()).or_default();
+        entry.retain(|w| w.strong_count() > 0);
+        entry.push(Rc::downgrade(refresh));
+    });
+}
+
+/// The cache says these files changed: rows showing them re-read their state.
+pub fn refresh_rows(file_ids: &[String]) {
+    let live: Vec<Rc<dyn Fn()>> = ROWS.with(|rows| {
+        let mut rows = rows.borrow_mut();
+        rows.retain(|_, v| {
+            v.retain(|w| w.strong_count() > 0);
+            !v.is_empty()
+        });
+        file_ids
+            .iter()
+            .filter_map(|id| rows.get(id))
+            .flatten()
+            .filter_map(Weak::upgrade)
+            .collect()
+    });
+    for refresh in live {
+        refresh();
+    }
+}
+
 /// Follow a transfer's progress on `bar` until it ends (on the GTK loop).
 fn follow_progress(client: &BrookClient, id: TransferId, bar: &gtk::ProgressBar) {
     let mut events = client.transfer_events();
@@ -385,6 +566,25 @@ pub fn save_error_text(err: &brook_core::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_keep_offline_view_follows_the_cache() {
+        let id = TransferId::new();
+        let pinned = |cached, transfer| FileCacheState::Pinned {
+            cached,
+            done: 0,
+            size: 1,
+            transfer,
+        };
+        assert_eq!(keep_view(&FileCacheState::Cached), KeepView::Off);
+        assert_eq!(keep_view(&FileCacheState::NotCached), KeepView::Off);
+        assert_eq!(keep_view(&pinned(true, None)), KeepView::Kept);
+        assert_eq!(
+            keep_view(&pinned(false, Some(id))),
+            KeepView::Fetching(Some(id))
+        );
+        assert_eq!(keep_view(&pinned(false, None)), KeepView::Fetching(None));
+    }
 
     #[test]
     fn open_errors_say_what_to_do() {
