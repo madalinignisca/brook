@@ -52,8 +52,8 @@ user-set cache size (the cap is a constant, §5).
   never reuses a key: a restarted download gets a new key.
 - The `files` table grows (a cache format change; pre-1.0, so the cache is rebuilt, not
   migrated):
-  - `files(file_id PK, message_id, channel_id, sha256, size, key, chunk,`
-    `state, done, pinned, last_used)`;
+  - `files(file_id PK, sha256, size, key, chunk, state, done, pinned, last_used)`;
+  - `message_files(file_id PK, message_id, channel_id)` (§4);
   - `state` is `partial` or `complete` (a file is `complete` once its last chunk is written
     and `verify` passed);
   - `done` is the plaintext bytes in complete chunks: the resume point.
@@ -82,23 +82,43 @@ UI can follow progress (`transfer_events`) and cancel (`cancel_transfer`) from t
 - The download loop moves into a `Downloader` next to the `Uploader`. `download_file`
   keeps its current behaviour through it.
 
-### 4.1 `cache_file(id, &FileInfo) -> Result<()>`
+**Which files.** Every call names a file by `file_id` only. Core looks it up in the cached
+messages, not in a `FileInfo` from the caller:
+- a `message_files(file_id PK, message_id, channel_id)` index is kept by the cache's apply
+  from each message's `attachments`, in the same transaction;
+- an id no cached message carries is refused with `file.unknown`.
+
+So every cached row belongs to a message the cache tracks, and §6's lifecycle can always
+drop it.
+
+**One download per file.** At most one download per `file_id` runs at a time:
+- A second call (Open while the pin fetcher runs, or two Opens) joins it: its `TransferId`
+  gets the same progress events.
+- `cancel_transfer` on a joined id detaches that caller only.
+- The download itself stops when no caller and no pin wants it any more.
+
+### 4.1 `cache_file(id, file_id) -> Result<()>`
 - Downloads into the cache, resuming a partial.
 - An `EncryptingSink` (a `DownloadSink`):
   - buffers up to one chunk and seals each full chunk as it arrives;
   - fsyncs and updates `done` every few chunks, so a crash resumes from the last recorded
     chunk and never trusts bytes that weren't recorded;
   - `resume_offset` = `done`;
-  - `restart` means a new key, truncation and `done = 0`;
-  - `finish` seals the last chunk, then runs `verify` against `FileInfo.sha256` and marks
+  - `restart` means a new key, truncation and `done = 0`.
+- **The resume invariant.** A partial continues under its key only after a `206` answering
+  `Range: bytes=<done>-` with `If-Range: "<sha256>"`, the strong ETag being the sha256
+  of the cached message's `FileInfo` for this file, and a `Content-Range` starting at `done`. Anything
+  else (a `200`, another start, another validator) means a new key and a restart at 0.
+  The same key never seals two different byte streams at the same chunk index.
+  - `finish` seals the last chunk, then runs `verify` against the cached `FileInfo.sha256` and marks
     the row `complete`.
 - On a cancel the partial stays, for a later resume.
 - A `404` drops the row and blob and returns `file.gone`.
 - Already complete: returns at once and updates `last_used`.
 
-### 4.2 `open_file(id, &FileInfo) -> Result<PathBuf>`
+### 4.2 `open_file(id, file_id) -> Result<PathBuf>`
 - `cache_file` first, then decrypts into the Open directory (§4.4) under
-  `FileInfo.filename` (the server's sanitised ASCII name), inside a fresh random
+  the cached `FileInfo.filename` (the server's sanitised ASCII name), inside a fresh random
   subdirectory so two opens never clash. Returns that path; the app hands it to the system
   (`gio::AppInfo::launch_default_for_uri`, `NSWorkspace`).
 - **Refused for executables and launchers**, sniffed from the first bytes, never the name:
@@ -108,7 +128,7 @@ UI can follow progress (`transfer_events`) and cancel (`cancel_transfer`) from t
   The refusal is `file.open_refused`, and Save stays available.
 - Updates `last_used`.
 
-### 4.3 `save_file(id, &FileInfo, destination) -> Result<()>`
+### 4.3 `save_file(id, file_id, destination) -> Result<()>`
 - Complete in the cache: decrypts straight into `destination` (a `FileSink`, so the Flatpak
   portal rules hold), then checks the sha256.
 - Otherwise: today's network download into `destination`. It does not also cache the file:
@@ -117,13 +137,14 @@ UI can follow progress (`transfer_events`) and cancel (`cancel_transfer`) from t
 ### 4.4 The Open directory
 - Linux: `$XDG_RUNTIME_DIR/brook/<store_id>/` (tmpfs, 0700), or
   `$XDG_RUNTIME_DIR/app/<app id>/brook/<store_id>/` under Flatpak.
-- Mac: the app's temporary directory.
+- Mac: the app's temporary directory, each copy tagged with `com.apple.quarantine`, so
+  Gatekeeper treats it as downloaded.
 - It is the one plaintext copy core makes on its own. It is emptied by `clear_open_copies()`
   (the app calls it on quit), at the next `enable_local_data`, and on sign-out with data
   removal.
 
 ### 4.5 Pinning
-- `pin_file(&FileInfo)`:
+- `pin_file(file_id)`:
   - makes or keeps the row with `pinned = 1`;
   - if it isn't complete, a background fetcher downloads it now, or when the cache's state
     says online again;
@@ -136,11 +157,14 @@ UI can follow progress (`transfer_events`) and cancel (`cancel_transfer`) from t
   - `Partial { done, size, transfer: Option<TransferId> }`;
   - `Cached`;
   - `Pinned { cached: bool, transfer: Option<TransferId> }`.
+- `pinned_bytes() -> u64`: the size of all pinned files, since pins don't count against the
+  cap and the app should show what they take.
 - A `CacheEvent::Files(Vec<file_id>)` whenever a file's state changes (downloaded, evicted,
   gone, pinned), so a UI refreshes its rows.
 
 ### 4.6 Errors
 - `file.gone` (404): the file was deleted.
+- `file.unknown`: no cached message carries this id.
 - `file.open_refused`: an executable or launcher.
 - `local.unavailable`: no local data, so there's no cache. Open then falls back to Save; the
   UI says so.
@@ -195,6 +219,10 @@ journalled. Pinned files go too, and the UI shows them as gone.
 ## 8. Tests
 
 **Core:**
+- **Which files:** an id no cached message carries is refused; `message_files` follows
+  apply, including when a list shrinks.
+- **One download per file:** Open during a pin fetch joins it, and cancelling one caller
+  keeps the other.
 - **Downloads:** encrypted resume across a crash (never past recorded `done`); a `200`
   instead of a `206` means a new key and a restart; a `404` gives `file.gone` and removes
   row and blob.
