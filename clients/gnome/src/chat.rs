@@ -88,8 +88,9 @@ struct Chat {
     /// Transfer ids the pending bubbles show (forgotten when they're redrawn).
     pending_ids: Rc<RefCell<Vec<brook_core::TransferId>>>,
     /// The staged message's outbox id, made at its first Send and kept until it's queued
-    /// or dropped: a second Send after an unclear failure can't make a second message.
-    draft_id: Rc<RefCell<Option<String>>>,
+    /// or dropped: a second Send of the same message after an unclear failure can't make a
+    /// second message, and a changed one (text, quote or files) gets a new id.
+    draft_id: Rc<RefCell<Option<(Draft, String)>>>,
     /// The chip whose button cancelled the copy: that file leaves, the others stay.
     cancelled_chip: Rc<Cell<Option<brook_core::TransferId>>>,
     /// A text send that failed: what it was (channel, text, quoted message) and its outbox
@@ -860,6 +861,7 @@ fn send_current(chat: &Rc<Chat>) {
             channel: channel_id.clone(),
             body: body.clone(),
             reply_to: reply_to.clone(),
+            files: Vec::new(),
         },
     );
 
@@ -1001,11 +1003,15 @@ fn send_with_files(chat: &Rc<Chat>) {
     let body = chat.composer.text().to_string();
     let reply_to = chat.replying_to.borrow().clone();
     let files: Vec<_> = chat.staged.borrow().iter().map(|f| f.outgoing()).collect();
-    let client_id = chat
-        .draft_id
-        .borrow_mut()
-        .get_or_insert_with(|| glib::uuid_string_random().to_string())
-        .clone();
+    let client_id = draft_id(
+        &mut chat.draft_id.borrow_mut(),
+        Draft {
+            channel: channel_id.clone(),
+            body: body.clone(),
+            reply_to: reply_to.clone(),
+            files: chat.staged.borrow().iter().map(|f| f.transfer_id).collect(),
+        },
+    );
     chat.cancelled_chip.set(None);
     set_preparing(chat, true);
 
@@ -1081,6 +1087,8 @@ struct Draft {
     channel: String,
     body: String,
     reply_to: Option<String>,
+    /// The staged files, by their (stable, per staging) transfer ids; none for text.
+    files: Vec<brook_core::TransferId>,
 }
 
 /// The outbox id for `this` send: the failed attempt's again when it's the same send, else a
@@ -2925,6 +2933,7 @@ mod offline_tests {
             channel: channel.into(),
             body: body.into(),
             reply_to: reply.map(str::to_string),
+            files: Vec::new(),
         };
         let mut draft = None;
         let first = draft_id(&mut draft, d("c1", "hello", None));
@@ -2941,6 +2950,20 @@ mod offline_tests {
         let quoted = draft_id(&mut draft, d("c2", "hello!", Some("m1")));
         assert_ne!(quoted, other, "a changed quote is a new message");
         assert_ne!(draft_id(&mut draft, d("c2", "hello!", Some("m2"))), quoted);
+        // A message with files: removing one after a failure is a new message too (core
+        // would otherwise answer with the stored one, the removed file included).
+        let (a, b) = (brook_core::TransferId::new(), brook_core::TransferId::new());
+        let with = |files: Vec<brook_core::TransferId>| Draft {
+            files,
+            ..d("c1", "", None)
+        };
+        let both = draft_id(&mut draft, with(vec![a, b]));
+        assert_eq!(
+            draft_id(&mut draft, with(vec![a, b])),
+            both,
+            "the same files again"
+        );
+        assert_ne!(draft_id(&mut draft, with(vec![a])), both, "a file removed");
     }
 
     #[test]
