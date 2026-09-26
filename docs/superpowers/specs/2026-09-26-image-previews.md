@@ -8,6 +8,10 @@
 
 - An image attachment (PNG, JPEG, GIF, WebP) shows a thumbnail under its row: at most
   360 × 240, aspect kept. Clicking it opens the image (core's `open_file`).
+- **Only attachments that declare an image type** (`image/png`, `image/jpeg`, `image/gif`,
+  `image/webp`) are offered a preview at all, automatically or by "Show preview".
+  `preview_file` fetches before it sniffs, so any other attachment would be downloaded just
+  to find out. The declared type only chooses which files to try; the sniff still decides.
 - **Small images (≤ 4 MiB) preview by themselves** when the row is shown: fetched into the
   encrypted cache if they aren't there yet.
 - **Larger ones** (up to 16 MiB) get a "Show preview" button: nothing is downloaded until the
