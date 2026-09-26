@@ -586,6 +586,16 @@ extension FakeRealtime {
     func subscribeCacheEvents(listener: any CacheEventListener) -> Subscription { fatalError("unused") }
     func subscribeCacheState(listener: any CacheStateListener) -> Subscription { fatalError("unused") }
     func subscribeTransfers(listener: any TransferListener) -> Subscription { fatalError("unused") }
+    // The file cache (#149, #155): unused by these tests.
+    func cacheFile(transferId: UInt64, fileId: String) async throws { throw unused }
+    func openFile(transferId: UInt64, fileId: String) async throws -> String { throw unused }
+    func saveCachedFile(fileId: String, destination: String) async throws -> Bool { throw unused }
+    func fileState(fileId: String) async throws -> FfiFileCacheState { throw unused }
+    func clearOpenCopies() async {}
+    func pinFile(fileId: String) async throws { throw unused }
+    func unpinFile(fileId: String) async throws { throw unused }
+    func pinnedBytes() async throws -> UInt64 { throw unused }
+    func previewFile(transferId: UInt64, fileId: String) async throws -> FfiImagePreview { throw unused }
     func unsentCount() async -> UInt64 { 0 }
     func wipeOtherLocalUsers() async throws { throw unused }
 }
