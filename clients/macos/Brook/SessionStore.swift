@@ -396,6 +396,9 @@ final class SessionStore {
             } else {
                 await client.logout() // core forgets the stored copy, then revokes (best effort)
             }
+            // This client's stores and index closed before this task ends, so the next
+            // sign-in's enable (which waits for this task) opens them alone.
+            await client.closeLocalData()
             // A sign-in completed since replaced the stored copy: then it's moot. Its own
             // value, not the form's error: typing into the form meanwhile must not hide it.
             guard let self, before == self.signIns else { return }

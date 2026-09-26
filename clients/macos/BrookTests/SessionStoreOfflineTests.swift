@@ -187,6 +187,27 @@ final class SessionStoreOfflineTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(started), 2, "a cancelled wait ran on")
     }
 
+    func testEitherSignOutClosesTheStoresBeforeTheNextSignInOpensThem() async {
+        for removeData in [false, true] {
+            defaults.removeObject(forKey: Settings.lastServerKey)
+            let fake = signedIn()
+            let store = store(fake)
+            await store.signIn(server: "https://h", handle: "alice", password: "pw")
+            await until("on") { store.localData == .on }
+            fake.closeGated.withLock { $0 = true }
+            store.signOut(removeData: removeData)
+            await until("closing") { fake.localCalls.withLock { $0 }.contains("close") }
+            await store.signIn(server: "https://h", handle: "alice", password: "pw")
+            try? await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(fake.localCalls.withLock { $0 }.filter { $0 == "enable" }.count, 1,
+                           "enabled while the stores were closing (removeData: \(removeData))")
+            fake.closeGate.open()
+            await until("enabled again") { fake.localCalls.withLock { $0 }.filter { $0 == "enable" }.count == 2 }
+            let calls = fake.localCalls.withLock { $0 }
+            XCTAssertLessThan(calls.firstIndex(of: "closed")!, calls.lastIndex(of: "enable")!)
+        }
+    }
+
     func testSignOutResetsTheFeed() async {
         let fake = signedIn()
         let store = store(fake)

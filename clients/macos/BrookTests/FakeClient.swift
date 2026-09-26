@@ -209,6 +209,13 @@ final class FakeClient: FfiBrookClient, @unchecked Sendable {
     override func unsentCount() async -> UInt64 { 0 }
     override func otherLocalUsers() async throws -> [FfiLocalUser] { [] }
     override func wipeOtherLocalUsers() async throws { note("wipe") }
+    let closeGate = Gate()
+    let closeGated = Mutex(false)
+    override func closeLocalData() async {
+        note("close")
+        if closeGated.withLock({ $0 }) { await closeGate.wait() }
+        note("closed")
+    }
 }
 
 /// Records what the store asked the factory for, and hands out a prepared client.
