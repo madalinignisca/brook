@@ -7,7 +7,7 @@ import Observation
 @MainActor
 @Observable
 final class PendingModel {
-    enum Action: Equatable {
+    enum Action: Hashable {
         case retry
         case sendWithoutQuote
         case delete
