@@ -48,3 +48,25 @@ Rebutted:
   to the model's actor, so a test from any thread exercises the same code.
 
 Closed.
+
+## Implementation review, round 1 (vibe; Standard)
+
+Taken:
+- **The decoder's `alive` check could crash.** `ImageDecoder` calls it from its own actor,
+  and the closure used `MainActor.assumeIsolated`, which traps off the main thread. It now
+  reads a lock-guarded `Flag` that `onScreen` updates. Tested by calling it from a detached
+  task: the old closure crashes the test host.
+- **"Show preview" does nothing for a row that's off screen** (no fetch).
+
+Rebutted:
+- **"`previewMaxBytes()` doesn't exist"** and **"`.cached?` is invalid".** Both compile:
+  the first is the bindings' 16 MiB cap, and the second matches an optional.
+- **"`hasLocalData` only when cached."** It means this Mac's storage answered, which a
+  not-cached file does too (it can still be opened or pinned).
+- **"Clear the message after a reload."** An Open error stays until the next Open. A reload
+  of the toggle's state isn't an answer to it.
+- **"`gone` sticks."** `file.gone` is permanent: the server deleted the file.
+- **"One size gate."** They differ on purpose: 4 MiB automatic, 16 MiB on request.
+
+Measured: 14 mutants, each caught (one as a hang past 180 s, one as a test-host crash).
+215 Mac tests pass.
