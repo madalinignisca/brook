@@ -529,6 +529,8 @@ fn end_text(reason: &EndReason) -> String {
         EndReason::Left => "You left the call.".into(),
         EndReason::SfuRestart => "The call ended: the media server restarted.".into(),
         EndReason::Removed => "You were removed from this channel.".into(),
+        // Left the channel (maybe from another device): its call ends too.
+        EndReason::LeftChannel => "You left this channel, so its call ended.".into(),
         EndReason::Replaced => "You joined this call from another window or device.".into(),
         EndReason::Expired => "Lost connection to the call.".into(),
         EndReason::SessionChanged => "You were signed out.".into(),
