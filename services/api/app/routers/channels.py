@@ -26,7 +26,7 @@ from .. import files as storage
 from ..db import get_session
 from ..deps import get_current_user
 from ..hub import Hub, get_hub
-from ..models import Channel, File, Membership, Message, Reaction, User, utcnow
+from ..models import Channel, File, Membership, Message, OwnerOffer, Reaction, User, utcnow
 from ..schemas import (
     ChannelCreate,
     ChannelMember,
@@ -37,6 +37,8 @@ from ..schemas import (
     MessageCreate,
     MessageEdit,
     MessageOut,
+    OwnerOfferIn,
+    OwnerOfferOut,
     ReactionSummary,
     ReactionToggle,
     ReadIn,
@@ -117,9 +119,11 @@ def _channel_out(
     members: list[User],
     unread_count: int = 0,
     roles: Mapping[uuid.UUID, str] | None = None,
+    offers: list[OwnerOffer] | None = None,
 ) -> ChannelOut:
     roles = roles or {}
     return ChannelOut(
+        owner_offers=[OwnerOfferOut.model_validate(o) for o in offers or []],
         id=channel.id,
         kind=channel.kind,
         name=channel.name,
@@ -151,8 +155,15 @@ async def _channel_out_for(
             .order_by(User.handle)
         )
     ).all()
+    offers = list(
+        (await session.scalars(select(OwnerOffer).where(OwnerOffer.channel_id == channel.id))).all()
+    )
     return _channel_out(
-        channel, [u for u, _ in rows], unread_count, roles={u.id: role for u, role in rows}
+        channel,
+        [u for u, _ in rows],
+        unread_count,
+        roles={u.id: role for u, role in rows},
+        offers=offers,
     )
 
 
@@ -450,6 +461,17 @@ async def remove_member(
                     "message": "The last owner can't leave; delete the channel instead",
                 },
             )
+    # Their pending ownership offers go with them, both ways: offered to them, or made by
+    # them in this channel (owner decision: an offer ends if either side leaves).
+    for offer in (
+        await session.scalars(
+            select(OwnerOffer).where(
+                OwnerOffer.channel_id == channel_id,
+                (OwnerOffer.user_id == user_id) | (OwnerOffer.offered_by == user_id),
+            )
+        )
+    ).all():
+        await session.delete(offer)
     await session.delete(target)
     await session.flush()  # stamps the tombstone's seq (app/sync.py)
     seq = transaction_seq(session.sync_session)
@@ -466,6 +488,111 @@ async def remove_member(
     manager._spawn(
         manager.end_for_user(channel_id, user_id, reason="left" if leaving else "removed")
     )
+
+
+def _offer_error(status_code: int, code: str, message: str) -> HTTPException:
+    return HTTPException(status_code=status_code, detail={"code": code, "message": message})
+
+
+async def _locked_channel_for(
+    session: AsyncSession, channel_id: uuid.UUID, user: User
+) -> tuple[Channel, Membership | None]:
+    """The channel, locked (offers, accepts and removals of one channel run one at a
+    time), and the caller's membership. 404 for a non-member who isn't an admin."""
+    channel = await session.get(Channel, channel_id, with_for_update=True)
+    if channel is None:
+        raise _not_found()
+    caller = await _membership(session, channel_id, user.id)
+    if caller is None and user.global_role != "admin":
+        raise _not_found()
+    if channel.kind == "dm":
+        raise _offer_error(422, "channel.dm", "A DM has no owners")
+    return channel, caller
+
+
+@router.post("/{channel_id}/owner-offers", response_model=ChannelOut, status_code=201)
+async def offer_ownership(
+    channel_id: uuid.UUID,
+    body: OwnerOfferIn,
+    user: CurrentUser,
+    session: Session,
+    hub: HubDep,
+    response: Response,
+) -> ChannelOut:
+    """Offer to make a member an owner (owner decision, 2026-09-26).
+
+    An owner or a global admin offers; the member accepts or declines when they next open
+    the channel, however long that takes (no expiry). Accepting adds an owner: the one who
+    offered stays one. One pending offer per member: offering again is 200 with the same
+    offer. Rides on the channel object (``owner_offers``), so an offline member gets it
+    through ``/sync``, and members online get ``channel.update``."""
+    channel, caller = await _locked_channel_for(session, channel_id, user)
+    if user.global_role != "admin" and (caller is None or caller.role != "owner"):
+        raise _forbidden("Only an owner or an admin can offer ownership")
+    target = await session.scalar(select(User).where(User.handle == body.handle))
+    member = None if target is None else await _membership(session, channel_id, target.id)
+    if target is None or member is None:
+        raise _offer_error(422, "channel.not_member", "They aren't a member of this channel")
+    if member.role == "owner":
+        raise _offer_error(409, "channel.already_owner", "They're already an owner")
+    if await session.get(OwnerOffer, (channel_id, target.id)) is not None:
+        response.status_code = status.HTTP_200_OK
+    else:
+        session.add(OwnerOffer(channel_id=channel_id, user_id=target.id, offered_by=user.id))
+        await session.commit()
+        await _emit_channel_update(hub, session, channel)
+    return await _channel_out_for(session, channel)
+
+
+@router.delete("/{channel_id}/owner-offers/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def withdraw_ownership_offer(
+    channel_id: uuid.UUID, user_id: uuid.UUID, user: CurrentUser, session: Session, hub: HubDep
+) -> None:
+    """Withdraw a pending offer (an owner or a global admin). 404 if there's none (it may
+    have just been answered)."""
+    channel, caller = await _locked_channel_for(session, channel_id, user)
+    if user.global_role != "admin" and (caller is None or caller.role != "owner"):
+        raise _forbidden("Only an owner or an admin can withdraw an offer")
+    offer = await session.get(OwnerOffer, (channel_id, user_id))
+    if offer is None:
+        raise _offer_error(404, "offer.not_found", "There's no pending offer for them")
+    await session.delete(offer)
+    await session.commit()
+    await _emit_channel_update(hub, session, channel)
+
+
+async def _my_offer(session: AsyncSession, channel_id: uuid.UUID, user: User) -> OwnerOffer:
+    offer = await session.get(OwnerOffer, (channel_id, user.id))
+    if offer is None:
+        raise _offer_error(404, "offer.not_found", "There's no pending offer for you")
+    return offer
+
+
+@router.post("/{channel_id}/owner-offers/accept", response_model=ChannelOut)
+async def accept_ownership(
+    channel_id: uuid.UUID, user: CurrentUser, session: Session, hub: HubDep
+) -> ChannelOut:
+    """Accept your pending offer: you become an owner (the one who offered stays one)."""
+    channel, caller = await _locked_channel_for(session, channel_id, user)
+    offer = await _my_offer(session, channel_id, user)
+    if caller is None:  # an admin who isn't a member can't have an offer; belt and braces
+        raise _not_found()
+    caller.role = "owner"
+    await session.delete(offer)
+    await session.commit()
+    await _emit_channel_update(hub, session, channel)
+    return await _channel_out_for(session, channel)
+
+
+@router.post("/{channel_id}/owner-offers/decline", status_code=status.HTTP_204_NO_CONTENT)
+async def decline_ownership(
+    channel_id: uuid.UUID, user: CurrentUser, session: Session, hub: HubDep
+) -> None:
+    """Decline your pending offer: nothing changes but the offer is gone."""
+    channel, _caller = await _locked_channel_for(session, channel_id, user)
+    await session.delete(await _my_offer(session, channel_id, user))
+    await session.commit()
+    await _emit_channel_update(hub, session, channel)
 
 
 @router.patch("/{channel_id}", response_model=ChannelOut)
