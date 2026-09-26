@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use brook_core::{BrookClient, FileCacheState, FileInfo, FileSink, TransferId, TransferState};
-use gtk::{gio, glib};
+use gtk::{gdk, gio, glib};
 use tokio::runtime::Handle;
 
 /// An icon for the declared type. Only cosmetic: the type is the uploader's claim.
@@ -154,6 +154,9 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
         keep.set_sensitive(false);
         return row.upcast();
     };
+
+    // The preview part (at the end) needs these after Save's handler has taken its own.
+    let (p_client, p_runtime, p_file) = (client.clone(), runtime.clone(), file.clone());
 
     // "Keep available offline": the row follows the cache's state for this file (pinned,
     // fetching, gone), refreshed on `CacheEvent::Files`.
@@ -419,7 +422,148 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
             });
         });
     });
-    row.upcast()
+    // An inline preview under a declared image (previews spec §1, §3).
+    if !previewable_type(&p_file.content_type) || p_file.size > brook_core::PREVIEW_MAX_BYTES {
+        return row.upcast();
+    }
+    let outer = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .build();
+    outer.append(&row);
+    let picture = gtk::Picture::builder()
+        .can_shrink(true)
+        .content_fit(gtk::ContentFit::Contain)
+        .halign(gtk::Align::Start)
+        .margin_top(4)
+        .visible(false)
+        .tooltip_text("Open")
+        .css_classes(["card"])
+        .build();
+    let show = gtk::Button::builder()
+        .label("Show preview")
+        .halign(gtk::Align::Start)
+        .css_classes(["flat", "caption"])
+        .visible(false)
+        .build();
+    outer.append(&picture);
+    outer.append(&show);
+    // Clicking the preview is Open.
+    let click = gtk::GestureClick::new();
+    click.connect_released({
+        let open = open.downgrade();
+        move |_, _, _, _| {
+            if let Some(open) = open.upgrade() {
+                open.emit_clicked();
+            }
+        }
+    });
+    picture.add_controller(click);
+    let start: Rc<dyn Fn()> = Rc::new({
+        let (client, runtime, file_id) = (p_client.clone(), p_runtime.clone(), p_file.id.clone());
+        let (picture, show) = (picture.downgrade(), show.downgrade());
+        move || {
+            if let Some(show) = show.upgrade() {
+                show.set_visible(false);
+            }
+            let alive = picture.clone();
+            let (client, runtime, file_id, picture) = (
+                client.clone(),
+                runtime.clone(),
+                file_id.clone(),
+                picture.clone(),
+            );
+            crate::preview::QUEUE.with(|q| {
+                q.push(crate::preview::Job {
+                    alive: Box::new(move || alive.upgrade().is_some()),
+                    run: Box::new(move |done| {
+                        let decoded = runtime.spawn(async move {
+                            let bytes = client
+                                .preview_file(TransferId::new(), &file_id)
+                                .await
+                                .ok()?
+                                .bytes;
+                            crate::preview::decode(bytes).await
+                        });
+                        glib::spawn_future_local(async move {
+                            if let (Ok(Some(px)), Some(picture)) =
+                                (decoded.await, picture.upgrade())
+                            {
+                                show_pixels(&picture, px);
+                            }
+                            done();
+                        });
+                    }),
+                })
+            });
+        }
+    });
+    show.connect_clicked({
+        let start = start.clone();
+        move |_| start()
+    });
+    // Small ones by themselves, unless the connection is metered and it isn't cached yet.
+    if p_file.size <= crate::preview::AUTO_MAX_BYTES {
+        let metered = gio::NetworkMonitor::default().is_network_metered();
+        if !metered {
+            start();
+        } else {
+            let cached = p_runtime.spawn({
+                let (client, file_id) = (p_client.clone(), p_file.id.clone());
+                async move { client.file_state(&file_id).await }
+            });
+            let (start, show) = (start.clone(), show.downgrade());
+            glib::spawn_future_local(async move {
+                match cached.await {
+                    Ok(Ok(
+                        FileCacheState::Cached | FileCacheState::Pinned { cached: true, .. },
+                    )) => start(),
+                    _ => {
+                        if let Some(show) = show.upgrade() {
+                            show.set_visible(true);
+                        }
+                    }
+                }
+            });
+        }
+    } else {
+        show.set_visible(true);
+    }
+    outer.upcast()
+}
+
+/// A declared image type a preview may be tried for (the sniff in core still decides).
+pub fn previewable_type(content_type: &str) -> bool {
+    matches!(
+        content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
+}
+
+/// Put decoded pixels on the picture, scaled down to at most 360 x 240, aspect kept.
+fn show_pixels(picture: &gtk::Picture, px: crate::preview::Pixels) {
+    let texture = gdk::MemoryTexture::new(
+        px.width as i32,
+        px.height as i32,
+        gdk::MemoryFormat::R8g8b8a8,
+        &glib::Bytes::from_owned(px.rgba),
+        px.stride,
+    );
+    let scale = (360.0 / px.width as f64)
+        .min(240.0 / px.height as f64)
+        .min(1.0);
+    picture.set_size_request(
+        ((px.width as f64 * scale).round() as i32).max(1),
+        ((px.height as f64 * scale).round() as i32).max(1),
+    );
+    picture.set_paintable(Some(&texture));
+    picture.set_visible(true);
 }
 
 /// How the "keep offline" part of a row shows a cache state.

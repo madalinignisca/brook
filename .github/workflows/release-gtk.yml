@@ -104,6 +104,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev libgtk-4-dev libadwaita-1-dev \
+            liblcms2-dev libseccomp-dev libfontconfig-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
