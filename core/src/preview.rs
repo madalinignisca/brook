@@ -80,8 +80,9 @@ pub(crate) fn within_caps(width: u32, height: u32) -> bool {
         && width as u64 * height as u64 <= PREVIEW_MAX_PIXELS
 }
 
-/// The larger of the logical screen and the first frame's image descriptor: a 1×1 screen can
-/// carry a frame far bigger, and the decoder allocates for the frame.
+/// The canvas a decoder may allocate: the logical screen, grown to hold the first frame where
+/// its descriptor places it (left + width, top + height). A 1×1 screen can carry a frame far
+/// bigger, or a small frame far out, and a compositing decoder allocates for either.
 fn gif_dimensions(b: &[u8]) -> Option<(u32, u32)> {
     let (sw, sh) = (le16(b, 6)? as u32, le16(b, 8)? as u32);
     let flags = *b.get(10)?;
@@ -104,8 +105,9 @@ fn gif_dimensions(b: &[u8]) -> Option<(u32, u32)> {
             }
             // The first image descriptor: left, top, width, height.
             0x2c => {
+                let (left, top) = (le16(b, i + 1)? as u32, le16(b, i + 3)? as u32);
                 let (fw, fh) = (le16(b, i + 5)? as u32, le16(b, i + 7)? as u32);
-                return Some((sw.max(fw), sh.max(fh)));
+                return Some((sw.max(left + fw), sh.max(top + fh)));
             }
             _ => return None, // a trailer before any frame, or garbage
         }
@@ -218,13 +220,19 @@ mod tests {
     /// A GIF with a `screen` and a first frame of `frame`, a graphic-control extension and
     /// a small global color table before it.
     fn gif_with(screen: (u16, u16), frame: (u16, u16)) -> Vec<u8> {
+        gif_at(screen, (0, 0), frame)
+    }
+
+    fn gif_at(screen: (u16, u16), at: (u16, u16), frame: (u16, u16)) -> Vec<u8> {
         let mut b = b"GIF89a".to_vec();
         b.extend(screen.0.to_le_bytes());
         b.extend(screen.1.to_le_bytes());
         b.extend([0x80, 0, 0]); // a 2-entry global color table follows
         b.extend([0, 0, 0, 255, 255, 255]);
         b.extend([0x21, 0xf9, 0x04, 0, 0, 0, 0, 0x00]); // graphic control extension
-        b.extend([0x2c, 0, 0, 0, 0]);
+        b.push(0x2c);
+        b.extend(at.0.to_le_bytes());
+        b.extend(at.1.to_le_bytes());
         b.extend(frame.0.to_le_bytes());
         b.extend(frame.1.to_le_bytes());
         b.push(0);
@@ -303,6 +311,11 @@ mod tests {
             read(&gif_with((100, 50), (10, 10))),
             Some((ImageKind::Gif, 100, 50))
         );
+        // A small frame placed far out still needs a canvas that big.
+        let far = gif_at((10, 10), (60000, 0), (10, 10));
+        let (w, h) = dimensions(ImageKind::Gif, &far).unwrap();
+        assert_eq!((w, h), (60010, 10));
+        assert!(!within_caps(w, h));
         // No frame before the trailer: no preview.
         let mut empty = gif(10, 10);
         let at = empty.iter().rposition(|&b| b == 0x2c).unwrap();
