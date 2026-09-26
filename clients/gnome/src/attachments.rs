@@ -164,7 +164,12 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
         let (client, runtime, file_id) = (client.clone(), runtime.clone(), file.id.clone());
         let (keep, status, progress) = (keep.downgrade(), status.downgrade(), progress.downgrade());
         let following = Rc::new(std::cell::Cell::new(None::<TransferId>));
+        // Reads are numbered: only the newest one started applies, whenever it finishes.
+        let reads = Rc::new(std::cell::Cell::new(0u64));
         move || {
+            let mine = reads.get() + 1;
+            reads.set(mine);
+            let reads = reads.clone();
             let (client, file_id) = (client.clone(), file_id.clone());
             let state = runtime.spawn({
                 let (client, file_id) = (client.clone(), file_id.clone());
@@ -178,6 +183,9 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
             );
             glib::spawn_future_local(async move {
                 let Ok(Ok(state)) = state.await else { return };
+                if reads.get() != mine {
+                    return; // a newer read is on its way
+                }
                 let (Some(keep), Some(status), Some(progress)) =
                     (keep.upgrade(), status.upgrade(), progress.upgrade())
                 else {
@@ -231,6 +239,9 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
                 return; // set from the cache's state, not by the user
             }
             let pin = button.is_active();
+            // No second toggle until this one's call returns: a quick on/off can't land out
+            // of order.
+            button.set_sensitive(false);
             let (client, file_id) = (client.clone(), file_id.clone());
             let done = runtime.spawn(async move {
                 if pin {
@@ -239,12 +250,16 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
                     client.unpin_file(&file_id).await
                 }
             });
-            let (button, status) = (button.clone(), status.clone());
+            let (button, status, refresh) = (button.clone(), status.clone(), refresh.clone());
             glib::spawn_future_local(async move {
-                if let Ok(Err(err)) = done.await {
-                    set_active_quietly(&button, !pin);
+                let result = done.await;
+                button.set_sensitive(true);
+                if let Ok(Err(err)) = result {
                     status.set_text(&keep_error_text(&err));
                     status.set_visible(true);
+                    // The cache's word, not a guess: a newer state (a Files event meanwhile)
+                    // wins over simply setting the toggle back.
+                    refresh();
                 }
             });
         }
@@ -298,10 +313,28 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
                 button.set_sensitive(true);
                 match result {
                     Ok(path) => {
+                        // Core's copy, opened exactly as returned; it's only ever cleared at
+                        // sign-out or close, but check before handing it over.
+                        if !path.exists() {
+                            status.set_text("Not available yet. Try again in a moment");
+                            status.set_visible(true);
+                            return;
+                        }
+                        let status = status.clone();
                         gtk::FileLauncher::new(Some(&gio::File::for_path(&path))).launch(
                             window.as_ref(),
                             gio::Cancellable::NONE,
-                            |_| {},
+                            move |launched| {
+                                if let Err(err) = launched {
+                                    // Dismissing the app chooser isn't a failure.
+                                    if !err.matches(gtk::DialogError::Dismissed)
+                                        && !err.matches(gtk::DialogError::Cancelled)
+                                    {
+                                        status.set_text("No app opens this. Save it instead");
+                                        status.set_visible(true);
+                                    }
+                                }
+                            },
                         );
                     }
                     Err(err) => {
