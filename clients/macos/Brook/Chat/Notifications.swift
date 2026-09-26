@@ -12,11 +12,15 @@ enum NotificationPlanner {
         return !(m.channelId == openChannel && appActive)
     }
 
+    /// It names you, or everyone (`@channel`, `@here`).
+    static func mentions(_ m: FfiMessage, me: String) -> Bool {
+        m.mentionEveryone || m.mentions.contains(me)
+    }
+
     static func body(_ m: FfiMessage, me: String) -> String {
         let author = m.authorDisplayName ?? m.authorHandle ?? "Someone"
         if m.body.isEmpty, !m.attachments.isEmpty { return "\(author) sent a file" }
-        let mentioned = m.mentionEveryone || m.mentions.contains(me)
-        return mentioned ? "\(author) mentioned you: \(m.body)" : "\(author): \(m.body)"
+        return mentions(m, me: me) ? "\(author) mentioned you: \(m.body)" : "\(author): \(m.body)"
     }
 }
 
