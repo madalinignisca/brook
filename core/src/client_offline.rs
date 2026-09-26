@@ -292,14 +292,7 @@ impl BrookClient {
         let cache = self.active_cache().await?;
         let rows = cache.cached_channels().await.map_err(|_| store_error())?;
         let total = rows.len();
-        let channels: Vec<Channel> = rows
-            .into_iter()
-            .filter_map(|row| {
-                let mut ch: Channel = serde_json::from_value(row.json).ok()?;
-                ch.unread_count = i64::from(row.unread);
-                Some(ch)
-            })
-            .collect();
+        let channels: Vec<Channel> = rows.into_iter().filter_map(channel_from_row).collect();
         if channels.len() < total {
             tracing::debug!(
                 dropped = total - channels.len(),
@@ -542,5 +535,33 @@ impl BrookClient {
         if let Ok(files) = self.active_files().await {
             files.clear_open_copies();
         }
+    }
+}
+
+/// A cached row as a channel, with this device's counts (the stored JSON's are the server's
+/// last word, which `/sync` sends as 0). `None`: unreadable.
+fn channel_from_row(row: crate::cache::CachedChannel) -> Option<Channel> {
+    let mut ch: Channel = serde_json::from_value(row.json).ok()?;
+    ch.unread_count = i64::from(row.unread);
+    ch.unread_mentions = i64::from(row.unread_mentions);
+    Some(ch)
+}
+
+#[cfg(test)]
+mod channel_row_tests {
+    use super::*;
+
+    #[test]
+    fn a_cached_channel_carries_this_devices_counts() {
+        let row = crate::cache::CachedChannel {
+            json: serde_json::json!({
+                "id": "c", "kind": "channel", "name": "general", "topic": null, "members": [],
+                "unread_count": 0, "unread_mentions": 0
+            }),
+            unread: 5,
+            unread_mentions: 2,
+        };
+        let ch = channel_from_row(row).unwrap();
+        assert_eq!((ch.unread_count, ch.unread_mentions), (5, 2));
     }
 }

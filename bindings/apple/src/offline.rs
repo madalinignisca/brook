@@ -50,6 +50,8 @@ pub struct FfiCachedChannel {
     pub name: Option<String>,
     pub archived: bool,
     pub unread_count: i64,
+    /// Of the unread, those mentioning you or everyone (counted from this device's cache).
+    pub unread_mentions: i64,
     pub members: Vec<FfiMember>,
     pub owner_offers: Vec<crate::types::FfiOwnerOffer>,
 }
@@ -62,6 +64,7 @@ impl From<brook_core::Channel> for FfiCachedChannel {
             name: c.name,
             archived: c.archived,
             unread_count: c.unread_count,
+            unread_mentions: c.unread_mentions,
             members: c.members.into_iter().map(Into::into).collect(),
             owner_offers: c.owner_offers.into_iter().map(Into::into).collect(),
         }
