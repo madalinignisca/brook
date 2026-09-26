@@ -139,8 +139,12 @@ final class ComposerModel {
         editing = nil
     }
 
+    /// A message needs text or files (#126), so an edit may clear the caption of a message
+    /// that has files, but not empty a text-only one.
     var canSend: Bool {
-        !sending && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard !sending else { return false }
+        let empty = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return !empty || editing?.attachments.isEmpty == false
     }
 
     /// Sends (or saves an edit). The box clears at once; on failure the text and the reply
@@ -148,7 +152,9 @@ final class ComposerModel {
     /// can't be retried safely), so it says so instead of "not sent".
     func send() async {
         guard canSend else { return }
-        let (body, reply, editing) = (text, replyingTo, self.editing)
+        let (typed, reply, editing) = (text, replyingTo, self.editing)
+        // A blank caption goes out as no caption, not as spaces.
+        let body = typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : typed
         text = ""
         replyingTo = nil
         self.editing = nil
@@ -167,7 +173,7 @@ final class ComposerModel {
             onMessage(message)
         } catch {
             if text.isEmpty {  // unless something new was typed meanwhile
-                text = body
+                text = typed
                 replyingTo = reply
                 self.editing = editing
             }
