@@ -241,7 +241,8 @@ final class ComposerModel {
     private(set) var staged: [StagedFile] = []
     /// The files are being copied into the outbox: nothing staged may change meanwhile.
     private(set) var preparing = false
-    /// Core said there's no local data: files can't be sent (text still can).
+    /// Core said there's no local data: files can't be sent (text still can). Cleared by the
+    /// next queued send that works (the stores may open after the first try).
     private(set) var filesUnavailable = false
     var fileAccess: any FileAccess = SystemFileAccess()
 
@@ -323,6 +324,7 @@ final class ComposerModel {
             do {
                 _ = try await cache.sendQueued(channelId: channelId, body: body, replyToId: reply?.id,
                                                clientId: id)
+                filesUnavailable = false // the queue works: this Mac's storage is there now
                 draft = nil
                 error = nil
                 await pending?.reload()

@@ -133,6 +133,22 @@ final class SendFilesTests: XCTestCase {
         XCTAssertFalse(c.canAttach)
     }
 
+    func testAttachReopensOnceTheQueueWorks() async {
+        let access = FakeFileAccess(["a.png": ok])
+        let chat = FakeChat()
+        chat.local = true
+        chat.queueFailure = localUnavailable
+        let c = composer(chat, access)
+        c.attach([fileURL("a.png")])
+        await c.send()
+        XCTAssertFalse(c.canAttach)
+        c.remove(c.staged[0])
+        chat.queueFailure = nil // the stores opened
+        c.text = "hello"
+        await c.send()
+        XCTAssertTrue(c.canAttach, "attach stayed closed with the queue working")
+    }
+
     func testNothingStagedChangesWhilePreparing() async {
         let access = FakeFileAccess(["a.png": ok, "b.png": ok])
         let chat = FakeChat()

@@ -72,3 +72,26 @@ Rebutted:
   transfer id.
 
 Closed.
+
+## Implementation review, round 1 (vibe; Standard)
+
+Taken:
+- **`filesUnavailable` clears on the next queued send that works.** The stores may open
+  after the first try, and until now Attach stayed closed for the life of the view.
+
+Rebutted:
+- **"Release access on a send error."** The spec keeps a failed message's files staged for
+  its retry, so they keep their access.
+- **"Mutations off the main actor."** `ComposerModel` and `PendingModel` are
+  `@MainActor`. The detached task only calls core, its result is applied back on the main
+  actor, and the transfer bridge hops to main.
+- **"No guard against a second send."** `send()` requires `canSend`, which is false while
+  `preparing`.
+- **"Cancel only cancels the first file."** Core cancels the whole message's sending from
+  any of its file transfers (the binding's contract).
+- **"Integer percentage."** Truncating never shows 100% before the upload is done. That's
+  intended.
+- **"Id and send from different snapshots."** Body, quote and files are captured once, and
+  both the id and the call use those same values.
+
+Measured: 12 mutants, each caught. 202 Mac tests pass.
