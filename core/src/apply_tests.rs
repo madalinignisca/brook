@@ -47,6 +47,15 @@ impl Cache {
             .unwrap()
     }
 
+    async fn cached_users(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<Vec<crate::chat::ChannelMember>, crate::store::StoreError> {
+        self.db
+            .call(move |c| crate::cache::users_by_id(c, &ids))
+            .await
+    }
+
     async fn channel_name(&self, id: &'static str) -> Option<String> {
         self.one(
             "SELECT json_extract(json, '$.name') FROM channels WHERE id = ?1",
@@ -770,4 +779,50 @@ async fn a_history_page_from_before_a_removal_never_lands() {
         })
         .await;
     assert_eq!(cache.body("gone").await, None);
+}
+
+/// Cached profiles by id, for redrawing authors after a `Users` notice: current names, the
+/// ids the cache doesn't know left out, and an unreadable row skipped.
+#[tokio::test]
+async fn cached_users_come_back_by_id() {
+    let cache = joined().await;
+    let user = |id: &str, seq: i64, handle: &str, name: &str| Row {
+        id: id.into(),
+        seq,
+        json: json!({ "id": id, "handle": handle, "display_name": name, "seq": seq }),
+    };
+    cache
+        .apply(Batch {
+            users: vec![
+                user("bob", 20, "bob", "Bob"),
+                user("amy", 21, "amy", "Amy"),
+                Row {
+                    id: "odd".into(),
+                    seq: 22,
+                    json: json!({ "id": "odd" }),
+                }, // no names
+            ],
+            ..Batch::default()
+        })
+        .await;
+    cache
+        .apply(Batch {
+            users: vec![user("bob", 30, "bob", "Robert")],
+            ..Batch::default()
+        })
+        .await;
+    let found = cache
+        .cached_users(vec![
+            "bob".into(),
+            "nobody".into(),
+            "odd".into(),
+            "amy".into(),
+        ])
+        .await
+        .unwrap();
+    let names: Vec<(&str, &str)> = found
+        .iter()
+        .map(|m| (m.id.as_str(), m.display_name.as_str()))
+        .collect();
+    assert_eq!(names, vec![("bob", "Robert"), ("amy", "Amy")]);
 }
