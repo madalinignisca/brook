@@ -33,8 +33,9 @@ zeroize = "1"
 rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
 ring = "0.17"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# The quarantine xattr on Open copies of cached files (keep-offline spec §4.4).
+[target.'cfg(unix)'.dependencies]
+# The quarantine xattr on Open copies of cached files (keep-offline spec §4.4, macOS), and
+# `O_NONBLOCK` for opening outgoing files (a named pipe mustn't block the open).
 libc = "0.2"
 
 [dev-dependencies]
