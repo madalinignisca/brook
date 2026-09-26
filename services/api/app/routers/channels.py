@@ -383,8 +383,10 @@ async def remove_member(
     ``/sync`` shows ``removed_channels``, everyone else's ``left_members``), re-stamps the
     channel and hints them all. Live, the remaining members get ``channel.update`` and
     the removed user ``channel.delete`` (core fences the channel on it, as for a
-    deleted one)."""
-    channel = await session.get(Channel, channel_id)
+    deleted one), and their call ends (they may no longer hear or publish in it)."""
+    # FOR UPDATE on the channel row first: two owners leaving at once must not both count
+    # the other as still there (READ COMMITTED), which would leave the channel ownerless.
+    channel = await session.get(Channel, channel_id, with_for_update=True)
     if channel is None:
         raise _not_found()
     caller = await _membership(session, channel_id, user.id)
@@ -426,6 +428,14 @@ async def remove_member(
         [user_id], _envelope("channel.delete", {"id": str(channel_id), "seq": seq})
     )
     await _emit_channel_update(hub, session, channel)
+    # Call membership was checked once, at join (calls.py): leaving the channel must end
+    # it explicitly, or the removed user keeps receiving everyone's media and publishing.
+    from ..calls import manager  # local import: calls pulls in the ws router
+
+    # Spawned, as delete_channel does: a wedged SFU must not hang the DELETE.
+    manager._spawn(
+        manager.end_for_user(channel_id, user_id, reason="left" if leaving else "removed")
+    )
 
 
 @router.patch("/{channel_id}", response_model=ChannelOut)

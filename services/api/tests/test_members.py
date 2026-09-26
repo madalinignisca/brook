@@ -7,9 +7,11 @@ profile has a display name (1..64) and a status line (0..100); the handle is fix
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, update
 
@@ -142,6 +144,30 @@ async def test_the_last_owner_stays_and_only_an_admin_removes_an_owner(
     assert (await _remove(client, ch, t["c"], hc)).status_code == 409
 
 
+async def test_leaving_or_being_removed_ends_your_call(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Call membership is checked once, at join: removal must end it explicitly, or the
+    removed user keeps receiving the channel's media and publishing (calls.py)."""
+    from app.calls import manager
+
+    ended: list[tuple[str, str, str]] = []
+
+    async def record(channel_id: uuid.UUID, user_id: uuid.UUID, reason: str) -> None:
+        ended.append((str(channel_id), str(user_id), reason))
+
+    monkeypatch.setattr(manager, "end_for_user", record)
+    t = await _team(client)
+    ch = t["ch"]
+    assert (await _remove(client, ch, t["c"], t["hc"])).status_code == 204  # carol leaves
+    assert (await _remove(client, ch, t["d"], t["hb"])).status_code == 204  # bob removes dave
+    for _ in range(50):  # spawned, not awaited (a wedged SFU mustn't hang the DELETE)
+        if len(ended) == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert ended == [(ch, t["c"], "left"), (ch, t["d"], "removed")]
+
+
 async def test_a_dm_cant_be_left(client: httpx.AsyncClient) -> None:
     ha, a = await _user(client, "alice")
     await _user(client, "bob", ha)
@@ -239,8 +265,56 @@ async def test_profile_text_is_checked(client: httpx.AsyncClient) -> None:
         {"display_name": "evil" + chr(0x202E) + "gnp.exe"},  # right-to-left override: a spoof
         {"display_name": "two\nlines"},
         {"status_text": "tab\there"},
+        {"display_name": "Al" + chr(0x200B) + "ice"},  # zero-width space: an invisible twin
+        {"display_name": "Al" + chr(0x00AD) + "ice"},  # soft hyphen
+        {"display_name": chr(0xFEFF) + "Alice"},  # byte-order mark
+        {"status_text": "line" + chr(0x2028) + "break"},  # line separator
     ):
         r = await client.patch(f"{AUTH}/me", json=body, headers=h)
         assert r.status_code == 422, body
         assert r.json()["error"]["code"] == "profile.invalid", body
     assert (await client.get(f"{AUTH}/me", headers=h)).json()["display_name"] == "Alice"
+
+
+async def test_emoji_that_need_invisible_characters_are_allowed(client: httpx.AsyncClient) -> None:
+    # ZWJ sequences, and a subdivision flag built from tag characters (Scotland).
+    h, _ = await _user(client, "alice")
+    family = "\U0001f469\u200d\U0001f469\u200d\U0001f467"
+    scotland = "\U0001f3f4\U000e0067\U000e0062\U000e0073\U000e0063\U000e0074\U000e007f"
+    r = await client.patch(
+        f"{AUTH}/me", json={"display_name": f"Ali {family} {scotland}"}, headers=h
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["display_name"] == f"Ali {family} {scotland}"
+
+
+async def test_a_name_must_show_something(client: httpx.AsyncClient) -> None:
+    # Joiners, tags and marks alone pass the character filter (emoji need them) but
+    # render as nothing; a name needs one visible character.
+    h, _ = await _user(client, "alice")
+    for invisible in (chr(0x200D), chr(0xE0041) + chr(0xE0042), chr(0x0301)):
+        r = await client.patch(f"{AUTH}/me", json={"display_name": invisible}, headers=h)
+        assert r.status_code == 422 and r.json()["error"]["code"] == "profile.invalid", invisible
+
+
+async def test_registration_cleans_the_name_too(client: httpx.AsyncClient) -> None:
+    ha, _ = await _user(client, "alice")
+    body = {"handle": "mallory", "display_name": "evil" + chr(0x202E) + "gnp", "password": PW}
+    r = await client.post(f"{AUTH}/register", json=body, headers=ha)
+    assert r.status_code == 422 and r.json()["error"]["code"] == "profile.invalid"
+
+
+async def test_a_bad_request_is_a_clean_422_that_echoes_nothing(client: httpx.AsyncClient) -> None:
+    # A lone surrogate made the 422 itself fail to encode (a 500); and a validation
+    # error must never echo the submitted value (a too-short password would be).
+    h, _ = await _user(client, "alice")
+    r = await client.patch(
+        f"{AUTH}/me",
+        content=b'{"display_name": "\\ud800"}',
+        headers={**h, "Content-Type": "application/json"},
+    )
+    assert r.status_code == 422, r.text
+    body = {"handle": "bob", "display_name": "Bob", "password": "sh"}
+    r = await client.post(f"{AUTH}/register", json=body, headers=h)
+    assert r.status_code == 422
+    assert "input" not in r.text and '"sh"' not in r.text

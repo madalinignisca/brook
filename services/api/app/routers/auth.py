@@ -145,7 +145,7 @@ async def register(
     limiter.success(ip)
     user = User(
         handle=body.handle,
-        display_name=body.display_name,
+        display_name=_clean_profile_text(body.display_name, "display_name", 1, 64),
         password_hash=hash_password(body.password),
         global_role="admin" if is_first else "member",
     )
@@ -488,19 +488,34 @@ async def me(
     return await _me_out(session, user)
 
 
-# Characters a name or status line may not contain: C0/C1 controls, and the
-# bidirectional overrides, isolates and marks used to spoof names (an RLO makes
-# "evil\u202egnp.exe" read as "evilexe.png"). Zero-width joiners stay allowed:
-# emoji sequences need them.
-_BIDI = frozenset("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200e\u200f\u061c")
+# What a name or status line may not contain: controls (Cc), format characters (Cf:
+# bidi overrides and marks, zero-width spaces, soft hyphens, BOMs, used to spoof or hide
+# text), line and paragraph separators (Zl, Zp), lone surrogates (Cs) and unassigned code
+# points (Cn). Three kinds of format character stay, because emoji need them: the
+# zero-width joiner and non-joiner (family and profession sequences) and the tag
+# characters U+E0020..U+E007F (subdivision flags such as Scotland's).
+_REFUSED = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Cn"})
+_EMOJI_FORMAT = frozenset({"\u200c", "\u200d"})
+
+
+def _refused_char(c: str) -> bool:
+    if c in _EMOJI_FORMAT or 0xE0020 <= ord(c) <= 0xE007F:
+        return False
+    return unicodedata.category(c) in _REFUSED
 
 
 def _clean_profile_text(value: str, field: str, low: int, high: int) -> str:
     text = value.strip()
-    if any(unicodedata.category(c) == "Cc" or c in _BIDI for c in text):
-        raise _profile_invalid(field, "control or text-direction characters aren't allowed")
+    if any(_refused_char(c) for c in text):
+        raise _profile_invalid(
+            field, "control, invisible or text-direction characters aren't allowed"
+        )
     if not low <= len(text) <= high:
         raise _profile_invalid(field, f"must be {low} to {high} characters")
+    # Something must show: a name of only joiners, tags, marks or spaces renders as
+    # nothing (strip() keeps those), and a blank name can't be told from another.
+    if text and not any(unicodedata.category(c)[0] not in "CZM" for c in text):
+        raise _profile_invalid(field, "must contain a visible character")
     return text
 
 
