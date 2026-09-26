@@ -578,6 +578,10 @@ async def accept_ownership(
 ) -> ChannelOut:
     """Accept your pending offer: you become an owner (the one who offered stays one)."""
     channel, caller = await _locked_channel_for(session, channel_id, user)
+    # The offer is trusted as it stands: whoever made it had the authority then, and it
+    # can't outlive that today (leaving or removal deletes their offers; nothing demotes an
+    # owner or an admin). A future demote route must delete the demoted user's offers too,
+    # or accept must re-check the offerer here.
     offer = await _my_offer(session, channel_id, user)
     if caller is None:  # an admin who isn't a member can't have an offer; belt and braces
         raise _not_found()
