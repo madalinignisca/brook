@@ -54,8 +54,21 @@ are tested with a table, including headers that lie.
 
   The frame becomes a `gdk::MemoryTexture` built by us, so glycin's gtk-rs version doesn't
   matter, shown in a `gtk::Picture` capped at 360 × 240.
-- If glycin can't run (no loaders installed, no sandbox), there's no preview: the row stays
-  as it is. It's logged once at `info`.
+- **The sandbox is chosen, never inferred.** The loader gets an explicit
+  `sandbox_selector`: `FlatpakSpawn` inside a Flatpak (`/.flatpak-info`), `Bwrap` everywhere
+  else. It's never `Auto`, which picks `NotSandboxed` in a Flatpak development environment, and
+  never `NotSandboxed`. So no decoder ever runs unsandboxed, not even to read a header. After
+  `load()`, `active_sandbox_mechanism()` is asserted to be `Bwrap` or `FlatpakSpawn`, or the
+  image is dropped.
+- If glycin can't run (no loaders installed, bwrap missing or refused), there's no preview:
+  the row stays as it is. It's logged once at `info`.
+- **A bounded queue:** at most 2 previews decode at a time, newest-requested first (the rows
+  just scrolled into view). A request whose row has gone is dropped before it starts.
+- **A timeout:** each decode (load plus the one frame) gets 10 s, then its `gio::Cancellable`
+  is cancelled and there's no preview.
+- **Metered networks:** automatic previews (4 MiB or less) only fetch when
+  `gio::NetworkMonitor` says the connection isn't metered. A file already in the cache still
+  previews. "Show preview" always works.
 - Decoding runs on the Tokio runtime, off the GTK loop. A row that scrolls away drops its
   task.
 - **Install note:** glycin's loaders are the distro's `glycin` package (`glycin-loaders` on
@@ -76,6 +89,10 @@ are tested with a table, including headers that lie.
    - the thumbnail in the attachment row (auto at 4 MiB or less, "Show preview" otherwise);
    - click to Open;
    - no preview when glycin fails;
+   - a unit test that the selector is `Bwrap` outside a Flatpak and `FlatpakSpawn` inside,
+     and never `Auto` or `NotSandboxed`, plus the mechanism check that drops anything else;
+   - the queue (2 in flight, newest first, gone rows dropped) and the timeout, tested without
+     GTK;
    - an ignored live test that decodes a real PNG through glycin, run by hand on this
      machine.
 3. **Then drag and drop** onto the message box: it's the composer's existing staged-files
