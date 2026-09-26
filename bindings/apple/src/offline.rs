@@ -450,6 +450,59 @@ impl From<brook_core::FileCacheState> for FfiFileCacheState {
     }
 }
 
+/// An image kind a preview may be (sniffed from the bytes, never from the name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiImageKind {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+}
+
+impl From<brook_core::ImageKind> for FfiImageKind {
+    fn from(k: brook_core::ImageKind) -> Self {
+        match k {
+            brook_core::ImageKind::Png => Self::Png,
+            brook_core::ImageKind::Jpeg => Self::Jpeg,
+            brook_core::ImageKind::Gif => Self::Gif,
+            brook_core::ImageKind::Webp => Self::Webp,
+        }
+    }
+}
+
+/// An image attachment's bytes for a sandboxed decoder, with the size its header states
+/// (already within the caps). Decode out of process, first frame only.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiImagePreview {
+    pub kind: FfiImageKind,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
+}
+
+// Never the bytes in a log line.
+impl std::fmt::Debug for FfiImagePreview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FfiImagePreview")
+            .field("kind", &self.kind)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+impl From<brook_core::ImagePreview> for FfiImagePreview {
+    fn from(p: brook_core::ImagePreview) -> Self {
+        Self {
+            kind: p.kind.into(),
+            width: p.width,
+            height: p.height,
+            bytes: p.bytes,
+        }
+    }
+}
+
 /// The signed-in user's sync state (the default while nobody's cache feeds it).
 #[derive(Debug, Clone, PartialEq, Eq, Default, uniffi::Record)]
 pub struct FfiCacheState {
@@ -710,6 +763,44 @@ impl FfiBrookClient {
             .into())
     }
 
+    /// An image attachment's bytes for a sandboxed decoder: refused
+    /// (`file.preview_refused`) over `previewMaxBytes()` before anything is fetched, or when
+    /// the bytes aren't PNG, JPEG, GIF or WebP within the size caps. Fetched only into this
+    /// device's encrypted cache (progress and cancel under `transfer_id`), and decrypted into
+    /// memory, never onto disk.
+    pub async fn preview_file(
+        &self,
+        transfer_id: u64,
+        file_id: String,
+    ) -> Result<FfiImagePreview, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        Ok(
+            run(async move { inner.preview_file(TransferId(transfer_id), &file_id).await })
+                .await?
+                .into(),
+        )
+    }
+
+    /// "Keep available offline": downloaded now or as soon as there's a connection, and
+    /// never evicted until unpinned. Durable across restarts. `fileState` reads `pinned`,
+    /// with the background download's transfer id while it runs.
+    pub async fn pin_file(&self, file_id: String) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.pin_file(&file_id).await }).await
+    }
+
+    /// Stop keeping `file_id` offline: it stays cached as an ordinary (evictable) file.
+    pub async fn unpin_file(&self, file_id: String) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.unpin_file(&file_id).await }).await
+    }
+
+    /// How much the pinned files take (they don't count against the cache's cap).
+    pub async fn pinned_bytes(&self) -> Result<u64, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.pinned_bytes().await }).await
+    }
+
     /// Remove the plaintext copies Open made. The app calls this when it quits; a crash's
     /// copies go at the next open.
     pub async fn clear_open_copies(&self) {
@@ -792,6 +883,12 @@ pub fn max_files_per_message() -> u32 {
 }
 
 /// Each file at most this many bytes (the server's default).
+/// The largest attachment a preview is tried for.
+#[uniffi::export]
+pub fn preview_max_bytes() -> u64 {
+    brook_core::PREVIEW_MAX_BYTES
+}
+
 #[uniffi::export]
 pub fn max_file_bytes() -> u64 {
     brook_core::MAX_FILE_BYTES
