@@ -529,7 +529,7 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         // it's someone else (don't notify our own messages, and
                         // don't guess if our identity isn't resolved yet).
                         let me = chat.me.borrow().clone().unwrap_or_default();
-                        if !me.is_empty() && message.author_id != me {
+                        if !me.is_empty() && message.author_id != me && !message.is_deleted() {
                             let author = message
                                 .author_display_name
                                 .clone()
@@ -542,13 +542,7 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                                 .find(|c| c.id == message.channel_id)
                                 .map(|c| c.title(&me))
                                 .unwrap_or_else(|| "Brook".to_string());
-                            let mentioned =
-                                message.mention_everyone || message.mentions.contains(&me);
-                            let body = if mentioned {
-                                format!("{author} mentioned you: {}", message.body)
-                            } else {
-                                format!("{author}: {}", message.body)
-                            };
+                            let body = notification_body(&message, &me, &author);
                             notify(&message.channel_id, &title, &body);
                         }
                     }
@@ -2042,6 +2036,20 @@ fn clear_typing(chat: &Rc<Chat>) {
     }
 }
 
+/// A notification's text for someone else's message: what they wrote, "mentioned you" when
+/// it names this user (or everyone), and "sent a file" for files with no text.
+fn notification_body(message: &Message, me: &str, author: &str) -> String {
+    if message.body.trim().is_empty() && !message.attachments.is_empty() {
+        return format!("{author} sent a file");
+    }
+    let mentioned = message.mention_everyone || message.mentions.iter().any(|m| m == me);
+    if mentioned {
+        format!("{author} mentioned you: {}", message.body)
+    } else {
+        format!("{author}: {}", message.body)
+    }
+}
+
 /// Whether the user can be looking at the open conversation: its window is focused.
 fn window_focused(chat: &Rc<Chat>) -> bool {
     chat.message_list
@@ -2978,6 +2986,29 @@ fn sign_out_body(unsent: u64, known: bool, remove: bool) -> String {
 #[cfg(test)]
 mod offline_tests {
     use super::*;
+
+    #[test]
+    fn a_notification_says_what_arrived() {
+        let mut m: Message = serde_json::from_value(serde_json::json!({
+            "id": "m1", "channel_id": "c", "author_id": "u9", "body": "hello",
+            "created_at": "2026-09-26T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(notification_body(&m, "me", "Bo"), "Bo: hello");
+        m.mentions = vec!["me".into()];
+        assert_eq!(notification_body(&m, "me", "Bo"), "Bo mentioned you: hello");
+        m.mentions.clear();
+        m.mention_everyone = true;
+        assert_eq!(notification_body(&m, "me", "Bo"), "Bo mentioned you: hello");
+        m.body = String::new();
+        m.attachments = vec![serde_json::from_value(serde_json::json!({
+            "id": "f", "channel_id": "c", "uploader_id": "u9", "filename": "a.png",
+            "original_name": "a.png", "size": 1, "content_type": "image/png",
+            "status": "committed", "sha256": "x"
+        }))
+        .unwrap()];
+        assert_eq!(notification_body(&m, "me", "Bo"), "Bo sent a file");
+    }
 
     #[test]
     fn a_failed_text_keeps_its_outbox_id_for_the_retry() {

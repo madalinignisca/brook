@@ -30,5 +30,7 @@ glycin = { version = "3.1", default-features = false, features = ["tokio"] }
 glycin-gio = { package = "gio", version = "0.22" }
 
 [dev-dependencies]
+# Builds core messages in tests the way the server sends them.
+serde_json = { workspace = true }
 # Scans the rendered QR code back in tests.
 rqrr = "0.11"
