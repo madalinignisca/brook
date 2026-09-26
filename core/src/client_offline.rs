@@ -246,6 +246,16 @@ impl BrookClient {
             .map_err(|_| store_error())
     }
 
+    /// Cached profiles by id (the ids the cache doesn't know are left out): after a `Users`
+    /// notice, the app redraws those authors with their current names.
+    pub async fn cached_users(&self, ids: &[String]) -> Result<Vec<crate::chat::ChannelMember>> {
+        let cache = self.active_cache().await?;
+        cache
+            .cached_users(ids.to_vec())
+            .await
+            .map_err(|_| store_error())
+    }
+
     /// The cached channels the signed-in user is in, with unread counts computed locally.
     pub async fn cached_channels(&self) -> Result<Vec<Channel>> {
         let cache = self.active_cache().await?;

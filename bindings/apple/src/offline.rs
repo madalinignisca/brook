@@ -28,6 +28,16 @@ pub struct FfiMember {
     pub display_name: String,
 }
 
+impl From<brook_core::ChannelMember> for FfiMember {
+    fn from(m: brook_core::ChannelMember) -> Self {
+        Self {
+            id: m.id,
+            handle: m.handle,
+            display_name: m.display_name,
+        }
+    }
+}
+
 /// A cached channel, with its unread count computed on this device.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiCachedChannel {
@@ -860,6 +870,14 @@ impl FfiBrookClient {
             .into_iter()
             .map(|(origin, user_id)| FfiLocalUser { origin, user_id })
             .collect())
+    }
+
+    /// Cached profiles by id (ids the cache doesn't know are left out): after a `Users`
+    /// event, redraw those authors with their current names.
+    pub async fn cached_users(&self, ids: Vec<String>) -> Result<Vec<FfiMember>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let users = run(async move { inner.cached_users(&ids).await }).await?;
+        Ok(users.into_iter().map(FfiMember::from).collect())
     }
 
     /// Erase every other user's data on this device.

@@ -406,6 +406,14 @@ impl Cache {
     }
 
     /// The channels the caller is in, with unread counts.
+    /// Cached profiles by id, for redrawing authors after a `Users` notice.
+    pub(crate) async fn cached_users(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<Vec<crate::chat::ChannelMember>, StoreError> {
+        self.db.call(move |c| users_by_id(c, &ids)).await
+    }
+
     pub(crate) async fn cached_channels(&self) -> Result<Vec<CachedChannel>, StoreError> {
         let me = self.me.clone();
         self.db
@@ -614,4 +622,22 @@ impl Cache {
 
 fn generation(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<i64> {
     tx.query_row("SELECT generation FROM meta WHERE id = 1", [], |r| r.get(0))
+}
+
+/// Cached profiles by id, in the order asked. Ids the cache doesn't know, and rows without a
+/// handle and a display name, are left out.
+pub(crate) fn users_by_id(
+    c: &rusqlite::Connection,
+    ids: &[String],
+) -> rusqlite::Result<Vec<crate::chat::ChannelMember>> {
+    use rusqlite::OptionalExtension;
+    let mut stmt = c.prepare("SELECT json FROM users WHERE id = ?1")?;
+    let mut out = Vec::new();
+    for id in ids {
+        let json: Option<String> = stmt.query_row([id], |r| r.get(0)).optional()?;
+        if let Some(member) = json.and_then(|j| serde_json::from_str(&j).ok()) {
+            out.push(member);
+        }
+    }
+    Ok(out)
 }
