@@ -139,6 +139,7 @@ fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
             usable: std::cell::Cell::new(false),
         }),
         signins: Rc::default(),
+        erasing: Rc::default(),
     };
     // The client for the server currently in use; replaced when the user logs
     // in to a different server. Dropping the old client ends its state watcher.
@@ -335,6 +336,9 @@ fn back_to_password(ui: &LoginUi, message: &str) {
     login_button.set_sensitive(true);
 }
 
+/// Shown while a sign-out erases this device's data (sign-in waits for it).
+const ERASING: &str = "Removing this device's data…";
+
 /// Build a core client for `server`. Plain http is only allowed for loopback,
 /// or anywhere with the hidden dev opt-in `BROOK_ALLOW_INSECURE_HTTP=1`.
 fn new_client(
@@ -387,6 +391,10 @@ struct LoginUi {
     /// Bumped on every completed sign-in, so a late note from an older sign-out can
     /// tell that a newer sign-in happened meanwhile.
     signins: Rc<std::cell::Cell<u64>>,
+    /// A sign-out with "Remove this device's data" is still erasing: no sign-in until it's
+    /// done, since a new sign-in (another server's client) would open the same data directory
+    /// while it's being erased.
+    erasing: Rc<std::cell::Cell<bool>>,
 }
 
 /// Reactive UI: apply a client's observable auth state on the GTK main loop.
@@ -447,7 +455,12 @@ fn watch_auth_state(
                             "You were signed out. Please log in again."
                         });
                     }
-                    login_button.set_sensitive(true);
+                    if ui.erasing.get() {
+                        login_button.set_sensitive(false);
+                        error_label.set_text(ERASING);
+                    } else {
+                        login_button.set_sensitive(true);
+                    }
                 }
                 AuthState::Authenticating => {
                     login_button.set_sensitive(false);
@@ -469,8 +482,11 @@ fn watch_auth_state(
                             let asked = ui.signed_out_by_user.clone();
                             let error_label = ui.error_label.clone();
                             let signins = ui.signins.clone();
+                            let (erasing, login_button) =
+                                (ui.erasing.clone(), ui.login_button.clone());
                             move |remove_data: bool| {
                                 asked.set(true);
+                                erasing.set(remove_data);
                                 let at_sign_out = signins.get();
                                 let signins = signins.clone();
                                 let client = client.clone();
@@ -489,11 +505,24 @@ fn watch_auth_state(
                                     client.sign_out_complete()
                                 });
                                 let error_label = error_label.clone();
+                                let (erasing, login_button) =
+                                    (erasing.clone(), login_button.clone());
                                 glib::spawn_future_local(async move {
                                     // Both the keyring delete and its fallback failed:
                                     // the stored sign-in may still be usable here.
                                     // Only while no newer sign-in has completed.
                                     let forgot = done.await;
+                                    // The erase is over: signing in is possible again.
+                                    if erasing.replace(false) {
+                                        if let Some(button) = login_button.upgrade() {
+                                            button.set_sensitive(true);
+                                        }
+                                        if let Some(label) = error_label.upgrade() {
+                                            if label.text() == ERASING {
+                                                label.set_text("");
+                                            }
+                                        }
+                                    }
                                     let stale = signins.get() != at_sign_out;
                                     if let (Ok(false), false) = (forgot, stale) {
                                         if let Some(label) = error_label.upgrade() {

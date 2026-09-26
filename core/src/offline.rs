@@ -375,13 +375,24 @@ impl Offline {
         }
     }
 
-    /// Other users with data on this device than `(origin, user_id)` (#46 §8).
+    /// Other users with data on this device than `(origin, user_id)` (#46 §8). The app reads
+    /// them with their counts ([`Offline::others_with_unsent`]); tests read them plain.
+    #[cfg(test)]
     pub(crate) async fn others(
         &self,
         origin: &str,
         user_id: &str,
     ) -> Result<Vec<(String, String)>, StoreError> {
         self.local.others(origin, user_id).await
+    }
+
+    /// As [`Offline::others`], each with its unsent count (`None`: unreadable).
+    pub(crate) async fn others_with_unsent(
+        &self,
+        origin: &str,
+        user_id: &str,
+    ) -> Result<Vec<(String, String, Option<u64>)>, StoreError> {
+        self.local.others_with_unsent(origin, user_id).await
     }
 
     /// Wipe every other user's data (after the app surfaced it).
