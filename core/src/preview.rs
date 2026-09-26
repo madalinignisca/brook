@@ -1,7 +1,9 @@
 //! Inline image previews, core half (spec 2026-09-26-image-previews.md §2): which bytes may be
 //! handed to a decoder at all. The kind is sniffed (never taken from the name), and the
-//! dimensions are read from the header and capped before anything decodes. The parsers here
-//! are pure and bounded: they look at no more than the first `HEADER_MAX` bytes.
+//! dimensions are read from the header and capped before anything decodes. The parsers are
+//! pure and panic-free (every read goes through `get`). They walk the whole in-memory file
+//! (at most `PREVIEW_MAX_BYTES`), since a phone's JPEG puts EXIF, XMP and ICC segments before
+//! its frame header, and each step moves forward, so they always end.
 
 /// Largest file a preview is made of (checked before anything is fetched).
 pub const PREVIEW_MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -9,8 +11,6 @@ pub const PREVIEW_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub const PREVIEW_MAX_SIDE: u32 = 8192;
 /// Largest area, in pixels.
 pub const PREVIEW_MAX_PIXELS: u64 = 40_000_000;
-/// How far into the file the header readers look.
-const HEADER_MAX: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageKind {
@@ -58,15 +58,14 @@ pub(crate) fn sniff(bytes: &[u8]) -> Option<ImageKind> {
 
 /// Width and height as the header states them, if it can be read.
 pub(crate) fn dimensions(kind: ImageKind, bytes: &[u8]) -> Option<(u32, u32)> {
-    let b = &bytes[..bytes.len().min(HEADER_MAX)];
+    let b = bytes;
     match kind {
         // Signature (8), IHDR length (4), "IHDR" (4), width (4), height (4).
         ImageKind::Png => {
             (b.get(12..16)? == b"IHDR").then_some(())?;
             Some((be32(b, 16)?, be32(b, 20)?))
         }
-        // The logical screen: little-endian u16s after the 6-byte signature.
-        ImageKind::Gif => Some((le16(b, 6)? as u32, le16(b, 8)? as u32)),
+        ImageKind::Gif => gif_dimensions(b),
         ImageKind::Jpeg => jpeg_dimensions(b),
         ImageKind::Webp => webp_dimensions(b),
     }
@@ -79,6 +78,38 @@ pub(crate) fn within_caps(width: u32, height: u32) -> bool {
         && width <= PREVIEW_MAX_SIDE
         && height <= PREVIEW_MAX_SIDE
         && width as u64 * height as u64 <= PREVIEW_MAX_PIXELS
+}
+
+/// The larger of the logical screen and the first frame's image descriptor: a 1×1 screen can
+/// carry a frame far bigger, and the decoder allocates for the frame.
+fn gif_dimensions(b: &[u8]) -> Option<(u32, u32)> {
+    let (sw, sh) = (le16(b, 6)? as u32, le16(b, 8)? as u32);
+    let flags = *b.get(10)?;
+    let mut i = 13;
+    if flags & 0x80 != 0 {
+        i += 3 << ((flags & 0x07) + 1); // the global color table
+    }
+    loop {
+        match *b.get(i)? {
+            // An extension: label, then sub-blocks until a zero-length one.
+            0x21 => {
+                i += 2;
+                loop {
+                    let len = *b.get(i)? as usize;
+                    i += 1 + len;
+                    if len == 0 {
+                        break;
+                    }
+                }
+            }
+            // The first image descriptor: left, top, width, height.
+            0x2c => {
+                let (fw, fh) = (le16(b, i + 5)? as u32, le16(b, i + 7)? as u32);
+                return Some((sw.max(fw), sh.max(fh)));
+            }
+            _ => return None, // a trailer before any frame, or garbage
+        }
+    }
 }
 
 /// Walk the JPEG markers to the first start-of-frame (SOF0 to SOF15, not DHT, JPG or DAC).
@@ -184,11 +215,24 @@ mod tests {
         b
     }
 
-    fn gif(w: u16, h: u16) -> Vec<u8> {
+    /// A GIF with a `screen` and a first frame of `frame`, a graphic-control extension and
+    /// a small global color table before it.
+    fn gif_with(screen: (u16, u16), frame: (u16, u16)) -> Vec<u8> {
         let mut b = b"GIF89a".to_vec();
-        b.extend(w.to_le_bytes());
-        b.extend(h.to_le_bytes());
+        b.extend(screen.0.to_le_bytes());
+        b.extend(screen.1.to_le_bytes());
+        b.extend([0x80, 0, 0]); // a 2-entry global color table follows
+        b.extend([0, 0, 0, 255, 255, 255]);
+        b.extend([0x21, 0xf9, 0x04, 0, 0, 0, 0, 0x00]); // graphic control extension
+        b.extend([0x2c, 0, 0, 0, 0]);
+        b.extend(frame.0.to_le_bytes());
+        b.extend(frame.1.to_le_bytes());
+        b.push(0);
         b
+    }
+
+    fn gif(w: u16, h: u16) -> Vec<u8> {
+        gif_with((w, h), (w, h))
     }
 
     fn webp(chunk: &[u8; 4], data: &[u8]) -> Vec<u8> {
@@ -231,11 +275,12 @@ mod tests {
         for bytes in [
             b"%PDF-1.7".as_slice(),
             b"<svg onload=x>",
-            b"BM\x00\x00",        // BMP: not on the list
-            b"\x00\x00\x01\x00",  // ICO
-            b"\x89PNG\r\n\x1a\n", // a PNG cut before IHDR
-            b"\xff\xd8\xff",      // a JPEG with no frame
-            b"GIF89a\x01",        // a GIF cut in its screen
+            b"BM\x00\x00",                         // BMP: not on the list
+            b"\x00\x00\x01\x00",                   // ICO
+            b"\x89PNG\r\n\x1a\n",                  // a PNG cut before IHDR
+            b"\xff\xd8\xff",                       // a JPEG with no frame
+            b"GIF89a\x01",                         // a GIF cut in its screen
+            b"GIF89a\x0a\x00\x0a\x00\x00\x00\x00", // a GIF cut before any frame
             b"RIFF\x00\x00\x00\x00WEBPVP8Z",
         ] {
             assert_eq!(read(bytes), None, "{bytes:?}");
@@ -246,6 +291,39 @@ mod tests {
         assert_eq!(read(&odd), None);
         // A JPEG segment with a length under 2 can't be walked.
         assert_eq!(read(&[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x01]), None);
+    }
+
+    #[test]
+    fn a_gif_frame_bigger_than_its_screen_counts() {
+        let bomb = gif_with((1, 1), (60000, 60000));
+        let (w, h) = dimensions(ImageKind::Gif, &bomb).unwrap();
+        assert_eq!((w, h), (60000, 60000));
+        assert!(!within_caps(w, h));
+        assert_eq!(
+            read(&gif_with((100, 50), (10, 10))),
+            Some((ImageKind::Gif, 100, 50))
+        );
+        // No frame before the trailer: no preview.
+        let mut empty = gif(10, 10);
+        let at = empty.iter().rposition(|&b| b == 0x2c).unwrap();
+        empty.truncate(at);
+        empty.push(0x3b);
+        assert_eq!(read(&empty), None);
+    }
+
+    #[test]
+    fn a_phone_jpeg_with_big_metadata_before_its_frame_still_reads() {
+        let mut b = vec![0xff, 0xd8];
+        for _ in 0..3 {
+            // Three near-64 KiB APPn segments (EXIF, XMP, ICC) before the frame.
+            b.extend([0xff, 0xe1, 0xff, 0xf0]);
+            b.extend(vec![0u8; 0xfff0 - 2]);
+        }
+        b.extend([0xff, 0xc0, 0x00, 0x11, 0x08]);
+        b.extend(3024u16.to_be_bytes());
+        b.extend(4032u16.to_be_bytes());
+        assert!(b.len() > 190_000);
+        assert_eq!(read(&b), Some((ImageKind::Jpeg, 4032, 3024)));
     }
 
     #[test]
