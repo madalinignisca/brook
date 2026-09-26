@@ -14,6 +14,9 @@ BROOK_DOMAIN {
 	# If-Range) and answers a Range request with a gzipped body under an identity
 	# Content-Range: a resumed download would be corrupt. Measured with caddy 2,
 	# 2026-09-26. The bytes are for saving, never rendering, so nothing is lost.
+	# KEEP IN STEP with @filecontent below: the same path, twice, because a `not`
+	# matcher can't reference a named one. Changing one alone either compresses
+	# downloads again or drops nosniff/CSP from them.
 	@compressible not path_regexp ^/api/v1/files/[^/]+/content$
 	encode @compressible gzip
 	# The dev call harness is off in production (BROOK_DEV_HARNESS unset); refuse
@@ -22,6 +25,7 @@ BROOK_DOMAIN {
 	# Attachment bytes (attachments spec §3, §5). The api enforces the declared size;
 	# this is a second cap in front of it. And a second layer of "never render, never
 	# run" on downloads, in case a response ever left the api without its headers.
+	# KEEP IN STEP with @compressible above (same path).
 	@filecontent path_regexp ^/api/v1/files/[^/]+/content$
 	request_body @filecontent {
 		max_size 100MiB
