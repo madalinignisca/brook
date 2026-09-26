@@ -905,8 +905,8 @@ async fn a_password_change_stores_a_login_the_old_client_spares() {
 
 /// Every path that writes the stored login marks its token at the slot's current
 /// generation (#140): an unmarked stored token defaults to *revoke*, so a superseded client
-/// would end the owner's login. Covers a password login, a restore, a refresh and a
-/// password change.
+/// would end the owner's login. Covers a password login, a refresh, both kinds of password
+/// change, a TOTP activation, a restore and a TOTP sign-in.
 #[tokio::test]
 async fn every_stored_write_marks_its_token() {
     let server = TestServer::start().await;
@@ -923,8 +923,13 @@ async fn every_stored_write_marks_its_token() {
     check(&a, "a login");
     refresh_now(&a).await;
     check(&a, "a refresh");
+    a.totp_enroll("pw").await.unwrap(); // (the test server checks against its own "pw")
+    a.totp_activate("123456").await.unwrap();
+    check(&a, "a TOTP activation");
     a.change_password("pw", "pw2", false).await.unwrap();
     check(&a, "a password change");
+    a.change_password("pw2", "pw3", true).await.unwrap();
+    check(&a, "a password change signing out other devices");
     drop(a);
     let (b, outcome) = relaunch(&server, &slot, dir.path()).await;
     assert!(
@@ -932,4 +937,13 @@ async fn every_stored_write_marks_its_token() {
         "{outcome:?}"
     );
     check(&b, "a restore");
+    drop(b);
+    // A TOTP sign-in stores through its own path (`install_for_challenge`).
+    server.enable_totp("carol", &["rc-1"]);
+    let c = client(&server, &slot, dir.path());
+    let LoginOutcome::TotpRequired(challenge) = c.login("carol", "pw").await.unwrap() else {
+        panic!("carol signed in without the second factor");
+    };
+    c.complete_totp(&challenge, "123456").await.unwrap();
+    check(&c, "a TOTP sign-in");
 }
