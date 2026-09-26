@@ -20,7 +20,8 @@ final class ChannelsModel {
     var openChannel: String? {
         didSet { if let id = openChannel { setUnread(id, 0) } }
     }
-    /// Closed by the cache (the user was removed): the view clears its selection.
+    /// Closed by the cache or the server (the user left or was removed): the view clears its
+    /// selection.
     private(set) var closed: String?
 
     private let client: any FfiBrookClientProtocol
@@ -128,7 +129,31 @@ final class ChannelsModel {
             arrived(message)
         case .messageUpdate, .messageDelete, .resync:
             timeline?.apply(event)
+        case let .channelDelete(channelId):
+            cacheRemoved([channelId]) // left, removed or deleted: as the cache's removal
+        case let .channelUpdate(channel):
+            channelChanged(channel)
         }
+    }
+
+    /// A channel's new state: replace its row, keeping the unread count. One not in the
+    /// list (added to it, or re-added after a removal) is never inserted from the event:
+    /// the list is re-read, so the server's word decides, and a channel just left can't
+    /// come back from a late update.
+    private func channelChanged(_ channel: FfiChannel) {
+        guard let i = channels.firstIndex(where: { $0.id == channel.id }) else {
+            Task { await reloadList() }
+            return
+        }
+        if channel.archived {
+            channels.remove(at: i) // as a list read drops archived channels
+            if channel.id == openChannel { // and an open one closes, as a removal does
+                closed = channel.id
+                timeline = nil
+            }
+            return
+        }
+        channels[i] = ChannelRow(channel, unread: channels[i].unread)
     }
 
     /// A live message that isn't being read: its channel's badge rises, and it notifies.

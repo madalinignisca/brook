@@ -258,6 +258,8 @@ pub struct FfiChannel {
     pub kind: String,
     pub name: Option<String>,
     pub archived: bool,
+    /// Current members (Members, and who Remove is offered for).
+    pub members: Vec<crate::offline::FfiMember>,
 }
 
 impl From<brook_core::Channel> for FfiChannel {
@@ -267,6 +269,7 @@ impl From<brook_core::Channel> for FfiChannel {
             kind: c.kind,
             name: c.name,
             archived: c.archived,
+            members: c.members.into_iter().map(Into::into).collect(),
         }
     }
 }
