@@ -233,3 +233,61 @@ fn a_source_over_the_limit_is_stopped_mid_copy() {
     );
     assert!(!dst.exists());
 }
+
+/// The download sealer writes the same format as the snapshot copy: byte for byte under the
+/// same key, whatever sizes the bytes arrive in.
+#[tokio::test]
+async fn the_streaming_sealer_writes_the_snapshot_format() {
+    use snapshot::{Layout, Sealer};
+    let dir = tempfile::tempdir().unwrap();
+    for len in [1usize, SMALL, SMALL * 2, SMALL * 3 + 5] {
+        let bytes: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
+        let (path, w) = write(dir.path(), &format!("s{len}"), &bytes, SMALL);
+        let layout = Layout {
+            chunk: SMALL,
+            size: len as u64,
+        };
+        for piece in [1usize, 3, SMALL, 64] {
+            let mut sealer = Sealer::new(&w.key, id(), layout, 0);
+            let mut out = Vec::new();
+            for part in bytes.chunks(piece) {
+                out.extend(sealer.push(part).unwrap());
+            }
+            assert!(sealer.is_complete());
+            assert_eq!(
+                out,
+                std::fs::read(&path).unwrap(),
+                "len {len}, pieces of {piece}"
+            );
+        }
+    }
+}
+
+/// A resumed download, sealing again from a chunk boundary under the same key, gives the same
+/// ciphertext as one pass; a byte past the size is refused.
+#[tokio::test]
+async fn a_sealer_resumes_at_a_chunk_boundary_and_stops_at_the_size() {
+    use snapshot::{Layout, SealError, Sealer};
+    let key = [9u8; 32];
+    let bytes: Vec<u8> = (0..SMALL * 3 + 2).map(|i| i as u8).collect();
+    let layout = Layout {
+        chunk: SMALL,
+        size: bytes.len() as u64,
+    };
+    let mut one = Sealer::new(&key, id(), layout, 0);
+    let whole = one.push(&bytes).unwrap();
+
+    let mut first = Sealer::new(&key, id(), layout, 0);
+    let mut resumed = first.push(&bytes[..SMALL * 2 + 3]).unwrap(); // 2 chunks + 3 buffered
+    assert_eq!(first.sealed_chunks(), 2);
+    // The buffered bytes were never on disk: the resume starts at chunk 2.
+    let mut second = Sealer::new(&key, id(), layout, 2);
+    resumed.extend(second.push(&bytes[SMALL * 2..]).unwrap());
+    assert_eq!(resumed, whole);
+    assert!(second.is_complete());
+    assert_eq!(second.push(&[0]), Err(SealError::TooLong));
+    assert_eq!(
+        layout.sealed_offset(2) as usize,
+        resumed.len() - (SMALL + 16 + 2 + 16)
+    );
+}

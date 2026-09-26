@@ -5,7 +5,7 @@
 //! is open: stores switched off, a locked or damaged key store, or nobody signed in. The app
 //! then works online-only, exactly as before.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
@@ -79,7 +79,8 @@ impl BrookClient {
             fetch: http.clone(),
             history: http.clone(),
             post: http.clone(),
-            upload: http,
+            upload: http.clone(),
+            download: http,
             transfers: self.transfers.clone(),
         }
     }
@@ -416,5 +417,59 @@ impl BrookClient {
 
     async fn active_outbox(&self) -> Result<Arc<crate::outbox::Outbox>> {
         Ok(self.active().await?.1)
+    }
+
+    async fn active_files(&self) -> Result<Arc<crate::files::Files>> {
+        let guard = self.offline.lock().await;
+        let (user, _) = self.who().await.ok_or_else(unavailable)?;
+        guard
+            .as_ref()
+            .and_then(|off| off.active_for(&self.origin(), &user))
+            .map(|a| a.files.clone())
+            .ok_or_else(unavailable)
+    }
+
+    /// Download attachment `file_id` into this device's file cache (encrypted), resuming a
+    /// partial, or join the download of it already running. Progress and cancel under `id`
+    /// ([`BrookClient::transfer_events`], [`BrookClient::cancel_transfer`]). The file is found
+    /// in the cached messages: `file.unknown` if none lists it, `file.gone` if the server
+    /// deleted it (it's dropped from the cache), `local.unavailable` without local data.
+    /// `transfer.paused`: the session ended (signed out, or another user); call again once
+    /// signed in, and it resumes.
+    pub async fn cache_file(&self, id: crate::TransferId, file_id: &str) -> Result<()> {
+        self.active_files().await?.cache_file(id, file_id).await
+    }
+
+    /// Cache `file_id` (as [`BrookClient::cache_file`]), then decrypt it into a private
+    /// per-user directory and return that path, for the system to open. Refused
+    /// (`file.open_refused`) for executables and launchers: those are Save only. The copy is
+    /// removed by [`BrookClient::clear_open_copies`], at the next start, and at sign-out.
+    pub async fn open_file(&self, id: crate::TransferId, file_id: &str) -> Result<PathBuf> {
+        self.active_files().await?.open_file(id, file_id).await
+    }
+
+    /// Save `file_id` to `destination` from the file cache, if it's complete there (so it
+    /// works offline). `Ok(false)`: not cached; download it as before
+    /// ([`BrookClient::download_file`]). A failed save leaves nothing at `destination`.
+    pub async fn save_cached_file(&self, file_id: &str, destination: &Path) -> Result<bool> {
+        Ok(self
+            .active_files()
+            .await?
+            .save_from_cache(file_id, destination)
+            .await?
+            .is_some())
+    }
+
+    /// Whether `file_id` is in this device's file cache. Re-read on
+    /// [`crate::CacheEvent::Files`].
+    pub async fn file_state(&self, file_id: &str) -> Result<crate::FileCacheState> {
+        self.active_files().await?.state(file_id).await
+    }
+
+    /// Remove the plaintext copies Open made (the app calls this when it quits).
+    pub async fn clear_open_copies(&self) {
+        if let Ok(files) = self.active_files().await {
+            files.clear_open_copies();
+        }
     }
 }

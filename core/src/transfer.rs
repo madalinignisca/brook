@@ -30,7 +30,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, RANGE, RETRY_AFTER};
+use reqwest::header::{
+    ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, RANGE,
+    RETRY_AFTER,
+};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -223,6 +226,10 @@ impl Transfers {
 
     #[cfg(test)]
     pub(crate) fn events_for_tests(&self) -> broadcast::Receiver<TransferEvent> {
+        self.events.subscribe()
+    }
+
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<TransferEvent> {
         self.events.subscribe()
     }
 
@@ -439,10 +446,15 @@ impl BrookClient {
         size: u64,
         sink: &mut dyn DownloadSink,
     ) -> Result<()> {
-        let cancel = self.transfers.flag(id);
-        let result = self
-            .download_inner(id, &cancel, file_id, sha256, size, sink)
-            .await;
+        let flags = self.transfers.flag(id);
+        let result = Downloader {
+            http: &self.http,
+            base: &self.base,
+            transfers: &self.transfers,
+            token: &CurrentToken(self),
+        }
+        .download(id, &flags, file_id, sha256, size, sink)
+        .await;
         if result.is_err() {
             sink.abort().await;
         }
@@ -450,156 +462,6 @@ impl BrookClient {
         self.finish_events(id, &result, done, size);
         self.transfers.forget(id);
         result
-    }
-
-    async fn download_inner(
-        &self,
-        id: TransferId,
-        cancel: &Arc<Flags>,
-        file_id: &str,
-        sha256: &str,
-        size: u64,
-        sink: &mut dyn DownloadSink,
-    ) -> Result<()> {
-        let url = self.base.join(&format!("api/v1/files/{file_id}/content"))?;
-        let validator = format!("\"{sha256}\"");
-        let mut attempt = 0u32;
-        let mut no_range = false;
-        loop {
-            if cancel.cancel.load(Ordering::SeqCst) {
-                return Err(cancelled_error());
-            }
-            attempt += 1;
-            let offset = sink.resume_offset();
-            if offset >= size && size > 0 {
-                return sink.finish(sha256).await.map_err(|e| match e {
-                    SinkError::Io(err) => io_error(&err),
-                    SinkError::Mismatch => integrity_error(),
-                });
-            }
-            self.transfers
-                .emit(id, offset, size, TransferState::Running);
-            let token = self.access_token().await?;
-            let mut request = self
-                .http
-                .get(url.clone())
-                .bearer_auth(token)
-                .timeout(TRANSFER_TIMEOUT);
-            if offset > 0 && !no_range {
-                request = request
-                    .header(RANGE, format!("bytes={offset}-"))
-                    .header(IF_RANGE, &validator);
-            }
-            let wait = match request.send().await {
-                Err(err) => {
-                    if attempt >= MAX_ATTEMPTS {
-                        return Err(Error::Http(err));
-                    }
-                    backoff(attempt)
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    match status {
-                        StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
-                            // The server's ETag is the sha256 we expect: a different one
-                            // means a different file, never "almost this one".
-                            let etag = resp.headers().get(ETAG).and_then(|v| v.to_str().ok());
-                            // A weak ETag (W/"…", a compressing proxy) promises nothing about
-                            // bytes: a range can't be trusted, so start over without one and
-                            // let the final sha256 decide.
-                            if etag.is_some_and(|e| e.starts_with("W/")) {
-                                if status == StatusCode::PARTIAL_CONTENT || offset > 0 {
-                                    sink.restart().await.map_err(|e| io_error(&e))?;
-                                    no_range = true;
-                                    continue;
-                                }
-                            } else if etag.is_some_and(|e| e != validator) {
-                                return Err(integrity_error());
-                            }
-                            if status == StatusCode::OK && offset > 0 {
-                                // If-Range didn't match (or no Range support): start over.
-                                sink.restart().await.map_err(|e| io_error(&e))?;
-                            }
-                            if status == StatusCode::PARTIAL_CONTENT
-                                && !content_range_starts_at(&resp, offset)
-                            {
-                                return Err(Error::UnexpectedResponse);
-                            }
-                            match self.stream_into(id, cancel, resp, sink, size).await {
-                                Ok(()) => {
-                                    return sink.finish(sha256).await.map_err(|e| match e {
-                                        SinkError::Io(err) => io_error(&err),
-                                        SinkError::Mismatch => integrity_error(),
-                                    })
-                                }
-                                Err(Streamed::Cancelled) => return Err(cancelled_error()),
-                                Err(Streamed::Sink(err)) => return Err(io_error(&err)),
-                                Err(Streamed::TooLong) => return Err(integrity_error()),
-                                Err(Streamed::Network) if attempt < MAX_ATTEMPTS => {
-                                    backoff(attempt) // resume from what the sink holds
-                                }
-                                Err(Streamed::Network) => {
-                                    return Err(Error::Api {
-                                        code: "transfer.network".into(),
-                                        message: "the download kept failing".into(),
-                                    })
-                                }
-                            }
-                        }
-                        StatusCode::UNAUTHORIZED => return Err(Error::NotAuthenticated),
-                        StatusCode::RANGE_NOT_SATISFIABLE => {
-                            // What the sink holds doesn't fit this file: start over.
-                            sink.restart().await.map_err(|e| io_error(&e))?;
-                            0
-                        }
-                        s if s.is_server_error() && attempt < MAX_ATTEMPTS => backoff(attempt),
-                        _ => {
-                            let (code, _) = error_code(resp).await;
-                            return Err(api(status, code));
-                        }
-                    }
-                }
-            };
-            if wait > 0 {
-                self.transfers.emit(
-                    id,
-                    sink.resume_offset(),
-                    size,
-                    TransferState::Retrying { after_secs: wait },
-                );
-                wait_or_stop(wait, cancel).await?;
-            }
-        }
-    }
-
-    async fn stream_into(
-        &self,
-        id: TransferId,
-        cancel: &Flags,
-        resp: reqwest::Response,
-        sink: &mut dyn DownloadSink,
-        size: u64,
-    ) -> std::result::Result<(), Streamed> {
-        let mut stream = resp.bytes_stream();
-        let mut last = Instant::now();
-        while let Some(chunk) = stream.next().await {
-            if cancel.cancel.load(Ordering::SeqCst) {
-                return Err(Streamed::Cancelled);
-            }
-            let chunk = chunk.map_err(|_| Streamed::Network)?;
-            // Never write past the declared size: an over-long body would otherwise fill
-            // the disk before the sha256 check at the end could refuse it.
-            if sink.resume_offset() + chunk.len() as u64 > size {
-                return Err(Streamed::TooLong);
-            }
-            sink.write_chunk(&chunk).await.map_err(Streamed::Sink)?;
-            if last.elapsed() >= PROGRESS_EVERY {
-                last = Instant::now();
-                self.transfers
-                    .emit(id, sink.resume_offset(), size, TransferState::Running);
-            }
-        }
-        Ok(())
     }
 
     fn finish_events(&self, id: TransferId, result: &Result<impl Sized>, done: u64, total: u64) {
@@ -830,8 +692,239 @@ impl Uploader<'_> {
     }
 }
 
+/// The download core, with the token from the caller: `download_file` (the current session)
+/// and the file cache (only the store's own session, paused when it ends) share it. It emits
+/// progress and `Retrying`, never an end state (that's the caller's).
+pub(crate) struct Downloader<'a> {
+    pub(crate) http: &'a reqwest::Client,
+    pub(crate) base: &'a url::Url,
+    pub(crate) transfers: &'a Transfers,
+    pub(crate) token: &'a dyn TokenSource,
+}
+
+impl Downloader<'_> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn download(
+        &self,
+        id: TransferId,
+        flags: &Arc<Flags>,
+        file_id: &str,
+        sha256: &str,
+        size: u64,
+        sink: &mut dyn DownloadSink,
+    ) -> Result<()> {
+        let url = self.base.join(&format!("api/v1/files/{file_id}/content"))?;
+        let validator = format!("\"{sha256}\"");
+        let mut attempt = 0u32;
+        let mut no_range = false;
+        loop {
+            if let Some(stop) = flags.stopped() {
+                return Err(stop);
+            }
+            attempt += 1;
+            let offset = sink.resume_offset();
+            if offset >= size && size > 0 {
+                return sink.finish(sha256).await.map_err(|e| match e {
+                    SinkError::Io(err) => io_error(&err),
+                    SinkError::Mismatch => integrity_error(),
+                });
+            }
+            self.transfers
+                .emit(id, offset, size, TransferState::Running);
+            let token = self.token.token().await?;
+            let mut request = self
+                .http
+                .get(url.clone())
+                .bearer_auth(token)
+                // Never a content coding: it rewrites the ETag and answers a Range with a
+                // coded body under an identity Content-Range (a corrupt resume).
+                .header(ACCEPT_ENCODING, "identity")
+                .timeout(TRANSFER_TIMEOUT);
+            if offset > 0 && !no_range {
+                request = request
+                    .header(RANGE, format!("bytes={offset}-"))
+                    .header(IF_RANGE, &validator);
+            }
+            let wait = match request.send().await {
+                Err(err) => {
+                    if attempt >= MAX_ATTEMPTS {
+                        return Err(Error::Http(err));
+                    }
+                    backoff(attempt)
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    match status {
+                        StatusCode::OK | StatusCode::PARTIAL_CONTENT
+                            if has_content_coding(&resp) =>
+                        {
+                            // A coded body is not the file's bytes: drop anything held (a
+                            // new key, from 0) and try again without a range.
+                            sink.restart().await.map_err(|e| io_error(&e))?;
+                            if attempt >= MAX_ATTEMPTS {
+                                return Err(Error::Api {
+                                    code: "transfer.encoded".into(),
+                                    message: "the server kept compressing the file".into(),
+                                });
+                            }
+                            // At once the first time (a range is often what a proxy codes),
+                            // then with the usual backoff.
+                            if std::mem::replace(&mut no_range, true) {
+                                backoff(attempt)
+                            } else {
+                                0
+                            }
+                        }
+                        StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
+                            // The server's ETag is the sha256 we expect: a different one
+                            // means a different file, never "almost this one".
+                            let etag = resp.headers().get(ETAG).and_then(|v| v.to_str().ok());
+                            // A weak ETag (W/"…", a compressing proxy) promises nothing about
+                            // bytes: a range can't be trusted, so start over without one and
+                            // let the final sha256 decide.
+                            if etag.is_some_and(|e| e.starts_with("W/")) {
+                                if status == StatusCode::PARTIAL_CONTENT || offset > 0 {
+                                    sink.restart().await.map_err(|e| io_error(&e))?;
+                                    no_range = true;
+                                    continue;
+                                }
+                            } else if etag.is_some_and(|e| e != validator) {
+                                return Err(integrity_error());
+                            }
+                            // A continuation is trusted only with the file's own validator: a
+                            // 206 without it (a proxy that dropped the ETag and ignored
+                            // If-Range) may be other bytes, never appended to what's held.
+                            if status == StatusCode::PARTIAL_CONTENT
+                                && offset > 0
+                                && etag != Some(validator.as_str())
+                            {
+                                sink.restart().await.map_err(|e| io_error(&e))?;
+                                no_range = true;
+                                continue;
+                            }
+                            if status == StatusCode::OK && offset > 0 {
+                                // If-Range didn't match (or no Range support): start over.
+                                sink.restart().await.map_err(|e| io_error(&e))?;
+                            }
+                            if status == StatusCode::PARTIAL_CONTENT
+                                && !content_range_starts_at(&resp, offset)
+                            {
+                                // Not the continuation of what's held: never append it.
+                                // Start over (a new key) without a range.
+                                sink.restart().await.map_err(|e| io_error(&e))?;
+                                no_range = true;
+                                continue;
+                            }
+                            match self.stream_into(id, flags, resp, sink, size).await {
+                                Ok(()) => {
+                                    return sink.finish(sha256).await.map_err(|e| match e {
+                                        SinkError::Io(err) => io_error(&err),
+                                        SinkError::Mismatch => integrity_error(),
+                                    })
+                                }
+                                Err(Streamed::Stopped(stop)) => return Err(stop),
+                                Err(Streamed::Sink(err)) => return Err(io_error(&err)),
+                                Err(Streamed::TooLong) => return Err(integrity_error()),
+                                Err(Streamed::Network) if attempt < MAX_ATTEMPTS => {
+                                    backoff(attempt) // resume from what the sink holds
+                                }
+                                Err(Streamed::Network) => {
+                                    return Err(Error::Api {
+                                        code: "transfer.network".into(),
+                                        message: "the download kept failing".into(),
+                                    })
+                                }
+                            }
+                        }
+                        StatusCode::UNAUTHORIZED => return Err(Error::NotAuthenticated),
+                        // Deleted (with its message, or on its own): gone for good.
+                        StatusCode::NOT_FOUND => return Err(gone_error()),
+                        StatusCode::RANGE_NOT_SATISFIABLE => {
+                            // What the sink holds doesn't fit this file: start over.
+                            sink.restart().await.map_err(|e| io_error(&e))?;
+                            0
+                        }
+                        s if s.is_server_error() && attempt < MAX_ATTEMPTS => backoff(attempt),
+                        _ => {
+                            let (code, _) = error_code(resp).await;
+                            return Err(api(status, code));
+                        }
+                    }
+                }
+            };
+            if wait > 0 {
+                self.transfers.emit(
+                    id,
+                    sink.resume_offset(),
+                    size,
+                    TransferState::Retrying { after_secs: wait },
+                );
+                wait_or_stop(wait, flags).await?;
+            }
+        }
+    }
+
+    async fn stream_into(
+        &self,
+        id: TransferId,
+        flags: &Flags,
+        resp: reqwest::Response,
+        sink: &mut dyn DownloadSink,
+        size: u64,
+    ) -> std::result::Result<(), Streamed> {
+        let mut stream = resp.bytes_stream();
+        let mut last = Instant::now();
+        loop {
+            // A stalled body mustn't hold off a cancel or a pause (or a store closing).
+            let next = tokio::select! {
+                next = stream.next() => next,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if let Some(stop) = flags.stopped() {
+                        return Err(Streamed::Stopped(stop));
+                    }
+                    continue;
+                }
+            };
+            let Some(chunk) = next else { break };
+            if let Some(stop) = flags.stopped() {
+                return Err(Streamed::Stopped(stop));
+            }
+            let chunk = chunk.map_err(|_| Streamed::Network)?;
+            // Never write past the declared size: an over-long body would otherwise fill
+            // the disk before the sha256 check at the end could refuse it.
+            if sink.resume_offset() + chunk.len() as u64 > size {
+                return Err(Streamed::TooLong);
+            }
+            sink.write_chunk(&chunk).await.map_err(Streamed::Sink)?;
+            if last.elapsed() >= PROGRESS_EVERY {
+                last = Instant::now();
+                self.transfers
+                    .emit(id, sink.resume_offset(), size, TransferState::Running);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn has_content_coding(resp: &reqwest::Response) -> bool {
+    resp.headers().get_all(CONTENT_ENCODING).iter().any(|v| {
+        !v.to_str()
+            .unwrap_or("x")
+            .trim()
+            .eq_ignore_ascii_case("identity")
+    })
+}
+
+pub(crate) fn gone_error() -> Error {
+    Error::Api {
+        code: "file.gone".into(),
+        message: "the file was deleted".into(),
+    }
+}
+
 enum Streamed {
-    Cancelled,
+    /// A cancel or a pause (the error to end with).
+    Stopped(Error),
     Network,
     Sink(io::Error),
     /// More bytes than the file's size.

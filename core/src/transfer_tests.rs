@@ -834,3 +834,178 @@ fn a_full_server_disk_is_worth_waiting_for() {
         message: String::new()
     }));
 }
+
+/// A coded body (a compressing proxy) is not the file's bytes: never appended to what's held,
+/// the partial is dropped (the cache's new key), and the download starts over without a range.
+/// Every request asks for no coding.
+#[tokio::test]
+async fn a_content_coded_download_starts_over_and_never_appends() {
+    let server = MockServer::start().await;
+    let client = signed_in(&server).await;
+    let digest = sha(BYTES);
+    let coded = ResponseTemplate::new(206)
+        .insert_header("etag", format!("\"{digest}\"").as_str())
+        .insert_header("content-encoding", "gzip")
+        .insert_header(
+            "content-range",
+            format!("bytes 6-{}/{}", BYTES.len() - 1, BYTES.len()).as_str(),
+        )
+        .set_body_bytes(b"\x1f\x8b not the bytes".as_slice());
+    let plain = ResponseTemplate::new(200)
+        .insert_header("etag", format!("\"{digest}\"").as_str())
+        .set_body_bytes(BYTES);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/files/f1/content"))
+        .and(header("accept-encoding", "identity"))
+        .respond_with(Sequence(Mutex::new(vec![coded, plain])))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let restarts = Arc::new(Mutex::new(0));
+    let mut sink = MemSink {
+        held: BYTES[..6].to_vec(),
+        restarts: restarts.clone(),
+    };
+    client
+        .download_file(
+            TransferId::new(),
+            "f1",
+            &digest,
+            BYTES.len() as u64,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sink.held, BYTES);
+    assert_eq!(*restarts.lock().unwrap(), 1);
+}
+
+/// A 206 that doesn't continue from what's held is never appended: start over.
+#[tokio::test]
+async fn a_range_from_elsewhere_starts_over() {
+    let server = MockServer::start().await;
+    let client = signed_in(&server).await;
+    let digest = sha(BYTES);
+    let elsewhere = ResponseTemplate::new(206)
+        .insert_header("etag", format!("\"{digest}\"").as_str())
+        .insert_header(
+            "content-range",
+            format!("bytes 2-{}/{}", BYTES.len() - 1, BYTES.len()).as_str(),
+        )
+        .set_body_bytes(&BYTES[2..]);
+    let plain = ResponseTemplate::new(200)
+        .insert_header("etag", format!("\"{digest}\"").as_str())
+        .set_body_bytes(BYTES);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/files/f1/content"))
+        .respond_with(Sequence(Mutex::new(vec![elsewhere, plain])))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let restarts = Arc::new(Mutex::new(0));
+    let mut sink = MemSink {
+        held: BYTES[..6].to_vec(),
+        restarts: restarts.clone(),
+    };
+    client
+        .download_file(
+            TransferId::new(),
+            "f1",
+            &digest,
+            BYTES.len() as u64,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sink.held, BYTES);
+    assert_eq!(*restarts.lock().unwrap(), 1);
+}
+
+/// A 404 means the file was deleted: `file.gone`, not a retry.
+#[tokio::test]
+async fn a_deleted_file_is_gone() {
+    let server = MockServer::start().await;
+    let client = signed_in(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/files/f1/content"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut sink = MemSink {
+        held: vec![],
+        restarts: Arc::default(),
+    };
+    let err = client
+        .download_file(
+            TransferId::new(),
+            "f1",
+            &sha(BYTES),
+            BYTES.len() as u64,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Api { code, .. } if code == "file.gone"),
+        "{err:?}"
+    );
+}
+
+/// The transfer client never decodes content (so it never asks for a coding either).
+#[test]
+fn reqwest_has_no_content_decoders() {
+    let manifest = include_str!("../Cargo.toml");
+    let line = manifest
+        .lines()
+        .find(|l| l.trim_start().starts_with("reqwest"))
+        .expect("reqwest in core's manifest");
+    for coding in ["gzip", "brotli", "deflate", "zstd"] {
+        assert!(
+            !line.contains(coding),
+            "reqwest's {coding} decoder is on: {line}"
+        );
+    }
+    assert!(line.contains("default-features = false"), "{line}");
+}
+
+/// A 206 to a resume without the file's ETag (a proxy that dropped it and ignored If-Range)
+/// may be other bytes: never appended, the download starts over.
+#[tokio::test]
+async fn a_resume_without_the_etag_starts_over() {
+    let server = MockServer::start().await;
+    let client = signed_in(&server).await;
+    let digest = sha(BYTES);
+    let anonymous = ResponseTemplate::new(206)
+        .insert_header(
+            "content-range",
+            format!("bytes 6-{}/{}", BYTES.len() - 1, BYTES.len()).as_str(),
+        )
+        .set_body_bytes(&BYTES[6..]);
+    let plain = ResponseTemplate::new(200)
+        .insert_header("etag", format!("\"{digest}\"").as_str())
+        .set_body_bytes(BYTES);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/files/f1/content"))
+        .respond_with(Sequence(Mutex::new(vec![anonymous, plain])))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let restarts = Arc::new(Mutex::new(0));
+    let mut sink = MemSink {
+        held: BYTES[..6].to_vec(),
+        restarts: restarts.clone(),
+    };
+    client
+        .download_file(
+            TransferId::new(),
+            "f1",
+            &digest,
+            BYTES.len() as u64,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sink.held, BYTES);
+    assert_eq!(*restarts.lock().unwrap(), 1);
+}

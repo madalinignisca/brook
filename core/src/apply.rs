@@ -22,6 +22,7 @@
 //! Coverage (`coverage.rs`) is not moved here: `/sync` delivers rows by their latest `seq`,
 //! not in creation order, so contiguity is only known once a sync run completes.
 
+use crate::file_rows;
 use std::collections::HashSet;
 
 use rusqlite::{params, OptionalExtension, Transaction};
@@ -85,6 +86,9 @@ pub(crate) struct Applied {
     pub(crate) removed: HashSet<String>,
     /// Profiles that changed (names, status): authors to re-render.
     pub(crate) users: HashSet<String>,
+    /// Files no cached message lists any more: their cache rows went in this transaction
+    /// and their blobs are journalled (`file_rows`).
+    pub(crate) dropped_files: Vec<String>,
 }
 
 /// Apply `batch` for the signed-in user `me`. The caller commits (with the cursor, for a
@@ -130,7 +134,8 @@ pub(crate) fn apply(tx: &Transaction<'_>, me: &str, batch: &Batch) -> rusqlite::
              ON CONFLICT(channel_id) DO UPDATE SET seq = excluded.seq, active = 1",
             params![channel_id, seq],
         )?;
-        remove_channel_rows(tx, channel_id)?;
+        let dropped = remove_channel_rows(tx, channel_id)?;
+        applied.dropped_files.extend(dropped);
         applied.removed.insert(channel_id.clone());
         applied.channels.remove(channel_id);
     }
@@ -201,6 +206,11 @@ pub(crate) fn apply(tx: &Transaction<'_>, me: &str, batch: &Batch) -> rusqlite::
         )?;
         if changed > 0 {
             applied.channels.insert(m.channel_id.clone());
+            // The files this version lists (a tombstone lists none): any it no longer does
+            // leave the file cache.
+            let dropped =
+                file_rows::index_message(tx, &m.id, &m.channel_id, &file_rows::listed(&m.json))?;
+            applied.dropped_files.extend(dropped);
             let deleted = !m.json.get("deleted_at").is_none_or(Value::is_null);
             let body = m.json.get("body").and_then(Value::as_str).unwrap_or("");
             // A history row may be older than a quote already cached: only a live or synced
@@ -249,6 +259,9 @@ pub(crate) fn apply(tx: &Transaction<'_>, me: &str, batch: &Batch) -> rusqlite::
             )?;
         }
         refresh_excerpts(tx, id, None)?;
+        applied
+            .dropped_files
+            .extend(file_rows::drop_message(tx, id)?);
         applied.channels.insert(channel_id.clone());
     }
     Ok(applied)
@@ -373,8 +386,9 @@ fn channel_present(tx: &Transaction<'_>, channel_id: &str) -> rusqlite::Result<b
 }
 
 /// A scoped removal's rows (spec §7.2): the channel, its members, messages and coverage.
-/// Files and Open copies are the files plan's (journalled deletion).
-fn remove_channel_rows(tx: &Transaction<'_>, channel_id: &str) -> rusqlite::Result<()> {
+/// Its cached files go too, journalled (`file_rows::drop_channel`).
+fn remove_channel_rows(tx: &Transaction<'_>, channel_id: &str) -> rusqlite::Result<Vec<String>> {
+    let dropped = file_rows::drop_channel(tx, channel_id)?;
     for sql in [
         "DELETE FROM messages WHERE channel_id = ?1",
         "DELETE FROM memberships WHERE channel_id = ?1",
@@ -383,5 +397,5 @@ fn remove_channel_rows(tx: &Transaction<'_>, channel_id: &str) -> rusqlite::Resu
     ] {
         tx.execute(sql, [channel_id])?;
     }
-    Ok(())
+    Ok(dropped)
 }

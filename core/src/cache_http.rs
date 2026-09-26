@@ -71,6 +71,32 @@ impl crate::outbox::Upload for Http {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::files::Download for Http {
+    async fn download(
+        &self,
+        id: crate::transfer::TransferId,
+        flags: &std::sync::Arc<crate::transfer::Flags>,
+        file_id: &str,
+        sha256: &str,
+        size: u64,
+        sink: &mut dyn crate::transfer::DownloadSink,
+        epoch: u64,
+    ) -> Result<(), crate::Error> {
+        crate::transfer::Downloader {
+            http: &self.http,
+            base: &self.base,
+            transfers: &self.transfers,
+            token: &EpochToken {
+                session: &self.session,
+                epoch,
+            },
+        }
+        .download(id, flags, file_id, sha256, size, sink)
+        .await
+    }
+}
+
 impl Http {
     async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<reqwest::Response, Error> {
         let token = self

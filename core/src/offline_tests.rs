@@ -89,7 +89,27 @@ fn net(f: &Arc<Fake>) -> Net {
         history: f.clone(),
         post: f.clone(),
         upload: f.clone(),
+        download: f.clone(),
         transfers: Arc::new(crate::transfer::Transfers::new()),
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::files::Download for Fake {
+    async fn download(
+        &self,
+        _: crate::transfer::TransferId,
+        _: &Arc<crate::transfer::Flags>,
+        _: &str,
+        _: &str,
+        _: u64,
+        _: &mut dyn crate::transfer::DownloadSink,
+        _: u64,
+    ) -> Result<(), crate::Error> {
+        Err(crate::Error::Api {
+            code: "transfer.network".into(),
+            message: String::new(),
+        })
     }
 }
 

@@ -36,6 +36,7 @@ pub(crate) struct Net {
     pub(crate) history: Arc<dyn History>,
     pub(crate) post: Arc<dyn Post>,
     pub(crate) upload: Arc<dyn crate::outbox::Upload>,
+    pub(crate) download: Arc<dyn crate::files::Download>,
     pub(crate) transfers: Arc<crate::transfer::Transfers>,
 }
 
@@ -88,6 +89,7 @@ pub(crate) struct Active {
     pub(crate) user_id: String,
     pub(crate) cache: Arc<Cache>,
     pub(crate) outbox: Arc<Outbox>,
+    pub(crate) files: Arc<crate::files::Files>,
     session: watch::Sender<Option<u64>>,
     /// The session epoch the state feed follows: a new one restarts it.
     epoch: u64,
@@ -271,6 +273,15 @@ impl Offline {
         };
         let cache = Cache::new(cache_db, user_id.to_string(), net.fetch, net.history);
         let (session, session_rx) = watch::channel(Some(epoch));
+        let files = crate::files::Files::open(
+            cache.clone(),
+            &store_dir,
+            crate::files::open_dir_for(&stores.store_id),
+            net.download,
+            net.transfers.clone(),
+            session_rx.clone(),
+        )
+        .await;
         let outbox = Outbox::open(
             outbox_db,
             cache.clone(),
@@ -290,6 +301,7 @@ impl Offline {
             user_id: user_id.to_string(),
             cache,
             outbox,
+            files,
             session,
             epoch,
             pump,
@@ -304,6 +316,7 @@ impl Offline {
         if let Some(a) = &mut self.active {
             a.session.send_replace(None);
             a.state_feed = None;
+            a.files.clear_open_copies(); // no plaintext copy outlives the session
         }
         self.state.reset();
     }
@@ -316,6 +329,10 @@ impl Offline {
             drop(a.state_feed);
             a.pump.abort();
             let _ = a.pump.await;
+            // Downloads first, joined: nothing writes into the store once it closes (a wipe
+            // erases right after this). Open copies go too.
+            a.files.close().await;
+            a.files.clear_open_copies();
             a.outbox.close().await;
             a.cache.close().await;
         }

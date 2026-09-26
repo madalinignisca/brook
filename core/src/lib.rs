@@ -30,6 +30,12 @@ mod coverage;
 #[cfg(test)]
 mod coverage_tests;
 mod error;
+mod file_rows;
+#[cfg(test)]
+mod file_rows_tests;
+mod files;
+#[cfg(test)]
+mod files_tests;
 mod keyslot;
 mod local;
 #[cfg(test)]
@@ -80,6 +86,7 @@ pub use client::{BrookClient, LoginOutcome, RestoreOutcome, TotpChallenge};
 pub use client_offline::CachedMessages;
 pub use config::CoreConfig;
 pub use error::{Error, Result};
+pub use files::{FileCacheState, FILE_CACHE_CAP};
 pub use keyslot::{InMemoryKeySlot, KeySlot, KeySlotError, KeyStore};
 pub use outbox::{
     Deleted, OutgoingFile, PendingFile, PendingMessage, PendingState, QueuedFile, SendReceipt,
