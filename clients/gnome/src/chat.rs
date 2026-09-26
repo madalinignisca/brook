@@ -333,6 +333,27 @@ pub fn build(
     content_box.append(&staged_box);
     content_box.append(&composer_row);
 
+    // Files dropped anywhere on the conversation join the message being written, as if
+    // picked with Add files (only while it can be written in).
+    let drop = gtk::DropTarget::new(
+        gtk::gdk::FileList::static_type(),
+        gtk::gdk::DragAction::COPY,
+    );
+    drop.connect_drop({
+        let chat = chat.clone();
+        move |_, value, _, _| {
+            if !chat.attach_button.is_sensitive() {
+                return false; // no conversation open, archived, or a send is being prepared
+            }
+            let Ok(list) = value.get::<gtk::gdk::FileList>() else {
+                return false;
+            };
+            stage_files(&chat, list.files());
+            true
+        }
+    });
+    content_box.add_controller(drop);
+
     composer.connect_changed({
         let chat = chat.clone();
         move |entry| {
@@ -870,24 +891,35 @@ fn send_current(chat: &Rc<Chat>) {
 fn add_files(chat: &Rc<Chat>) {
     let window = chat.composer.root().and_downcast::<gtk::Window>();
     let chat = chat.clone();
-    crate::outgoing::pick(window.as_ref(), move |files| {
-        let chat = chat.clone();
-        glib::spawn_future_local(async move {
-            for file in files {
-                let Some(staged) = crate::outgoing::describe(&file).await else {
-                    show_send_error(&chat, "That file couldn't be read.");
-                    continue;
-                };
-                let count = chat.staged.borrow().len();
-                if let Some(why) = crate::outgoing::refusal(count, &staged.name, staged.size) {
-                    show_send_error(&chat, &why);
+    crate::outgoing::pick(window.as_ref(), move |files| stage_files(&chat, files));
+}
+
+/// Put files (picked, or dropped on the conversation) under the message box, checking the
+/// limits as they're added.
+fn stage_files(chat: &Rc<Chat>, files: Vec<gtk::gio::File>) {
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        for file in files {
+            let staged = match crate::outgoing::describe(&file).await {
+                Ok(staged) => staged,
+                Err(crate::outgoing::NotStaged::NotAFile) => {
+                    show_send_error(&chat, "Only files can be sent (not folders or devices).");
                     continue;
                 }
-                chat.staged.borrow_mut().push(staged);
+                Err(crate::outgoing::NotStaged::Unreadable) => {
+                    show_send_error(&chat, "That file couldn't be read.");
+                    continue;
+                }
+            };
+            let count = chat.staged.borrow().len();
+            if let Some(why) = crate::outgoing::refusal(count, &staged.name, staged.size) {
+                show_send_error(&chat, &why);
+                continue;
             }
-            redraw_staged(&chat);
-            chat.composer.grab_focus();
-        });
+            chat.staged.borrow_mut().push(staged);
+        }
+        redraw_staged(&chat);
+        chat.composer.grab_focus();
     });
 }
 

@@ -431,3 +431,32 @@ fn file_cache_states_cross_with_their_progress() {
         }
     );
 }
+
+#[test]
+fn an_image_preview_crosses_whole_and_never_logs_its_bytes() {
+    use brook_core::ImageKind as K;
+    for (core, ffi) in [
+        (K::Png, FfiImageKind::Png),
+        (K::Jpeg, FfiImageKind::Jpeg),
+        (K::Gif, FfiImageKind::Gif),
+        (K::Webp, FfiImageKind::Webp),
+    ] {
+        assert_eq!(FfiImageKind::from(core), ffi);
+    }
+    let p = FfiImagePreview::from(brook_core::ImagePreview {
+        kind: K::Gif,
+        width: 3,
+        height: 2,
+        bytes: b"secret".to_vec(),
+    });
+    assert_eq!(
+        p,
+        FfiImagePreview {
+            kind: FfiImageKind::Gif,
+            width: 3,
+            height: 2,
+            bytes: b"secret".to_vec(),
+        }
+    );
+    assert!(!format!("{p:?}").contains("115")); // no byte values
+}
