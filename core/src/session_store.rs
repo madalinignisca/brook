@@ -527,14 +527,14 @@ impl SessionStore {
         refresh_token: String,
         rotation: bool,
     ) -> RefreshApplied {
-        {
-            let mut tokens = self.slot_tokens();
-            if let Some(family) = tokens.remove(rotated_from) {
-                if rotation {
-                    tokens.insert(refresh_token.clone(), family);
-                }
+        // The sent token's generation, taken off now; where the new token goes is decided
+        // below, by what happens to it.
+        let inherited = self.slot_tokens().remove(rotated_from);
+        let carry = |me: &Self| {
+            if let (true, Some(family)) = (rotation, inherited) {
+                me.mark_family(&refresh_token, family);
             }
-        }
+        };
         let rev = {
             let mut cell = self.cell.write().await;
             if self.is_closed() {
@@ -547,6 +547,7 @@ impl SessionStore {
                 } else {
                     None
                 };
+                carry(self);
                 return if stored == Some(true) {
                     RefreshApplied::Stored
                 } else {
@@ -556,16 +557,29 @@ impl SessionStore {
             match cell.session.as_mut() {
                 Some(s) if s.refresh_token == rotated_from => {
                     s.access_token = access_token;
-                    s.refresh_token = refresh_token;
+                    s.refresh_token = refresh_token.clone();
                     // Rotation made the stored token dead: follow it (unless a newer client
                     // owns the slot now). Not `with_slot`: `s` borrows the cell.
-                    if let Some(p) = self.persistence.get() {
-                        p.guarded(self.id, |p| p.write(s));
+                    let landed = self
+                        .persistence
+                        .get()
+                        .map(|p| p.guarded(self.id, |p| p.write(s)));
+                    match landed {
+                        None => {}                 // no persistence
+                        Some(None) => carry(self), // not the owner: the owner's login still
+                        // The owner's write landed: a refresh continues the stored login; a
+                        // password change or TOTP activation stored a new one.
+                        Some(Some(true)) if rotation => carry(self),
+                        Some(Some(true)) => self.mark_new_login(&refresh_token),
+                        Some(Some(false)) => {} // fenced: nobody can restore it
                     }
                     cell.rev.credential_rev += 1;
                     cell.rev
                 }
-                _ => return RefreshApplied::Discarded,
+                _ => {
+                    carry(self);
+                    return RefreshApplied::Discarded;
+                }
             }
         };
         *self.refresh_not_before.lock().unwrap() = None; // the wait is over: it worked

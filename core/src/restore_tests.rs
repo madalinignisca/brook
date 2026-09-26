@@ -880,3 +880,25 @@ async fn an_unstored_restore_is_revoked_when_superseded() {
     a.logout().await;
     assert_eq!(server.logouts().len(), 1, "a fenced restore was left live");
 }
+
+/// A password change on the owner stores a new login: once a newer client restores it,
+/// the old client's logout must spare it, not end it (#120, review round 2).
+#[tokio::test]
+async fn a_password_change_stores_a_login_the_old_client_spares() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let a = signed_in(&server, &slot, dir.path(), "alice").await;
+    a.change_password("pw", "pw2", false).await.unwrap();
+    let (_b, outcome) = relaunch(&server, &slot, dir.path()).await;
+    assert!(
+        matches!(outcome, RestoreOutcome::LoggedIn(_)),
+        "{outcome:?}"
+    );
+    a.logout().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        server.logouts().is_empty(),
+        "the old client ended the login it had stored"
+    );
+}
