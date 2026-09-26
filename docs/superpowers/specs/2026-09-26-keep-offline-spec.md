@@ -143,8 +143,10 @@ drop it.
 - Mac: the app's temporary directory, each copy tagged with `com.apple.quarantine`, so
   Gatekeeper treats it as downloaded.
 - It is the one plaintext copy core makes on its own. It is emptied by `clear_open_copies()`
-  (the app calls it on quit), at the next `enable_local_data`, and on sign-out with data
-  removal.
+  (the app calls it on quit: GTK on shutdown, the Mac in `applicationWillTerminate`), at the
+  next `enable_local_data`, and on sign-out with data removal.
+- The quit call is best-effort, since a crash or a kill skips it. The sweep at the next
+  launch is the real guarantee.
 
 ### 4.5 Pinning
 - `pin_file(file_id)`:
