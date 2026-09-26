@@ -58,6 +58,7 @@ fn outbox_error(e: OutboxError) -> Error {
                 OutboxError::EmptyFile => "outbox.empty_file",
                 OutboxError::EmptyMessage => "outbox.empty_message",
                 OutboxError::FileUnreadable => "outbox.file_unreadable",
+                OutboxError::Cancelled => "transfer.cancelled",
                 _ => "outbox.store",
             }
             .into(),

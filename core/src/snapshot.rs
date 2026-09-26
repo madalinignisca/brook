@@ -37,6 +37,15 @@ pub(crate) struct Written {
     pub(crate) sha256: String,
 }
 
+/// Why a write failed: the user's file (gone, unreadable, empty), our store (full disk), or
+/// the caller stopped it (a cancel while copying).
+#[derive(Debug)]
+pub(crate) enum WriteError {
+    Source,
+    Store,
+    Stopped,
+}
+
 /// A snapshot that can't be trusted: not uploaded, never retried (`outbox.snapshot_damaged`).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Damaged;
@@ -95,33 +104,38 @@ fn fill(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 /// and read once; `dst` must not exist, and its directory must (it is never created here:
 /// a write racing a wipe of the store fails instead of recreating it). The file and its
 /// directory are fsynced before this returns. `progress(done, total)` follows the copy
-/// (`total` is the size seen when it started). An empty source is refused.
+/// (`total` is the size seen when it started); returning false stops it (nothing is kept).
+/// An empty source is refused.
 pub(crate) fn write(
     src: &Path,
     dst: &Path,
     id: [u8; 16],
     chunk: usize,
-    progress: &mut dyn FnMut(u64, u64),
-) -> io::Result<Written> {
-    let mut input = File::open(src)?;
+    progress: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<Written, WriteError> {
+    let mut input = File::open(src).map_err(|_| WriteError::Source)?;
     let total = input.metadata().map(|m| m.len()).unwrap_or(0);
     let mut key = [0u8; 32];
-    getrandom::fill(&mut key).map_err(|_| io::Error::other("no randomness"))?;
+    getrandom::fill(&mut key).map_err(|_| WriteError::Store)?;
     let sealing = sealing_key(&key);
-    let mut out = OpenOptions::new().write(true).create_new(true).open(dst)?;
+    let mut out = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+        .map_err(|_| WriteError::Store)?;
     let result = (|| {
         let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
         let mut current = vec![0u8; chunk];
-        let mut n = fill(&mut input, &mut current)?;
+        let mut n = fill(&mut input, &mut current).map_err(|_| WriteError::Source)?;
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty file"));
+            return Err(WriteError::Source); // empty
         }
         let mut next = vec![0u8; chunk];
         let (mut index, mut size) = (0u64, 0u64);
         loop {
             // A chunk is the last one if nothing follows it: read ahead before sealing.
             let m = if n == chunk {
-                fill(&mut input, &mut next)?
+                fill(&mut input, &mut next).map_err(|_| WriteError::Source)?
             } else {
                 0
             };
@@ -134,10 +148,12 @@ pub(crate) fn write(
                     Aad::from(aad(&id, index, last)),
                     &mut sealed,
                 )
-                .map_err(|_| io::Error::other("seal failed"))?;
-            out.write_all(&sealed)?;
+                .map_err(|_| WriteError::Store)?;
+            out.write_all(&sealed).map_err(|_| WriteError::Store)?;
             size += n as u64;
-            progress(size, total.max(size));
+            if !progress(size, total.max(size)) {
+                return Err(WriteError::Stopped);
+            }
             if last {
                 break;
             }
@@ -145,9 +161,11 @@ pub(crate) fn write(
             n = m;
             index += 1;
         }
-        out.sync_all()?;
+        out.sync_all().map_err(|_| WriteError::Store)?;
         if let Some(dir) = dst.parent() {
-            File::open(dir)?.sync_all()?;
+            File::open(dir)
+                .and_then(|d| d.sync_all())
+                .map_err(|_| WriteError::Store)?;
         }
         Ok(Written {
             key,
@@ -239,6 +257,9 @@ pub(crate) struct SnapshotSource {
     pub(crate) size: u64,
     pub(crate) sha256: String,
     pub(crate) chunk: usize,
+    /// Set if a read met damage (a chunk that won't open): the upload's error then reads as
+    /// a network failure, and the outbox needs to know it was the snapshot.
+    pub(crate) broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -264,6 +285,7 @@ impl crate::transfer::UploadSource for SnapshotSource {
             filled: 0,
             plain: 0,
             pos: 0,
+            broken: self.broken.clone(),
         }))
     }
 }
@@ -282,6 +304,7 @@ struct Decrypting {
     filled: usize,
     plain: usize,
     pos: usize,
+    broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn damaged() -> io::Error {
@@ -309,7 +332,10 @@ impl AsyncRead for Decrypting {
                 let mut rb = ReadBuf::new(&mut probe);
                 return match Pin::new(&mut me.file).poll_read(cx, &mut rb) {
                     Poll::Ready(Ok(())) if rb.filled().is_empty() => Poll::Ready(Ok(())),
-                    Poll::Ready(Ok(())) => Poll::Ready(Err(damaged())),
+                    Poll::Ready(Ok(())) => {
+                        me.broken.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Poll::Ready(Err(damaged()))
+                    }
                     Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
                     Poll::Pending => Poll::Pending,
                 };
@@ -319,6 +345,7 @@ impl AsyncRead for Decrypting {
                 let mut rb = ReadBuf::new(&mut me.sealed[me.filled..want]);
                 match Pin::new(&mut me.file).poll_read(cx, &mut rb) {
                     Poll::Ready(Ok(())) if rb.filled().is_empty() => {
+                        me.broken.store(true, std::sync::atomic::Ordering::SeqCst);
                         return Poll::Ready(Err(damaged())); // ended early
                     }
                     Poll::Ready(Ok(())) => me.filled += rb.filled().len(),
@@ -334,7 +361,10 @@ impl AsyncRead for Decrypting {
                     me.filled = 0;
                     me.index += 1;
                 }
-                Err(Damaged) => return Poll::Ready(Err(damaged())),
+                Err(Damaged) => {
+                    me.broken.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Poll::Ready(Err(damaged()));
+                }
             }
         }
     }

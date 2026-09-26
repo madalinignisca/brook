@@ -1215,6 +1215,9 @@ mod files {
         Fail(crate::Error),
         /// Wait for `gate`, stopping on the row's flags like a real transfer.
         Held,
+        /// Wait for `gate`, then read the source; a read error comes back as a network
+        /// failure, as reqwest reports a body stream that fails.
+        HeldThenRead,
     }
 
     #[derive(Default)]
@@ -1261,6 +1264,16 @@ mod files {
             _: u64,
         ) -> Result<FileInfo, crate::Error> {
             use tokio::io::AsyncReadExt;
+            let next = self.ups.lock().unwrap().pop_front().unwrap_or(Up::Ok);
+            if let Up::HeldThenRead = next {
+                self.gate.notified().await;
+                let mut bytes = vec![];
+                let mut r = source.reader().await.map_err(|_| api("transfer.io"))?;
+                return match r.read_to_end(&mut bytes).await {
+                    Ok(_) => Ok(info(&format!("id-{}", file.file_client_id))),
+                    Err(_) => Err(crate::Error::Timeout),
+                };
+            }
             let mut bytes = vec![];
             source
                 .reader()
@@ -1268,8 +1281,8 @@ mod files {
                 .map_err(|_| api("transfer.io"))?
                 .read_to_end(&mut bytes)
                 .await
-                .map_err(|_| api("transfer.io"))?;
-            let next = self.ups.lock().unwrap().pop_front().unwrap_or(Up::Ok);
+                // As reqwest reports a body stream that fails mid-send: a network error.
+                .map_err(|_| crate::Error::Timeout)?;
             if let Up::Held = next {
                 loop {
                     if flags.cancel.load(Ordering::SeqCst) {
@@ -1871,5 +1884,138 @@ mod files {
         assert_eq!(p[0].files[0].error, None, "Retry kept the old refusal");
         s.session.send_replace(Some(2));
         drained(&s).await;
+    }
+
+    /// Damage found mid-upload (after a good verification) fails the row as damaged at the
+    /// next attempt, instead of retrying a network error forever.
+    #[tokio::test]
+    async fn damage_found_mid_upload_fails_the_row() {
+        let s = setup().await;
+        s.files.ups.lock().unwrap().push_back(Up::HeldThenRead);
+        let r = s
+            .outbox
+            .enqueue_with_files(
+                "c1",
+                "x",
+                None,
+                None,
+                vec![file(&s, "a", b"some bytes to damage")],
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await; // verified, now held
+        let path = s
+            .outbox
+            .snap_dir_for_tests()
+            .join(&r.files[0].file_client_id);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[5] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        s.files.gate.notify_one();
+        until_state(&s, failed).await;
+        assert_eq!(
+            state(&s).await,
+            PendingState::Failed {
+                code: "outbox.snapshot_damaged".into()
+            }
+        );
+    }
+
+    /// The server has an accepted message: a cancel can't make it fail (or read as removed).
+    #[tokio::test]
+    async fn an_accepted_row_with_files_ignores_a_cancel() {
+        let s = setup().await;
+        s.session.send_replace(None);
+        let r = s
+            .outbox
+            .enqueue_with_files("c1", "x", None, None, vec![file(&s, "a", b"1")])
+            .await
+            .unwrap();
+        let cid = r.client_id.clone();
+        s.outbox
+            .db_for_tests()
+            .call(move |c| {
+                c.execute(
+                    "UPDATE outbox SET state = 'accepted' WHERE client_id = ?1",
+                    [&cid],
+                )?;
+                c.execute("UPDATE outbox_files SET file_id = 'fx'", [])
+            })
+            .await
+            .unwrap();
+        s.transfers
+            .flag(r.files[0].transfer_id)
+            .cancel
+            .store(true, Ordering::SeqCst);
+        s.session.send_replace(Some(1));
+        // (An accepted row isn't "unsent": wait for it to leave.)
+        for _ in 0..500 {
+            if s.outbox.pending("c1").await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            s.outbox.pending("c1").await.unwrap().is_empty(),
+            "the accepted row stayed"
+        );
+        assert!(
+            s.files.uploaded.lock().unwrap().is_empty(),
+            "an accepted row uploaded"
+        );
+        assert_eq!(
+            s.files.posts.lock().unwrap()[0].attachments,
+            vec!["fx".to_string()]
+        );
+    }
+
+    /// A cancel while its files are being copied stops the copy: nothing is queued.
+    #[tokio::test]
+    async fn cancel_while_copying_queues_nothing() {
+        let s = setup().await;
+        s.session.send_replace(None);
+        let mut events = s.transfers.events_for_tests();
+        let transfers = s.transfers.clone();
+        let watcher = tokio::spawn(async move {
+            while let Ok(e) = events.recv().await {
+                if e.state == crate::transfer::TransferState::Preparing {
+                    transfers.flag(e.id).cancel.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+        let big = file(&s, "big", &vec![7u8; 8 * 64]); // 64 chunks of 8
+        let got = s
+            .outbox
+            .enqueue_with_files("c1", "x", None, None, vec![big])
+            .await;
+        watcher.await.unwrap();
+        assert_eq!(got, Err(OutboxError::Cancelled));
+        assert!(s.outbox.pending("c1").await.unwrap().is_empty());
+        assert_eq!(snaps(&s), 0);
+    }
+
+    /// A snapshot is read with the chunk size it was written with, whatever the current one.
+    #[tokio::test]
+    async fn a_snapshot_keeps_its_own_chunk_size() {
+        let s = setup().await;
+        s.session.send_replace(None);
+        s.outbox
+            .enqueue_with_files(
+                "c1",
+                "x",
+                None,
+                None,
+                vec![file(&s, "a", b"twenty-one bytes long")],
+            )
+            .await
+            .unwrap();
+        s.outbox.set_chunk_for_tests(16);
+        s.session.send_replace(Some(1));
+        drained(&s).await;
+        assert_eq!(
+            s.files.uploaded.lock().unwrap()[0].1,
+            b"twenty-one bytes long"
+        );
     }
 }

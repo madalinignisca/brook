@@ -107,7 +107,7 @@ CREATE TABLE outbox_files(client_id TEXT NOT NULL
                           ordinal INTEGER NOT NULL, file_client_id TEXT NOT NULL UNIQUE,
                           filename TEXT NOT NULL, content_type TEXT NOT NULL,
                           size INTEGER NOT NULL, sha256 TEXT NOT NULL, key BLOB NOT NULL,
-                          file_id TEXT, error TEXT);
+                          chunk INTEGER NOT NULL, file_id TEXT, error TEXT);
 CREATE INDEX outbox_files_by_row ON outbox_files(client_id, ordinal);
 CREATE TABLE deletions(path TEXT PRIMARY KEY);
 ";

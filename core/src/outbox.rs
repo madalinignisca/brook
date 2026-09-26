@@ -92,6 +92,9 @@ pub(crate) struct FileRow {
     pub(crate) size: u64,
     pub(crate) sha256: String,
     pub(crate) key: [u8; 32],
+    /// The chunk size its snapshot was written with (a later change of `CHUNK` can't
+    /// misread it).
+    pub(crate) chunk: usize,
     pub(crate) file_id: Option<String>,
 }
 
@@ -223,6 +226,9 @@ pub enum OutboxError {
     /// A file couldn't be read to copy it (gone, or no permission).
     #[error("a file couldn't be read")]
     FileUnreadable,
+    /// Cancelled while its files were being copied: nothing was queued.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// Transient failures back off up to this.
@@ -701,6 +707,19 @@ impl Outbox {
             .clone()
     }
 
+    /// A call's own files, never committed (a failed copy, or a repeat that lost the race):
+    /// their ids go, but not the row's flags, which a live row with this id may be using.
+    fn drop_ids(&self, file_client_ids: &[String]) {
+        let ids: Vec<TransferId> = {
+            let mut map = lock(&self.ids);
+            file_client_ids
+                .iter()
+                .filter_map(|f| map.remove(f))
+                .collect()
+        };
+        self.transfers.unregister(&ids);
+    }
+
     /// The row is gone: its registrations and per-process marks go with it.
     fn forget_row(&self, row_id: &str, file_client_ids: &[String]) {
         lock(&self.row_flags).remove(row_id);
@@ -723,7 +742,8 @@ impl Outbox {
         self.db
             .call(move |c| {
                 c.prepare(
-                    "SELECT file_client_id, filename, content_type, size, sha256, key, file_id
+                    "SELECT file_client_id, filename, content_type, size, sha256, key, file_id,
+                            chunk
                      FROM outbox_files WHERE client_id = ?1 ORDER BY ordinal",
                 )?
                 .query_map([&id], |r| {
@@ -736,6 +756,7 @@ impl Outbox {
                         sha256: r.get(4)?,
                         key: key.try_into().unwrap_or([0u8; 32]),
                         file_id: r.get(6)?,
+                        chunk: r.get::<_, i64>(7)? as usize,
                     })
                 })?
                 .collect()
@@ -812,8 +833,12 @@ impl Outbox {
             }
             return self.receipt_of(&client_id).await;
         }
+        // The channel's sender exists before anything commits (as for `enqueue`): a caller
+        // dropped after the commit must not leave a row no sender will look at.
+        let sender = self.sender(channel_id)?;
         // Snapshots first (off the runtime's workers), each under its own new key.
         let chunk = self.chunk.load(Ordering::SeqCst);
+        let row_flags = self.flags(&client_id);
         let mut made: Vec<(OutgoingFile, String, snapshot::Written)> = vec![];
         let mut failed = None;
         for f in files {
@@ -821,17 +846,28 @@ impl Outbox {
             let tid = self.transfer_id(&client_id, &fcid);
             let (src, dst) = (f.path.clone(), self.snap_dir.join(&fcid));
             let id = snapshot::id_bytes(&fcid).expect("a canonical id");
-            let transfers = self.transfers.clone();
+            let (transfers, flags) = (self.transfers.clone(), row_flags.clone());
             let written = tokio::task::spawn_blocking(move || {
                 snapshot::write(&src, &dst, id, chunk, &mut |done, total| {
-                    transfers.emit(tid, done, total, TransferState::Preparing)
+                    transfers.emit(tid, done, total, TransferState::Preparing);
+                    // A cancel while copying stops it: nothing is queued.
+                    !flags.cancel.load(Ordering::SeqCst)
                 })
             })
             .await;
             match written {
                 Ok(Ok(w)) => made.push((f, fcid, w)),
-                _ => {
+                Ok(Err(snapshot::WriteError::Source)) => {
                     failed = Some(OutboxError::FileUnreadable);
+                    break;
+                }
+                Ok(Err(snapshot::WriteError::Stopped)) => {
+                    failed = Some(OutboxError::Cancelled);
+                    break;
+                }
+                // Our side: a full disk, a store that can't be written.
+                Ok(Err(snapshot::WriteError::Store)) | Err(_) => {
+                    failed = Some(OutboxError::Store);
                     break;
                 }
             }
@@ -839,7 +875,10 @@ impl Outbox {
         let names: Vec<String> = made.iter().map(|(_, n, _)| n.clone()).collect();
         if let Some(err) = failed {
             self.remove_snapshots(&names).await;
-            self.forget_row(&client_id, &names);
+            self.drop_ids(&names);
+            if matches!(err, OutboxError::Cancelled) {
+                row_flags.cancel.store(false, Ordering::SeqCst); // this id may be sent again
+            }
             return Err(err);
         }
         let rows: Vec<(String, String, String, i64, String, Vec<u8>)> = made
@@ -855,6 +894,7 @@ impl Outbox {
                 )
             })
             .collect();
+        let chunk_col = chunk as i64;
         let (ch, b, cid) = (channel_id.to_string(), body.to_string(), client_id.clone());
         let inserted = self
             .db
@@ -870,9 +910,11 @@ impl Outbox {
                     for (i, (fcid, name, ctype, size, sha, key)) in rows.iter().enumerate() {
                         tx.execute(
                             "INSERT INTO outbox_files(client_id, ordinal, file_client_id,
-                                 filename, content_type, size, sha256, key)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                            rusqlite::params![cid, i as i64, fcid, name, ctype, size, sha, key],
+                                 filename, content_type, size, sha256, key, chunk)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                            rusqlite::params![
+                                cid, i as i64, fcid, name, ctype, size, sha, key, chunk_col
+                            ],
                         )?;
                     }
                 }
@@ -885,16 +927,15 @@ impl Outbox {
             Ok(_) => {
                 // A first call with this id committed meanwhile: its row wins.
                 self.remove_snapshots(&names).await;
-                self.forget_row(&client_id, &names);
+                self.drop_ids(&names);
                 return self.receipt_of(&client_id).await;
             }
             Err(_) => {
                 self.remove_snapshots(&names).await;
-                self.forget_row(&client_id, &names);
+                self.drop_ids(&names);
                 return Err(OutboxError::Store);
             }
         }
-        let sender = self.sender(channel_id)?;
         sender.wake.notify_one();
         self.changed(channel_id);
         self.receipt_of(&client_id).await
@@ -970,10 +1011,12 @@ impl Outbox {
         };
         let sender = self.sender(&channel)?;
         let _held = sender.lock.lock().await;
-        // A retry is the user's word: an earlier cancel no longer holds.
-        let flags = self.flags(client_id);
-        flags.cancel.store(false, Ordering::SeqCst);
-        flags.pause.store(false, Ordering::SeqCst);
+        // A retry is the user's word: an earlier cancel no longer holds. (Only a row that
+        // has flags: none are made for a row the ack removed meanwhile.)
+        if let Some(flags) = lock(&self.row_flags).get(client_id) {
+            flags.cancel.store(false, Ordering::SeqCst);
+            flags.pause.store(false, Ordering::SeqCst);
+        }
         let cid = client_id.to_string();
         self.db
             .call(move |c| {
@@ -1152,8 +1195,13 @@ impl Outbox {
         };
         let mut msg = msg.clone();
         let mut reattached = false;
+        // An accepted row's files are all on the server: its ids are resent as stored, and
+        // no cancel or upload can touch it (the server has the message).
+        if accepted {
+            msg.attachments = files.iter().filter_map(|f| f.file_id.clone()).collect();
+        }
         let answer = loop {
-            if !files.is_empty() {
+            if !files.is_empty() && !accepted {
                 let files = if reattached {
                     match self.files_of(client_id).await {
                         Ok(f) => f,
@@ -1290,22 +1338,26 @@ impl Outbox {
         }
         // Any change away from this epoch (a sign-out, a switch, or both merged into one
         // change) pauses the uploads at their next chunk: they resume at the next sign-in.
-        let pauser = {
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        // Aborted however this ends (a return, or the sender task itself aborted by close).
+        let _pauser = {
             let (flags, mut session) = (flags.clone(), self.session.clone());
-            tokio::spawn(async move {
+            AbortOnDrop(tokio::spawn(async move {
                 while *session.borrow_and_update() == Some(epoch) {
                     if session.changed().await.is_err() {
                         break;
                     }
                 }
                 flags.pause.store(true, Ordering::SeqCst);
-            })
+            }))
         };
-        let result = self
-            .upload_each(channel_id, row_id, files, &flags, waiting, epoch)
-            .await;
-        pauser.abort();
-        result
+        self.upload_each(channel_id, row_id, files, &flags, waiting, epoch)
+            .await
     }
 
     async fn upload_each(
@@ -1317,7 +1369,6 @@ impl Outbox {
         waiting: &'static str,
         epoch: u64,
     ) -> Result<Vec<String>, Attempt> {
-        let chunk = self.chunk.load(Ordering::SeqCst);
         let mut ids = Vec::with_capacity(files.len());
         for f in files {
             if let Some(id) = &f.file_id {
@@ -1334,7 +1385,8 @@ impl Outbox {
             // Verified once per process before its first byte goes out: a damaged snapshot
             // fails the row here, instead of reading as a network error mid-PUT forever.
             if !lock(&self.verified).contains(&f.file_client_id) {
-                let (p, key, size, sha) = (path.clone(), f.key, f.size, f.sha256.clone());
+                let (p, key, size, sha, chunk) =
+                    (path.clone(), f.key, f.size, f.sha256.clone(), f.chunk);
                 let ok = tokio::task::spawn_blocking(move || {
                     snapshot::verify(&p, &key, id, size, &sha, chunk).is_ok()
                 })
@@ -1360,7 +1412,8 @@ impl Outbox {
                 id,
                 size: f.size,
                 sha256: f.sha256.clone(),
-                chunk,
+                chunk: f.chunk,
+                broken: Arc::default(),
             };
             match self
                 .upload
@@ -1387,7 +1440,7 @@ impl Outbox {
                         return Err(self.fail(row_id, "transfer.cancelled").await);
                     }
                     let code = error_code(&err);
-                    if code == "transfer.io" {
+                    if code == "transfer.io" || source.broken.load(Ordering::SeqCst) {
                         // A read error mid-PUT: verify again before the next attempt.
                         lock(&self.verified).remove(&f.file_client_id);
                     }

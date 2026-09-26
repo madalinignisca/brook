@@ -908,7 +908,7 @@ mod post_http {
         let fcid = "0190a000-0000-7000-8000-00000000cafe";
         let id = crate::snapshot::id_bytes(fcid).unwrap();
         let snap = dir.path().join(fcid);
-        let w = crate::snapshot::write(&src, &snap, id, 8, &mut |_, _| {}).unwrap();
+        let w = crate::snapshot::write(&src, &snap, id, 8, &mut |_, _| true).unwrap();
         let source = crate::snapshot::SnapshotSource {
             path: snap,
             key: w.key,
@@ -916,6 +916,7 @@ mod post_http {
             size: w.size,
             sha256: w.sha256.clone(),
             chunk: 8,
+            broken: Default::default(),
         };
         let row = crate::outbox::FileRow {
             file_client_id: fcid.into(),
@@ -924,6 +925,7 @@ mod post_http {
             size: w.size,
             sha256: w.sha256.clone(),
             key: w.key,
+            chunk: 8,
             file_id: None,
         };
         let flags = Arc::new(crate::transfer::Flags::default());
