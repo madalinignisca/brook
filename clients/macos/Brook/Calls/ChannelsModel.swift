@@ -25,6 +25,10 @@ final class ChannelsModel {
 
     private let client: any FfiBrookClientProtocol
     private var events: Subscription?
+    /// This user's id (nil until known: nothing counts or notifies before).
+    private let me: String?
+    private let notifier: (any Notifying)?
+    private let isActive: @MainActor () -> Bool
     /// Channels the cache said this user was removed from, with the newest read number at
     /// that moment: a read that started before the removal can't bring one back, and a later
     /// read (re-added since) can.
@@ -32,8 +36,12 @@ final class ChannelsModel {
     /// Each list read's number: only the newest one to finish applies.
     private var generation = 0
 
-    init(client: any FfiBrookClientProtocol) {
+    init(client: any FfiBrookClientProtocol, me: String? = nil, notifier: (any Notifying)? = nil,
+         isActive: @escaping @MainActor () -> Bool = { AppActivity.isActive }) {
         self.client = client
+        self.me = me
+        self.notifier = notifier
+        self.isActive = isActive
     }
 
     private var offline: (any OfflineClient)? { client as? any OfflineClient }
@@ -115,9 +123,22 @@ final class ChannelsModel {
             ready = true
         case let .channelCall(channelId, callId, count):
             liveCalls[channelId] = callId != nil && count > 0 ? count : nil
-        case .messageNew, .messageUpdate, .messageDelete, .resync:
+        case let .messageNew(message):
             timeline?.apply(event)  // the open conversation's
+            arrived(message)
+        case .messageUpdate, .messageDelete, .resync:
+            timeline?.apply(event)
         }
+    }
+
+    /// A live message that isn't being read: its channel's badge rises, and it notifies.
+    private func arrived(_ message: FfiMessage) {
+        guard NotificationPlanner.counts(message, me: me, openChannel: openChannel, appActive: isActive()),
+              let me, let i = channels.firstIndex(where: { $0.id == message.channelId })
+        else { return }
+        channels[i].unread += 1
+        notifier?.post(channelId: message.channelId, title: title(channels[i]),
+                       body: NotificationPlanner.body(message, me: me))
     }
 
     func canJoin(_ channel: ChannelRow) -> Bool { ready }
