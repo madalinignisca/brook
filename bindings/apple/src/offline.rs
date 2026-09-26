@@ -890,6 +890,18 @@ impl FfiBrookClient {
         Ok(users.into_iter().map(FfiMember::from).collect())
     }
 
+    /// Close this client's local data (stores and index), done when this returns: after a
+    /// sign-out that keeps the data, before the next sign-in's client opens the same
+    /// directory. Local data stays off for this client afterwards.
+    pub async fn close_local_data(&self) {
+        let inner = Arc::clone(&self.inner);
+        let _ = run(async move {
+            inner.close_local_data().await;
+            Ok::<(), brook_core::Error>(())
+        })
+        .await;
+    }
+
     /// Erase every other user's data on this device.
     pub async fn wipe_other_local_users(&self) -> Result<(), LoginError> {
         let inner = Arc::clone(&self.inner);

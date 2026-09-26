@@ -602,6 +602,41 @@ mod client {
         assert_eq!(c.outbox_lost(), None);
     }
 
+    /// After a sign-out that keeps the data, `close_local_data` closes the stores and the
+    /// index before it returns, with no polling: the next sign-in's client opens them alone.
+    #[tokio::test]
+    async fn closing_local_data_is_done_when_it_returns() {
+        let server = TestServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let slot: Arc<dyn KeySlot> = Arc::new(InMemoryKeySlot::default());
+        let c = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        assert!(
+            c.enable_local_data(slot.clone(), dir.path().to_path_buf())
+                .await
+        );
+        c.login("alice", "pw").await.unwrap();
+        assert!(active(&c).await);
+        let user = c.session.snapshot().await.1.unwrap().user.id;
+        let origin = server.base.trim_end_matches('/').to_string();
+        c.logout().await; // keeps the data: the stores stay open for reads
+        c.close_local_data().await;
+        assert!(c.offline.lock().await.is_none(), "still switched on");
+        assert!(c.cached_channels().await.is_err());
+        let local = crate::local::LocalData::open(&dir.path().join("stores"), slot)
+            .await
+            .expect("the index is still open")
+            .unwrap();
+        let stores = local.open_user(&origin, &user).await.unwrap();
+        assert!(
+            matches!(
+                stores.cache,
+                crate::store::Opened::Ready { rebuilt: None, .. }
+            ),
+            "the cache is still open"
+        );
+        c.close_local_data().await; // twice: nothing left, no panic
+    }
+
     /// Dropping the client closes the open stores and the index: once it has, every file
     /// opens again at once (nothing is left to whenever the last handle drops).
     #[tokio::test]
