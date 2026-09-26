@@ -423,6 +423,9 @@ impl BrookClient {
             return Err(crate::client::api_error(resp).await);
         }
         let out: MeOut = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
+        // Kept current in the session and beside the stored token, so the next launch shows
+        // it (the stored user is otherwise the one from the last password sign-in).
+        self.session.replace_user(epoch, out.user.clone()).await;
         Ok(Me {
             user: out.user,
             totp_enabled: out.totp_enabled,

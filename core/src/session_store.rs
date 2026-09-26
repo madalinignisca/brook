@@ -20,12 +20,13 @@ use tokio::runtime::Handle;
 use tokio::sync::{watch, RwLock};
 use url::Url;
 
-use crate::{AuthState, Session};
+use crate::{AuthState, Session, User};
 
 /// What `install_for_login` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Install {
-    Installed,
+    /// Installed as session `epoch` (what a later `replace_user` is bound to).
+    Installed(u64),
     /// A sign-out, a newer login or a close won meanwhile: the pair is nobody's (revoke it).
     Stale,
     /// A newer client owns the persistence slot. A pair refreshed from the stored token is in
@@ -433,7 +434,40 @@ impl SessionStore {
         };
         *self.refresh_not_before.lock().unwrap() = None;
         self.rev_tx.send_replace(rev);
-        Install::Installed
+        Install::Installed(rev.epoch)
+    }
+
+    /// The signed-in user's profile changed (`update_profile`, or the server's current one
+    /// at a restore): replace it in the live session and, when this client's session is the
+    /// stored one, beside the same refresh token. Only for session `epoch`, the same user and
+    /// an open store; false otherwise, and nothing changes.
+    ///
+    /// Nothing else moves: tokens, `credential_rev` (no socket re-auth), the login's markers,
+    /// and `AuthState`, which a client reads as a sign-in (its user stays the one as of sign-in;
+    /// `session.user` is current). Takes the flight first, as every stored write does, so a
+    /// refresh's re-store and this one are ordered. The caller must not hold it.
+    pub(crate) async fn replace_user(&self, epoch: u64, user: User) -> bool {
+        let _flight = self.flight().await;
+        let mut guard = self.cell.write().await;
+        let cell = &mut *guard;
+        if self.is_closed() || cell.rev.epoch != epoch {
+            return false;
+        }
+        let persisted = cell.persisted;
+        let Some(session) = cell.session.as_mut() else {
+            return false;
+        };
+        if session.user.id != user.id {
+            return false;
+        }
+        if session.user == user {
+            return true; // unchanged (most restores): no keychain round trip
+        }
+        session.user = user;
+        if persisted {
+            let _ = self.with_slot(|p| p.rewrite_user(session));
+        }
+        true
     }
 
     /// Sign out (or, with `close`, the client is gone): end any login attempt, take the
@@ -664,7 +698,7 @@ mod tests {
         let out = tokio::spawn(async move { s.sign_out(false).await });
         tokio::task::yield_now().await; // the sign-out waits behind it
         drop(held);
-        assert_eq!(install.await.unwrap(), Install::Installed);
+        assert!(matches!(install.await.unwrap(), Install::Installed(_)));
         out.await.unwrap();
         assert!(store.snapshot().await.1.is_none());
         assert_eq!(*state.borrow(), AuthState::LoggedOut);
@@ -691,7 +725,7 @@ mod tests {
         let out = tokio::spawn(async move { s.sign_out(false).await });
         tokio::task::yield_now().await;
         drop(held);
-        assert_eq!(install.await.unwrap(), Install::Installed);
+        assert!(matches!(install.await.unwrap(), Install::Installed(_)));
         out.await.unwrap();
         assert!(
             !slot.contains("session:https://h"),

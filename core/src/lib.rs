@@ -63,6 +63,8 @@ mod state;
 mod store;
 #[cfg(test)]
 mod store_tests;
+#[cfg(test)]
+mod stored_user_tests;
 mod sync;
 #[cfg(test)]
 mod sync_tests;

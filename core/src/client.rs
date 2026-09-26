@@ -68,7 +68,9 @@ impl std::fmt::Debug for TotpChallenge {
 /// What a restore at launch found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreOutcome {
-    /// Signed in with the stored session (its refresh token rotated and stored again).
+    /// Signed in with the stored session (its refresh token rotated and stored again). The
+    /// user is the server's current profile when it answered within `profile_wait`, else the
+    /// stored one.
     LoggedIn(User),
     /// Nothing to restore (never stored, signed out, fenced, or the server refused it).
     NotSignedIn,
@@ -108,6 +110,8 @@ pub struct BrookClient {
     pub(crate) locked_bound: std::time::Duration,
     /// How long `logout` waits for the server to hear the revoke (tests shorten it).
     pub(crate) revoke_wait: std::time::Duration,
+    /// Bound on restore's profile check (`me` and its re-store): past it, the stored user.
+    pub(crate) profile_wait: std::time::Duration,
     /// Attachment transfers: progress events and cancel flags (transfer.rs).
     pub(crate) transfers: Arc<crate::transfer::Transfers>,
     /// Dropped with the client: the background loops end on it, from whatever wait.
@@ -165,6 +169,7 @@ impl BrookClient {
             transport: std::sync::Mutex::new(Some(transport)),
             locked_bound: std::time::Duration::from_secs(30),
             revoke_wait: std::time::Duration::from_secs(3),
+            profile_wait: std::time::Duration::from_secs(5),
             transfers: Arc::new(crate::transfer::Transfers::new()),
             shutdown,
             tasks: std::sync::Mutex::default(),
@@ -314,7 +319,7 @@ impl BrookClient {
         let task = tokio::spawn(async move {
             let _flight = session.flight().await;
             if session.persistence().is_none() {
-                return RestoreOutcome::NotSignedIn;
+                return (RestoreOutcome::NotSignedIn, None);
             }
             // Read (and a fence's cleanup) only as the slot's owner: a newer client's stored
             // session is never read, refreshed or deleted by an older one.
@@ -328,13 +333,13 @@ impl BrookClient {
                 p.load().map(|s| s.map(|s| (s, p.family())))
             });
             let (stored, family) = match read {
-                None => return RestoreOutcome::Superseded, // a newer client owns the slot
+                None => return (RestoreOutcome::Superseded, None), // a newer client owns the slot
                 Some(Ok(Some(stored))) => stored,
-                Some(Ok(None)) => return RestoreOutcome::NotSignedIn,
-                Some(Err(_)) => return RestoreOutcome::Unavailable, // locked or failing: delete nothing
+                Some(Ok(None)) => return (RestoreOutcome::NotSignedIn, None),
+                Some(Err(_)) => return (RestoreOutcome::Unavailable, None), // locked or failing: delete nothing
             };
             let Ok(url) = base.join("api/v1/auth/refresh") else {
-                return RestoreOutcome::Offline;
+                return (RestoreOutcome::Offline, None);
             };
             let resp = match http
                 .post(url)
@@ -343,20 +348,20 @@ impl BrookClient {
                 .await
             {
                 Ok(resp) => resp,
-                Err(_) => return RestoreOutcome::Offline,
+                Err(_) => return (RestoreOutcome::Offline, None),
             };
             if refused(resp.status()) {
                 // Refused: forget it, but only if it's still the stored one.
                 session
                     .clear_persisted_if_holds(gen, &stored.refresh_token)
                     .await;
-                return RestoreOutcome::NotSignedIn;
+                return (RestoreOutcome::NotSignedIn, None);
             }
             if !resp.status().is_success() {
-                return RestoreOutcome::Offline; // 429, 5xx, or not the api answering: kept
+                return (RestoreOutcome::Offline, None); // 429, 5xx, or not the api answering: kept
             }
             let Ok(pair) = resp.json::<TokenPair>().await else {
-                return RestoreOutcome::Offline;
+                return (RestoreOutcome::Offline, None);
             };
             let restored = Session {
                 access_token: pair.access_token,
@@ -370,21 +375,46 @@ impl BrookClient {
                 .install_for_login(gen, restored.clone(), Some(family))
                 .await
             {
-                Install::Installed => RestoreOutcome::LoggedIn(user),
+                Install::Installed(epoch) => {
+                    let access = restored.access_token.clone();
+                    (RestoreOutcome::LoggedIn(user), Some((epoch, access)))
+                }
                 Install::Stale => {
                     // Refreshed from the stored token: spared if that login is the owner's
                     // now, revoked if nobody's (see `revoke_detached`).
                     session.mark_family(&restored.refresh_token, family);
                     session.revoke_detached(restored.refresh_token);
-                    RestoreOutcome::Superseded
+                    (RestoreOutcome::Superseded, None)
                 }
                 // Refreshed from the stored token, so it's the same login as the newer
                 // client that took the slot: the server ends a whole login on logout, and
                 // revoking this would sign that client out. It's left to expire.
-                Install::SlotTaken => RestoreOutcome::Superseded,
+                Install::SlotTaken => (RestoreOutcome::Superseded, None),
             }
         });
-        task.await.unwrap_or(RestoreOutcome::Offline)
+        let (outcome, installed) = task.await.unwrap_or((RestoreOutcome::Offline, None));
+        // The stored user is as of the last password sign-in: ask for the current one, now
+        // that the task's flight has ended (`replace_user` takes it). Bounded, `me` and the
+        // re-store together; past it, or on any failure, the stored user stands.
+        let (RestoreOutcome::LoggedIn(stored_user), Some((epoch, access))) = (&outcome, installed)
+        else {
+            return outcome;
+        };
+        let check = async {
+            let current = fetch_me(&self.http, &self.base, &access).await.ok()?;
+            if current.id != stored_user.id {
+                tracing::warn!("the profile answered for another user; keeping the stored one");
+                return None;
+            }
+            self.session
+                .replace_user(epoch, current.clone())
+                .await
+                .then_some(current)
+        };
+        match tokio::time::timeout(self.profile_wait, check).await {
+            Ok(Some(current)) => RestoreOutcome::LoggedIn(current),
+            _ => outcome,
+        }
     }
 
     /// The background loops' handles (tests: to see them end).
@@ -472,8 +502,10 @@ impl BrookClient {
                     };
                     // A fresh login is a login of its own: whatever refused it, revoking it
                     // touches nobody else.
-                    if session.install_for_login(gen, new.clone(), None).await == Install::Installed
-                    {
+                    if matches!(
+                        session.install_for_login(gen, new.clone(), None).await,
+                        Install::Installed(_)
+                    ) {
                         Ok(LoginOutcome::LoggedIn(new)) // LoggedIn published by the install
                     } else {
                         session.revoke_detached(new.refresh_token); // superseded meanwhile
