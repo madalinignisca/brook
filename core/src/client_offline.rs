@@ -466,6 +466,23 @@ impl BrookClient {
         self.active_files().await?.state(file_id).await
     }
 
+    /// "Keep available offline": `file_id` is downloaded now, or as soon as there's a
+    /// connection, and kept until unpinned (never evicted). Durable across restarts.
+    /// `file.unknown` / `file.gone` as for [`BrookClient::cache_file`].
+    pub async fn pin_file(&self, file_id: &str) -> Result<()> {
+        self.active_files().await?.pin_file(file_id).await
+    }
+
+    /// Stop keeping `file_id` offline: it stays cached as an ordinary (evictable) file.
+    pub async fn unpin_file(&self, file_id: &str) -> Result<()> {
+        self.active_files().await?.unpin_file(file_id).await
+    }
+
+    /// How much the pinned files take (they don't count against the cache's cap).
+    pub async fn pinned_bytes(&self) -> Result<u64> {
+        self.active_files().await?.pinned_bytes().await
+    }
+
     /// Remove the plaintext copies Open made (the app calls this when it quits).
     pub async fn clear_open_copies(&self) {
         if let Ok(files) = self.active_files().await {

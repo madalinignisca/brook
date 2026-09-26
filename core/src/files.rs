@@ -38,6 +38,13 @@ pub const FILE_CACHE_CAP: u64 = 1 << 30;
 /// Sealed chunks between a blob's fsync and its recorded `done` (the crash-resume point).
 const SYNC_EVERY: u64 = 8;
 
+/// After a round with failures, the pin fetcher tries again this much later (or sooner,
+/// woken by the connection coming back).
+const FETCH_RETRY: Duration = Duration::from_secs(60);
+
+/// The longest a pinned file that keeps failing waits between attempts.
+const FETCH_BACKOFF_MAX: Duration = Duration::from_secs(4 * 3600);
+
 /// How often a caller waiting on a shared download checks its own cancel.
 const CALLER_TICK: Duration = Duration::from_millis(100);
 
@@ -52,6 +59,14 @@ pub enum FileCacheState {
     },
     /// Complete: opens with no connection.
     Cached,
+    /// Kept available offline: never evicted, and downloaded whenever there's a connection.
+    /// `transfer` is the background download's id while it runs (its progress and cancel).
+    Pinned {
+        cached: bool,
+        done: u64,
+        size: u64,
+        transfer: Option<TransferId>,
+    },
 }
 
 /// Where a cached download comes from: the store's own session only (`epoch`).
@@ -108,6 +123,16 @@ impl Failure {
     }
 }
 
+/// The server wasn't reached (or there's no session): not the file's fault, so it doesn't
+/// back the file off. A failure the server answered (a 5xx, wrong bytes) does.
+pub(crate) fn is_connection_failure(err: &Error) -> bool {
+    match err {
+        Error::Api { code, .. } => matches!(code.as_str(), "transfer.network" | "transfer.paused"),
+        Error::NotAuthenticated | Error::Http(_) | Error::Timeout | Error::Disconnected => true,
+        _ => false,
+    }
+}
+
 fn api_error(code: &str) -> Error {
     let message = match code {
         "file.unknown" => "no cached message has this file",
@@ -136,6 +161,7 @@ struct Row {
     sha256: String,
     state: String,
     done: u64,
+    pinned: bool,
 }
 
 pub(crate) struct Files {
@@ -158,12 +184,217 @@ pub(crate) struct Files {
     /// Held by the journal sweep and by whoever makes a row and opens its blob: a sweep never
     /// unlinks a blob that a new download of the same file has just opened.
     blob_lock: tokio::sync::Mutex<()>,
+    /// Wakes the pin fetcher (a pin, the connection back, the session back).
+    fetch_wake: Arc<tokio::sync::Notify>,
+    /// Pinned files the fetcher is downloading now, with the id their progress runs under.
+    fetching: Mutex<HashMap<String, TransferId>>,
+    /// How long the fetcher waits after a failed round before trying again (tests shorten it).
+    fetch_retry: Mutex<Duration>,
+    /// Pinned files that keep failing: how many times in a row, and not before when. The
+    /// wait doubles each time (from `fetch_retry`, up to `FETCH_BACKOFF_MAX`), so a file that
+    /// can't be fetched (a server that keeps sending wrong bytes) isn't re-downloaded whole
+    /// every minute. Reset by a success or a new pin.
+    fetch_failures: Mutex<HashMap<String, (u32, tokio::time::Instant)>>,
 }
 
 impl Files {
     #[cfg(test)]
     pub(crate) fn set_cap(&self, cap: u64) {
         self.cap.store(cap, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_fetch_retry(&self, wait: Duration) {
+        *lock(&self.fetch_retry) = wait;
+        self.fetch_wake.notify_one();
+    }
+
+    // ---- Keep available offline ----
+
+    /// Keep `file_id` on this device: never evicted, downloaded now or as soon as there's a
+    /// connection (and again after a restart until it's complete). Durable.
+    pub(crate) async fn pin_file(&self, file_id: &str) -> crate::Result<()> {
+        self.check_open()?;
+        let info = self.lookup(file_id).await?;
+        let sha256 = info
+            .sha256
+            .clone()
+            .ok_or_else(|| api_error("file.unknown"))?;
+        let key = new_key()?;
+        let (fid, k, size) = (file_id.to_string(), key.to_vec(), info.size as i64);
+        let made = self
+            .cache
+            .db()
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO files(file_id, sha256, size, key, chunk, state, done, pinned)
+                     SELECT ?1, ?2, ?3, ?4, ?5, 'partial', 0, 1
+                     WHERE EXISTS (SELECT 1 FROM message_files WHERE file_id = ?1)
+                     ON CONFLICT(file_id) DO UPDATE SET pinned = 1",
+                    params![fid, sha256, size, k, CHUNK as i64],
+                )
+            })
+            .await
+            .map_err(store_failed)?;
+        if made == 0 {
+            return Err(api_error("file.gone"));
+        }
+        lock(&self.fetch_failures).remove(file_id); // pinning again retries at once
+        self.cache
+            .announce(CacheEvent::Files(vec![file_id.to_string()]));
+        self.fetch_wake.notify_one();
+        Ok(())
+    }
+
+    /// Stop keeping `file_id`: it stays cached as an ordinary file (evictable). A background
+    /// download of it stops unless someone else is waiting on it (an Open).
+    pub(crate) async fn unpin_file(&self, file_id: &str) -> crate::Result<()> {
+        self.check_open()?;
+        let fid = file_id.to_string();
+        self.cache
+            .db()
+            .call(move |c| c.execute("UPDATE files SET pinned = 0 WHERE file_id = ?1", [&fid]))
+            .await
+            .map_err(store_failed)?;
+        let fetching = lock(&self.fetching).get(file_id).copied();
+        if let Some(id) = fetching {
+            self.transfers.flag(id).cancel.store(true, Ordering::SeqCst);
+        }
+        self.cache
+            .announce(CacheEvent::Files(vec![file_id.to_string()]));
+        Ok(())
+    }
+
+    /// The size of every pinned file (they don't count against the cap).
+    pub(crate) async fn pinned_bytes(&self) -> crate::Result<u64> {
+        self.cache
+            .db()
+            .call(|c| {
+                c.query_row(
+                    "SELECT COALESCE(SUM(size), 0) FROM files WHERE pinned = 1",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .await
+            .map(|n| n as u64)
+            .map_err(store_failed)
+    }
+
+    /// The background task that downloads pinned files, one at a time: at open, on a pin,
+    /// when the connection or the session comes back, and a while after a failed round.
+    fn start_fetcher(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let wake = self.fetch_wake.clone();
+        let mut online = self.cache.state();
+        let mut session = self.session.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Some(files) = weak.upgrade() else { break };
+                if files.closed.load(Ordering::SeqCst) {
+                    break;
+                }
+                let failed = files.fetch_round().await;
+                let retry = *lock(&files.fetch_retry);
+                drop(files);
+                let mut was_offline = online.borrow_and_update().offline;
+                // Wait for a reason to go round again.
+                loop {
+                    tokio::select! {
+                        _ = wake.notified() => break,
+                        changed = online.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            let now_offline = online.borrow_and_update().offline;
+                            // Only the way back online matters.
+                            if was_offline && !now_offline {
+                                // A round now: pins that failed for want of a connection have
+                                // no backoff and go at once. Backoffs from failures the server
+                                // answered keep their wait (a flapping signal mustn't re-download
+                                // a stuck file on every reconnect).
+                                break;
+                            }
+                            was_offline = now_offline;
+                        }
+                        changed = session.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            if session.borrow_and_update().is_some() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(retry), if failed => break,
+                    }
+                }
+            }
+        });
+        lock(&self.tasks).push(task);
+    }
+
+    /// Download every pinned file that isn't complete; whether any failed.
+    async fn fetch_round(self: &Arc<Self>) -> bool {
+        if self.closed.load(Ordering::SeqCst) || self.session.borrow().is_none() {
+            return false;
+        }
+        let wanted = self
+            .cache
+            .db()
+            .call(|c| {
+                c.prepare("SELECT file_id FROM files WHERE pinned = 1 AND state != 'complete'")?
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()
+            })
+            .await
+            .unwrap_or_default();
+        let mut failed = false;
+        let now = tokio::time::Instant::now();
+        for file_id in wanted {
+            if self.closed.load(Ordering::SeqCst) {
+                break;
+            }
+            // Backing off after failures: not yet (a later round picks it up).
+            let due = lock(&self.fetch_failures)
+                .get(&file_id)
+                .is_none_or(|(_, not_before)| *not_before <= now);
+            if !due {
+                failed = true; // keeps the fetcher coming back
+                continue;
+            }
+            let id = TransferId::new();
+            lock(&self.fetching).insert(file_id.clone(), id);
+            self.cache
+                .announce(CacheEvent::Files(vec![file_id.clone()]));
+            let result = self.cache_file(id, &file_id).await;
+            lock(&self.fetching).remove(&file_id);
+            match &result {
+                Ok(()) => {
+                    lock(&self.fetch_failures).remove(&file_id);
+                }
+                // Gone or unknown: the lifecycle dropped it, pin and all. Cancelled: unpinned
+                // (or the store is closing).
+                Err(Error::Api { code, .. })
+                    if matches!(
+                        code.as_str(),
+                        "file.gone" | "file.unknown" | "transfer.cancelled"
+                    ) => {}
+                // No connection (or no session): not the file's fault, so no backoff for it;
+                // the connection or the session coming back wakes the fetcher.
+                Err(e) if is_connection_failure(e) => failed = true,
+                Err(_) => {
+                    failed = true;
+                    let base = *lock(&self.fetch_retry);
+                    let mut failures = lock(&self.fetch_failures);
+                    let n = failures.get(&file_id).map_or(0, |(n, _)| *n) + 1;
+                    let wait = base
+                        .saturating_mul(1u32 << (n - 1).min(16))
+                        .min(FETCH_BACKOFF_MAX);
+                    failures.insert(file_id.clone(), (n, tokio::time::Instant::now() + wait));
+                }
+            }
+        }
+        failed
     }
 
     /// Open the file cache of the store at `store_dir` and reconcile it (best-effort, before
@@ -186,6 +417,10 @@ impl Files {
             open_dir,
             cap: std::sync::atomic::AtomicU64::new(FILE_CACHE_CAP),
             blob_lock: tokio::sync::Mutex::new(()),
+            fetch_wake: Arc::default(),
+            fetching: Mutex::default(),
+            fetch_retry: Mutex::new(FETCH_RETRY),
+            fetch_failures: Mutex::default(),
             net,
             transfers,
             session,
@@ -208,6 +443,7 @@ impl Files {
             })
         };
         *lock(&files.sweeper) = Some(sweeper);
+        files.start_fetcher();
         files
     }
 
@@ -222,6 +458,7 @@ impl Files {
                 flight.flags.cancel.store(true, Ordering::SeqCst);
             }
         }
+        self.fetch_wake.notify_one(); // the fetcher sees `closed` and ends
         let sweeper = lock(&self.sweeper).take();
         if let Some(sweeper) = sweeper {
             sweeper.abort();
@@ -426,14 +663,21 @@ impl Files {
     pub(crate) async fn state(&self, file_id: &str) -> crate::Result<FileCacheState> {
         Ok(match self.row(file_id).await? {
             None => FileCacheState::NotCached,
+            Some(r) if r.pinned => FileCacheState::Pinned {
+                cached: r.state == "complete",
+                done: if r.state == "complete" {
+                    r.size
+                } else {
+                    r.done
+                },
+                size: r.size,
+                transfer: lock(&self.fetching).get(file_id).copied(),
+            },
             Some(r) if r.state == "complete" => FileCacheState::Cached,
-            Some(r) => {
-                let flying = lock(&self.flights).contains_key(file_id);
-                FileCacheState::Partial {
-                    done: if flying { r.done } else { r.done.min(r.size) },
-                    size: r.size,
-                }
-            }
+            Some(r) => FileCacheState::Partial {
+                done: r.done,
+                size: r.size,
+            },
         })
     }
 
@@ -777,7 +1021,8 @@ impl Files {
                     }
                 }
             }
-            // A row whose blob is missing or shorter than it records goes.
+            // A row whose blob is shorter than it records (or missing, when it records any
+            // bytes) can't be trusted.
             named
                 .into_iter()
                 .filter(|(id, (state, size, chunk, done))| {
@@ -790,6 +1035,11 @@ impl Files {
                     } else {
                         layout.sealed_offset(done / *chunk as u64)
                     };
+                    // Nothing downloaded yet (a pin waiting for a connection): no blob is
+                    // fine, the first download makes it.
+                    if need == 0 {
+                        return false;
+                    }
                     let have = std::fs::metadata(blobs.join(id)).map(|m| m.len()).ok();
                     have.is_none_or(|h| h < need)
                 })
@@ -804,7 +1054,26 @@ impl Files {
                 .db()
                 .call(move |c| {
                     let tx = c.transaction()?;
-                    file_rows::drop_files(&tx, &bad)?;
+                    for id in &bad {
+                        let pinned: bool = tx.query_row(
+                            "SELECT pinned FROM files WHERE file_id = ?1",
+                            [id],
+                            |r| r.get::<_, i64>(0).map(|p| p != 0),
+                        )?;
+                        if pinned {
+                            // Kept offline: start it over (a new key, from 0), keeping the
+                            // pin. The next download truncates the blob to 0 as it opens it.
+                            let mut key = [0u8; 32];
+                            let _ = getrandom::fill(&mut key);
+                            tx.execute(
+                                "UPDATE files SET key = ?2, done = 0, state = 'partial'
+                                 WHERE file_id = ?1",
+                                params![id, key.to_vec()],
+                            )?;
+                        } else {
+                            file_rows::drop_files(&tx, std::slice::from_ref(id))?;
+                        }
+                    }
                     tx.commit()
                 })
                 .await;
@@ -852,7 +1121,8 @@ impl Files {
             .db()
             .call(move |c| {
                 c.query_row(
-                    "SELECT key, chunk, size, sha256, state, done FROM files WHERE file_id = ?1",
+                    "SELECT key, chunk, size, sha256, state, done, pinned FROM files
+                     WHERE file_id = ?1",
                     [&id],
                     |r| {
                         let key: Vec<u8> = r.get(0)?;
@@ -863,6 +1133,7 @@ impl Files {
                             r.get(3)?,
                             r.get(4)?,
                             r.get::<_, i64>(5)?,
+                            r.get::<_, i64>(6)? != 0,
                         ))
                     },
                 )
@@ -871,7 +1142,7 @@ impl Files {
             .await
             .map_err(store_failed)
             .map(|found| {
-                found.and_then(|(key, chunk, size, sha256, state, done)| {
+                found.and_then(|(key, chunk, size, sha256, state, done, pinned)| {
                     Some(Row {
                         key: key.try_into().ok()?,
                         chunk: chunk as usize,
@@ -879,6 +1150,7 @@ impl Files {
                         sha256,
                         state,
                         done: done as u64,
+                        pinned,
                     })
                 })
             })
@@ -959,9 +1231,12 @@ impl EncryptingSink {
                         // A journal entry left for this path by an earlier copy is stale now.
                         tx.execute("DELETE FROM deletions WHERE path = 'files/' || ?1", [&fid])?;
                         let made = tx.execute(
-                            "INSERT OR REPLACE INTO files(file_id, sha256, size, key, chunk, state, done)
+                            "INSERT INTO files(file_id, sha256, size, key, chunk, state, done)
                              SELECT ?1, ?2, ?3, ?4, ?5, 'partial', 0
-                             WHERE EXISTS (SELECT 1 FROM message_files WHERE file_id = ?1)",
+                             WHERE EXISTS (SELECT 1 FROM message_files WHERE file_id = ?1)
+                             ON CONFLICT(file_id) DO UPDATE SET sha256 = excluded.sha256,
+                                 size = excluded.size, key = excluded.key,
+                                 chunk = excluded.chunk, state = 'partial', done = 0",
                             params![fid, sha, size as i64, k, chunk as i64],
                         )?;
                         tx.commit()?;
