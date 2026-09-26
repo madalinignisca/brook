@@ -26,7 +26,17 @@ from .. import files as storage
 from ..db import get_session
 from ..deps import get_current_user
 from ..hub import Hub, get_hub
-from ..models import Channel, File, Membership, Message, OwnerOffer, Reaction, User, utcnow
+from ..models import (
+    Channel,
+    File,
+    Membership,
+    Message,
+    MessageMention,
+    OwnerOffer,
+    Reaction,
+    User,
+    utcnow,
+)
 from ..schemas import (
     ChannelCreate,
     ChannelMember,
@@ -193,6 +203,30 @@ async def _unread_counts(session: AsyncSession, user_id: uuid.UUID) -> dict[uuid
     return {channel_id: count for channel_id, count in (await session.execute(stmt)).all()}
 
 
+async def _unread_mentions(session: AsyncSession, user_id: uuid.UUID) -> dict[uuid.UUID, int]:
+    """Unread messages that mention you, per channel, in one query: newer than your read
+    marker, not deleted, not your own, and naming you or ``@channel``/``@here``."""
+    mentioned = (
+        select(MessageMention.message_id).where(MessageMention.user_id == user_id).scalar_subquery()
+    )
+    stmt = (
+        select(Message.channel_id, func.count(Message.id))
+        .join(Membership, Membership.channel_id == Message.channel_id)
+        .where(
+            Membership.user_id == user_id,
+            Message.deleted_at.is_(None),
+            Message.author_id != user_id,
+            or_(
+                Membership.last_read_message_id.is_(None),
+                Message.id > Membership.last_read_message_id,
+            ),
+            or_(Message.mention_everyone.is_(True), Message.id.in_(mentioned)),
+        )
+        .group_by(Message.channel_id)
+    )
+    return {channel_id: count for channel_id, count in (await session.execute(stmt)).all()}
+
+
 async def _latest_message_id(session: AsyncSession, channel_id: uuid.UUID) -> uuid.UUID | None:
     """The newest non-deleted message id in a channel, or None."""
     latest: uuid.UUID | None = await session.scalar(
@@ -251,7 +285,13 @@ async def list_channels(user: CurrentUser, session: Session) -> list[ChannelOut]
         ).all()
     )
     unread = await _unread_counts(session, user.id)
-    return [await _channel_out_for(session, c, unread.get(c.id, 0)) for c in channels]
+    mentions = await _unread_mentions(session, user.id)
+    return [
+        (await _channel_out_for(session, c, unread.get(c.id, 0))).model_copy(
+            update={"unread_mentions": mentions.get(c.id, 0)}
+        )
+        for c in channels
+    ]
 
 
 @router.get("/public", response_model=list[ChannelOut])
@@ -312,7 +352,11 @@ async def search_messages(
     )
     rows = (await session.execute(stmt)).all()
     files = await _attachments_for(session, [m.id for m, _ in rows])
-    return [_message_out(m, author, attachments=files.get(m.id)) for m, author in rows]
+    mentions = await _mentions_for(session, [m.id for m, _ in rows])
+    return [
+        _message_out(m, author, mentions=mentions.get(m.id), attachments=files.get(m.id))
+        for m, author in rows
+    ]
 
 
 @router.post("", response_model=ChannelOut, status_code=status.HTTP_201_CREATED)
@@ -717,11 +761,17 @@ async def history(
     excerpts = await _reply_excerpts(session, messages)
     reactions = await _reactions_for(session, [m.id for m in messages], user.id)
     files = await _attachments_for(session, [m.id for m in messages])
-    # Mentions are resolved only on the live send (they drive notifications); not
-    # recomputed per history read (that would mis-resolve against today's membership).
+    # Mentions as stored at send, never re-resolved per read (that would mis-resolve
+    # against today's membership).
+    mentions = await _mentions_for(session, [m.id for m in messages])
     return [
         _message_out(
-            m, author, excerpts.get(m.reply_to_id), reactions.get(m.id), attachments=files.get(m.id)
+            m,
+            author,
+            excerpts.get(m.reply_to_id),
+            reactions.get(m.id),
+            mentions=mentions.get(m.id),
+            attachments=files.get(m.id),
         )
         for m, author in rows
     ]
@@ -799,6 +849,13 @@ async def send_message(
             raise
         return _resend_answer(stored, channel_id, response)
     attached = await _attach_files(session, message, body.attachments, user, channel_id)
+    # Mentions are resolved once, here, against the channel's members now, and stored so
+    # history and /sync carry them: a mention received while offline still highlights.
+    members = await _members(session, channel_id)
+    mentions, everyone = _mentions_in(message.body, members)
+    message.mention_everyone = everyone
+    for mentioned in mentions:
+        session.add(MessageMention(message_id=message.id, user_id=mentioned))
     # Sending implicitly reads the channel up to your own message — but only ever
     # advance the marker (don't rewind past a newer message read concurrently).
     membership = await _membership(session, channel_id, user.id)
@@ -809,8 +866,6 @@ async def send_message(
     await session.commit()
     await session.refresh(message)
 
-    members = await _members(session, channel_id)
-    mentions, everyone = _mentions_in(message.body, members)
     out = _message_out(
         message, user, reply, mentions=mentions, mention_everyone=everyone, attachments=attached
     )
@@ -910,8 +965,14 @@ async def _stored_send(
             reply = await _quote(session, quoted)
     reactions = await _reactions_for(session, [message.id], user.id)
     files = await _attachments_for(session, [message.id])
+    mentions = await _mentions_for(session, [message.id])
     return _message_out(
-        message, user, reply, reactions.get(message.id), attachments=files.get(message.id)
+        message,
+        user,
+        reply,
+        reactions.get(message.id),
+        mentions=mentions.get(message.id),
+        attachments=files.get(message.id),
     )
 
 
@@ -964,7 +1025,10 @@ async def edit_message(
 
     # Edits don't re-resolve/re-notify mentions (mentions fire on the original send).
     files = await _attachments_for(session, [message_id])
-    out = _message_out(message, user, reply, reactions, attachments=files.get(message_id))
+    mentions = (await _mentions_for(session, [message_id])).get(message_id)
+    out = _message_out(
+        message, user, reply, reactions, mentions=mentions, attachments=files.get(message_id)
+    )
     await broadcast_message_update(session, hub, message_id)  # each member's own `me`
     return out
 
@@ -986,9 +1050,10 @@ async def broadcast_message_update(session: AsyncSession, hub: Hub, message_id: 
         if quoted is not None:
             reply = await _quote(session, quoted)
     files = (await _attachments_for(session, [message_id])).get(message_id)
+    mentions = (await _mentions_for(session, [message_id])).get(message_id)
     for member in await _members(session, message.channel_id):
         reactions = (await _reactions_for(session, [message_id], member.id)).get(message_id, [])
-        out = _message_out(message, author, reply, reactions, attachments=files)
+        out = _message_out(message, author, reply, reactions, mentions=mentions, attachments=files)
         await hub.send_to_users([member.id], _envelope("message.update", jsonable_encoder(out)))
 
 
@@ -1007,6 +1072,9 @@ async def delete_message(
         raise _forbidden("Only the author or an admin can delete a message")
 
     message.deleted_at = utcnow()
+    # A tombstone mentions nobody: its words are gone, and so is anything they flagged.
+    message.mention_everyone = False
+    await session.execute(delete(MessageMention).where(MessageMention.message_id == message_id))
     # The message's files go with it (attachments spec §7): rows now, bytes after commit.
     file_ids = list(
         (await session.scalars(select(File.id).where(File.message_id == message_id))).all()
@@ -1142,6 +1210,23 @@ async def mark_read(
         await session.commit()
 
 
+async def _mentions_for(
+    session: AsyncSession, message_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[uuid.UUID]]:
+    """Stored ``@handle`` mentions per message, in one query (resolved once, at send)."""
+    if not message_ids:
+        return {}
+    rows = await session.execute(
+        select(MessageMention.message_id, MessageMention.user_id).where(
+            MessageMention.message_id.in_(message_ids)
+        )
+    )
+    out: dict[uuid.UUID, list[uuid.UUID]] = {}
+    for message_id, user_id in rows.all():
+        out.setdefault(message_id, []).append(user_id)
+    return out
+
+
 def _mentions_in(body: str, members: list[User]) -> tuple[list[uuid.UUID], bool]:
     """Resolve a body's mentions to (specific member ids, everyone?).
 
@@ -1163,7 +1248,7 @@ def _message_out(
     reply: ReplyExcerpt | None = None,
     reactions: list[ReactionSummary] | None = None,
     mentions: list[uuid.UUID] | None = None,
-    mention_everyone: bool = False,
+    mention_everyone: bool | None = None,
     attachments: list[FileOut] | None = None,
 ) -> MessageOut:
     return MessageOut(
@@ -1185,7 +1270,7 @@ def _message_out(
         # A tombstone carries no attachments (their files are removed with it).
         attachments=[] if message.deleted_at is not None else (attachments or []),
         mentions=mentions or [],
-        mention_everyone=mention_everyone,
+        mention_everyone=message.mention_everyone if mention_everyone is None else mention_everyone,
     )
 
 

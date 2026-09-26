@@ -34,6 +34,7 @@ from ..schemas import ChannelOut, MessageOut
 from .channels import (
     _attachments_for,
     _channel_out,
+    _mentions_for,
     _message_out,
     _reactions_for,
     _reply_excerpts,
@@ -317,9 +318,15 @@ async def _messages_out(
     excerpts = await _reply_excerpts(session, messages)
     reactions = await _reactions_for(session, [m.id for m in messages], user.id)
     files = await _attachments_for(session, [m.id for m in messages])
+    mentions = await _mentions_for(session, [m.id for m in messages])
     return [
         _message_out(
-            m, author, excerpts.get(m.reply_to_id), reactions.get(m.id), attachments=files.get(m.id)
+            m,
+            author,
+            excerpts.get(m.reply_to_id),
+            reactions.get(m.id),
+            mentions=mentions.get(m.id),
+            attachments=files.get(m.id),
         )
         for m, author in rows
     ]

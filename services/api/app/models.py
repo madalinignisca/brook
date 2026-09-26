@@ -20,6 +20,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -129,6 +130,22 @@ class RefreshToken(Base):
     # No foreign key on purpose: rotation writes this on the old row before the
     # successor row is inserted (same transaction), which a non-deferred FK refuses.
     replaced_by_id: Mapped[uuid.UUID | None] = mapped_column(default=None)
+
+
+class MessageMention(Base):
+    """A member a message mentions by ``@handle``, resolved once at send (edits don't
+    re-resolve). Stored so history and ``/sync`` carry mentions: a mention received
+    while offline still highlights. ``@channel``/``@here`` is ``Message.mention_everyone``.
+    Deleting the message deletes these (a tombstone mentions nobody)."""
+
+    __tablename__ = "message_mentions"
+
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
 
 
 class OwnerOffer(Base):
@@ -242,6 +259,8 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # ``@channel``/``@here`` at send (specific ``@handle``s are in ``message_mentions``).
+    mention_everyone: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
 
 class Reaction(Base):
