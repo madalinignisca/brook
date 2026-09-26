@@ -205,6 +205,12 @@ final class ComposerModel {
     private let client: any ChatClient
     /// Where a sent or edited message goes (the timeline, before the live event arrives).
     private let onMessage: (FfiMessage) -> Void
+    /// The channel's unsent bubbles, re-read after a message is queued.
+    weak var pending: PendingModel?
+    /// A queued send that failed: the same text, quote and channel again reuse its id, so
+    /// a retry can never become two messages (core keeps the first); anything else changed
+    /// is a new message with a new id (as GTK, #162).
+    private var draft: (body: String, reply: String?, id: String)?
 
     init(channelId: String, client: any ChatClient, onMessage: @escaping (FfiMessage) -> Void) {
         self.channelId = channelId
@@ -250,6 +256,26 @@ final class ComposerModel {
         self.editing = nil
         sending = true
         defer { sending = false }
+        if editing == nil, let cache = client as? any OfflineClient {
+            let id = draftId(body: body, reply: reply?.id)
+            do {
+                _ = try await cache.sendQueued(channelId: channelId, body: body, replyToId: reply?.id,
+                                               clientId: id)
+                draft = nil
+                error = nil
+                await pending?.reload()
+                return
+            } catch where error.isLocalUnavailable {
+                draft = nil // no local data (yet): sent directly below, as before
+            } catch {
+                if text.isEmpty { // unless something new was typed meanwhile
+                    text = typed
+                    replyingTo = reply
+                }
+                self.error = Self.explainQueued(error)
+                return
+            }
+        }
         do {
             let message: FfiMessage
             if let editing {
@@ -268,6 +294,23 @@ final class ComposerModel {
                 self.editing = editing
             }
             self.error = Self.explain(error)
+        }
+    }
+
+    /// The failed draft's id for the same message, else a new lowercase one.
+    private func draftId(body: String, reply: String?) -> String {
+        if let draft, draft.body == body, draft.reply == reply { return draft.id }
+        let id = UUID().uuidString.lowercased()
+        draft = (body, reply, id)
+        return id
+    }
+
+    /// A queued send that failed before it was saved (nothing was queued).
+    static func explainQueued(_ error: Error) -> String {
+        switch error as? LoginError {
+        case let .Api(code, _) where code == "outbox.empty_message": "Write something first."
+        case .NotAuthenticated: "You were signed out."
+        default: "Couldn't save the message to send."
         }
     }
 
