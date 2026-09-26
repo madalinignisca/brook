@@ -109,7 +109,11 @@ struct MessageWidgets {
     /// Shown as a tombstone (the message was deleted).
     deleted: Rc<Cell<bool>>,
     /// The message carries files (its text may then be empty).
-    has_files: bool,
+    has_files: Rc<Cell<bool>>,
+    /// The attachment rows by file id, in `files_box` (a file deleted from the message
+    /// leaves on `message.update`).
+    files_box: gtk::Box,
+    file_rows: Rc<RefCell<Vec<(String, gtk::Widget)>>>,
     /// The message text as sent (markdown, not the rendered markup), for editing.
     source: Rc<RefCell<String>>,
     /// Hidden once the message is a tombstone: actions, quote, files, reactions.
@@ -490,12 +494,7 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     // Update the row in place if the edited message is on screen.
                     let widgets = chat.message_rows.borrow().get(&message.id).cloned();
                     if let Some(widgets) = widgets {
-                        widgets.body.set_markup(&markdown_to_pango(&message.body));
-                        widgets.source.replace(message.body.clone());
-                        // An edit can add or clear a file message's caption (the server refuses
-                        // a blank edit on a message without files), so follow the new text.
-                        widgets.body.set_visible(!message.body.trim().is_empty());
-                        widgets.edited.set_visible(true);
+                        update_message(&chat, &widgets, &message);
                     }
                 }
                 Ok(ServerEvent::MessageDelete { message_id, .. }) => {
@@ -1193,14 +1192,23 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
     // A file sent without a caption has no text line (the server allows an empty body
     // when files are attached).
     body_label.set_visible(!(message.body.trim().is_empty() && !message.attachments.is_empty()));
+    if message.body.trim().is_empty() && message.attachments.is_empty() && !message.is_deleted() {
+        // Every file was deleted from a message that had no text.
+        body_label.set_markup("<i>Files removed</i>");
+        body_label.add_css_class("dim-label");
+    }
     row.append(&body_label);
     // Attached files (a tombstone has none): shown, and saved only on request.
+    let files_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let file_rows = Rc::new(RefCell::new(Vec::new()));
     for file in &message.attachments {
         let file_row =
             crate::attachments::attachment_row(file, chat.client.clone(), chat.runtime.clone());
-        row.append(&file_row);
-        extras.push(file_row.upcast());
+        files_box.append(&file_row);
+        file_rows.borrow_mut().push((file.id.clone(), file_row));
     }
+    row.append(&files_box);
+    extras.push(files_box.clone().upcast());
 
     // Reactions row: chips + a quick-react picker.
     let reactions_box = gtk::Box::builder()
@@ -1243,7 +1251,9 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
         reactions_box,
         reactions: Rc::new(RefCell::new(message.reactions.clone())),
         deleted: Rc::new(Cell::new(false)),
-        has_files: !message.attachments.is_empty(),
+        has_files: Rc::new(Cell::new(!message.attachments.is_empty())),
+        files_box,
+        file_rows,
         source: Rc::new(RefCell::new(message.body.clone())),
         extras,
         quote: quote_widgets,
@@ -1450,7 +1460,7 @@ fn message_actions_button(chat: &Rc<Chat>, message: &Message, is_own: bool) -> g
                 .message_rows
                 .borrow()
                 .get(&message_id)
-                .map(|w| (w.source.borrow().clone(), w.has_files))
+                .map(|w| (w.source.borrow().clone(), w.has_files.get()))
                 .unwrap_or_default();
             edit_message_dialog(&chat, channel_id.clone(), message_id.clone(), current);
         }
@@ -2371,7 +2381,7 @@ fn pending_row(chat: &Rc<Chat>, item: &PendingMessage) -> gtk::ListBoxRow {
         let quoted = chat.message_rows.borrow().get(target).map(|w| Quoted {
             text: w.body.text().to_string(),
             deleted: w.deleted.get(),
-            has_files: w.has_files,
+            has_files: w.has_files.get(),
         });
         let excerpt = reply_excerpt(quoted.as_ref());
         column.append(
@@ -2885,6 +2895,49 @@ struct Quoted {
     text: String,
     deleted: bool,
     has_files: bool,
+}
+
+/// A `message.update`: an edit of the text, or a file deleted from the message (its
+/// `attachments` only ever shrink; an edit never touches them).
+fn update_message(chat: &Rc<Chat>, widgets: &MessageWidgets, message: &Message) {
+    if widgets.deleted.get() {
+        return; // a tombstone stays one
+    }
+    widgets.body.set_markup(&markdown_to_pango(&message.body));
+    widgets.source.replace(message.body.clone());
+    widgets.edited.set_visible(message.edited_at.is_some());
+    // Rows of files still attached stay as they are (a Save in progress continues).
+    let wanted: Vec<&str> = message.attachments.iter().map(|f| f.id.as_str()).collect();
+    widgets.file_rows.borrow_mut().retain(|(id, row)| {
+        let keep = wanted.contains(&id.as_str());
+        if !keep {
+            widgets.files_box.remove(row);
+        }
+        keep
+    });
+    for file in &message.attachments {
+        let shown = widgets
+            .file_rows
+            .borrow()
+            .iter()
+            .any(|(id, _)| *id == file.id);
+        if !shown {
+            let row =
+                crate::attachments::attachment_row(file, chat.client.clone(), chat.runtime.clone());
+            widgets.files_box.append(&row);
+            widgets.file_rows.borrow_mut().push((file.id.clone(), row));
+        }
+    }
+    widgets.has_files.set(!message.attachments.is_empty());
+    // The text line follows the text; a message left with neither text nor files says so.
+    if message.body.trim().is_empty() && message.attachments.is_empty() {
+        widgets.body.set_markup("<i>Files removed</i>");
+        widgets.body.add_css_class("dim-label");
+        widgets.body.set_visible(true);
+    } else {
+        widgets.body.remove_css_class("dim-label");
+        widgets.body.set_visible(!message.body.trim().is_empty());
+    }
 }
 
 /// Show a row's text line as a tombstone.
