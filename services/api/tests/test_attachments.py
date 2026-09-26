@@ -411,6 +411,25 @@ async def test_the_sweep_leaves_a_slow_upload_in_flight_alone(
     assert (await sweep_once())["pending"] == 1  # once it stops, the age rule applies
 
 
+async def test_a_crashed_upload_does_not_pin_its_row(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The sweep skips uploads in flight, so an entry left behind by a crash would
+    # protect its row forever. Any exit from the stream must remove it.
+    from app.routers import files as files_router
+
+    ha, _hb, ch = await _setup(client)
+    created = (await _create(client, ha, ch, b"c")).json()
+
+    async def crashes(*_args: object) -> None:
+        raise RuntimeError("storage fell over")
+
+    monkeypatch.setattr(files_router, "_stream_and_commit", crashes)
+    with pytest.raises(RuntimeError):
+        await client.put(created["upload_url"], content=b"c", headers=ha)
+    assert not files_router._in_flight and not files_router._in_flight_per_user
+
+
 async def test_upload_whose_part_was_swept_asks_for_a_retry(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
