@@ -204,6 +204,34 @@ impl LocalData {
             .await
     }
 
+    /// As [`LocalData::others`], each with how many messages its outbox holds unsent, or
+    /// `None` when that can't be read (#46 §8: the app names them before the wipe, and "may
+    /// have included unsent messages" beats a silent loss).
+    pub(crate) async fn others_with_unsent(
+        &self,
+        origin: &str,
+        user_id: &str,
+    ) -> Result<Vec<(String, String, Option<u64>)>, StoreError> {
+        let (o, u) = (origin.to_string(), user_id.to_string());
+        let rows: Vec<(String, String, String)> = self
+            .index
+            .call(move |c| {
+                c.prepare(
+                    "SELECT origin, user_id, store_id FROM stores
+                     WHERE NOT (origin = ?1 AND user_id = ?2)",
+                )?
+                .query_map([&o, &u], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect()
+            })
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (origin, user, store_id) in rows {
+            let unsent = self.unsent_in(&store_id).await;
+            out.push((origin, user, unsent));
+        }
+        Ok(out)
+    }
+
     /// Both stores are attempted whatever the other did. The directory goes only if neither
     /// refused (a store still open refuses: its files are never pulled from under it).
     /// `Ok(true)` only if both keys were destroyed and the files are gone.
@@ -273,9 +301,15 @@ impl LocalData {
     /// survives the index's, so it is read; an outbox that can't be read counts as holding
     /// something (saying "lost" wrongly beats losing messages silently).
     async fn orphan_had_unsent(&self, store_id: &str) -> bool {
+        self.unsent_in(store_id).await != Some(0)
+    }
+
+    /// How many messages a closed store's outbox holds unsent (not yet accepted): `Some(0)`
+    /// with no outbox, `None` when it can't be read (its key gone, or not countable).
+    async fn unsent_in(&self, store_id: &str) -> Option<u64> {
         let dir = self.dir(store_id);
         if !dir.join("outbox.db").exists() {
-            return false;
+            return Some(0);
         }
         let keys = KeyStore::new(self.keys.slots());
         let id = store_id.to_string();
@@ -283,11 +317,13 @@ impl LocalData {
             tokio::task::spawn_blocking(move || store::open(&dir, Kind::Outbox, &id, &keys)).await;
         let (db, rebuilt) = match opened {
             Ok(Ok(Opened::Ready { db, rebuilt })) => (db, rebuilt),
-            _ => return true,
+            _ => return None,
         };
         if rebuilt.is_some() {
+            // Its key was gone: whatever it held is unreadable (opening made it anew, empty;
+            // it's about to be erased either way).
             db.close().await; // closed before the erase that follows, which needs it shut
-            return true; // its key was gone: whatever it held is unreadable
+            return None;
         }
         let count = db
             .call(|c| {
@@ -299,7 +335,7 @@ impl LocalData {
             })
             .await;
         db.close().await;
-        !matches!(count, Ok(0))
+        count.ok().and_then(|n| u64::try_from(n).ok())
     }
 
     /// Whether a store with an outbox was erased for want of an owner (then cleared): the app

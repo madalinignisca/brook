@@ -460,3 +460,16 @@ fn an_image_preview_crosses_whole_and_never_logs_its_bytes() {
     );
     assert!(!format!("{p:?}").contains("115")); // no byte values
 }
+
+#[test]
+fn another_users_unsent_count_crosses_including_unknown() {
+    let user = |unsent| brook_core::OtherLocalUser {
+        origin: "https://a".into(),
+        user_id: "u1".into(),
+        unsent,
+    };
+    assert_eq!(FfiLocalUser::from(user(Some(3))).unsent, Some(3));
+    assert_eq!(FfiLocalUser::from(user(None)).unsent, None);
+    let u = FfiLocalUser::from(user(Some(0)));
+    assert_eq!((u.origin.as_str(), u.user_id.as_str()), ("https://a", "u1"));
+}
