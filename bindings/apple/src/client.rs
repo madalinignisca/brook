@@ -138,8 +138,9 @@ impl FfiBrookClient {
         Ok(users.into_iter().map(Into::into).collect())
     }
 
-    /// Realtime events the Apple UI uses (`Ready`, `ChannelCall`); others are skipped.
-    /// Cancel (or drop) the subscription to stop.
+    /// Realtime events the Apple UI uses (`Ready`, `ChannelCall`, the message events); others
+    /// are skipped. Missed events arrive as one `Resync`. Cancel (or drop) the subscription
+    /// to stop.
     pub fn subscribe_events(&self, listener: Arc<dyn ServerEventListener>) -> Arc<Subscription> {
         let mut rx = self.inner.events();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -148,21 +149,18 @@ impl FfiBrookClient {
             loop {
                 let event = match rx.recv().await {
                     Ok(event) => event,
-                    Err(RecvError::Lagged(_)) => continue, // UI state is re-derivable
+                    // Missed: the UI reloads (a timeline can't be patched from a gap).
+                    Err(RecvError::Lagged(_)) => {
+                        if flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        listener.on_event(FfiServerEvent::Resync);
+                        continue;
+                    }
                     Err(RecvError::Closed) => break,
                 };
-                let mapped = match event {
-                    ServerEvent::Ready => FfiServerEvent::Ready,
-                    ServerEvent::ChannelCall {
-                        channel_id,
-                        call_id,
-                        participant_count,
-                    } => FfiServerEvent::ChannelCall {
-                        channel_id,
-                        call_id,
-                        participant_count,
-                    },
-                    _ => continue,
+                let Some(mapped) = map_event(event) else {
+                    continue;
                 };
                 if flag.load(Ordering::SeqCst) {
                     break;
@@ -171,6 +169,102 @@ impl FfiBrookClient {
             }
         });
         Subscription::from_task(cancelled, task)
+    }
+
+    /// A page of a channel's history, **oldest first**: the newest page without `before`,
+    /// else the messages older than `before`.
+    pub async fn channel_history(
+        &self,
+        channel_id: String,
+        before: Option<String>,
+    ) -> Result<Vec<crate::offline::FfiMessage>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let page =
+            run(async move { inner.channel_history(&channel_id, before.as_deref()).await }).await?;
+        Ok(page.into_iter().map(Into::into).collect())
+    }
+
+    /// Send a message directly (online). With local data on, prefer `send_queued`.
+    pub async fn send_message(
+        &self,
+        channel_id: String,
+        body: String,
+        reply_to_id: Option<String>,
+    ) -> Result<crate::offline::FfiMessage, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let m = run(async move {
+            inner
+                .send_message(&channel_id, &body, reply_to_id.as_deref())
+                .await
+        })
+        .await?;
+        Ok(m.into())
+    }
+
+    /// Edit your message's text.
+    pub async fn edit_message(
+        &self,
+        channel_id: String,
+        message_id: String,
+        body: String,
+    ) -> Result<crate::offline::FfiMessage, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let m =
+            run(async move { inner.edit_message(&channel_id, &message_id, &body).await }).await?;
+        Ok(m.into())
+    }
+
+    /// Delete your message (it stays as a tombstone).
+    pub async fn delete_message(
+        &self,
+        channel_id: String,
+        message_id: String,
+    ) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.delete_message(&channel_id, &message_id).await }).await
+    }
+
+    /// Mark a channel read up to `message_id` (the newest shown when nil).
+    pub async fn mark_read(
+        &self,
+        channel_id: String,
+        message_id: Option<String>,
+    ) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.mark_read(&channel_id, message_id.as_deref()).await }).await
+    }
+
+    /// Save an attachment to `destination` (the path a save panel chose), checked against
+    /// `sha256`. Progress and cancel go by `transfer_id` (`subscribe_transfers`,
+    /// `cancel_transfer`). A failed or cancelled download leaves no file behind;
+    /// `file.gone`: the file was deleted.
+    pub async fn download_file(
+        &self,
+        transfer_id: u64,
+        file_id: String,
+        sha256: String,
+        size: u64,
+        destination: String,
+    ) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move {
+            let mut sink = brook_core::FileSink::create(std::path::Path::new(&destination))
+                .await
+                .map_err(|_| brook_core::Error::Api {
+                    code: "transfer.io".into(),
+                    message: "the file couldn't be created".into(),
+                })?;
+            inner
+                .download_file(
+                    brook_core::TransferId(transfer_id),
+                    &file_id,
+                    &sha256,
+                    size,
+                    &mut sink,
+                )
+                .await
+        })
+        .await
     }
 
     /// Join `channel_id`'s call, driving the Swift `engine`. Requires a ready socket.
@@ -297,6 +391,32 @@ impl FfiBrookClient {
         let inner = Arc::clone(&self.inner);
         run(async move { inner.admin_reset_totp(&user_id, &admin_password).await }).await
     }
+}
+
+/// The events the Apple UI uses, as it sees them; `None` for the rest.
+pub(crate) fn map_event(event: ServerEvent) -> Option<FfiServerEvent> {
+    Some(match event {
+        ServerEvent::Ready => FfiServerEvent::Ready,
+        ServerEvent::ChannelCall {
+            channel_id,
+            call_id,
+            participant_count,
+        } => FfiServerEvent::ChannelCall {
+            channel_id,
+            call_id,
+            participant_count,
+        },
+        ServerEvent::MessageNew(m) => FfiServerEvent::MessageNew { message: m.into() },
+        ServerEvent::MessageUpdate(m) => FfiServerEvent::MessageUpdate { message: m.into() },
+        ServerEvent::MessageDelete {
+            channel_id,
+            message_id,
+        } => FfiServerEvent::MessageDelete {
+            channel_id,
+            message_id,
+        },
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
