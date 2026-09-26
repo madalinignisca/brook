@@ -390,6 +390,7 @@ mod http {
                     handle: "me".into(),
                     display_name: "Me".into(),
                     global_role: "member".into(),
+                    status_text: None,
                 },
             }))
             .await;
@@ -806,6 +807,7 @@ mod post_http {
                     handle: "me".into(),
                     display_name: "Me".into(),
                     global_role: "member".into(),
+                    status_text: None,
                 },
             }))
             .await;

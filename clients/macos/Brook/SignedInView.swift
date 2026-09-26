@@ -40,7 +40,7 @@ struct SignedInView: View {
         self.client = client
         self.calls = calls
         self.signOut = signOut
-        _channels = State(initialValue: ChannelsModel(client: client))
+        _channels = State(initialValue: ChannelsModel(client: client, me: user.id, notifier: MacNotifier.shared))
     }
     @Environment(\.openWindow) private var openWindow
 
@@ -94,7 +94,10 @@ struct SignedInView: View {
                 }
             }
         }
-        .task { await channels.start() }
+        .task {
+            MacNotifier.shared.onOpen = { selection = $0 } // a clicked notification opens its channel
+            await channels.start()
+        }
         // The feed arrives once local data is switched on, after this view appears.
         .onChange(of: feed.map(ObjectIdentifier.init), initial: true) { _, _ in registerWithFeed() }
         .safeAreaInset(edge: .top) {
@@ -185,6 +188,7 @@ extension SignedInView {
     /// forwards it the message events (the previous one stops receiving them).
     fileprivate func openTimeline(_ channelId: String?) {
         channels.openChannel = channelId
+        if let channelId { MacNotifier.shared.remove(channelId: channelId) } // read now
         guard let channelId, let chat = client as? any ChatClient else {
             timeline = nil
             channels.timeline = nil

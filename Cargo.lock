@@ -437,6 +437,7 @@ dependencies = [
  "pulldown-cmark",
  "qrcode",
  "rqrr",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

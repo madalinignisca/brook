@@ -590,6 +590,9 @@ extension FakeRealtime {
     func loadHead(channelId: String, limit: UInt32) async throws { throw unused }
     func loadOlder(channelId: String, limit: UInt32) async throws { throw unused }
     func markRead(channelId: String, messageId: String?) async throws { throw unused }
+    func removeMember(channelId: String, userId: String) async throws { throw unused }
+    func leaveChannel(channelId: String) async throws { throw unused }
+    func updateProfile(displayName: String?, statusText: String?) async throws -> FfiMe { throw unused }
     func otherLocalUsers() async throws -> [FfiLocalUser] { throw unused }
     func outboxLost() -> UInt64? { nil }
     func pendingMessages(channelId: String) async throws -> [FfiPendingMessage] { throw unused }

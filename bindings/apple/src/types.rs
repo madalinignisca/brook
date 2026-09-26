@@ -11,6 +11,8 @@ pub struct FfiUser {
     pub handle: String,
     pub display_name: String,
     pub global_role: String,
+    /// The line under the name; none when unset.
+    pub status_text: Option<String>,
 }
 
 impl From<User> for FfiUser {
@@ -20,6 +22,7 @@ impl From<User> for FfiUser {
             handle: u.handle,
             display_name: u.display_name,
             global_role: u.global_role,
+            status_text: u.status_text,
         }
     }
 }

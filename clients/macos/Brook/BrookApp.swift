@@ -7,6 +7,10 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var quit: QuitCoordinator?
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        MacNotifier.shared.install() // clicks on notifications arrive through it
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         quit?.shouldTerminate() ?? .terminateNow
     }
