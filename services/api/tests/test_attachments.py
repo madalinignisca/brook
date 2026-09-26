@@ -217,6 +217,28 @@ async def test_a_message_may_be_files_only_but_not_empty(client: httpx.AsyncClie
     assert blanked.status_code == 422
 
 
+async def test_a_quote_says_whether_its_target_is_deleted_or_has_files(
+    client: httpx.AsyncClient,
+) -> None:
+    # A quoted captionless file and a quoted deleted message must not look alike.
+    ha, hb, ch = await _setup(client)
+    url = f"/api/v1/channels/{ch}/messages"
+    f = await _upload(client, ha, ch, b"photo", name="photo.jpg")
+    target = (await client.post(url, json={"attachments": [f["id"]]}, headers=ha)).json()
+    reply = await client.post(url, json={"body": "nice", "reply_to_id": target["id"]}, headers=hb)
+    quote = reply.json()["reply_to"]
+    assert (quote["body"], quote["deleted"], quote["attachments"]) == ("", False, 1)
+
+    assert (await client.delete(f"{url}/{target['id']}", headers=ha)).status_code == 204
+    history = (await client.get(url, headers=hb)).json()
+    (row,) = [m for m in history if m["id"] == reply.json()["id"]]
+    assert (row["reply_to"]["deleted"], row["reply_to"]["attachments"]) == (True, 0)
+    assert row["reply_to"]["body"] == "(deleted)"
+    synced = (await client.get("/api/v1/sync", params={"since": "1"}, headers=hb)).json()
+    (row,) = [m for m in synced["messages"] if m["id"] == reply.json()["id"]]
+    assert row["reply_to"]["deleted"] is True
+
+
 async def test_attach_rules(client: httpx.AsyncClient) -> None:
     ha, hb, ch = await _setup(client)
     other = (
