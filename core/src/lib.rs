@@ -49,6 +49,7 @@ mod outbox;
 #[cfg(test)]
 mod outbox_tests;
 mod persist;
+mod preview;
 #[cfg(test)]
 mod restore_tests;
 mod session;
@@ -91,6 +92,9 @@ pub use keyslot::{InMemoryKeySlot, KeySlot, KeySlotError, KeyStore};
 pub use outbox::{
     Deleted, OutgoingFile, PendingFile, PendingMessage, PendingState, QueuedFile, SendReceipt,
     MAX_FILES_PER_MESSAGE, MAX_FILE_BYTES,
+};
+pub use preview::{
+    ImageKind, ImagePreview, PREVIEW_MAX_BYTES, PREVIEW_MAX_PIXELS, PREVIEW_MAX_SIDE,
 };
 pub use session::{Session, User};
 pub use state::AuthState;

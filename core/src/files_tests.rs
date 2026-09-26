@@ -915,3 +915,87 @@ fn only_file_failures_back_a_pin_off() {
         assert!(!is_connection_failure(&e), "{e:?}");
     }
 }
+
+// ---- Image previews (previews spec §2) ----
+
+fn png_bytes(w: u32, h: u32, body: usize) -> Vec<u8> {
+    let mut b = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+    b.extend(w.to_be_bytes());
+    b.extend(h.to_be_bytes());
+    b.extend([8, 6, 0, 0, 0]);
+    b.extend(bytes(body, 40));
+    b
+}
+
+fn preview_refused(err: &Error) -> bool {
+    matches!(err, Error::Api { code, .. } if code == "file.preview_refused")
+}
+
+#[tokio::test]
+async fn a_preview_comes_from_the_cache_sniffed_and_sized() {
+    let image = png_bytes(640, 480, 3000);
+    // The name says .jpg: the bytes decide (it's a PNG).
+    let s = setup_with(&[(F1, image.clone(), "photo.jpg")]).await;
+    let p = s.files.preview_file(TransferId::new(), F1).await.unwrap();
+    assert_eq!(
+        (p.kind, p.width, p.height),
+        (crate::ImageKind::Png, 640, 480)
+    );
+    assert_eq!(p.bytes, image);
+    assert_eq!(s.files.state(F1).await.unwrap(), FileCacheState::Cached);
+    // Nothing in the clear anywhere under the store (the blob is sealed).
+    for entry in walk(&s.store) {
+        let on_disk = std::fs::read(&entry).unwrap();
+        assert!(
+            !on_disk.windows(24).any(|w| w == &image[40..64]),
+            "plaintext in {entry:?}"
+        );
+    }
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = vec![];
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_file_too_big_for_a_preview_is_refused_before_any_fetch() {
+    let big = png_bytes(100, 100, crate::PREVIEW_MAX_BYTES as usize);
+    let s = setup_with(&[(F1, big, "big.png")]).await;
+    let err = s
+        .files
+        .preview_file(TransferId::new(), F1)
+        .await
+        .unwrap_err();
+    assert!(preview_refused(&err), "{err:?}");
+    assert!(s.server.asked().is_empty(), "fetched before refusing");
+}
+
+#[tokio::test]
+async fn no_preview_for_other_kinds_or_huge_images() {
+    let pdf = [b"%PDF-1.7\n".as_slice(), &bytes(100, 41)].concat();
+    let huge = png_bytes(20_000, 20_000, 100);
+    let s = setup_with(&[(F1, pdf, "fake.png"), (F2, huge, "huge.png")]).await;
+    for id in [F1, F2] {
+        let err = s
+            .files
+            .preview_file(TransferId::new(), id)
+            .await
+            .unwrap_err();
+        assert!(preview_refused(&err), "{id}: {err:?}");
+    }
+    let err = s
+        .files
+        .preview_file(TransferId::new(), "0190a000-0000-7000-8000-0000000000ff")
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, Error::Api { code, .. } if code == "file.unknown"));
+}
