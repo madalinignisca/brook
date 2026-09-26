@@ -839,3 +839,46 @@ async fn a_pin_that_keeps_failing_backs_off() {
     })
     .await;
 }
+
+/// Failures of the connection don't back a pin off, and the connection coming back makes
+/// every pin due at once: a pin isn't left missing for hours after a trip offline.
+#[tokio::test]
+async fn coming_back_online_fetches_pins_at_once() {
+    let s = setup_with(&[(F1, bytes(MIB, 32), "a.bin")]).await;
+    *s.server.broken.lock().unwrap() = true; // failing for a while
+    s.files.set_fetch_retry(Duration::from_secs(3600));
+    s.files.pin_file(F1).await.unwrap();
+    wait_until("the first failure", || s.server.asked().len() == 1).await;
+    // The server works again, but the next retry is an hour away...
+    *s.server.broken.lock().unwrap() = false;
+    s.cache.set_offline_for_tests(true);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    // ...until the connection comes back.
+    s.cache.set_offline_for_tests(false);
+    settle(&s, F1, "fetched when back online", pinned_cached).await;
+}
+
+#[test]
+fn only_file_failures_back_a_pin_off() {
+    use crate::files::is_connection_failure;
+    let api = |code: &str| Error::Api {
+        code: code.into(),
+        message: String::new(),
+    };
+    for e in [
+        api("transfer.network"),
+        api("transfer.paused"),
+        Error::Timeout,
+        Error::NotAuthenticated,
+    ] {
+        assert!(is_connection_failure(&e), "{e:?}");
+    }
+    for e in [
+        api("http_503"),
+        api("transfer.integrity"),
+        api("transfer.io"),
+        api("file.too_large"),
+    ] {
+        assert!(!is_connection_failure(&e), "{e:?}");
+    }
+}

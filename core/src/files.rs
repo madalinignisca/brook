@@ -123,6 +123,16 @@ impl Failure {
     }
 }
 
+/// The server wasn't reached (or there's no session): not the file's fault, so it doesn't
+/// back the file off. A failure the server answered (a 5xx, wrong bytes) does.
+pub(crate) fn is_connection_failure(err: &Error) -> bool {
+    match err {
+        Error::Api { code, .. } => matches!(code.as_str(), "transfer.network" | "transfer.paused"),
+        Error::NotAuthenticated | Error::Http(_) | Error::Timeout | Error::Disconnected => true,
+        _ => false,
+    }
+}
+
 fn api_error(code: &str) -> Error {
     let message = match code {
         "file.unknown" => "no cached message has this file",
@@ -299,6 +309,11 @@ impl Files {
                             let now_offline = online.borrow_and_update().offline;
                             // Only the way back online matters.
                             if was_offline && !now_offline {
+                                // Failures while offline say nothing about the files:
+                                // everything is due again.
+                                if let Some(files) = weak.upgrade() {
+                                    lock(&files.fetch_failures).clear();
+                                }
                                 break;
                             }
                             was_offline = now_offline;
@@ -308,6 +323,9 @@ impl Files {
                                 return;
                             }
                             if session.borrow_and_update().is_some() {
+                                if let Some(files) = weak.upgrade() {
+                                    lock(&files.fetch_failures).clear();
+                                }
                                 break;
                             }
                         }
@@ -365,6 +383,9 @@ impl Files {
                         code.as_str(),
                         "file.gone" | "file.unknown" | "transfer.cancelled"
                     ) => {}
+                // No connection (or no session): not the file's fault, so no backoff for it;
+                // the connection or the session coming back wakes the fetcher.
+                Err(e) if is_connection_failure(e) => failed = true,
                 Err(_) => {
                     failed = true;
                     let base = *lock(&self.fetch_retry);
@@ -1045,17 +1066,13 @@ impl Files {
                         )?;
                         if pinned {
                             // Kept offline: start it over (a new key, from 0), keeping the
-                            // pin. Its old blob is journalled; the fetcher downloads it again.
+                            // pin. The next download truncates the blob to 0 as it opens it.
                             let mut key = [0u8; 32];
                             let _ = getrandom::fill(&mut key);
                             tx.execute(
                                 "UPDATE files SET key = ?2, done = 0, state = 'partial'
                                  WHERE file_id = ?1",
                                 params![id, key.to_vec()],
-                            )?;
-                            tx.execute(
-                                "INSERT OR IGNORE INTO deletions(path) VALUES (?1)",
-                                [file_rows::blob_path(id)],
                             )?;
                         } else {
                             file_rows::drop_files(&tx, std::slice::from_ref(id))?;
