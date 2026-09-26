@@ -18,8 +18,9 @@ protocol ChatClient: AnyObject, Sendable {
 extension FfiBrookClient: ChatClient {}
 
 /// One channel's messages, oldest at the top. Keyed by id and kept in id order (ids are
-/// UUIDv7: time order), so a history page and a live event racing never duplicate or
-/// reorder anything: whichever lands second replaces the first.
+/// UUIDv7: time order). With local data, pages come from this device's cache first (#62),
+/// then the network; whatever order pages and live events land in, the merge gives the same
+/// result (see `merge`).
 @MainActor
 @Observable
 final class TimelineModel {
@@ -28,27 +29,96 @@ final class TimelineModel {
     private(set) var loading = false
     /// No older page: the start of the channel is on screen.
     private(set) var atStart = false
+    /// The network's error. Hidden (`visibleError`) while offline with cached messages shown.
     private(set) var error: String?
+    /// Set from the cache's state feed: the last sync couldn't reach the server.
+    var offline = false
+    /// Current names for authors (a `Users` notice): cached rows keep the name they were
+    /// stored with.
+    private(set) var authorNames: [String: String] = [:]
+
+    /// Ids deleted, including ones not shown yet: every later copy stays a tombstone.
+    private var deleted: Set<String> = []
+    /// Messages here came from the cache.
+    private var fromCache = false
 
     private let client: any ChatClient
+    static let pageSize: UInt32 = 50
 
     init(channelId: String, client: any ChatClient) {
         self.channelId = channelId
         self.client = client
     }
 
-    /// The newest page, then mark it read.
+    private var cache: (any OfflineClient)? { client as? any OfflineClient }
+
+    /// What the view shows: no network error while offline with cached messages on screen.
+    var visibleError: String? { offline && fromCache ? nil : error }
+
+    /// The name to show for a message's author.
+    func authorName(_ message: FfiMessage) -> String {
+        authorNames[message.authorId] ?? message.authorDisplayName ?? message.authorHandle ?? "Someone"
+    }
+
+    /// The cached head first (and, when the cache can't vouch for it, a load and a re-read),
+    /// then the network's newest page; then mark read.
     func load() async {
+        await readCache(before: nil, loadIfIncomplete: true)
         await fetch(before: nil)
         if let newest = messages.last {
             try? await client.markRead(channelId: channelId, messageId: newest.id)
         }
     }
 
-    /// The page before the oldest shown (scrolled to the top).
+    /// The page before the oldest shown (scrolled to the top): the cache's, loading it when
+    /// the cache can't vouch for it; the network's when there's no local data.
     func loadOlder() async {
         guard !atStart, !loading, let oldest = messages.first else { return }
+        loading = true // one older page at a time
+        let fromCache = await readCache(before: oldest.id, loadIfIncomplete: true)
+        loading = false
+        if fromCache { return }
         await fetch(before: oldest.id)
+    }
+
+    /// Re-read the cached head (the cache changed for this channel, or was reset).
+    func refill() async {
+        await readCache(before: nil, loadIfIncomplete: false)
+    }
+
+    /// Current names for these authors, from the cache.
+    func refreshAuthors(_ ids: [String]) async {
+        guard let users = try? await cache?.cachedUsers(ids: ids) else { return }
+        for u in users { authorNames[u.id] = u.displayName }
+    }
+
+    /// One cached page, merged: true if the cache answered (so the network isn't needed for
+    /// paging). An incomplete page is loaded and read again; an empty, complete page before
+    /// `before` is the start of the channel.
+    @discardableResult
+    private func readCache(before: String?, loadIfIncomplete: Bool) async -> Bool {
+        guard let cache else { return false }
+        do {
+            var page = try await cache.cachedMessages(channelId: channelId, before: before, limit: Self.pageSize)
+            if page.needsNetwork, loadIfIncomplete {
+                if before == nil {
+                    try? await cache.loadHead(channelId: channelId, limit: Self.pageSize)
+                } else {
+                    try? await cache.loadOlder(channelId: channelId, limit: Self.pageSize)
+                }
+                page = try await cache.cachedMessages(channelId: channelId, before: before, limit: Self.pageSize)
+                // Still nothing the cache can vouch for (the load failed, or brought
+                // nothing): the network path, which pages or shows its error, instead of
+                // paging getting stuck.
+                if page.needsNetwork, page.messages.isEmpty { return false }
+            }
+            if before != nil, page.messages.isEmpty, !page.needsNetwork { atStart = true }
+            if !page.messages.isEmpty { fromCache = true }
+            merge(page.messages)
+            return true
+        } catch {
+            return false // no local data (yet): the network path
+        }
     }
 
     private func fetch(before: String?) async {
@@ -74,13 +144,11 @@ final class TimelineModel {
                 Task { try? await client.markRead(channelId: channelId, messageId: message.id) }
             }
         case let .messageDelete(channel, messageId):
-            guard channel == channelId,
-                  let i = messages.firstIndex(where: { $0.id == messageId }) else { return }
-            var gone = messages[i]
-            gone.body = ""
-            gone.deleted = true
-            gone.attachments = []
-            messages[i] = gone
+            guard channel == channelId else { return }
+            deleted.insert(messageId) // even before its page lands
+            if let i = messages.firstIndex(where: { $0.id == messageId }) {
+                messages[i] = Self.tombstone(messages[i])
+            }
         case .resync:
             Task { await fetch(before: nil) }
         case .ready, .channelCall:
@@ -88,16 +156,65 @@ final class TimelineModel {
         }
     }
 
-    /// Insert or replace by id, keeping id order.
+    /// Insert or replace by id, keeping id order, so arrival order doesn't matter:
+    /// - a deleted id stays deleted (a late copy can't bring it back);
+    /// - the body and its edited mark change only for a newer `editedAt` (a missing one is
+    ///   older than any), so a stale page never undoes an edit;
+    /// - every other field (names, the quoted excerpt, files) takes the incoming copy.
     func merge(_ incoming: [FfiMessage]) {
         guard !incoming.isEmpty else { return }
         var byId = Dictionary(messages.map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })
-        for m in incoming {
-            // A tombstone stays one: a late copy of the live message can't bring it back.
-            if let old = byId[m.id], old.deleted, !m.deleted { continue }
+        for var m in incoming {
+            if m.deleted { deleted.insert(m.id) }
+            if deleted.contains(m.id) {
+                byId[m.id] = Self.tombstone(m)
+                continue
+            }
+            if let old = byId[m.id], !Self.isNewer(m.editedAt, than: old.editedAt) {
+                m.body = old.body
+                m.editedAt = old.editedAt
+            }
             byId[m.id] = m
         }
         messages = byId.values.sorted { $0.id < $1.id }
+    }
+
+    /// Whether `incoming`'s body replaces `shown`'s: a later edit (nil: never edited, older
+    /// than any edit), or neither ever edited (the incoming copy, as for every other field).
+    static func isNewer(_ incoming: String?, than shown: String?) -> Bool {
+        switch (incoming, shown) {
+        case (nil, nil): true
+        case (nil, .some): false
+        case (.some, nil): true
+        case let (.some(a), .some(b)):
+            if let da = parseTime(a), let db = parseTime(b) { da > db } else { a > b }
+        }
+    }
+
+    /// The server's RFC 3339 times, with or without fractional seconds (it drops zero ones,
+    /// so they don't order as text: "…:00.5Z" < "…:00Z").
+    private static func parseTime(_ s: String) -> Date? {
+        fractional.date(from: s) ?? whole.date(from: s)
+    }
+
+    // Formatters are costly to make; these are only read (thread-safe for reading).
+    nonisolated(unsafe) private static let fractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    nonisolated(unsafe) private static let whole: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    private static func tombstone(_ m: FfiMessage) -> FfiMessage {
+        var gone = m
+        gone.body = ""
+        gone.deleted = true
+        gone.attachments = []
+        return gone
     }
 }
 
@@ -115,6 +232,12 @@ final class ComposerModel {
     private let client: any ChatClient
     /// Where a sent or edited message goes (the timeline, before the live event arrives).
     private let onMessage: (FfiMessage) -> Void
+    /// The channel's unsent bubbles, re-read after a message is queued.
+    weak var pending: PendingModel?
+    /// A queued send that failed: the same text, quote and channel again reuse its id, so
+    /// a retry can never become two messages (core keeps the first); anything else changed
+    /// is a new message with a new id (as GTK, #162).
+    private var draft: (body: String, reply: String?, id: String)?
 
     init(channelId: String, client: any ChatClient, onMessage: @escaping (FfiMessage) -> Void) {
         self.channelId = channelId
@@ -160,6 +283,26 @@ final class ComposerModel {
         self.editing = nil
         sending = true
         defer { sending = false }
+        if editing == nil, let cache = client as? any OfflineClient {
+            let id = draftId(body: body, reply: reply?.id)
+            do {
+                _ = try await cache.sendQueued(channelId: channelId, body: body, replyToId: reply?.id,
+                                               clientId: id)
+                draft = nil
+                error = nil
+                await pending?.reload()
+                return
+            } catch where error.isLocalUnavailable {
+                draft = nil // no local data (yet): sent directly below, as before
+            } catch {
+                if text.isEmpty { // unless something new was typed meanwhile
+                    text = typed
+                    replyingTo = reply
+                }
+                self.error = Self.explainQueued(error)
+                return
+            }
+        }
         do {
             let message: FfiMessage
             if let editing {
@@ -178,6 +321,23 @@ final class ComposerModel {
                 self.editing = editing
             }
             self.error = Self.explain(error)
+        }
+    }
+
+    /// The failed draft's id for the same message, else a new lowercase one.
+    private func draftId(body: String, reply: String?) -> String {
+        if let draft, draft.body == body, draft.reply == reply { return draft.id }
+        let id = UUID().uuidString.lowercased()
+        draft = (body, reply, id)
+        return id
+    }
+
+    /// A queued send that failed before it was saved (nothing was queued).
+    static func explainQueued(_ error: Error) -> String {
+        switch error as? LoginError {
+        case let .Api(code, _) where code == "outbox.empty_message": "Write something first."
+        case .NotAuthenticated: "You were signed out."
+        default: "Couldn't save the message to send."
         }
     }
 

@@ -20,18 +20,31 @@ final class FakeSubscription: Subscription, @unchecked Sendable {
 final class FakeRealtime: FfiBrookClientProtocol, @unchecked Sendable {
     let order = Mutex<[String]>([])
     let listener = Mutex<ServerEventListener?>(nil)
-    let channels: [FfiChannel]
+    var channels: [FfiChannel]
     init(channels: [FfiChannel]) { self.channels = channels }
+    /// For the offline tests (#62): a failing realtime start or network list, and the cache's
+    /// channels (nil: `local.unavailable`).
+    var realtimeFails = false
+    var listFails = false
+    var cached: [FfiCachedChannel]?
+    /// Holds the network list until opened (a read that finishes late).
+    var listGate: Gate?
 
     func subscribeEvents(listener: ServerEventListener) -> Subscription {
         order.withLock { $0.append("subscribe") }
         self.listener.withLock { $0 = listener }
         return FakeSubscription()
     }
-    func startRealtime() async throws { order.withLock { $0.append("start") } }
+    func startRealtime() async throws {
+        order.withLock { $0.append("start") }
+        if realtimeFails { throw LoginError.Network(message: "offline") }
+    }
     func listChannels() async throws -> [FfiChannel] {
         order.withLock { $0.append("list") }
-        return channels
+        let snapshot = channels
+        if let listGate { await listGate.wait() }
+        if listFails { throw LoginError.Network(message: "offline") }
+        return snapshot
     }
     /// nil: joining fails. Set: join waits for the gate, then returns a handle.
     var joinGate: Gate?
@@ -362,7 +375,7 @@ final class CallReviewFixTests: XCTestCase {
         let client = FakeRealtime(channels: [])
         client.joinGate = Gate()
         let center = CallCenter(auth: GrantedNothing(), makeEngine: { _ in FakeMedia() })
-        let joining = Task { await center.join(channel("c1", "general"), name: "general", client: client) }
+        let joining = Task { await center.join(channelId: "c1", name: "general", client: client) }
         await Task.yield() // join() registers its task; the join's work has not started yet
         await center.endAll()
         client.joinGate?.open()
@@ -376,7 +389,7 @@ final class CallReviewFixTests: XCTestCase {
         let client = FakeRealtime(channels: [])
         client.joinGate = Gate()
         let center = CallCenter(auth: GrantedNothing(), makeEngine: { _ in FakeMedia() })
-        let joining = Task { await center.join(channel("c1", "general"), name: "general", client: client) }
+        let joining = Task { await center.join(channelId: "c1", name: "general", client: client) }
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertTrue(center.joining)
         let ended = Task { await center.endAll() }
@@ -394,7 +407,7 @@ final class CallReviewFixTests: XCTestCase {
         var replies = 0
         let quit = QuitCoordinator(timeout: .seconds(5), reply: { _ in replies += 1 })
         let center = CallCenter(auth: GrantedNothing(), quit: quit, makeEngine: { _ in FakeMedia() })
-        let joining = Task { await center.join(channel("c1", "general"), name: "general", client: client) }
+        let joining = Task { await center.join(channelId: "c1", name: "general", client: client) }
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(quit.shouldTerminate(), .terminateLater, "quit mid-join skipped the handshake")
         client.joinGate?.open()
@@ -562,7 +575,10 @@ final class QuitCoordinatorTests: XCTestCase {
 extension FakeRealtime {
     private var unused: LoginError { .NotAuthenticated }
     func acknowledgeOutboxLost(n: UInt64) {}
-    func cachedChannels() async throws -> [FfiCachedChannel] { throw unused }
+    func cachedChannels() async throws -> [FfiCachedChannel] {
+        guard let cached else { throw LoginError.Api(code: "local.unavailable", message: "") }
+        return cached
+    }
     func cachedMessages(channelId: String, before: String?, limit: UInt32) async throws -> FfiCachedMessages { throw unused }
     func cancelTransfer(transferId: UInt64) {}
     func channelHistory(channelId: String, before: String?) async throws -> [FfiMessage] { throw unused }
@@ -596,6 +612,9 @@ extension FakeRealtime {
     func unpinFile(fileId: String) async throws { throw unused }
     func pinnedBytes() async throws -> UInt64 { throw unused }
     func previewFile(transferId: UInt64, fileId: String) async throws -> FfiImagePreview { throw unused }
+    func cachedUsers(ids: [String]) async throws -> [FfiMember] { throw unused }
     func unsentCount() async -> UInt64 { 0 }
     func wipeOtherLocalUsers() async throws { throw unused }
 }
+
+extension FakeRealtime: OfflineClient {}

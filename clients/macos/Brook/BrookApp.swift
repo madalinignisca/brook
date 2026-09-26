@@ -33,7 +33,9 @@ struct BrookApp: App {
                     if let client = store.client {
                         SignedInView(
                             user: user, client: client, calls: calls, signOut: { store.signOut() },
-                            recoveryCodesLeft: store.recoveryCodesLeft)
+                            recoveryCodesLeft: store.recoveryCodesLeft, feed: store.feed,
+                            offersRemoval: store.offersRemoval,
+                            signOutChoosing: { store.signOut(removeData: $0) })
                     }
                 case .restoring:
                     ProgressView("Signing in…").frame(maxWidth: .infinity, maxHeight: .infinity)

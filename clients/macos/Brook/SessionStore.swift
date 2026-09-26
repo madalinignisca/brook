@@ -45,6 +45,8 @@ final class SessionStore {
         static let restoreOffline = "Couldn't reach the server to resume your session. It's kept for next time; you can also sign in again."
         static let signOutIncomplete = "This Mac couldn't forget your saved sign-in, so Brook may sign you in again at the next launch. Sign in and out again to retry."
         static let secondInstance = "Brook is already open. This window won't remember your sign-in."
+        static let removalIncomplete = "Brook couldn't remove all of this Mac's data. Sign in and out again to retry."
+        static let removalAndSignOutIncomplete = "Brook couldn't remove all of this Mac's data, and may sign you in again at the next launch. Sign in and out again to retry."
     }
 
     typealias ClientFactory = (_ server: String, _ allowInsecureHttp: Bool) throws -> FfiBrookClient
@@ -68,8 +70,10 @@ final class SessionStore {
 
     init(
         settings: Settings = Settings(), persistence: SessionPersistence = .off,
-        makeClient: @escaping ClientFactory = SessionStore.liveClient
+        makeClient: @escaping ClientFactory = SessionStore.liveClient,
+        localDataWait: Duration = .seconds(30)
     ) {
+        self.localDataWait = localDataWait
         self.settings = settings
         self.persistence = persistence
         self.makeClient = makeClient
@@ -165,6 +169,46 @@ final class SessionStore {
 
     /// Set when a sign-out couldn't make the stored session unusable; shown until a sign-in.
     private(set) var signOutWarning: String?
+
+    // ---- This device's local data (#62) ----
+
+    enum LocalData: Equatable {
+        /// No persistence (no Keychain group yet, #79), or signed out: online only.
+        case off
+        /// Being switched on for the signed-in client (stores opening).
+        case enabling
+        case on
+        /// `enableLocalData` answered false: online only.
+        case failed
+    }
+
+    private(set) var localData: LocalData = .off
+    /// The signed-in client's cache notices (nil without local data).
+    private(set) var feed: CacheFeed?
+    /// The last sign-out (it may still be erasing) and the last enable (it may still be
+    /// opening stores): the next sign-in's enable waits for both, since the stores directory
+    /// has no lock.
+    @ObservationIgnored private var enableTask: Task<Void, Never>?
+    /// Every sign-out and enable that hasn't finished yet, whoever started it: each new
+    /// enable waits for all of them, not only the latest (a wait that timed out passes its
+    /// unfinished tasks on).
+    @ObservationIgnored private var unsettled: [UUID: Task<Void, Never>] = [:]
+
+    /// Start `body` as a task that stays in `unsettled` until it ends.
+    private func tracked(_ body: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
+        let id = UUID()
+        let task = Task { [weak self] in
+            await body()
+            self?.unsettled[id] = nil
+        }
+        unsettled[id] = task // before the task can run: it's on this actor
+        return task
+    }
+    /// The longest a sign-in waits for them; after that it stays online-only.
+    private let localDataWait: Duration
+
+    /// Sign Out offers "Remove this device's data" (switched on, or switching on).
+    var offersRemoval: Bool { localData == .on || localData == .enabling }
     /// Completed sign-ins, counted: a sign-out's late result applies only if none came after.
     @ObservationIgnored private var signIns = 0
 
@@ -196,6 +240,73 @@ final class SessionStore {
         signOutWarning = nil // the new sign-in replaced the stored copy
         settings.saveLastGoodServer(address)
         phase = .signedIn(user)
+        if case let .on(slot, dataDir) = persistence { startLocalData(client, slot: slot, dataDir: dataDir) }
+    }
+
+    /// Local data for this signed-in client: after the previous sign-out and enable (bounded),
+    /// subscribe, switch on, then read losses. Dropped if the attempt moved on meanwhile.
+    private func startLocalData(_ client: FfiBrookClient, slot: FfiKeySlot, dataDir: String) {
+        let mine = attempt
+        let previous = Array(unsettled.values)
+        let limit = localDataWait
+        localData = .enabling
+        enableTask = tracked { [weak self] in
+            let settled = await Self.waitAll(previous, upTo: limit)
+            // A sign-out or a newer sign-in meanwhile decides first: nothing to log.
+            guard let self, mine == self.attempt, !Task.isCancelled else { return }
+            guard settled else {
+                Self.log("the previous sign-out hasn't finished: staying online only")
+                self.localData = .off
+                return
+            }
+            let feed = CacheFeed(client: client)
+            feed.start() // before enabling: opening the stores can report a loss
+            self.feed = feed
+            let ok = await client.enableLocalData(slot: slot, dataDir: dataDir)
+            guard mine == self.attempt, !Task.isCancelled else {
+                feed.stop()
+                if self.feed === feed { self.feed = nil }
+                return
+            }
+            if ok {
+                self.localData = .on
+                feed.checkLost()
+            } else {
+                Self.log("this device's data couldn't be opened: online only")
+                feed.stop()
+                if self.feed === feed { self.feed = nil }
+                self.localData = .failed
+            }
+        }
+    }
+
+    /// Whether every task ended within `limit`: resumes on whichever comes first (or `false`
+    /// when the waiter is cancelled, as by a sign-out), and never joins a task that doesn't
+    /// end. A sign-out that never ends keeps every later enable waiting on it, and so this
+    /// Mac online-only until relaunch: the stores directory has no lock, so that's the safe
+    /// side.
+    nonisolated static func waitAll(_ tasks: [Task<Void, Never>], upTo limit: Duration) async -> Bool {
+        if tasks.isEmpty { return true }
+        let box = ResumeBox<Bool>()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (done: CheckedContinuation<Bool, Never>) in
+                box.set(ResumeOnce(done))
+                Task {
+                    for task in tasks { await task.value }
+                    box.resume(true)
+                }
+                Task {
+                    try? await Task.sleep(for: limit)
+                    box.resume(false)
+                }
+            }
+        } onCancel: {
+            box.resume(false)
+        }
+    }
+
+    nonisolated static func log(_ message: String) {
+        NSLog("Brook local data: %@", message)
     }
 
     /// The 6-digit code (spaces allowed, as pasted from "123 456").
@@ -263,17 +374,40 @@ final class SessionStore {
 
     /// Account → Sign Out. The attempt ends first, so a remote `LoggedOut` arriving after it
     /// changes nothing (the user just chose to sign out; no message needed).
-    func signOut() {
+    func signOut() { signOut(removeData: false) }
+
+    /// Sign out, removing this device's data or keeping it (the sheet's choice). Removal waits
+    /// for an enable still opening the stores, so what it opens goes too. The next sign-in's
+    /// enable waits for this task.
+    func signOut(removeData: Bool) {
         guard case .signedIn = phase, let client else { return }
+        let enabling = enableTask
         end()
         phase = .signedOut(error: nil)
         let before = signIns
-        Task {
-            await client.logout() // core forgets the stored copy, then revokes (best effort)
+        _ = tracked { [weak self] in
+            var removalFailed = false
+            if removeData {
+                // What an enable still opening the stores opens is removed too. A keep-data
+                // sign-out doesn't wait: it never touches the stores, and the next enable
+                // waits for this task (and that one) anyway.
+                await enabling?.value
+                do { try await client.signOutAndForget() } catch { removalFailed = true }
+            } else {
+                await client.logout() // core forgets the stored copy, then revokes (best effort)
+            }
+            // A sign-in completed since replaced the stored copy: then it's moot. Its own
+            // value, not the form's error: typing into the form meanwhile must not hide it.
+            guard let self, before == self.signIns else { return }
             // Both the keychain delete and the fence failed: the next launch could sign in
-            // again. Its own value, not the form's error: typing into the form meanwhile must
-            // not hide it. A sign-in completed since replaced the stored copy: then it's moot.
-            if !client.signOutComplete(), before == signIns { signOutWarning = Message.signOutIncomplete }
+            // again. Checked whether or not the removal worked.
+            let incomplete = !client.signOutComplete()
+            switch (removalFailed, incomplete) {
+            case (true, true): self.signOutWarning = Message.removalAndSignOutIncomplete
+            case (true, false): self.signOutWarning = Message.removalIncomplete
+            case (false, true): self.signOutWarning = Message.signOutIncomplete
+            case (false, false): break
+            }
         }
     }
 
@@ -313,6 +447,10 @@ final class SessionStore {
         pending = nil
         recoveryCodesLeft = nil
         client = nil
+        enableTask?.cancel() // its handle stays: the next enable waits for it to finish
+        feed?.stop()
+        feed = nil
+        localData = .off
     }
 
     static func message(for error: LoginError, address: String) -> String {
@@ -356,5 +494,41 @@ final class DeliveryCount: Sendable {
             n += 1
             deliver(n)
         }
+    }
+}
+
+/// A `ResumeOnce` that may be resumed (cancelled) before it exists: the value is kept and
+/// delivered as soon as it's set.
+final class ResumeBox<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var once: ResumeOnce<T>?
+    private var early: T?
+    func set(_ once: ResumeOnce<T>) {
+        let value = lock.withLock { () -> T? in
+            self.once = once
+            return early
+        }
+        if let value { once.resume(value) }
+    }
+    func resume(_ value: T) {
+        let target = lock.withLock { () -> ResumeOnce<T>? in
+            if once == nil, early == nil { early = value }
+            return once
+        }
+        target?.resume(value)
+    }
+}
+
+/// A continuation resumed once, by whichever comes first.
+final class ResumeOnce<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Never>?
+    init(_ continuation: CheckedContinuation<T, Never>) { self.continuation = continuation }
+    func resume(_ value: T) {
+        let c = lock.withLock { () -> CheckedContinuation<T, Never>? in
+            defer { continuation = nil }
+            return continuation
+        }
+        c?.resume(returning: value)
     }
 }
