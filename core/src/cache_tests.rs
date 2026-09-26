@@ -397,6 +397,7 @@ mod http {
             http: reqwest::Client::new(),
             base: format!("{}/", server.uri()).parse().unwrap(),
             session,
+            transfers: Arc::new(crate::transfer::Transfers::new()),
         }
     }
 
@@ -813,6 +814,7 @@ mod post_http {
             http: reqwest::Client::new(),
             base: format!("{}/", server.uri()).parse().unwrap(),
             session,
+            transfers: Arc::new(crate::transfer::Transfers::new()),
         };
         (h, epoch)
     }
@@ -891,6 +893,80 @@ mod post_http {
             h.send("c1", &super::hi(), "cid", epoch + 1).await,
             Err(SendFailure::Transient { .. })
         ));
+    }
+
+    /// The real uploader: a session that isn't the outbox's epoch sends nothing (not even
+    /// the create), and the current one uploads with that session's token.
+    #[tokio::test]
+    async fn uploads_go_out_only_under_the_outboxs_epoch() {
+        use crate::outbox::Upload;
+        let server = MockServer::start().await;
+        let (h, epoch) = http(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::write(&src, b"file bytes").unwrap();
+        let fcid = "0190a000-0000-7000-8000-00000000cafe";
+        let id = crate::snapshot::id_bytes(fcid).unwrap();
+        let snap = dir.path().join(fcid);
+        let w = crate::snapshot::write(&src, &snap, id, 8, u64::MAX, &mut |_, _| true).unwrap();
+        let source = crate::snapshot::SnapshotSource {
+            path: snap,
+            key: w.key,
+            id,
+            size: w.size,
+            sha256: w.sha256.clone(),
+            chunk: 8,
+            broken: Default::default(),
+        };
+        let row = crate::outbox::FileRow {
+            file_client_id: fcid.into(),
+            filename: "a.txt".into(),
+            content_type: "text/plain".into(),
+            size: w.size,
+            sha256: w.sha256.clone(),
+            key: w.key,
+            chunk: 8,
+            file_id: None,
+        };
+        let flags = Arc::new(crate::transfer::Flags::default());
+        let tid = crate::transfer::TransferId::new();
+        let err = h
+            .upload(tid, &flags, "c1", &row, &source, epoch + 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::NotAuthenticated), "{err:?}");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "sent under another epoch"
+        );
+        let file = json!({ "id": "f9", "channel_id": "c1", "uploader_id": "me",
+            "filename": "a.txt", "original_name": "a.txt", "size": w.size,
+            "content_type": "text/plain", "status": "committed", "sha256": w.sha256 });
+        Mock::given(method("POST"))
+            .and(path("/api/v1/channels/c1/files"))
+            .and(wiremock::matchers::header("authorization", "Bearer tok"))
+            .and(body_partial_json(
+                json!({ "client_id": fcid, "size": w.size }),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "file": { "id": "f9", "channel_id": "c1", "uploader_id": "me",
+                    "filename": "a.txt", "original_name": "a.txt", "size": w.size,
+                    "content_type": "text/plain", "status": "pending", "sha256": null },
+                "upload_url": "/api/v1/files/f9/content" })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/files/f9/content"))
+            .and(wiremock::matchers::body_bytes(b"file bytes".to_vec()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(file))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let got = h
+            .upload(tid, &flags, "c1", &row, &source, epoch)
+            .await
+            .unwrap();
+        assert_eq!(got.id, "f9");
     }
 }
 
@@ -1007,7 +1083,7 @@ async fn a_reset_at_zero_does_not_loop() {
 fn hi() -> crate::outbox::Outgoing {
     crate::outbox::Outgoing {
         body: "hi".into(),
-        reply_to_id: None,
+        ..Default::default()
     }
 }
 
@@ -1020,4 +1096,10 @@ fn the_send_body_names_the_reply_target_only_for_a_reply() {
     m.reply_to_id = Some("q".into());
     assert_eq!(send_body(&m, "cid")["reply_to_id"], "q");
     assert_eq!(send_body(&m, "cid")["client_id"], "cid");
+    assert!(send_body(&m, "cid").get("attachments").is_none());
+    m.attachments = vec!["f2".into(), "f1".into()];
+    assert_eq!(
+        send_body(&m, "cid")["attachments"],
+        serde_json::json!(["f2", "f1"])
+    );
 }

@@ -23,6 +23,8 @@ pub(crate) struct UserStores {
     pub(crate) store_id: String,
     pub(crate) cache: Opened,
     pub(crate) outbox: Opened,
+    /// The store's directory (the outbox keeps its snapshots under it).
+    pub(crate) dir: PathBuf,
 }
 
 pub(crate) struct LocalData {
@@ -119,6 +121,7 @@ impl LocalData {
         .await
         .map_err(|_| StoreError::Io)??;
         Ok(UserStores {
+            dir: self.dir(&store_id),
             store_id,
             cache,
             outbox,

@@ -109,7 +109,7 @@ pub struct BrookClient {
     /// How long `logout` waits for the server to hear the revoke (tests shorten it).
     pub(crate) revoke_wait: std::time::Duration,
     /// Attachment transfers: progress events and cancel flags (transfer.rs).
-    pub(crate) transfers: crate::transfer::Transfers,
+    pub(crate) transfers: Arc<crate::transfer::Transfers>,
     /// Dropped with the client: the background loops end on it, from whatever wait.
     shutdown: watch::Sender<()>,
     /// The background loops (refresh, realtime), for tests to observe that they end.
@@ -165,7 +165,7 @@ impl BrookClient {
             transport: std::sync::Mutex::new(Some(transport)),
             locked_bound: std::time::Duration::from_secs(30),
             revoke_wait: std::time::Duration::from_secs(3),
-            transfers: crate::transfer::Transfers::new(),
+            transfers: Arc::new(crate::transfer::Transfers::new()),
             shutdown,
             tasks: std::sync::Mutex::default(),
             offline: Arc::default(),
