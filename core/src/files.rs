@@ -309,11 +309,10 @@ impl Files {
                             let now_offline = online.borrow_and_update().offline;
                             // Only the way back online matters.
                             if was_offline && !now_offline {
-                                // Failures while offline say nothing about the files:
-                                // everything is due again.
-                                if let Some(files) = weak.upgrade() {
-                                    lock(&files.fetch_failures).clear();
-                                }
+                                // A round now: pins that failed for want of a connection have
+                                // no backoff and go at once. Backoffs from failures the server
+                                // answered keep their wait (a flapping signal mustn't re-download
+                                // a stuck file on every reconnect).
                                 break;
                             }
                             was_offline = now_offline;
@@ -323,9 +322,6 @@ impl Files {
                                 return;
                             }
                             if session.borrow_and_update().is_some() {
-                                if let Some(files) = weak.upgrade() {
-                                    lock(&files.fetch_failures).clear();
-                                }
                                 break;
                             }
                         }
