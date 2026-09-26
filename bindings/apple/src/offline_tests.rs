@@ -322,6 +322,18 @@ fn wire_message(extra: serde_json::Value) -> brook_core::Message {
 }
 
 #[test]
+fn a_message_keeps_its_mentions() {
+    let m = FfiMessage::from(wire_message(json!({
+        "mentions": ["u7", "u9"], "mention_everyone": true,
+    })));
+    assert_eq!(m.mentions, vec!["u7".to_string(), "u9".to_string()]);
+    assert!(m.mention_everyone);
+    let plain = FfiMessage::from(wire_message(json!({})));
+    assert!(plain.mentions.is_empty());
+    assert!(!plain.mention_everyone);
+}
+
+#[test]
 fn a_message_keeps_its_edit_quote_and_files() {
     let m = FfiMessage::from(wire_message(json!({
         "edited_at": "2026-09-26T11:00:00Z",
