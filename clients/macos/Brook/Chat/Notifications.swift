@@ -45,11 +45,15 @@ final class MacNotifier: NSObject, Notifying, UNUserNotificationCenterDelegate {
     func post(channelId: String, title: String, body: String) {
         let center = self.center
         Task {
-            if !asked {
+            var settings = await center.notificationSettings()
+            // Asked at the first notification, and again only while still undecided (a
+            // request that failed); a decision, either way, is the user's.
+            if settings.authorizationStatus == .notDetermined, !asked {
                 asked = true
-                _ = try? await center.requestAuthorization(options: [.alert, .sound])
+                let granted = (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
+                settings = await center.notificationSettings()
+                if !granted, settings.authorizationStatus == .notDetermined { asked = false }
             }
-            let settings = await center.notificationSettings()
             guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
             else { return } // denied or not decided: nothing is posted
             let content = UNMutableNotificationContent()
@@ -64,6 +68,7 @@ final class MacNotifier: NSObject, Notifying, UNUserNotificationCenterDelegate {
 
     func remove(channelId: String) {
         center.removeDeliveredNotifications(withIdentifiers: [channelId])
+        center.removePendingNotificationRequests(withIdentifiers: [channelId])
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
