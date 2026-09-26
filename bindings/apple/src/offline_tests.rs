@@ -462,6 +462,19 @@ fn an_image_preview_crosses_whole_and_never_logs_its_bytes() {
 }
 
 #[test]
+fn a_cached_profile_crosses_with_its_names() {
+    let m = FfiMember::from(brook_core::ChannelMember {
+        id: "bob".into(),
+        handle: "bobby".into(),
+        display_name: "Robert".into(),
+    });
+    assert_eq!(
+        (m.id.as_str(), m.handle.as_str(), m.display_name.as_str()),
+        ("bob", "bobby", "Robert")
+    );
+}
+
+#[test]
 fn another_users_unsent_count_crosses_including_unknown() {
     let user = |unsent| brook_core::OtherLocalUser {
         origin: "https://a".into(),
