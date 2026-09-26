@@ -234,10 +234,41 @@ final class ComposerModel {
     private let onMessage: (FfiMessage) -> Void
     /// The channel's unsent bubbles, re-read after a message is queued.
     weak var pending: PendingModel?
+
+    // ---- Files for the next message (#66, spec 2026-09-26-mac-send-files) ----
+
+    /// Staged files, each holding its security-scoped access until removed or sent.
+    private(set) var staged: [StagedFile] = []
+    /// The files are being copied into the outbox: nothing staged may change meanwhile.
+    private(set) var preparing = false
+    /// Core said there's no local data: files can't be sent (text still can).
+    private(set) var filesUnavailable = false
+    var fileAccess: any FileAccess = SystemFileAccess()
+
+    /// Attach and drops are open: local data possible, not preparing, not editing.
+    var canAttach: Bool {
+        client is any OfflineClient && !filesUnavailable && !preparing && editing == nil
+    }
+
+    func attach(_ urls: [URL]) {
+        guard canAttach else { return }
+        for url in urls {
+            switch Staging.stage(url, already: staged, access: fileAccess) {
+            case let .success(file): staged.append(file)
+            case let .failure(refusal): if let text = refusal.text { error = text }
+            }
+        }
+    }
+
+    func remove(_ file: StagedFile) {
+        guard !preparing else { return } // its access is in use by the enqueue
+        staged.removeAll { $0 === file }
+        file.release()
+    }
     /// A queued send that failed: the same text, quote and channel again reuse its id, so
     /// a retry can never become two messages (core keeps the first); anything else changed
     /// is a new message with a new id (as GTK, #162).
-    private var draft: (body: String, reply: String?, id: String)?
+    private var draft: (body: String, reply: String?, files: [UInt64], id: String)?
 
     init(channelId: String, client: any ChatClient, onMessage: @escaping (FfiMessage) -> Void) {
         self.channelId = channelId
@@ -265,9 +296,9 @@ final class ComposerModel {
     /// A message needs text or files (#126), so an edit may clear the caption of a message
     /// that has files, but not empty a text-only one.
     var canSend: Bool {
-        guard !sending else { return false }
+        guard !sending, !preparing else { return false }
         let empty = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        return !empty || editing?.attachments.isEmpty == false
+        return !empty || editing?.attachments.isEmpty == false || (editing == nil && !staged.isEmpty)
     }
 
     /// Sends (or saves an edit). The box clears at once; on failure the text and the reply
@@ -275,6 +306,10 @@ final class ComposerModel {
     /// can't be retried safely), so it says so instead of "not sent".
     func send() async {
         guard canSend else { return }
+        if editing == nil, !staged.isEmpty {
+            await sendWithFiles()
+            return
+        }
         let (typed, reply, editing) = (text, replyingTo, self.editing)
         // A blank caption goes out as no caption, not as spaces.
         let body = typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : typed
@@ -284,7 +319,7 @@ final class ComposerModel {
         sending = true
         defer { sending = false }
         if editing == nil, let cache = client as? any OfflineClient {
-            let id = draftId(body: body, reply: reply?.id)
+            let id = draftId(body: body, reply: reply?.id, files: [])
             do {
                 _ = try await cache.sendQueued(channelId: channelId, body: body, replyToId: reply?.id,
                                                clientId: id)
@@ -324,12 +359,63 @@ final class ComposerModel {
         }
     }
 
-    /// The failed draft's id for the same message, else a new lowercase one.
-    private func draftId(body: String, reply: String?) -> String {
-        if let draft, draft.body == body, draft.reply == reply { return draft.id }
+    /// The failed draft's id for the same message (text, quote and staged files), else a new
+    /// lowercase one.
+    private func draftId(body: String, reply: String?, files: [UInt64]) -> String {
+        if let draft, draft.body == body, draft.reply == reply, draft.files == files { return draft.id }
         let id = UUID().uuidString.lowercased()
-        draft = (body, reply, id)
+        draft = (body, reply, files, id)
         return id
+    }
+
+    /// A message with files: copied into the outbox off the main thread (large files), with
+    /// everything locked meanwhile; on success sent and cleared, on error all kept, with why.
+    private func sendWithFiles() async {
+        guard let cache = client as? any OfflineClient else { return }
+        let files = staged
+        let (typed, reply) = (text, replyingTo)
+        let body = typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : typed
+        let id = draftId(body: body, reply: reply?.id, files: files.map(\.transferId))
+        let outgoing = files.map(\.outgoing)
+        let channel = channelId
+        preparing = true
+        let result: Result<FfiSendReceipt, Error> = await Task.detached {
+            do {
+                return .success(try await cache.sendQueuedWithFiles(
+                    channelId: channel, body: body, replyToId: reply?.id, clientId: id, files: outgoing))
+            } catch {
+                return .failure(error)
+            }
+        }.value
+        preparing = false
+        switch result {
+        case .success:
+            files.forEach { $0.release() } // snapshotted: their access is no longer needed
+            staged = []
+            if text == typed { text = "" }
+            replyingTo = nil
+            draft = nil
+            error = nil
+            await pending?.reload()
+        case let .failure(failure):
+            if failure.isLocalUnavailable { filesUnavailable = true }
+            error = Self.explainFiles(failure)
+        }
+    }
+
+    /// A send with files that core refused, as GTK's `send_error_text`.
+    static func explainFiles(_ error: Error) -> String {
+        guard case let .Api(code, _) = error as? LoginError else { return explain(error) }
+        switch code {
+        case "outbox.too_many_files": return "Too many files for one message."
+        case "outbox.file_too_large": return "A file is too large to send."
+        case "outbox.empty_file": return "An empty file can't be sent."
+        case "outbox.empty_message": return "Write something or add a file."
+        case "outbox.file_unreadable": return "A file couldn't be read. Is it still there?"
+        case "outbox.store": return "Couldn't prepare the files. Is the disk full?"
+        case "local.unavailable": return "Sending files needs this Mac's storage, which isn't available yet."
+        default: return explain(error)
+        }
     }
 
     /// A queued send that failed before it was saved (nothing was queued).

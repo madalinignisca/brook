@@ -11,6 +11,8 @@ protocol OfflineClient: AnyObject, Sendable {
     func loadOlder(channelId: String, limit: UInt32) async throws
     func cachedUsers(ids: [String]) async throws -> [FfiMember]
     func sendQueued(channelId: String, body: String, replyToId: String?, clientId: String) async throws -> String
+    func sendQueuedWithFiles(channelId: String, body: String, replyToId: String?, clientId: String,
+                             files: [FfiOutgoingFile]) async throws -> FfiSendReceipt
     func pendingMessages(channelId: String) async throws -> [FfiPendingMessage]
     func retrySend(clientId: String) async throws
     func retryWithoutReply(clientId: String) async throws

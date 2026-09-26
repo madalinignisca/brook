@@ -45,6 +45,16 @@ extension FakeChat: OfflineClient {
         return clientId
     }
 
+    func sendQueuedWithFiles(channelId: String, body: String, replyToId: String?, clientId: String,
+                             files: [FfiOutgoingFile]) async throws -> FfiSendReceipt {
+        try need()
+        if let filesGate { await filesGate.wait() }
+        let list = files.map { "\($0.filename):\($0.contentType):\($0.transferId ?? 0)" }.joined(separator: ",")
+        queuedFiles.withLock { $0.append("\(clientId)|\(body)|\(list)") }
+        if let queueFailure { throw queueFailure }
+        return FfiSendReceipt(clientId: clientId, files: [])
+    }
+
     func pendingMessages(channelId: String) async throws -> [FfiPendingMessage] {
         try need()
         record("pending")

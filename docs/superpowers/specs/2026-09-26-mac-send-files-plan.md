@@ -20,7 +20,8 @@ Spec: `2026-09-26-mac-send-files-spec.md` (#172, closed). Standard. One PR.
    - `attach(urls:)`, `remove(file)` (refused while preparing);
    - `send()` with files: it calls `sendQueuedWithFiles` from a detached task (off main),
      with `preparing = true`.
-   - The draft id (#162's rule) is keyed on the text, the quote and the files' URLs.
+   - The draft id (#162's rule) is keyed on the text, the quote and the staged files'
+     transfer ids, as GTK does since #173: stable while staged, new on any add or remove.
    - On success it releases every file and clears. On error it keeps everything, with
      GTK's `send_error_text`.
    - `local.unavailable` sets `canAttach = false` for the rest of the session.
@@ -54,12 +55,14 @@ Taken:
   succeeds).
 - **`preparing` is set and reset only on the main actor, on every path.** The detached task
   only calls core.
-- **The draft id also keys on each file's size and modification date,** so a file replaced
-  at the same path is a new message and never gets the old one's stored receipt.
+- ~~The draft id also keys on each file's size and modification date.~~ Reversed after
+  #173: if the first attempt was stored, an edit on disk plus Send would queue a second
+  message beside it. The key is the staged transfer ids, stable while staged and new on
+  any add or remove, as GTK does.
 - **Tests:**
   - `FakeFileAccess` counts starts and stops, and every path ends balanced (refusal,
     remove, success);
-  - a changed file at the same URL gets a new id.
+  - a removed or added file gets a new id, and the same staged set keeps it.
 
 Rebutted:
 - **"Release on a send error."** The spec keeps a failed message's files staged for the
