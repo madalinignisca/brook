@@ -152,7 +152,9 @@ final class ComposerModel {
     /// can't be retried safely), so it says so instead of "not sent".
     func send() async {
         guard canSend else { return }
-        let (body, reply, editing) = (text, replyingTo, self.editing)
+        let (typed, reply, editing) = (text, replyingTo, self.editing)
+        // A blank caption goes out as no caption, not as spaces.
+        let body = typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : typed
         text = ""
         replyingTo = nil
         self.editing = nil
@@ -171,7 +173,7 @@ final class ComposerModel {
             onMessage(message)
         } catch {
             if text.isEmpty {  // unless something new was typed meanwhile
-                text = body
+                text = typed
                 replyingTo = reply
                 self.editing = editing
             }

@@ -153,7 +153,7 @@ final class ComposerModelTests: XCTestCase {
         withFile.attachments = [FfiFileInfo(id: "f", filename: "a.png", originalName: "a.png",
                                             size: 1, contentType: "image/png", sha256: "ab")]
         c.edit(withFile)
-        c.text = ""
+        c.text = " \n"
         XCTAssertTrue(c.canSend)
         await c.send()
         XCTAssertEqual(chat.sent.withLock { $0 }, ["edit:m2:"])
