@@ -35,6 +35,19 @@ pub enum RefreshMode {
     EchoFail,
 }
 
+/// How `GET /auth/me` answers (set after a login, whose own `me` it would otherwise change).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeMode {
+    /// The user, with any profile set (`set_profile`, or a `PATCH /auth/me`).
+    Ok,
+    /// Answer with this status and an error envelope.
+    Fail(u16),
+    /// Never answer.
+    Stall,
+    /// Someone else's profile (another id).
+    OtherId,
+}
+
 /// How the password endpoints answer (`/auth/password`, `/users/{id}/password`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PasswordMode {
@@ -96,6 +109,9 @@ struct ServerState {
     /// Handles with an enrolment waiting for activation, and whether it has expired.
     enrolling: HashSet<String>,
     enrollment_expired: bool,
+    /// Profiles changed since sign-up: handle → (display name, status line).
+    profiles: HashMap<String, (String, String)>,
+    me_mode: MeMode,
     sockets: mpsc::UnboundedSender<WsPeer>,
 }
 
@@ -115,6 +131,8 @@ impl TestServer {
             next: 0,
             tokens: HashMap::new(),
             refresh_tokens: HashMap::new(),
+            profiles: HashMap::new(),
+            me_mode: MeMode::Ok,
             refresh_mode: RefreshMode::Rotate,
             refresh_calls: 0,
             stall_login: false,
@@ -140,7 +158,7 @@ impl TestServer {
         }));
         let app = Router::new()
             .route("/api/v1/auth/login", post(login))
-            .route("/api/v1/auth/me", get(me))
+            .route("/api/v1/auth/me", get(me).patch(update_me))
             .route("/api/v1/auth/refresh", post(refresh))
             .route("/api/v1/auth/password", post(change_password))
             .route("/api/v1/auth/totp", post(complete_totp))
@@ -170,6 +188,23 @@ impl TestServer {
     /// A client pointed at this origin (loopback http is allowed by core).
     pub fn client(&self) -> BrookClient {
         BrookClient::new(CoreConfig::new(&self.base).unwrap()).unwrap()
+    }
+
+    pub fn set_me_mode(&self, mode: MeMode) {
+        self.state.lock().unwrap().me_mode = mode;
+    }
+
+    /// Change a user's display name on the server (as another device's edit would).
+    pub fn set_profile(&self, handle: &str, display_name: &str) {
+        let mut state = self.state.lock().unwrap();
+        let status = state
+            .profiles
+            .get(handle)
+            .map(|p| p.1.clone())
+            .unwrap_or_default();
+        state
+            .profiles
+            .insert(handle.to_string(), (display_name.to_string(), status));
     }
 
     pub fn set_refresh_mode(&self, mode: RefreshMode) {
@@ -622,22 +657,64 @@ async fn list_users(State(state): State<Shared>, headers: HeaderMap, uri: Uri) -
     .into_response()
 }
 
+/// The `MeOut` for `handle`, with its profile as changed so far.
+fn me_out(state: &ServerState, handle: &str) -> Value {
+    let on = state.totp_users.contains(handle);
+    let (name, status) = state
+        .profiles
+        .get(handle)
+        .cloned()
+        .unwrap_or_else(|| (handle.to_string(), String::new()));
+    json!({
+        "id": format!("id-{handle}"), "handle": handle,
+        "display_name": name, "status_text": status, "global_role": "member",
+        "totp_enabled": on,
+        "recovery_codes_left": if on { json!(state.recovery_codes.len()) } else { Value::Null },
+    })
+}
+
 async fn me(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let token = bearer(&headers);
+    let mode = state.lock().unwrap().me_mode;
+    match mode {
+        MeMode::Stall => std::future::pending::<()>().await,
+        MeMode::Fail(code) => return error(code, "boom", "me failed"),
+        MeMode::Ok | MeMode::OtherId => {}
+    }
     let state = state.lock().unwrap();
     match state.tokens.get(&token) {
-        Some(handle) => {
-            let on = state.totp_users.contains(handle);
-            Json(json!({
-                "id": format!("id-{handle}"), "handle": handle,
-                "display_name": handle, "global_role": "member",
-                "totp_enabled": on,
-                "recovery_codes_left": if on { json!(state.recovery_codes.len()) } else { Value::Null },
-            }))
-            .into_response()
+        Some(handle) if mode == MeMode::OtherId => {
+            let mut out = me_out(&state, handle);
+            out["id"] = json!("id-someone-else");
+            Json(out).into_response()
         }
+        Some(handle) => Json(me_out(&state, handle)).into_response(),
         None => StatusCode::UNAUTHORIZED.into_response(),
     }
+}
+
+/// `PATCH /auth/me`: the given fields change; the answer is the new `MeOut`.
+async fn update_me(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let token = bearer(&headers);
+    let mut state = state.lock().unwrap();
+    let Some(handle) = state.tokens.get(&token).cloned() else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let entry = state
+        .profiles
+        .entry(handle.clone())
+        .or_insert_with(|| (handle.clone(), String::new()));
+    if let Some(name) = body["display_name"].as_str() {
+        entry.0 = name.to_string();
+    }
+    if let Some(status) = body["status_text"].as_str() {
+        entry.1 = status.to_string();
+    }
+    Json(me_out(&state, &handle)).into_response()
 }
 
 async fn refresh(State(state): State<Shared>, Json(body): Json<Value>) -> Response {
