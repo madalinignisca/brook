@@ -21,6 +21,10 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     /// Pending reads, handed out in order (the last one repeats).
     var pendingReads: [[FfiPendingMessage]] = []
     var queueFailure: Error?
+    /// Messages with files: "clientId|body|name:type:transferId,…"; held while `filesGate` is set.
+    let queuedFiles = Mutex<[String]>([])
+    var filesGate: Gate?
+    let cancelled = Mutex<[UInt64]>([])
     let queued = Mutex<[String]>([]) // "clientId|body|reply"
     var unsent: UInt64 = 0
     var lost: UInt64?
@@ -56,7 +60,7 @@ final class FakeChat: ChatClient, @unchecked Sendable {
         if let downloadFailure { throw downloadFailure }
         try downloadBytes.write(to: URL(fileURLWithPath: destination))
     }
-    func cancelTransfer(transferId: UInt64) {}
+    func cancelTransfer(transferId: UInt64) { cancelled.withLock { $0.append(transferId) } }
     func subscribeTransfers(listener: TransferListener) -> Subscription {
         fatalError("not used by these tests")
     }

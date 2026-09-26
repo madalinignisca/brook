@@ -63,14 +63,25 @@ struct ChatView: View {
             Divider()
             ComposerView(composer: composer)
         }
+        // Files dropped anywhere on the conversation join the next message (not while
+        // editing, and only with this Mac's storage).
+        .dropDestination(for: URL.self) { urls, _ in
+            guard composer.canAttach else { return false }
+            composer.attach(urls.filter(\.isFileURL))
+            return true
+        }
         .task {
             saves.start()
+            pending?.startProgress()
             // Unsent bubbles don't wait for the network history.
             async let bubbles: Void = pending?.reload() ?? ()
             await timeline.load()
             await bubbles
         }
-        .onDisappear { saves.stop() }
+        .onDisappear {
+            saves.stop()
+            pending?.stopProgress()
+        }
     }
 }
 
@@ -81,7 +92,10 @@ struct PendingRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(message.body).foregroundStyle(.secondary)
+            if !message.body.isEmpty { Text(message.body).foregroundStyle(.secondary) }
+            ForEach(message.files, id: \.transferId) { file in
+                Label(pending.fileLine(file), systemImage: "doc").font(.caption).foregroundStyle(.secondary)
+            }
             HStack(spacing: 8) {
                 Text(PendingModel.text(message)).font(.caption).foregroundStyle(.secondary)
                 ForEach(PendingModel.actions(message), id: \.self) { action in
@@ -100,6 +114,7 @@ struct PendingRow: View {
         case .retry: "Retry"
         case .sendWithoutQuote: "Send without the quote"
         case .delete: "Delete"
+        case .cancel: "Cancel"
         }
     }
 }
@@ -231,7 +246,34 @@ struct ComposerView: View {
             if let error = composer.error {
                 Text(error).font(.caption).foregroundStyle(.red)
             }
+            if !composer.staged.isEmpty {
+                ScrollView(.horizontal) {
+                    HStack {
+                        ForEach(composer.staged) { file in
+                            HStack(spacing: 4) {
+                                Image(systemName: "doc")
+                                Text(file.name).lineLimit(1)
+                                Text(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .binary))
+                                    .foregroundStyle(.secondary)
+                                Button { composer.remove(file) } label: { Image(systemName: "xmark.circle.fill") }
+                                    .buttonStyle(.borderless).disabled(composer.preparing)
+                                    .accessibilityLabel("Remove \(file.name)")
+                            }
+                            .font(.caption).padding(.horizontal, 6).padding(.vertical, 3)
+                            .background(.quaternary, in: Capsule())
+                        }
+                    }
+                }
+            }
+            if composer.preparing {
+                Label("Preparing files…", systemImage: "hourglass").font(.caption).foregroundStyle(.secondary)
+            }
             HStack(alignment: .bottom) {
+                Button { attach() } label: { Image(systemName: "paperclip") }
+                    .buttonStyle(.borderless)
+                    .disabled(!composer.canAttach)
+                    .help(composer.canAttach ? "Attach files" : "Sending files needs this Mac's storage")
+                    .accessibilityLabel("Attach files")
                 TextField("Message", text: $composer.text, axis: .vertical)
                     .lineLimit(1 ... 6)
                     .textFieldStyle(.roundedBorder)
@@ -244,6 +286,17 @@ struct ComposerView: View {
             }
         }
         .padding(10)
+    }
+
+    /// Files only, several at once.
+    private func attach() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.treatsFilePackagesAsDirectories = false
+        guard panel.runModal() == .OK else { return }
+        composer.attach(panel.urls)
     }
 
     private func banner(_ text: String) -> some View {

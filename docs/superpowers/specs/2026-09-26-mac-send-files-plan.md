@@ -20,7 +20,8 @@ Spec: `2026-09-26-mac-send-files-spec.md` (#172, closed). Standard. One PR.
    - `attach(urls:)`, `remove(file)` (refused while preparing);
    - `send()` with files: it calls `sendQueuedWithFiles` from a detached task (off main),
      with `preparing = true`.
-   - The draft id (#162's rule) is keyed on the text, the quote and the files' URLs.
+   - The draft id (#162's rule) is keyed on the text, the quote and the staged files'
+     transfer ids, as GTK does since #173: stable while staged, new on any add or remove.
    - On success it releases every file and clears. On error it keeps everything, with
      GTK's `send_error_text`.
    - `local.unavailable` sets `canAttach = false` for the rest of the session.
@@ -54,12 +55,14 @@ Taken:
   succeeds).
 - **`preparing` is set and reset only on the main actor, on every path.** The detached task
   only calls core.
-- **The draft id also keys on each file's size and modification date,** so a file replaced
-  at the same path is a new message and never gets the old one's stored receipt.
+- ~~The draft id also keys on each file's size and modification date.~~ Reversed after
+  #173: if the first attempt was stored, an edit on disk plus Send would queue a second
+  message beside it. The key is the staged transfer ids, stable while staged and new on
+  any add or remove, as GTK does.
 - **Tests:**
   - `FakeFileAccess` counts starts and stops, and every path ends balanced (refusal,
     remove, success);
-  - a changed file at the same URL gets a new id.
+  - a removed or added file gets a new id, and the same staged set keeps it.
 
 Rebutted:
 - **"Release on a send error."** The spec keeps a failed message's files staged for the
@@ -69,3 +72,26 @@ Rebutted:
   transfer id.
 
 Closed.
+
+## Implementation review, round 1 (vibe; Standard)
+
+Taken:
+- **`filesUnavailable` clears on the next queued send that works.** The stores may open
+  after the first try, and until now Attach stayed closed for the life of the view.
+
+Rebutted:
+- **"Release access on a send error."** The spec keeps a failed message's files staged for
+  its retry, so they keep their access.
+- **"Mutations off the main actor."** `ComposerModel` and `PendingModel` are
+  `@MainActor`. The detached task only calls core, its result is applied back on the main
+  actor, and the transfer bridge hops to main.
+- **"No guard against a second send."** `send()` requires `canSend`, which is false while
+  `preparing`.
+- **"Cancel only cancels the first file."** Core cancels the whole message's sending from
+  any of its file transfers (the binding's contract).
+- **"Integer percentage."** Truncating never shows 100% before the upload is done. That's
+  intended.
+- **"Id and send from different snapshots."** Body, quote and files are captured once, and
+  both the id and the call use those same values.
+
+Measured: 12 mutants, each caught. 202 Mac tests pass.
