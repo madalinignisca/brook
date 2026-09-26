@@ -1879,12 +1879,44 @@ fn show_alert(chat: &Rc<Chat>, heading: &str, body: &str) {
     alert.present(Some(&chat.message_list));
 }
 
+/// Whether a viewer is offered Remove on a member, as the server allows it (#183): never
+/// themselves (that's Leave); a global admin removes anyone; a channel owner removes members
+/// but not other owners.
+fn may_remove(admin: bool, my_role: Option<&str>, their_role: Option<&str>, is_me: bool) -> bool {
+    if is_me {
+        return false;
+    }
+    admin || (my_role == Some("owner") && their_role != Some("owner"))
+}
+
 /// "Leave channel": confirm, then leave. The server's `channel.delete` to us closes it.
 fn leave_channel_confirm(chat: &Rc<Chat>) {
     let Some(channel_id) = chat.current.borrow().clone() else {
         return;
     };
     let me = chat.me.borrow().clone().unwrap_or_default();
+    // The last owner can't leave (the server refuses): say so before asking.
+    let owners: Vec<String> = chat
+        .channels
+        .borrow()
+        .iter()
+        .find(|c| c.id == channel_id)
+        .map(|c| {
+            c.members
+                .iter()
+                .filter(|m| m.role.as_deref() == Some("owner"))
+                .map(|m| m.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if owners.len() == 1 && owners[0] == me {
+        show_alert(
+            chat,
+            "You're the Last Owner",
+            "The last owner can't leave. Delete the channel instead.",
+        );
+        return;
+    }
     let title = chat
         .channels
         .borrow()
@@ -1939,19 +1971,32 @@ fn members_dialog(chat: &Rc<Chat>) {
         .find(|c| c.id == channel_id)
         .map(|c| c.members.clone())
         .unwrap_or_default();
-    // Removing others is for channel owners and admins; the member list doesn't say who
-    // owns the channel yet, so only admins are offered it (the server decides anyway).
-    let can_remove = *chat.is_admin.borrow();
+    // The server's rules (#183): an owner or an admin removes others; only an admin
+    // removes an owner. The server decides anyway; this only offers what it would allow.
+    let admin = *chat.is_admin.borrow();
+    let my_role = members
+        .iter()
+        .find(|m| m.id == me)
+        .and_then(|m| m.role.clone());
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
         .build();
     for member in members {
+        let subtitle = match member.role.as_deref() {
+            Some("owner") => format!("@{} · owner", member.handle),
+            _ => format!("@{}", member.handle),
+        };
         let row = adw::ActionRow::builder()
             .title(glib::markup_escape_text(&member.display_name).as_str())
-            .subtitle(glib::markup_escape_text(&format!("@{}", member.handle)).as_str())
+            .subtitle(glib::markup_escape_text(&subtitle).as_str())
             .build();
-        if can_remove && member.id != me {
+        if may_remove(
+            admin,
+            my_role.as_deref(),
+            member.role.as_deref(),
+            member.id == me,
+        ) {
             let remove = gtk::Button::builder()
                 .label("Remove")
                 .valign(gtk::Align::Center)
@@ -3274,6 +3319,22 @@ fn sign_out_body(unsent: u64, known: bool, remove: bool) -> String {
 #[cfg(test)]
 mod offline_tests {
     use super::*;
+
+    #[test]
+    fn remove_is_offered_as_the_server_allows_it() {
+        // Never yourself.
+        assert!(!may_remove(true, Some("owner"), Some("owner"), true));
+        // An admin removes anyone, owners included.
+        assert!(may_remove(true, None, Some("owner"), false));
+        assert!(may_remove(true, Some("member"), Some("member"), false));
+        // An owner removes members, not other owners.
+        assert!(may_remove(false, Some("owner"), Some("member"), false));
+        assert!(may_remove(false, Some("owner"), None, false));
+        assert!(!may_remove(false, Some("owner"), Some("owner"), false));
+        // A member removes no one; unknown roles offer nothing.
+        assert!(!may_remove(false, Some("member"), Some("member"), false));
+        assert!(!may_remove(false, None, None, false));
+    }
 
     #[test]
     fn membership_refusals_read_as_sentences() {
