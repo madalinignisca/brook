@@ -77,6 +77,21 @@ struct Chat {
     shown_client_ids: Rc<RefCell<std::collections::HashSet<String>>>,
     /// "You're offline" above the messages, from the cache's state.
     offline_banner: adw::Banner,
+    /// Files waiting to go with the next message, drawn as chips in `staged_box`.
+    staged: Rc<RefCell<Vec<crate::outgoing::Staged>>>,
+    staged_box: gtk::Box,
+    attach_button: gtk::Button,
+    /// A send with files is being copied into the outbox: the composer waits for it.
+    preparing: Rc<Cell<bool>>,
+    /// Upload progress by transfer id, for the chips and the pending bubbles.
+    progress: crate::outgoing::Progress,
+    /// Transfer ids the pending bubbles show (forgotten when they're redrawn).
+    pending_ids: Rc<RefCell<Vec<brook_core::TransferId>>>,
+    /// The staged message's outbox id, made at its first Send and kept until it's queued
+    /// or dropped: a second Send after an unclear failure can't make a second message.
+    draft_id: Rc<RefCell<Option<String>>>,
+    /// The chip whose button cancelled the copy: that file leaves, the others stay.
+    cancelled_chip: Rc<Cell<Option<brook_core::TransferId>>>,
 }
 
 /// The widgets of a rendered message we may mutate after an edit/delete/reaction.
@@ -134,6 +149,19 @@ pub fn build(
         .icon_name("paper-plane-symbolic")
         .sensitive(false)
         .css_classes(["suggested-action"])
+        .build();
+    let attach_button = gtk::Button::builder()
+        .icon_name("mail-attachment-symbolic")
+        .tooltip_text("Add files")
+        .sensitive(false)
+        .css_classes(["flat"])
+        .build();
+    let staged_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_start(6)
+        .margin_end(6)
+        .visible(false)
         .build();
 
     let title = adw::WindowTitle::new("Brook", "Pick a conversation");
@@ -217,7 +245,16 @@ pub fn build(
             .title("You're offline. Showing saved messages.")
             .revealed(false)
             .build(),
+        staged: Rc::default(),
+        staged_box: staged_box.clone(),
+        attach_button: attach_button.clone(),
+        preparing: Rc::default(),
+        progress: crate::outgoing::Progress::default(),
+        pending_ids: Rc::default(),
+        draft_id: Rc::default(),
+        cancelled_chip: Rc::default(),
     });
+    chat.progress.listen(&chat.client);
 
     // --- sidebar ---
     let add_button = gtk::MenuButton::builder()
@@ -280,6 +317,7 @@ pub fn build(
         .margin_start(6)
         .margin_end(6)
         .build();
+    composer_row.append(&attach_button);
     composer_row.append(&composer);
     composer_row.append(&send_button);
 
@@ -288,6 +326,7 @@ pub fn build(
     content_box.append(&message_scroll);
     content_box.append(&typing_label);
     content_box.append(&reply_bar);
+    content_box.append(&staged_box);
     content_box.append(&composer_row);
 
     composer.connect_changed({
@@ -340,6 +379,10 @@ pub fn build(
     send_button.connect_clicked({
         let do_send = do_send.clone();
         move |_| (do_send)()
+    });
+    attach_button.connect_clicked({
+        let chat = chat.clone();
+        move |_| add_files(&chat)
     });
 
     // Resolve our user id, load channels, open the realtime stream.
@@ -489,6 +532,7 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         chat.title.set_subtitle("Pick a conversation");
                         chat.composer.set_sensitive(false);
                         chat.send_button.set_sensitive(false);
+                        chat.attach_button.set_sensitive(false);
                         chat.channel_settings.set_visible(false);
                         chat.call_button.set_sensitive(false);
                     }
@@ -611,8 +655,11 @@ fn apply_channel_chrome(chat: &Rc<Chat>, channel_id: &str) {
     });
     chat.channel_settings
         .set_visible(!is_dm && *chat.is_admin.borrow());
-    chat.composer.set_sensitive(!archived);
-    chat.send_button.set_sensitive(!archived);
+    // While files are being copied the composer waits (a reload mustn't unlock it).
+    let open = !archived && !chat.preparing.get();
+    chat.composer.set_sensitive(open);
+    chat.send_button.set_sensitive(open);
+    chat.attach_button.set_sensitive(open);
     // Archived channels refuse call.join.
     chat.call_button.set_sensitive(!archived);
     refresh_call_button(chat);
@@ -661,6 +708,10 @@ fn open_call(chat: &Rc<Chat>, button: &gtk::Button) {
 }
 
 fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
+    // Files picked for one conversation never go to another.
+    if !chat.preparing.get() {
+        clear_staged(chat);
+    }
     *chat.current.borrow_mut() = Some(channel_id.to_string());
     apply_channel_chrome(chat, channel_id);
 
@@ -744,6 +795,13 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
 
 /// Send the composer's text into the current channel (the WS echo renders it).
 fn send_current(chat: &Rc<Chat>) {
+    if chat.preparing.get() {
+        return;
+    }
+    if !chat.staged.borrow().is_empty() {
+        send_with_files(chat);
+        return;
+    }
     let body = chat.composer.text().to_string();
     let Some(channel_id) = chat.current.borrow().clone() else {
         return;
@@ -807,6 +865,153 @@ fn send_current(chat: &Rc<Chat>) {
             }
         }
     });
+}
+
+/// Pick files and put them under the message box (limits checked as they're added).
+fn add_files(chat: &Rc<Chat>) {
+    let window = chat.composer.root().and_downcast::<gtk::Window>();
+    let chat = chat.clone();
+    crate::outgoing::pick(window.as_ref(), move |files| {
+        let chat = chat.clone();
+        glib::spawn_future_local(async move {
+            for file in files {
+                let Some(staged) = crate::outgoing::describe(&file).await else {
+                    show_send_error(&chat, "That file couldn't be read.");
+                    continue;
+                };
+                let count = chat.staged.borrow().len();
+                if let Some(why) = crate::outgoing::refusal(count, &staged.name, staged.size) {
+                    show_send_error(&chat, &why);
+                    continue;
+                }
+                chat.staged.borrow_mut().push(staged);
+            }
+            redraw_staged(&chat);
+            chat.composer.grab_focus();
+        });
+    });
+}
+
+/// Draw the staged files as chips above the message box.
+fn redraw_staged(chat: &Rc<Chat>) {
+    while let Some(child) = chat.staged_box.first_child() {
+        chat.staged_box.remove(&child);
+    }
+    let staged = chat.staged.borrow().clone();
+    for file in &staged {
+        let tid = file.transfer_id;
+        let chip = crate::outgoing::staged_chip(file, &chat.progress, {
+            let chat = Rc::downgrade(chat);
+            move || {
+                let Some(chat) = chat.upgrade() else { return };
+                if chat.preparing.get() {
+                    // Mid-copy: stop the whole send (core's flags are per message, so
+                    // nothing gets queued); this file then leaves, the others stay.
+                    chat.cancelled_chip.set(Some(tid));
+                    chat.client.cancel_transfer(tid);
+                } else {
+                    chat.staged.borrow_mut().retain(|f| f.transfer_id != tid);
+                    chat.progress.forget([tid]);
+                    redraw_staged(&chat);
+                }
+            }
+        });
+        chat.staged_box.append(&chip);
+    }
+    chat.staged_box.set_visible(!staged.is_empty());
+}
+
+fn clear_staged(chat: &Rc<Chat>) {
+    chat.draft_id.replace(None);
+    let ids: Vec<_> = chat
+        .staged
+        .borrow_mut()
+        .drain(..)
+        .map(|f| f.transfer_id)
+        .collect();
+    chat.progress.forget(ids);
+    redraw_staged(chat);
+}
+
+/// Send the staged files with the composer's text (which may be empty). Core copies each
+/// file before the call returns; meanwhile the chips show the copy and can cancel it.
+fn send_with_files(chat: &Rc<Chat>) {
+    let Some(channel_id) = chat.current.borrow().clone() else {
+        return;
+    };
+    let body = chat.composer.text().to_string();
+    let reply_to = chat.replying_to.borrow().clone();
+    let files: Vec<_> = chat.staged.borrow().iter().map(|f| f.outgoing()).collect();
+    let client_id = chat
+        .draft_id
+        .borrow_mut()
+        .get_or_insert_with(|| glib::uuid_string_random().to_string())
+        .clone();
+    chat.cancelled_chip.set(None);
+    set_preparing(chat, true);
+
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let handle = chat.runtime.spawn({
+            let client = chat.client.clone();
+            let body = body.clone();
+            async move {
+                client
+                    .send_queued_with_files(&channel_id, &body, reply_to, Some(client_id), files)
+                    .await
+            }
+        });
+        let result = handle
+            .await
+            .unwrap_or(Err(brook_core::Error::UnexpectedResponse));
+        set_preparing(&chat, false);
+        match result {
+            Ok(_) => {
+                // Queued: the bubble takes over. Keep anything typed since.
+                if chat.composer.text() == body {
+                    chat.composer.set_text("");
+                }
+                set_reply(&chat, None);
+                clear_staged(&chat);
+                render_pending(&chat);
+            }
+            Err(err) => {
+                // Nothing was queued: the files and text stay for another try, except a
+                // file whose own button cancelled the copy.
+                if let Some(tid) = chat.cancelled_chip.take() {
+                    chat.staged.borrow_mut().retain(|f| f.transfer_id != tid);
+                    chat.progress.forget([tid]);
+                    if chat.staged.borrow().is_empty() {
+                        chat.draft_id.replace(None);
+                    }
+                }
+                redraw_staged(&chat);
+                let code = match &err {
+                    brook_core::Error::Api { code, .. } => code.as_str(),
+                    _ => "",
+                };
+                if code != "transfer.cancelled" {
+                    tracing::warn!(%err, "failed to queue files");
+                    let text = crate::outgoing::send_error_text(code)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| send_error_text(&err));
+                    show_send_error(&chat, &text);
+                }
+            }
+        }
+    });
+}
+
+/// Lock the composer while files are copied (the chips' buttons then cancel).
+fn set_preparing(chat: &Rc<Chat>, on: bool) {
+    chat.preparing.set(on);
+    if on {
+        chat.composer.set_sensitive(false);
+        chat.send_button.set_sensitive(false);
+        chat.attach_button.set_sensitive(false);
+    } else if let Some(id) = chat.current.borrow().clone() {
+        apply_channel_chrome(chat, &id);
+    }
 }
 
 /// Convert a markdown message body to Pango markup (bold / italic / inline code /
@@ -2106,6 +2311,11 @@ fn pending_text(state: &PendingState) -> String {
                 "Not sent: you can't post here any more".into()
             }
             "message.reply_target_gone" => "Not sent: the quoted message was deleted".into(),
+            "transfer.cancelled" => "Cancelled".into(),
+            "outbox.snapshot_damaged" => "Not sent: a file's saved copy is damaged".into(),
+            c if c.starts_with("file.") || c == "outbox.duplicate_file" => {
+                "Not sent: a file was refused".into()
+            }
             _ => "Not sent".into(),
         },
     }
@@ -2133,6 +2343,8 @@ fn render_pending(chat: &Rc<Chat>) {
         for row in chat.pending_rows.borrow_mut().drain(..) {
             chat.message_list.remove(&row);
         }
+        let old: Vec<_> = chat.pending_ids.borrow_mut().drain(..).collect();
+        chat.progress.forget(old);
         for item in pending {
             if chat.shown_client_ids.borrow().contains(&item.client_id) {
                 continue; // already in the history (between the ack's two steps)
@@ -2176,10 +2388,25 @@ fn pending_row(chat: &Rc<Chat>, item: &PendingMessage) -> gtk::ListBoxRow {
             .label(&item.body)
             .xalign(0.0)
             .wrap(true)
+            .visible(!item.body.trim().is_empty() || item.files.is_empty())
             .build(),
     );
+    for file in &item.files {
+        column.append(&crate::outgoing::pending_file_line(file, &chat.progress));
+        chat.pending_ids.borrow_mut().push(file.transfer_id);
+    }
     let footer = gtk::Box::builder().spacing(6).build();
     let failed = matches!(item.state, PendingState::Failed { .. });
+    // Files still to upload: Cancel stops the message's sending (it fails; Retry resumes).
+    if let Some(file) = item.files.iter().find(|f| !f.uploaded).filter(|_| !failed) {
+        let cancel = gtk::Button::builder()
+            .label("Cancel")
+            .css_classes(["flat"])
+            .build();
+        let (client, tid) = (chat.client.clone(), file.transfer_id);
+        cancel.connect_clicked(move |_| client.cancel_transfer(tid));
+        footer.append(&cancel);
+    }
     footer.append(
         &gtk::Label::builder()
             .label(pending_text(&item.state))
