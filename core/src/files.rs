@@ -42,6 +42,9 @@ const SYNC_EVERY: u64 = 8;
 /// woken by the connection coming back).
 const FETCH_RETRY: Duration = Duration::from_secs(60);
 
+/// The longest a pinned file that keeps failing waits between attempts.
+const FETCH_BACKOFF_MAX: Duration = Duration::from_secs(4 * 3600);
+
 /// How often a caller waiting on a shared download checks its own cancel.
 const CALLER_TICK: Duration = Duration::from_millis(100);
 
@@ -177,6 +180,11 @@ pub(crate) struct Files {
     fetching: Mutex<HashMap<String, TransferId>>,
     /// How long the fetcher waits after a failed round before trying again (tests shorten it).
     fetch_retry: Mutex<Duration>,
+    /// Pinned files that keep failing: how many times in a row, and not before when. The
+    /// wait doubles each time (from `fetch_retry`, up to `FETCH_BACKOFF_MAX`), so a file that
+    /// can't be fetched (a server that keeps sending wrong bytes) isn't re-downloaded whole
+    /// every minute. Reset by a success or a new pin.
+    fetch_failures: Mutex<HashMap<String, (u32, tokio::time::Instant)>>,
 }
 
 impl Files {
@@ -221,6 +229,7 @@ impl Files {
         if made == 0 {
             return Err(api_error("file.gone"));
         }
+        lock(&self.fetch_failures).remove(file_id); // pinning again retries at once
         self.cache
             .announce(CacheEvent::Files(vec![file_id.to_string()]));
         self.fetch_wake.notify_one();
@@ -326,9 +335,18 @@ impl Files {
             .await
             .unwrap_or_default();
         let mut failed = false;
+        let now = tokio::time::Instant::now();
         for file_id in wanted {
             if self.closed.load(Ordering::SeqCst) {
                 break;
+            }
+            // Backing off after failures: not yet (a later round picks it up).
+            let due = lock(&self.fetch_failures)
+                .get(&file_id)
+                .is_none_or(|(_, not_before)| *not_before <= now);
+            if !due {
+                failed = true; // keeps the fetcher coming back
+                continue;
             }
             let id = TransferId::new();
             lock(&self.fetching).insert(file_id.clone(), id);
@@ -336,8 +354,10 @@ impl Files {
                 .announce(CacheEvent::Files(vec![file_id.clone()]));
             let result = self.cache_file(id, &file_id).await;
             lock(&self.fetching).remove(&file_id);
-            match result {
-                Ok(()) => {}
+            match &result {
+                Ok(()) => {
+                    lock(&self.fetch_failures).remove(&file_id);
+                }
                 // Gone or unknown: the lifecycle dropped it, pin and all. Cancelled: unpinned
                 // (or the store is closing).
                 Err(Error::Api { code, .. })
@@ -345,7 +365,16 @@ impl Files {
                         code.as_str(),
                         "file.gone" | "file.unknown" | "transfer.cancelled"
                     ) => {}
-                Err(_) => failed = true,
+                Err(_) => {
+                    failed = true;
+                    let base = *lock(&self.fetch_retry);
+                    let mut failures = lock(&self.fetch_failures);
+                    let n = failures.get(&file_id).map_or(0, |(n, _)| *n) + 1;
+                    let wait = base
+                        .saturating_mul(1u32 << (n - 1).min(16))
+                        .min(FETCH_BACKOFF_MAX);
+                    failures.insert(file_id.clone(), (n, tokio::time::Instant::now() + wait));
+                }
             }
         }
         failed
@@ -374,6 +403,7 @@ impl Files {
             fetch_wake: Arc::default(),
             fetching: Mutex::default(),
             fetch_retry: Mutex::new(FETCH_RETRY),
+            fetch_failures: Mutex::default(),
             net,
             transfers,
             session,

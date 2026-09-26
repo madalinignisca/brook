@@ -44,6 +44,8 @@ struct Server {
     files: Mutex<HashMap<String, Vec<u8>>>,
     fail_after: Mutex<Option<u64>>,
     gone: Mutex<bool>,
+    /// Every download fails as if the bytes were wrong.
+    broken: Mutex<bool>,
     hold: Mutex<Option<(u64, Arc<Notify>)>>,
     /// `(file id, resume offset, epoch)` per request.
     asked: Mutex<Vec<(String, u64, u64)>>,
@@ -91,6 +93,12 @@ impl Download for Server {
             .push((file_id.into(), offset, epoch));
         if *self.gone.lock().unwrap() {
             return Err(crate::transfer::gone_error());
+        }
+        if *self.broken.lock().unwrap() {
+            return Err(Error::Api {
+                code: "transfer.integrity".into(),
+                message: String::new(),
+            });
         }
         let content = self.files.lock().unwrap().get(file_id).cloned().unwrap();
         let fail_after = self.fail_after.lock().unwrap().take();
@@ -811,4 +819,23 @@ async fn a_pinned_file_whose_message_goes_goes_with_it() {
         matches!(&err, Error::Api { code, .. } if code == "file.unknown"),
         "{err:?}"
     );
+}
+
+/// A pinned file that keeps failing backs off (doubling each time) instead of being fetched
+/// again every round; pinning it again retries at once.
+#[tokio::test]
+async fn a_pin_that_keeps_failing_backs_off() {
+    let s = setup_with(&[(F1, bytes(MIB, 31), "a.bin")]).await;
+    *s.server.broken.lock().unwrap() = true;
+    s.files.set_fetch_retry(Duration::from_millis(20));
+    s.files.pin_file(F1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let tries = s.server.asked().len();
+    // 20, 40, 80, 160, 320 ms apart: about six tries, where a fixed 20 ms would be ~35.
+    assert!((3..=8).contains(&tries), "{tries} tries");
+    s.files.pin_file(F1).await.unwrap();
+    wait_until("a retry at once after a new pin", || {
+        s.server.asked().len() > tries
+    })
+    .await;
 }
