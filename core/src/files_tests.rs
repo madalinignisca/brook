@@ -44,6 +44,8 @@ struct Server {
     files: Mutex<HashMap<String, Vec<u8>>>,
     fail_after: Mutex<Option<u64>>,
     gone: Mutex<bool>,
+    /// Every download fails as if the bytes were wrong.
+    broken: Mutex<bool>,
     hold: Mutex<Option<(u64, Arc<Notify>)>>,
     /// `(file id, resume offset, epoch)` per request.
     asked: Mutex<Vec<(String, u64, u64)>>,
@@ -91,6 +93,12 @@ impl Download for Server {
             .push((file_id.into(), offset, epoch));
         if *self.gone.lock().unwrap() {
             return Err(crate::transfer::gone_error());
+        }
+        if *self.broken.lock().unwrap() {
+            return Err(Error::Api {
+                code: "transfer.integrity".into(),
+                message: String::new(),
+            });
         }
         let content = self.files.lock().unwrap().get(file_id).cloned().unwrap();
         let fail_after = self.fail_after.lock().unwrap().take();
@@ -690,4 +698,144 @@ fn text_with_markup_anywhere_is_save_only() {
         );
     }
     assert!(openable("notes.txt", b"a < b and 3<4, x <= y"));
+}
+
+// ---- Keep available offline (core PR 2) ----
+
+async fn settle(s: &Setup, id: &str, what: &str, ok: impl Fn(&FileCacheState) -> bool) {
+    for _ in 0..500 {
+        if ok(&s.files.state(id).await.unwrap()) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{what}: {:?}", s.files.state(id).await);
+}
+
+fn pinned_cached(st: &FileCacheState) -> bool {
+    matches!(st, FileCacheState::Pinned { cached: true, .. })
+}
+
+#[tokio::test]
+async fn a_pin_downloads_at_once_and_counts_as_pinned() {
+    let content = bytes(2 * MIB + 3, 20);
+    let s = setup_with(&[(F1, content.clone(), "a.pdf")]).await;
+    s.files.pin_file(F1).await.unwrap();
+    settle(&s, F1, "the pin fetched", pinned_cached).await;
+    assert_eq!(s.files.pinned_bytes().await.unwrap(), content.len() as u64);
+    let dest = s._root.path().join("a.out");
+    assert_eq!(s.files.save_from_cache(F1, &dest).await.unwrap(), Some(()));
+    assert_eq!(std::fs::read(dest).unwrap(), content);
+}
+
+#[tokio::test]
+async fn a_pin_that_fails_is_fetched_again_later_and_after_a_restart() {
+    let content = bytes(3 * MIB, 21);
+    let s = setup_with(&[(F1, content, "a.bin")]).await;
+    s.files.set_fetch_retry(Duration::from_millis(50));
+    *s.server.fail_after.lock().unwrap() = Some(MIB as u64 + 5);
+    s.files.pin_file(F1).await.unwrap();
+    settle(&s, F1, "the retry completed it", pinned_cached).await;
+    let asked: Vec<u64> = s.server.asked().iter().map(|a| a.1).collect();
+    assert_eq!(asked, [0, MIB as u64], "resumed where the failure left it");
+
+    // A pin still incomplete at a restart is fetched when the cache opens again.
+    // (Its first fetch fails; the next round would be a minute away, so a restart comes first.)
+    let mut s2 = setup_with(&[(F2, bytes(MIB, 22), "b.bin")]).await;
+    *s2.server.fail_after.lock().unwrap() = Some(10);
+    s2.files.pin_file(F2).await.unwrap();
+    wait_until("the failed first fetch", || s2.server.asked().len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    s2.reopen().await;
+    settle(&s2, F2, "fetched after the restart", pinned_cached).await;
+    assert_eq!(s2.server.asked().len(), 2);
+    drop(s);
+}
+
+#[tokio::test]
+async fn opening_a_file_being_fetched_joins_it_and_cancelling_the_open_keeps_the_pin() {
+    let s = setup_with(&[(F1, bytes(2 * MIB, 23), "a.pdf")]).await;
+    let release = Arc::new(Notify::new());
+    *s.server.hold.lock().unwrap() = Some((MIB as u64, release.clone()));
+    s.files.pin_file(F1).await.unwrap();
+    wait_until("the pin's download held", || s.server.asked().len() == 1).await;
+    let open = TransferId::new();
+    let opening = tokio::spawn({
+        let f = s.files.clone();
+        async move { f.cache_file(open, F1).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    s.transfers.flag(open).cancel.store(true, Ordering::SeqCst);
+    assert!(opening.await.unwrap().is_err());
+    release.notify_one();
+    settle(&s, F1, "the pin's download finished", pinned_cached).await;
+    assert_eq!(
+        s.server.asked().len(),
+        1,
+        "one download for the pin and the Open"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_file_is_never_evicted_until_unpinned() {
+    let s = setup_with(&[(F1, bytes(MIB, 24), "a.bin"), (F2, bytes(MIB, 25), "b.bin")]).await;
+    s.files.set_cap(10);
+    s.files.pin_file(F1).await.unwrap();
+    settle(&s, F1, "pinned", pinned_cached).await;
+    s.files.cache_file(TransferId::new(), F2).await.unwrap();
+    assert!(
+        pinned_cached(&s.files.state(F1).await.unwrap()),
+        "a pin was evicted"
+    );
+    s.files.unpin_file(F1).await.unwrap();
+    assert_eq!(s.files.state(F1).await.unwrap(), FileCacheState::Cached);
+    assert_eq!(s.files.pinned_bytes().await.unwrap(), 0);
+    // Unpinned, it's an ordinary file: the next download over the cap evicts it.
+    s.files.cache_file(TransferId::new(), F2).await.unwrap(); // already cached: no eviction
+    let f3 = "0190a000-0000-7000-8000-0000000000f3";
+    let extra = message("m2", 12, vec![attachment(f3, &bytes(MIB, 26), "c.bin")]);
+    s.server.put(f3, bytes(MIB, 26));
+    s.cache.live_event("message.new", &extra).await;
+    s.files.cache_file(TransferId::new(), f3).await.unwrap();
+    assert_eq!(s.files.state(F1).await.unwrap(), FileCacheState::NotCached);
+}
+
+#[tokio::test]
+async fn a_pinned_file_whose_message_goes_goes_with_it() {
+    let s = setup_with(&[(F1, bytes(MIB, 27), "a.bin")]).await;
+    s.files.pin_file(F1).await.unwrap();
+    settle(&s, F1, "pinned", pinned_cached).await;
+    s.cache
+        .live_event(
+            "message.delete",
+            &json!({ "id": "m1", "channel_id": "c", "seq": 40 }),
+        )
+        .await;
+    wait_until("the pinned blob unlinked", || !s.blob(F1).exists()).await;
+    assert_eq!(s.files.state(F1).await.unwrap(), FileCacheState::NotCached);
+    assert_eq!(s.files.pinned_bytes().await.unwrap(), 0);
+    let err = s.files.pin_file(F1).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Api { code, .. } if code == "file.unknown"),
+        "{err:?}"
+    );
+}
+
+/// A pinned file that keeps failing backs off (doubling each time) instead of being fetched
+/// again every round; pinning it again retries at once.
+#[tokio::test]
+async fn a_pin_that_keeps_failing_backs_off() {
+    let s = setup_with(&[(F1, bytes(MIB, 31), "a.bin")]).await;
+    *s.server.broken.lock().unwrap() = true;
+    s.files.set_fetch_retry(Duration::from_millis(20));
+    s.files.pin_file(F1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let tries = s.server.asked().len();
+    // 20, 40, 80, 160, 320 ms apart: about six tries, where a fixed 20 ms would be ~35.
+    assert!((3..=8).contains(&tries), "{tries} tries");
+    s.files.pin_file(F1).await.unwrap();
+    wait_until("a retry at once after a new pin", || {
+        s.server.asked().len() > tries
+    })
+    .await;
 }
