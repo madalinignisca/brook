@@ -41,6 +41,12 @@ struct SignedInView: View {
                     if let badge = channels.badge(channel) {
                         Text(badge).font(.caption).foregroundStyle(.green)
                     }
+                    if let unread = channels.unread(channel) {
+                        Text("\(unread)").font(.caption.bold()).monospacedDigit()
+                            .padding(.horizontal, 6).padding(.vertical, 1)
+                            .background(.tint.opacity(0.2), in: Capsule())
+                            .accessibilityLabel("\(unread) unread")
+                    }
                 }
             }
             .navigationSplitViewColumnWidth(min: 200, ideal: 240)
@@ -55,7 +61,7 @@ struct SignedInView: View {
                             Button {
                                 openWindow(id: "call")
                                 Task {
-                                    await calls.join(channel, name: channels.title(channel),
+                                    await calls.join(channelId: channel.id, name: channels.title(channel),
                                                      client: client)
                                 }
                             } label: {
@@ -77,6 +83,9 @@ struct SignedInView: View {
         }
         .task { await channels.start() }
         .onChange(of: selection, initial: true) { _, channelId in openTimeline(channelId) }
+        .onChange(of: channels.closed) { _, closed in
+            if let closed, selection == closed { selection = nil } // removed from it (#62)
+        }
         .toolbar {
             ToolbarItem {
                 Menu {
@@ -142,6 +151,7 @@ extension SignedInView {
     /// A new conversation for the selected channel, handed to the channel list, which
     /// forwards it the message events (the previous one stops receiving them).
     fileprivate func openTimeline(_ channelId: String?) {
+        channels.openChannel = channelId
         guard let channelId, let chat = client as? any ChatClient else {
             timeline = nil
             channels.timeline = nil
