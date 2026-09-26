@@ -663,16 +663,23 @@ fn refresh_channels(chat: &Rc<Chat>, select: Option<String>) {
         chat.badges.borrow_mut().clear();
         let me = chat.me.borrow().clone().unwrap_or_default();
         for channel in &channels {
-            let (row, badge) =
-                channel_row(&channel.title(&me), channel.is_dm(), channel.unread_count);
+            let (row, badge) = channel_row(
+                &channel.title(&me),
+                channel.is_dm(),
+                channel.unread_count,
+                channel.owner_offer_for(&me).is_some(),
+            );
             chat.channel_list.append(&row);
             chat.badges.borrow_mut().push(badge);
         }
         *chat.channels.borrow_mut() = channels;
 
         // Re-apply chrome for the open channel so a live rename/archive shows now.
-        if let Some(current) = chat.current.borrow().clone() {
+        let current = chat.current.borrow().clone();
+        if let Some(current) = current {
             apply_channel_chrome(&chat, &current);
+            // An offer made while it's open is answered now too.
+            ask_about_ownership(&chat, &current);
         }
 
         if let Some(id) = select {
@@ -770,6 +777,7 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
     }
     *chat.current.borrow_mut() = Some(channel_id.to_string());
     apply_channel_chrome(chat, channel_id);
+    ask_about_ownership(chat, channel_id);
 
     // Opening a channel reads it: clear its unread badge locally and tell the
     // server. Compute idx in its own statement so the immutable borrow is dropped
@@ -1862,6 +1870,9 @@ fn membership_error_text(err: &brook_core::Error) -> String {
             "channel.dm" => "A direct message can't be left.".into(),
             "authz.forbidden" => "Only an admin or the channel's owner can do that.".into(),
             "not_found" => "That member isn't in this channel any more.".into(),
+            "offer.not_found" => "That offer was already answered or withdrawn.".into(),
+            "channel.already_owner" => "They're already an owner.".into(),
+            "channel.not_member" => "They aren't a member of this channel.".into(),
             "profile.invalid" => {
                 "That name or status can't be used (it's empty, too long, or has invisible characters)."
                     .into()
@@ -1971,6 +1982,119 @@ fn leave_channel_confirm(chat: &Rc<Chat>) {
     dialog.present(Some(&chat.message_list));
 }
 
+/// Run a member action (offer, withdraw) from its button: insensitive while it runs, `done`
+/// on success (the `channel.update` echo refreshes the lists), the reason on failure.
+fn member_action<F, Fut>(
+    chat: &Rc<Chat>,
+    button: &gtk::Button,
+    done: &'static str,
+    heading: &'static str,
+    action: F,
+) where
+    F: FnOnce(Arc<BrookClient>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = brook_core::Result<()>> + Send + 'static,
+{
+    button.set_sensitive(false);
+    let (chat, button) = (chat.clone(), button.clone());
+    glib::spawn_future_local(async move {
+        let client = chat.client.clone();
+        let result = chat
+            .runtime
+            .spawn(async move { action(client).await })
+            .await
+            .unwrap_or(Err(brook_core::Error::UnexpectedResponse));
+        match result {
+            Ok(()) => button.set_label(done),
+            Err(err) => {
+                button.set_sensitive(true);
+                show_alert(&chat, heading, &membership_error_text(&err));
+            }
+        }
+    });
+}
+
+/// An ownership offer waits for this user in `channel_id`: it must be answered, with a
+/// dialog that can't be dismissed (owner decision). One at a time.
+fn ask_about_ownership(chat: &Rc<Chat>, channel_id: &str) {
+    thread_local! {
+        static ASKING: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    }
+    let me = chat.me.borrow().clone().unwrap_or_default();
+    let offer = chat
+        .channels
+        .borrow()
+        .iter()
+        .find(|c| c.id == channel_id)
+        .and_then(|c| {
+            c.owner_offer_for(&me)
+                .map(|o| (c.title(&me), o.offered_by.clone(), c.members.clone()))
+        });
+    let Some((title, offered_by, members)) = offer else {
+        return;
+    };
+    if ASKING.with(|a| a.borrow().is_some()) {
+        return;
+    }
+    ASKING.with(|a| *a.borrow_mut() = Some(channel_id.to_string()));
+    let by = members
+        .iter()
+        .find(|m| m.id == offered_by)
+        .map(|m| format!("{} (@{})", m.display_name, m.handle))
+        .unwrap_or_else(|| "An owner".into());
+    let dialog = adw::AlertDialog::new(
+        Some("Become an Owner?"),
+        Some(&format!(
+            "{by} offered to make you an owner of {title}. Owners can rename it, remove members and offer ownership to others."
+        )),
+    );
+    dialog.add_response("decline", "Decline");
+    dialog.add_response("accept", "Accept");
+    dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
+    // No Escape, no close: only an answer ends it.
+    dialog.set_can_close(false);
+    dialog.connect_response(None, {
+        let (chat, channel_id) = (chat.clone(), channel_id.to_string());
+        move |dialog, response| {
+            let accept = match response {
+                "accept" => true,
+                "decline" => false,
+                _ => return, // an attempt to dismiss: stays open
+            };
+            dialog.force_close();
+            let (chat, channel_id) = (chat.clone(), channel_id.clone());
+            glib::spawn_future_local(async move {
+                let result = chat
+                    .runtime
+                    .spawn({
+                        let (client, channel_id) = (chat.client.clone(), channel_id.clone());
+                        async move {
+                            if accept {
+                                client.accept_ownership(&channel_id).await.map(|_| ())
+                            } else {
+                                client.decline_ownership(&channel_id).await
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap_or(Err(brook_core::Error::UnexpectedResponse));
+                if let Err(err) = result {
+                    // Withdrawn or answered elsewhere meanwhile: nothing left to answer.
+                    let gone =
+                        matches!(&err, brook_core::Error::Api { code, .. } if code == "offer.not_found");
+                    if !gone {
+                        // Still pending: the next refresh asks again.
+                        show_alert(&chat, "Couldn't Answer", &membership_error_text(&err));
+                    }
+                }
+                refresh_channels(&chat, None);
+            });
+        }
+    });
+    // However it goes (answered, or the view torn down at sign-out), the next offer may ask.
+    dialog.connect_closed(|_| ASKING.with(|a| *a.borrow_mut() = None));
+    dialog.present(Some(&chat.message_list));
+}
+
 /// "Members": who's in the open channel; for a global admin, each can be removed.
 fn members_dialog(chat: &Rc<Chat>) {
     let Some(channel_id) = chat.current.borrow().clone() else {
@@ -1995,9 +2119,20 @@ fn members_dialog(chat: &Rc<Chat>) {
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
         .build();
+    let offers: Vec<String> = chat
+        .channels
+        .borrow()
+        .iter()
+        .find(|c| c.id == channel_id)
+        .map(|c| c.owner_offers.iter().map(|o| o.user_id.clone()).collect())
+        .unwrap_or_default();
+    // Offering ownership is for owners and admins, to members who aren't owners yet.
+    let may_offer = admin || my_role.as_deref() == Some("owner");
     for member in members {
+        let offered = offers.contains(&member.id);
         let subtitle = match member.role.as_deref() {
             Some("owner") => format!("@{} · owner", member.handle),
+            _ if offered => format!("@{} · owner offered", member.handle),
             _ => format!("@{}", member.handle),
         };
         let row = adw::ActionRow::builder()
@@ -2043,6 +2178,37 @@ fn members_dialog(chat: &Rc<Chat>) {
                 }
             });
             row.add_suffix(&remove);
+        }
+        if may_offer && member.id != me && member.role.as_deref() != Some("owner") {
+            let (label, done, heading) = if offered {
+                ("Withdraw", "Withdrawn", "Couldn't Withdraw")
+            } else {
+                ("Make owner…", "Offered", "Couldn't Offer")
+            };
+            let button = gtk::Button::builder()
+                .label(label)
+                .valign(gtk::Align::Center)
+                .css_classes(["flat"])
+                .build();
+            button.connect_clicked({
+                let (chat, channel_id, member) = (chat.clone(), channel_id.clone(), member.clone());
+                move |button| {
+                    let (channel_id, member) = (channel_id.clone(), member.clone());
+                    member_action(&chat, button, done, heading, move |client| async move {
+                        if offered {
+                            client
+                                .withdraw_ownership_offer(&channel_id, &member.id)
+                                .await
+                        } else {
+                            client
+                                .offer_ownership(&channel_id, &member.handle)
+                                .await
+                                .map(|_| ())
+                        }
+                    });
+                }
+            });
+            row.add_suffix(&button);
         }
         list.append(&row);
     }
@@ -2275,7 +2441,12 @@ fn delete_channel_confirm(chat: &Rc<Chat>) {
 }
 
 /// A sidebar row; returns the row and its (initially-styled) unread badge label.
-fn channel_row(title: &str, is_dm: bool, unread: i64) -> (gtk::ListBoxRow, gtk::Label) {
+fn channel_row(
+    title: &str,
+    is_dm: bool,
+    unread: i64,
+    offered: bool,
+) -> (gtk::ListBoxRow, gtk::Label) {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -2301,6 +2472,17 @@ fn channel_row(title: &str, is_dm: bool, unread: i64) -> (gtk::ListBoxRow, gtk::
         .build();
     row.append(&icon);
     row.append(&label);
+    // An ownership offer waits for this user here: highlighted until it's answered.
+    if offered {
+        label.add_css_class("heading");
+        row.append(
+            &gtk::Label::builder()
+                .label("Owner offer")
+                .css_classes(["caption", "accent"])
+                .tooltip_text("You're offered ownership of this channel: open it to answer")
+                .build(),
+        );
+    }
     row.append(&badge);
     (gtk::ListBoxRow::builder().child(&row).build(), badge)
 }
