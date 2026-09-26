@@ -55,6 +55,27 @@ fn within_caps(width: u32, height: u32) -> bool {
         && width as u64 * height as u64 <= PREVIEW_MAX_PIXELS
 }
 
+/// Whether a frame's claims hold for its buffer: RGBA, rows at least `width * 4` bytes, and
+/// enough bytes for every row (the last one needn't be padded). All arithmetic is checked.
+/// Anything else would reach `gdk::MemoryTexture::new`, which refuses it and makes gtk-rs
+/// panic: one crafted image would crash the app.
+pub fn frame_fits(rgba: bool, width: u32, height: u32, stride: u32, len: usize) -> bool {
+    if !rgba || width == 0 || height == 0 {
+        return false;
+    }
+    let (width, height, stride) = (width as usize, height as usize, stride as usize);
+    let Some(row) = width.checked_mul(4) else {
+        return false;
+    };
+    if stride < row {
+        return false;
+    }
+    stride
+        .checked_mul(height - 1)
+        .and_then(|n| n.checked_add(row))
+        .is_some_and(|need| len >= need)
+}
+
 pub fn in_flatpak() -> bool {
     Path::new("/.flatpak-info").exists()
 }
@@ -88,11 +109,24 @@ pub async fn decode(bytes: Vec<u8>) -> Option<Pixels> {
         if !within_caps(frame.width(), frame.height()) {
             return None;
         }
+        // The frame's size, stride, format and buffer come from the sandboxed process, which a
+        // hostile image may have taken over: check they describe the buffer, or no preview.
+        let rgba = frame.memory_format() == glycin::MemoryFormat::R8g8b8a8;
+        let buf = frame.buf_slice();
+        if !frame_fits(
+            rgba,
+            frame.width(),
+            frame.height(),
+            frame.stride(),
+            buf.len(),
+        ) {
+            return None;
+        }
         Some(Pixels {
             width: frame.width(),
             height: frame.height(),
             stride: frame.stride() as usize,
-            rgba: frame.buf_slice().to_vec(),
+            rgba: buf.to_vec(),
         })
     };
     // Dropping the loader on timeout ends the sandboxed process with it.
@@ -205,6 +239,30 @@ mod tests {
         let done = finish.borrow_mut().remove(0);
         done(); // "gone" is skipped, "c" runs
         assert_eq!(*log.borrow(), ["a", "b", "d", "c"]);
+    }
+
+    #[test]
+    fn a_frame_that_lies_about_its_buffer_is_dropped() {
+        // 10 x 4 RGBA, stride 40: 3 full rows plus a last row of 40 bytes = 160.
+        assert!(frame_fits(true, 10, 4, 40, 160));
+        assert!(
+            frame_fits(true, 10, 4, 48, 3 * 48 + 40),
+            "padded rows, unpadded last row"
+        );
+        assert!(!frame_fits(true, 10, 4, 40, 159), "one byte short");
+        assert!(
+            !frame_fits(true, 10, 4, 39, 1000),
+            "a stride shorter than a row"
+        );
+        assert!(!frame_fits(false, 10, 4, 40, 160), "not RGBA");
+        assert!(!frame_fits(true, 0, 4, 40, 160));
+        assert!(!frame_fits(true, 10, 0, 40, 160));
+        // Sizes whose byte counts overflow are refused, never wrapped.
+        assert!(!frame_fits(true, u32::MAX, u32::MAX, u32::MAX, usize::MAX));
+        assert!(
+            !frame_fits(true, 8192, 8192, 32768, 16),
+            "a short buffer claiming a big frame"
+        );
     }
 
     #[test]
