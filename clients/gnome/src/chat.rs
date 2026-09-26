@@ -122,6 +122,9 @@ struct MessageWidgets {
     file_rows: Rc<RefCell<Vec<(String, gtk::Widget)>>>,
     /// The message text as sent (markdown, not the rendered markup), for editing.
     source: Rc<RefCell<String>>,
+    /// Who wrote it, and the label showing their name (redrawn when their profile changes).
+    author_id: String,
+    author: gtk::Label,
     /// Hidden once the message is a tombstone: actions, quote, files, reactions.
     extras: Vec<gtk::Widget>,
     /// The quoted message's id, its author and the quote line, if this is a reply.
@@ -1326,6 +1329,8 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
         channel_id: message.channel_id.clone(),
         reactions_box,
         reactions: Rc::new(RefCell::new(message.reactions.clone())),
+        author_id: message.author_id.clone(),
+        author: author_label.clone(),
         deleted: Rc::new(Cell::new(false)),
         has_files: Rc::new(Cell::new(!message.attachments.is_empty())),
         files_box,
@@ -2613,11 +2618,50 @@ fn spawn_cache_loop(chat: &Rc<Chat>) {
                     report_outbox_lost(&chat);
                 }
                 Ok(CacheEvent::OutboxLost) => report_outbox_lost(&chat),
+                // Profiles changed: authors on screen take their current names.
+                Ok(CacheEvent::Users(ids)) => redraw_authors(&chat, ids),
                 // Cached files changed (fetched, kept, evicted, gone): rows showing them
                 // re-read their state.
                 Ok(CacheEvent::Files(ids)) => crate::attachments::refresh_rows(&ids),
-                Ok(_) => {}
                 Err(RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+/// Put the cache's current names on the authors shown among `ids` (message rows keep the
+/// name they were stored with).
+fn redraw_authors(chat: &Rc<Chat>, ids: Vec<String>) {
+    let shown: Vec<String> = {
+        let rows = chat.message_rows.borrow();
+        ids.into_iter()
+            .filter(|id| rows.values().any(|w| w.author_id == *id))
+            .collect()
+    };
+    if shown.is_empty() {
+        return;
+    }
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let handle = chat.runtime.spawn({
+            let client = chat.client.clone();
+            async move { client.cached_users(&shown).await }
+        });
+        let Ok(Ok(users)) = handle.await else { return };
+        let names: HashMap<String, String> = users
+            .into_iter()
+            .map(|u| {
+                let name = if u.display_name.trim().is_empty() {
+                    u.handle
+                } else {
+                    u.display_name
+                };
+                (u.id, name)
+            })
+            .collect();
+        for widgets in chat.message_rows.borrow().values() {
+            if let Some(name) = names.get(&widgets.author_id) {
+                widgets.author.set_label(name);
             }
         }
     });
@@ -2758,24 +2802,42 @@ fn wipe_other_accounts(chat: &Rc<Chat>) {
         let handle = chat.runtime.spawn({
             let client = chat.client.clone();
             async move {
+                // Their unsent counts are read before the wipe (#46 §8), so the notice can
+                // say what went with it.
                 let others = client.other_local_users().await?;
                 if !others.is_empty() {
                     client.wipe_other_local_users().await?;
                 }
-                Ok::<_, brook_core::Error>(others.len())
+                Ok::<_, brook_core::Error>(others)
             }
         });
-        if let Ok(Ok(n)) = handle.await {
-            if n > 0 {
+        if let Ok(Ok(others)) = handle.await {
+            if !others.is_empty() {
+                let unsent: Vec<Option<u64>> = others.iter().map(|o| o.unsent).collect();
                 let alert = adw::AlertDialog::new(
                     Some("Saved Data Removed"),
-                    Some("Another account's saved messages were removed from this device."),
+                    Some(&others_removed_text(&unsent)),
                 );
+
                 alert.add_response("ok", "OK");
                 alert.present(Some(&chat.message_list));
             }
         }
     });
+}
+
+/// The notice after another account's saved data was removed: with its unsent messages when
+/// they could be counted, and a "may have" when any couldn't.
+fn others_removed_text(unsent: &[Option<u64>]) -> String {
+    let base = "Another account's saved messages were removed from this device";
+    if unsent.iter().any(Option::is_none) {
+        return format!("{base}. They may have included unsent messages.");
+    }
+    match unsent.iter().flatten().sum::<u64>() {
+        0 => format!("{base}."),
+        1 => format!("{base}, including 1 unsent message."),
+        n => format!("{base}, including {n} unsent messages."),
+    }
 }
 
 /// Sign Out, with "Remove this device's data" (ticked by default, #46 §8) and a warning
@@ -2872,6 +2934,14 @@ mod offline_tests {
         let quoted = draft_id(&mut draft, d("c2", "hello!", Some("m1")));
         assert_ne!(quoted, other, "a changed quote is a new message");
         assert_ne!(draft_id(&mut draft, d("c2", "hello!", Some("m2"))), quoted);
+    }
+
+    #[test]
+    fn the_other_account_notice_says_what_went_with_it() {
+        assert!(others_removed_text(&[Some(0)]).ends_with("this device."));
+        assert!(others_removed_text(&[Some(1)]).contains("including 1 unsent message."));
+        assert!(others_removed_text(&[Some(2), Some(1)]).contains("including 3 unsent messages"));
+        assert!(others_removed_text(&[Some(2), None]).contains("may have included unsent"));
     }
 
     #[test]
