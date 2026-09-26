@@ -92,9 +92,9 @@ struct Chat {
     draft_id: Rc<RefCell<Option<String>>>,
     /// The chip whose button cancelled the copy: that file leaves, the others stay.
     cancelled_chip: Rc<Cell<Option<brook_core::TransferId>>>,
-    /// A text send that failed: its channel, text and outbox id. Sending the same text to
-    /// the same channel again reuses the id, so it can never become two messages.
-    text_draft: Rc<RefCell<Option<(String, String, String)>>>,
+    /// A text send that failed: what it was (channel, text, quoted message) and its outbox
+    /// id. Sending exactly that again reuses the id, so it can never become two messages.
+    text_draft: Rc<RefCell<Option<(Draft, String)>>>,
     /// This user's local stores answered a cached call: `unsent_count` can be trusted (it
     /// answers 0 while they're closed).
     local_open: Rc<Cell<bool>>,
@@ -847,7 +847,14 @@ fn send_current(chat: &Rc<Chat>) {
         .map(str::to_string)
         .unwrap_or_default();
     set_reply(chat, None);
-    let client_id = draft_id(&mut chat.text_draft.borrow_mut(), &channel_id, &body);
+    let client_id = draft_id(
+        &mut chat.text_draft.borrow_mut(),
+        Draft {
+            channel: channel_id.clone(),
+            body: body.clone(),
+            reply_to: reply_to.clone(),
+        },
+    );
 
     let chat = chat.clone();
     glib::spawn_future_local(async move {
@@ -1059,16 +1066,26 @@ fn set_preparing(chat: &Rc<Chat>, on: bool) {
     }
 }
 
-/// The outbox id for sending `body` to `channel`: the failed attempt's again when it's the
-/// same text to the same channel, else a new one (remembered until the send succeeds).
-fn draft_id(draft: &mut Option<(String, String, String)>, channel: &str, body: &str) -> String {
-    if let Some((c, b, id)) = draft.as_ref() {
-        if c == channel && b == body {
+/// What a text send is: an id is reused only for exactly the same one. Core answers a known
+/// id with the stored message, so a retry that changed any of these (the quote included)
+/// must be a new message, never the old one sent again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Draft {
+    channel: String,
+    body: String,
+    reply_to: Option<String>,
+}
+
+/// The outbox id for `this` send: the failed attempt's again when it's the same send, else a
+/// new one (remembered until the send succeeds).
+fn draft_id(draft: &mut Option<(Draft, String)>, this: Draft) -> String {
+    if let Some((was, id)) = draft.as_ref() {
+        if *was == this {
             return id.clone();
         }
     }
     let id = glib::uuid_string_random().to_string();
-    *draft = Some((channel.to_string(), body.to_string(), id.clone()));
+    *draft = Some((this, id.clone()));
     id
 }
 
@@ -2835,20 +2852,26 @@ mod offline_tests {
 
     #[test]
     fn a_failed_text_keeps_its_outbox_id_for_the_retry() {
+        let d = |channel: &str, body: &str, reply: Option<&str>| Draft {
+            channel: channel.into(),
+            body: body.into(),
+            reply_to: reply.map(str::to_string),
+        };
         let mut draft = None;
-        let first = draft_id(&mut draft, "c1", "hello");
+        let first = draft_id(&mut draft, d("c1", "hello", None));
         assert_eq!(
-            draft_id(&mut draft, "c1", "hello"),
+            draft_id(&mut draft, d("c1", "hello", None)),
             first,
             "the same send again"
         );
-        let edited = draft_id(&mut draft, "c1", "hello!");
+        let edited = draft_id(&mut draft, d("c1", "hello!", None));
         assert_ne!(edited, first, "edited text is a new message");
-        assert_ne!(
-            draft_id(&mut draft, "c2", "hello!"),
-            edited,
-            "another channel"
-        );
+        let other = draft_id(&mut draft, d("c2", "hello!", None));
+        assert_ne!(other, edited, "another channel");
+        // Core would answer a reused id with the stored (unquoted) message.
+        let quoted = draft_id(&mut draft, d("c2", "hello!", Some("m1")));
+        assert_ne!(quoted, other, "a changed quote is a new message");
+        assert_ne!(draft_id(&mut draft, d("c2", "hello!", Some("m2"))), quoted);
     }
 
     #[test]
