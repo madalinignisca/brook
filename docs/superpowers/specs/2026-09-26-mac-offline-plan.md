@@ -205,3 +205,20 @@ round-1 fixes (the deleted-id set doesn't leak), and raised three new points, al
 - **A sign-out while enable is running** offers the sheet, and removal waits for the enable.
 
 Nothing disputed: closed.
+
+## Deviations in the implementation (for the reviewers)
+
+- **`Users(ids)` overlays current names; it doesn't re-read messages.** Cached message rows
+  keep the name they were stored with (settled in #164). So `TimelineModel.refreshAuthors`
+  fetches `cachedUsers(ids)` into `authorNames`, and every row reads its author through it,
+  including rows drawn later (GTK does the same since #166).
+- **`localDataWait` is an init parameter** (30 s by default), so the hung-sign-out test runs
+  at 300 ms.
+- **One existing test's data changed:** `testEditsReplaceAndDeletesStay` now gives its edit
+  an `editedAt`, as every server edit carries, since the merge changes a body only for a
+  newer `editedAt`.
+
+## Measured
+
+- 175 Mac tests pass (`build.sh test`).
+- 23 mutants, one or more per spec bullet, each caught by the test aimed at it.
