@@ -629,3 +629,37 @@ def test_deleting_an_attached_file_updates_its_message_live(sync_client: TestCli
     assert ev["data"]["id"] == sent["id"]
     assert [f["id"] for f in ev["data"]["attachments"]] == [ids[1]]
     assert ev["data"]["seq"] > sent["seq"]
+
+
+def test_message_update_carries_each_members_own_reactions(sync_client: TestClient) -> None:
+    """Caches store a message.update's row whole, so its reactions' `me` must be the
+    recipient's, not the actor's: bob reacted, alice edits, and only bob's frame says so."""
+    http = sync_client
+    http.post(f"{AUTH}/register", json={"handle": "alice", "display_name": "A", "password": PW})
+    a = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
+    ha = {"Authorization": f"Bearer {a['access_token']}"}
+    http.post(
+        f"{AUTH}/register", json={"handle": "bob", "display_name": "B", "password": PW}, headers=ha
+    )
+    b = http.post(f"{AUTH}/login", json={"handle": "bob", "password": PW}).json()
+    hb = {"Authorization": f"Bearer {b['access_token']}"}
+    ch = http.post("/api/v1/channels", json={"kind": "channel", "name": "g"}, headers=ha).json()
+    http.post(f"/api/v1/channels/{ch['id']}/members", json={"handle": "bob"}, headers=ha)
+    url = f"/api/v1/channels/{ch['id']}/messages"
+    mid = http.post(url, json={"body": "hi"}, headers=ha).json()["id"]
+    http.post(f"{url}/{mid}/reactions", json={"emoji": "👍"}, headers=hb)
+
+    def me_in_update(ws: object) -> bool:
+        while True:
+            frame = ws.receive_json()  # type: ignore[attr-defined]
+            if frame["type"] == "message.update":
+                (reaction,) = frame["data"]["reactions"]
+                return bool(reaction["me"])
+
+    with http.websocket_connect("/ws") as wa, http.websocket_connect("/ws") as wb:
+        wa.send_json({"type": "auth", "data": {"access_token": a["access_token"]}})
+        wb.send_json({"type": "auth", "data": {"access_token": b["access_token"]}})
+        assert wa.receive_json()["type"] == "ready" and wb.receive_json()["type"] == "ready"
+        assert http.patch(f"{url}/{mid}", json={"body": "hi!"}, headers=ha).status_code == 200
+        assert me_in_update(wb) is True  # bob reacted
+        assert me_in_update(wa) is False  # alice didn't

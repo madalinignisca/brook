@@ -383,10 +383,9 @@ async def delete_file(
     if row.uploader_id != user.id and membership.role != "owner":
         raise _error(status.HTTP_403_FORBIDDEN, "authz.forbidden", "Not your file")
     message_id = row.message_id
-    user_id = user.id  # read before the commit expires it
     await session.delete(row)
     await session.commit()
     await run_in_threadpool(storage.remove, file_id)
     if message_id is not None:
         # Without this, members online only noticed at their next /sync.
-        await broadcast_message_update(session, hub, message_id, user_id)
+        await broadcast_message_update(session, hub, message_id)
