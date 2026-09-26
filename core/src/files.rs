@@ -305,10 +305,10 @@ impl Files {
             .ok_or_else(|| api_error("file.gone"))?;
         let source = self.source(file_id, &row)?;
         let mut reader = source_reader(&source).await?;
-        let mut head = vec![0u8; 64];
+        let mut head = vec![0u8; SNIFF];
         let n = read_up_to(&mut reader, &mut head).await?;
         head.truncate(n);
-        if is_launchable(&head) {
+        if !openable(&info.filename, &head) {
             return Err(api_error("file.open_refused"));
         }
         let dir = open_dir.join(random_hex());
@@ -1118,6 +1118,117 @@ pub(crate) fn open_dir_for(store_id: &str) -> Option<PathBuf> {
         };
         Some(base.join("brook").join(store_id))
     }
+}
+
+/// How much of a file Open sniffs.
+const SNIFF: usize = 4096;
+
+/// Kinds of file Open hands to the system, each with the extensions it may carry.
+/// Anything else is Save only: the system picks the app by extension and type, so a
+/// denylist of formats can't cover what might run (a `.jar` is a zip, like `.docx`; an
+/// `.msi` is OLE, like `.doc`; `.html` and `.svg` run script in a browser; `.deb`,
+/// `.rpm` and `.flatpakref` open installers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Pdf,
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+    /// Plain text (read as text by an editor).
+    Text,
+    /// Office Open XML and OpenDocument: zip containers, allowed only under their own
+    /// extensions (the macro-enabled `m` variants are not on the list).
+    OfficeZip,
+    Mp3,
+    Mp4,
+    Ogg,
+    Wav,
+    Flac,
+    Matroska,
+}
+
+fn kind_for_extension(ext: &str) -> Option<Kind> {
+    Some(match ext {
+        "pdf" => Kind::Pdf,
+        "png" => Kind::Png,
+        "jpg" | "jpeg" => Kind::Jpeg,
+        "gif" => Kind::Gif,
+        "webp" => Kind::Webp,
+        "txt" | "md" | "log" | "csv" => Kind::Text,
+        "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp" => Kind::OfficeZip,
+        "mp3" => Kind::Mp3,
+        "mp4" | "m4a" | "mov" => Kind::Mp4,
+        "ogg" | "oga" | "opus" => Kind::Ogg,
+        "wav" => Kind::Wav,
+        "flac" => Kind::Flac,
+        "mkv" | "webm" => Kind::Matroska,
+        _ => return None,
+    })
+}
+
+/// Whether the first bytes are that kind.
+fn looks_like(kind: Kind, head: &[u8]) -> bool {
+    match kind {
+        Kind::Pdf => head.starts_with(b"%PDF-"),
+        Kind::Png => head.starts_with(b"\x89PNG\r\n\x1a\n"),
+        Kind::Jpeg => head.starts_with(b"\xff\xd8\xff"),
+        Kind::Gif => head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a"),
+        Kind::Webp => head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP",
+        Kind::Text => is_plain_text(head),
+        Kind::OfficeZip => head.starts_with(b"PK\x03\x04"),
+        Kind::Mp3 => {
+            head.starts_with(b"ID3")
+                || (head.len() >= 2 && head[0] == 0xff && head[1] & 0xe0 == 0xe0)
+        }
+        Kind::Mp4 => head.len() >= 8 && &head[4..8] == b"ftyp",
+        Kind::Ogg => head.starts_with(b"OggS"),
+        Kind::Wav => head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WAVE",
+        Kind::Flac => head.starts_with(b"fLaC"),
+        Kind::Matroska => head.starts_with(b"\x1a\x45\xdf\xa3"),
+    }
+}
+
+/// Text an editor shows as text: UTF-8, no NULs, and not markup a viewer might render
+/// (HTML, SVG, XML) whatever the extension says.
+fn is_plain_text(head: &[u8]) -> bool {
+    if head.contains(&0) {
+        return false;
+    }
+    // A cut at the sniff limit may split a character: judge only what's complete.
+    let text = match std::str::from_utf8(head) {
+        Ok(t) => t,
+        Err(e) if e.error_len().is_none() => {
+            std::str::from_utf8(&head[..e.valid_up_to()]).unwrap_or("")
+        }
+        Err(_) => return false,
+    };
+    let start = text
+        .trim_start_matches('\u{feff}')
+        .trim_start()
+        .to_ascii_lowercase();
+    ![
+        "<!doctype",
+        "<html",
+        "<svg",
+        "<?xml",
+        "<script",
+        "<head",
+        "<body",
+        "<iframe",
+    ]
+    .iter()
+    .any(|tag| start.starts_with(tag))
+}
+
+/// Open may hand this file to the system: its extension is on the list, its bytes are
+/// that kind, and they aren't an executable or a launcher anyway (a second check).
+pub(crate) fn openable(filename: &str, head: &[u8]) -> bool {
+    let ext = filename
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    kind_for_extension(&ext).is_some_and(|kind| looks_like(kind, head)) && !is_launchable(head)
 }
 
 /// Executables and launchers, sniffed from the first bytes: those are Save only.
