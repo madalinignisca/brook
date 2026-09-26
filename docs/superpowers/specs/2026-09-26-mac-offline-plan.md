@@ -222,3 +222,44 @@ Nothing disputed: closed.
 
 - 175 Mac tests pass (`build.sh test`).
 - 23 mutants, one or more per spec bullet, each caught by the test aimed at it.
+
+## Implementation review, round 1
+
+Two reviewers (vibe, and a second model standing in while codex is unavailable).
+
+Taken, from the second reviewer:
+- **Every unfinished sign-out and enable is waited for, not only the latest.** A wait that
+  timed out passes its unfinished tasks on, through `unsettled`.
+- **A failed load of an incomplete page falls back to the network,** so paging no longer gets
+  stuck, and `loading` is held during cache reads.
+- **Unsent bubbles load alongside the history**, not after the network.
+- **Removals are recorded per read generation,** so a re-added channel comes back and only
+  older reads are filtered.
+- **`signOutComplete()` is checked after a failed removal too,** with a combined message.
+- **Never-edited copies take the incoming body**, and edit times are parsed as dates
+  (fractional seconds).
+- **One alert queue** (a loss, then the other-accounts notice), and a newer loss re-queues
+  after the update.
+- **The other-accounts clean-up retries** at the next sync after a failure.
+- **Tests:**
+  - a failed enable (`.failed`, no sheet, no feed);
+  - the feed's `outbox`, `channels`, `users` and `removed` reaching the right models;
+  - event delivery from a background queue;
+  - the network error hidden through the feed;
+  - two sign-ins after a hung sign-out;
+  - a stuck page.
+
+Taken, from vibe:
+- **The feed is stopped when the enable fails.**
+- **Both sign-out paths wait for an enable still opening the stores.**
+
+Rebutted (vibe):
+- **"The stores may close between the probe and the count."** They close only at sign-out,
+  and the sign-out sheet is modal.
+
+Confirmed in core, and followed up separately: after a keep-data sign-out, core keeps the
+stores open until the client is dropped (`signed_out` keeps them for reads), and dropping it
+doesn't close them deterministically. A core `close_local_data()` for the sign-out task to
+await is its own PR.
+
+Measured: 11 more mutants, one per fix, each caught.
