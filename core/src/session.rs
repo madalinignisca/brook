@@ -21,8 +21,19 @@ pub struct User {
     pub global_role: String,
     /// The line under the name the user sets (`PATCH /auth/me`); none when unset or from a
     /// server before it. Not `status`: that's the account state (active or disabled).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The server stores an unset line as `""`; it's read as none, so callers have one
+    /// "unset", not two.
+    #[serde(
+        default,
+        deserialize_with = "empty_as_none",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub status_text: Option<String>,
+}
+
+fn empty_as_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let s: Option<String> = serde::Deserialize::deserialize(d)?;
+    Ok(s.filter(|s| !s.is_empty()))
 }
 
 /// An authenticated session: tokens plus the resolved user.

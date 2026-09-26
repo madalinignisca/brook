@@ -1415,7 +1415,7 @@ mod tests {
             .and(wiremock::matchers::body_json(json!({ "status_text": "" })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "u1", "handle": "alice", "display_name": "Alice", "global_role": "admin",
-                "status": "active", "status_text": null, "created_at": "2026-06-18T00:00:00Z",
+                "status": "active", "status_text": "", "created_at": "2026-06-18T00:00:00Z",
                 "totp_enabled": true, "recovery_codes_left": 8
             })))
             .expect(1)
