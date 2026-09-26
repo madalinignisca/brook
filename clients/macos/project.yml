@@ -26,12 +26,15 @@ targets:
   Brook:
     type: application
     platform: macOS
-    sources: [Brook]
+    sources: [Brook, Shared]
     configFiles:
       Release: Signing.xcconfig
     dependencies:
       - package: BrookCore
         products: [BrookCore, BrookMedia]
+      # The image decoder runs in its own sandboxed process (previews spec §1).
+      - target: BrookImageDecoder
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.brook.Brook
@@ -88,6 +91,88 @@ targets:
           flags=()
           [ "${CONFIGURATION}" = "Release" ] && flags+=(--options=runtime)
           codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" ${flags[@]+"${flags[@]}"} --timestamp=none "$fw"
+
+  # Decodes image previews out of the app's process, sandboxed with no entitlements beyond
+  # the sandbox key: no user data, no network (previews spec §1).
+  BrookImageDecoder:
+    type: xpc-service
+    platform: macOS
+    # Signed like the app (Release), so its team matches the app's.
+    configFiles:
+      Release: Signing.xcconfig
+    sources: [BrookImageDecoder, Shared]
+    dependencies:
+      # One worker process per image, spawned by the service: it inherits the service's
+      # entitlement-free sandbox.
+      - target: BrookImageWorker
+        embed: true
+        copy:
+          destination: executables
+    postBuildScripts:
+      # The worker runs with exactly its own entitlements (the sandbox, inherited), in every
+      # build: Xcode adds testing exceptions to what it builds for tests, and a child with
+      # extra keys beside `inherit` is killed at launch. Re-signed here, before the service
+      # is signed around it.
+      - name: Re-sign the worker with exactly its entitlements
+        # Only when the worker changed: the service is then signed again around it (a run on
+        # every build would break the service's seal whenever its own signing is skipped).
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(EXECUTABLE_FOLDER_PATH)/BrookImageWorker
+        outputFiles:
+          - $(DERIVED_FILE_DIR)/worker-resigned.stamp
+        script: |
+          set -euo pipefail
+          worker="${TARGET_BUILD_DIR}/${EXECUTABLE_FOLDER_PATH}/BrookImageWorker"
+          [ -f "$worker" ] || { echo "error: $worker not embedded"; exit 1; }
+          flags=()
+          [ "${CONFIGURATION}" = "Release" ] && flags+=(--options=runtime)
+          codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" ${flags[@]+"${flags[@]}"} \
+            --entitlements "${SRCROOT}/BrookImageWorker/BrookImageWorker.entitlements" \
+            --timestamp=none "$worker"
+          touch "${DERIVED_FILE_DIR}/worker-resigned.stamp"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.brook.BrookImageDecoder
+        PRODUCT_NAME: BrookImageDecoder
+        # Never Xcode's injected entitlements, not even in Debug: its test injection adds read
+        # access to all of / and extra Mach lookups, which would make the sandbox probe test a
+        # different sandbox from the shipped one (and no debugger attaches to the decoder).
+        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+      configs:
+        Release:
+          OTHER_CODE_SIGN_FLAGS: "--options=runtime"
+    info:
+      path: BrookImageDecoder/Info.plist
+      properties:
+        CFBundleDisplayName: BrookImageDecoder
+        XPCService:
+          ServiceType: Application
+    entitlements:
+      path: BrookImageDecoder/BrookImageDecoder.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+
+  BrookImageWorker:
+    type: tool
+    platform: macOS
+    # Signed like the app (Release), so its team matches the app's.
+    configFiles:
+      Release: Signing.xcconfig
+    sources: [BrookImageWorker, Shared]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.brook.BrookImageWorker
+        PRODUCT_NAME: BrookImageWorker
+        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+        SKIP_INSTALL: YES
+      configs:
+        Release:
+          OTHER_CODE_SIGN_FLAGS: "--options=runtime"
+    entitlements:
+      path: BrookImageWorker/BrookImageWorker.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.inherit: true
 
   BrookTests:
     type: bundle.unit-test
