@@ -85,3 +85,18 @@ token that was sent, not at commit; the test order the gate allows, using `logou
 the assertion that catches the bug (the TestServer has no family model); `NoSession`
 checked before ownership; the refresh tests go through `Refresher::refresh`, the path the
 loop and the 1008 recovery share.
+
+## Deviations in the implementation (for the reviewers)
+
+- **Origin keyed by token, not a `Taken` flag.** The store keeps each stored-login refresh
+  token with its slot *generation* (`persist::FAMILIES`). A fresh login written to the slot
+  starts a new generation; a restore continues it; each rotation passes it on.
+  `revoke_detached` spares a token only if this client doesn't own the slot **and** the
+  token's generation is the slot's current one. The flag is always the sent token's own,
+  which settles round 1's N1 without threading it through every call site. The generation
+  also covers a case the flag missed: a different user's fresh sign-in replacing the
+  stored login makes the old client's tokens nobody's, so they're revoked, not left live.
+- **The slot lock is not taken on login or TOTP.** A fresh sign-in presents no stored token,
+  and holding the slot lock there made one client's login wait behind another client's
+  in-flight restore refresh, up to the request timeout (two existing tests took 30 s).
+  Restore, `Refresher::refresh` and the account sections take it.

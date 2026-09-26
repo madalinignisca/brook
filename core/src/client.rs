@@ -240,6 +240,8 @@ impl BrookClient {
         // Its own task holding the refresh lock, like login: a cancelled caller cannot stop it
         // between the server issuing a pair and core installing (or revoking) it.
         let task = tokio::spawn(async move {
+            // The refresh lock only: a fresh sign-in presents no stored token, so it never
+            // waits on the slot's lock (another client's refresh in flight).
             let _flight = session.refresh_lock.clone().lock_owned().await;
             if !session.challenge_current(gen).await {
                 return Err(Error::ChallengeSuperseded); // nothing sent
@@ -310,7 +312,7 @@ impl BrookClient {
         let gen = self.session.reserve_login().await;
         let (session, http, base) = (self.session.clone(), self.http.clone(), self.base.clone());
         let task = tokio::spawn(async move {
-            let _flight = session.refresh_lock.clone().lock_owned().await;
+            let _flight = session.flight().await;
             if session.persistence().is_none() {
                 return RestoreOutcome::NotSignedIn;
             }
@@ -359,9 +361,11 @@ impl BrookClient {
                 refresh_token: pair.refresh_token,
                 user: stored.user,
             };
+            // Refreshed from the stored token: the stored login, whoever owns it later.
+            session.mark_from_slot(&restored.refresh_token);
             let user = restored.user.clone();
             // Install and re-store in one write section, only if still current.
-            match session.install_for_login(gen, restored.clone()).await {
+            match session.install_for_login(gen, restored.clone(), true).await {
                 Install::Installed => RestoreOutcome::LoggedIn(user),
                 Install::Stale => {
                     session.revoke_detached(restored.refresh_token);
@@ -414,6 +418,7 @@ impl BrookClient {
             // The refresh lock: a password change in flight revokes every refresh token of the
             // user when its server call commits; a login in between would install a pair it
             // then revokes. Every holder's requests are bounded by the request timeout.
+            // The refresh lock only: a fresh sign-in presents no stored token (see TOTP).
             let _flight = session.refresh_lock.clone().lock_owned().await;
             // Take any prior session out up front so a failed attempt can never leave the
             // previous user's token usable by chat calls; its refresh token is revoked now,
@@ -460,7 +465,9 @@ impl BrookClient {
                     };
                     // A fresh login is a login of its own: whatever refused it, revoking it
                     // touches nobody else.
-                    if session.install_for_login(gen, new.clone()).await == Install::Installed {
+                    if session.install_for_login(gen, new.clone(), false).await
+                        == Install::Installed
+                    {
                         Ok(LoginOutcome::LoggedIn(new)) // LoggedIn published by the install
                     } else {
                         session.revoke_detached(new.refresh_token); // superseded meanwhile
@@ -1023,7 +1030,7 @@ impl Refresher {
     pub(crate) async fn refresh(&self, seen: Revision) -> Result<RefreshOutcome> {
         let me = self.clone();
         let task = tokio::spawn(async move {
-            let _flight = me.session.refresh_lock.clone().lock_owned().await;
+            let _flight = me.session.flight().await;
             let now = me.session.snapshot().await.0;
             if now != seen {
                 return Ok(if now.epoch == seen.epoch {
@@ -1082,6 +1089,14 @@ pub(crate) async fn refresh_once(
     let Some(refresh_token) = session.with_session(|s| s.refresh_token.clone()).await else {
         return Ok(RefreshOutcome::NoSession);
     };
+    // A newer client owns the stored login now (#120): send nothing (the family is its), and
+    // end this session here without revoking anything (a revoke would end the owner's).
+    if !session.owns() {
+        if let Some(old) = session.sign_out(false).await {
+            session.revoke_detached(old.refresh_token); // a stored-login token: dropped
+        }
+        return Ok(RefreshOutcome::Rejected);
+    }
     // Still inside a 429's wait: do not ask again, whoever the caller is.
     let not_before = *session.refresh_not_before.lock().unwrap();
     if let Some(until) = not_before {

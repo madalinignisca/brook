@@ -396,22 +396,128 @@ async fn refresh_now(c: &BrookClient) {
     let _ = refresher(c).refresh(seen).await;
 }
 
-/// An older client's rotation after a newer sign-in in another client never overwrites it.
+/// A client that no longer owns the slot never refreshes (#120): it sends nothing and ends
+/// its session locally, and the newer sign-in stays as stored. Its own login isn't the
+/// stored one any more (bob's fresh sign-in replaced it), so that one is revoked, not left
+/// live on the server.
 #[tokio::test]
-async fn an_older_clients_rotation_never_overwrites_a_newer_sign_in() {
+async fn a_superseded_client_sends_no_refresh_and_signs_out() {
     let server = TestServer::start().await; // Rotate: any token rotates
     let dir = tempfile::tempdir().unwrap();
     let slot = Arc::new(InMemoryKeySlot::default());
     let alice = signed_in(&server, &slot, dir.path(), "alice").await;
     let bob = signed_in(&server, &slot, dir.path(), "bob").await;
     let bobs = held_token(&bob).await;
-    refresh_now(&alice).await;
-    assert_ne!(held_token(&alice).await, bobs);
+    let before = server.refresh_calls();
+    let seen = alice.session.snapshot().await.0;
+    let _ = refresher(&alice).refresh(seen).await;
     assert_eq!(
-        stored_token(&slot, &server),
-        Some(bobs),
-        "alice's rotation overwrote bob"
+        server.refresh_calls(),
+        before,
+        "a superseded client refreshed"
     );
+    assert!(
+        alice.session.snapshot().await.1.is_none(),
+        "still signed in"
+    );
+    assert_eq!(stored_token(&slot, &server), Some(bobs.clone()));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        server.logouts().len(),
+        1,
+        "alice's orphaned login wasn't revoked"
+    );
+    assert!(!server.logouts().contains(&bobs), "bob's login was revoked");
+}
+
+/// The shipped trigger (#120): the previous attempt's client, signed in from the stored
+/// login, is dropped while its refresh is in flight; the next client restores that same
+/// login. The dropped client's fresh pair belongs to the owner's login now: it's dropped,
+/// never revoked (a logout ends the whole login, #116).
+#[tokio::test]
+async fn a_dropped_clients_refresh_never_revokes_the_stored_login() {
+    let server = TestServer::start().await; // Rotate
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    drop(signed_in(&server, &slot, dir.path(), "alice").await);
+    let (a, outcome) = relaunch(&server, &slot, dir.path()).await;
+    assert!(
+        matches!(outcome, RestoreOutcome::LoggedIn(_)),
+        "{outcome:?}"
+    );
+    let gate = server.gate_refresh();
+    let before = server.refresh_calls();
+    let seen = a.session.snapshot().await.0;
+    let r = refresher(&a);
+    let inflight = tokio::spawn(async move { r.refresh(seen).await });
+    for _ in 0..300 {
+        if server.refresh_calls() > before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        server.refresh_calls() > before,
+        "a's refresh never reached the server"
+    );
+    drop(a);
+    let b = client(&server, &slot, dir.path()); // takes the slot
+    gate.add_permits(1);
+    let _ = inflight.await;
+    tokio::time::sleep(Duration::from_millis(200)).await; // a detached revoke would be out
+    assert!(
+        server.logouts().is_empty(),
+        "the dropped client revoked the stored login"
+    );
+    gate.add_permits(10);
+    let outcome = b.restore().await;
+    assert!(
+        matches!(outcome, RestoreOutcome::LoggedIn(_)),
+        "{outcome:?}"
+    );
+}
+
+/// A fresh login refused because a newer client took the slot is still revoked: it was
+/// never stored, so it's nobody's login.
+#[tokio::test]
+async fn a_fresh_login_that_lost_the_slot_is_still_revoked() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let old = client(&server, &slot, dir.path());
+    let gate = server.gate_login();
+    let o = old.clone();
+    let login = tokio::spawn(async move { o.login("alice", "pw").await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _newer = client(&server, &slot, dir.path()); // takes the slot
+    gate.add_permits(1);
+    let _ = login.await;
+    for _ in 0..100 {
+        if !server.logouts().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        server.logouts().len(),
+        1,
+        "an unstored fresh pair was left live"
+    );
+}
+
+/// A login whose keychain write failed was never stored: superseded, its logout still
+/// revokes it.
+#[tokio::test]
+async fn an_unstored_login_is_revoked_when_superseded() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let c = client(&server, &slot, dir.path());
+    slot.fail_next("replace", KeySlotError::Unavailable);
+    c.login("alice", "pw").await.unwrap();
+    let _newer = client(&server, &slot, dir.path());
+    c.logout().await;
+    assert_eq!(server.logouts().len(), 1, "an unstored login was left live");
 }
 
 /// An older client's rejection after a newer sign-in never deletes the newer one.

@@ -9,7 +9,6 @@
 use reqwest::{RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::OwnedMutexGuard;
 use url::Url;
 
 use crate::client::{refresh_once, RefreshOutcome, Refresher, TokenPair};
@@ -292,7 +291,7 @@ impl BrookClient {
         sign_out_other_devices: bool,
     ) -> Result<Option<bool>> {
         let epoch = self.session.snapshot().await.0.epoch;
-        let lock: OwnedMutexGuard<()> = self.session.refresh_lock.clone().lock_owned().await;
+        let lock = self.session.flight().await;
         let ctx = self.ctx();
         let (current, new) = (current.to_string(), new.to_string());
         let bound = self.locked_bound;
@@ -394,7 +393,7 @@ impl BrookClient {
     /// next code; `auth.totp_enrollment_expired`: enrol again (a new QR code).
     pub async fn totp_activate(&self, code: &str) -> Result<Vec<String>> {
         let epoch = self.session.snapshot().await.0.epoch;
-        let lock: OwnedMutexGuard<()> = self.session.refresh_lock.clone().lock_owned().await;
+        let lock = self.session.flight().await;
         let ctx = self.ctx();
         let code = code.to_string();
         let bound = self.locked_bound;
