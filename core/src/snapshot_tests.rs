@@ -291,3 +291,54 @@ async fn a_sealer_resumes_at_a_chunk_boundary_and_stops_at_the_size() {
         resumed.len() - (SMALL + 16 + 2 + 16)
     );
 }
+
+/// Only a regular file is copied. A named pipe would block the open until a writer came
+/// (holding a blocking thread for good), and a folder or a device isn't a file to send:
+/// each is refused at once, judged on what was opened (a path swapped after staging
+/// can't slip past a check made earlier).
+#[test]
+fn only_a_regular_file_is_copied() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("pipe");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let link = dir.path().join("link");
+    let file = dir.path().join("f.src");
+    std::fs::write(&file, [3u8; 10]).unwrap();
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let paths = [
+        (fifo, false),
+        (dir.path().to_path_buf(), false),
+        (std::path::PathBuf::from("/dev/zero"), false),
+        (link, true), // a link to a regular file is that file
+    ];
+    let out = dir.path().to_path_buf();
+    std::thread::spawn(move || {
+        for (i, (src, ok)) in paths.into_iter().enumerate() {
+            let dst = out.join(format!("o{i}.snap"));
+            let got = snapshot::write(&src, &dst, id(), SMALL, 1 << 20, &mut |_, _| true);
+            let _ = tx.send((
+                src,
+                ok,
+                got.is_ok(),
+                matches!(got, Err(snapshot::WriteError::Source)),
+                dst.exists(),
+            ));
+        }
+    });
+    for _ in 0..4 {
+        let (src, ok, got_ok, source_err, kept) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the copy blocked on a source that isn't a regular file");
+        if ok {
+            assert!(got_ok, "{src:?} should copy");
+        } else {
+            assert!(source_err, "{src:?} should be refused as a source");
+            assert!(!kept, "{src:?} left a snapshot");
+        }
+    }
+}

@@ -102,6 +102,22 @@ fn fill(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     Ok(n)
 }
 
+/// Open `src` for reading only if it is a regular file (a link to one counts), judged on the
+/// opened descriptor so a path swapped after an earlier check can't slip past. The open is
+/// non-blocking: without it, a named pipe blocks the open until some writer appears,
+/// holding the caller's blocking thread for good. Reads from a regular file ignore the flag.
+fn open_regular(src: &Path) -> Option<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(src).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
 /// Copy `src` into a new snapshot at `dst`, sealed under a fresh key. `src` is opened once
 /// and read once; `dst` must not exist, and its directory must (it is never created here:
 /// a write racing a wipe of the store fails instead of recreating it). The file and its
@@ -116,7 +132,7 @@ pub(crate) fn write(
     max: u64,
     progress: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<Written, WriteError> {
-    let mut input = File::open(src).map_err(|_| WriteError::Source)?;
+    let mut input = open_regular(src).ok_or(WriteError::Source)?;
     let total = input.metadata().map(|m| m.len()).unwrap_or(0);
     let mut key = [0u8; 32];
     getrandom::fill(&mut key).map_err(|_| WriteError::Store)?;
