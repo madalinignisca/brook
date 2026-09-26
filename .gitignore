@@ -48,4 +48,7 @@ clients/macos/Brook.xcodeproj/
 clients/macos/build/
 clients/macos/Brook/Info.plist
 clients/macos/Brook/Brook.entitlements
+clients/macos/BrookImageDecoder/Info.plist
+clients/macos/BrookImageDecoder/BrookImageDecoder.entitlements
+clients/macos/BrookImageWorker/BrookImageWorker.entitlements
 clients/macos/Local.xcconfig
