@@ -46,6 +46,8 @@ struct Server {
     gone: Mutex<bool>,
     /// Every download fails as if the bytes were wrong.
     broken: Mutex<bool>,
+    /// Every download fails for want of a connection.
+    down: Mutex<bool>,
     hold: Mutex<Option<(u64, Arc<Notify>)>>,
     /// `(file id, resume offset, epoch)` per request.
     asked: Mutex<Vec<(String, u64, u64)>>,
@@ -93,6 +95,12 @@ impl Download for Server {
             .push((file_id.into(), offset, epoch));
         if *self.gone.lock().unwrap() {
             return Err(crate::transfer::gone_error());
+        }
+        if *self.down.lock().unwrap() {
+            return Err(Error::Api {
+                code: "transfer.network".into(),
+                message: String::new(),
+            });
         }
         if *self.broken.lock().unwrap() {
             return Err(Error::Api {
@@ -838,4 +846,72 @@ async fn a_pin_that_keeps_failing_backs_off() {
         s.server.asked().len() > tries
     })
     .await;
+}
+
+/// Coming back online starts a round: a pin that failed for want of a connection is fetched
+/// at once, while one the server failed (wrong bytes) keeps its backoff.
+#[tokio::test]
+async fn coming_back_online_fetches_network_failed_pins_but_keeps_answered_backoffs() {
+    // Failed for want of a connection: no backoff, fetched as soon as it's back.
+    let s = setup_with(&[(F1, bytes(MIB, 32), "a.bin")]).await;
+    s.files.set_fetch_retry(Duration::from_secs(3600));
+    *s.server.down.lock().unwrap() = true;
+    s.files.pin_file(F1).await.unwrap();
+    wait_until("the network failure", || !s.server.asked().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await; // the fetcher settles into its wait
+    *s.server.down.lock().unwrap() = false;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !pinned_cached(&s.files.state(F1).await.unwrap()),
+        "fetched before any reconnect"
+    );
+    s.cache.set_offline_for_tests(true);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    s.cache.set_offline_for_tests(false);
+    settle(&s, F1, "fetched when back online", pinned_cached).await;
+
+    // Failed by the server (wrong bytes): its backoff holds across a reconnect.
+    let t = setup_with(&[(F2, bytes(MIB, 33), "b.bin")]).await;
+    t.files.set_fetch_retry(Duration::from_secs(3600));
+    *t.server.broken.lock().unwrap() = true;
+    t.files.pin_file(F2).await.unwrap();
+    wait_until("the answered failure", || t.server.asked().len() == 1).await;
+    *t.server.broken.lock().unwrap() = false;
+    t.cache.set_offline_for_tests(true);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    t.cache.set_offline_for_tests(false);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        t.server.asked().len(),
+        1,
+        "a stuck file was re-downloaded on reconnect"
+    );
+    // A new pin retries it at once.
+    t.files.pin_file(F2).await.unwrap();
+    settle(&t, F2, "fetched after a re-pin", pinned_cached).await;
+}
+
+#[test]
+fn only_file_failures_back_a_pin_off() {
+    use crate::files::is_connection_failure;
+    let api = |code: &str| Error::Api {
+        code: code.into(),
+        message: String::new(),
+    };
+    for e in [
+        api("transfer.network"),
+        api("transfer.paused"),
+        Error::Timeout,
+        Error::NotAuthenticated,
+    ] {
+        assert!(is_connection_failure(&e), "{e:?}");
+    }
+    for e in [
+        api("http_503"),
+        api("transfer.integrity"),
+        api("transfer.io"),
+        api("file.too_large"),
+    ] {
+        assert!(!is_connection_failure(&e), "{e:?}");
+    }
 }
