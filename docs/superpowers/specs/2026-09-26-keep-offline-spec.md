@@ -26,7 +26,10 @@ user-set cache size (the cap is a constant, §5).
 - `GET /files/{id}/content` supports `Range` and `If-Range`, with `ETag: "<sha256>"`. A `200`
   instead of a `206` means start over.
 - Deleting a message deletes its files' bytes at once. There's no deferred delete yet (#83),
-  so a download can meet a `404` midway. **A `404` means the file is gone**, not "retry".
+  and a download can meet a `404`. **A `404` means the file is gone**, not "retry".
+- The delete unlinks the bytes, so a `GET` already streaming finishes normally on Linux.
+  Only a new request or a `Range` resume after the delete gets the `404`: in practice this
+  is the resume-after-interruption path.
 - Files have no `seq` of their own. They ride on their message: the message's `attachments`
   list, its tombstone (`deleted_at`) and its channel's removal are how core learns a file
   went.
