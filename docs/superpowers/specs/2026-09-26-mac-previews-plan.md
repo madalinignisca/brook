@@ -212,3 +212,13 @@ Rebutted (vibe):
 Noted: the fake-client stubs in `CallModelTests.swift` are the separate #158 fix, merged
 into this branch so it builds. The 40 MP peak was measured outside the sandbox (see
 "Measured").
+
+## Implementation review, round 2
+
+Vibe: no objections, and it accepts the rebuttals. The second reviewer confirmed each fix and
+found one new gap:
+- **A `waitid` error other than `EINTR` let go of a live worker's pid without killing it,**
+  and the blocking reap could then wait on it. The worker is now killed before its pid is
+  released. No errno is known to reach this path on macOS, so it has no deterministic test.
+
+Also taken: a run cancelled while it waits for a slot returns without taking one. Closed.

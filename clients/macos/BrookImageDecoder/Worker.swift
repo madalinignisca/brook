@@ -41,6 +41,8 @@ final class WorkerRun: @unchecked Sendable {
         killpg(pid, SIGKILL)
     }
 
+    var isCancelled: Bool { lock.withLock { cancelled } }
+
     func finish() -> Frame {
         func failed(_ code: ReplyCode) -> Frame { Frame(code: UInt32(code.rawValue), width: 0, height: 0, body: Data()) }
         if lock.withLock({ cancelled }) { return failed(.workerFailed) }
@@ -127,7 +129,13 @@ final class WorkerRun: @unchecked Sendable {
                 exitedAlone = !lock.withLock { killed }
                 break
             }
-            if r != 0 && errno != EINTR { break } // no such child: reaped below, reported as failed
+            if r != 0 && errno != EINTR {
+                // No longer watchable (not known to have exited): kill it before letting go of
+                // its pid, so the blocking reap below can't wait on a live worker. Nothing but
+                // this thread reaps it, so the pid is still this worker's.
+                lock.withLock { killLocked() }
+                break
+            }
             if DispatchTime.now() >= deadline { lock.withLock { killLocked() } }
             usleep(5_000)
         }

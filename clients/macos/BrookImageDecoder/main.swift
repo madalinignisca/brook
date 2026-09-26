@@ -79,9 +79,15 @@ final class Session: NSObject, ImageDecoding, @unchecked Sendable {
         }
         guard admitted else { return answer.send(.workerFailed) }
         Self.queue.async { [self] in
-            WorkerRun.slots.wait()
-            let result = run.finish()
-            WorkerRun.slots.signal()
+            // A run cancelled while it waits doesn't hold up a slot on its way out.
+            let result: Frame
+            if run.isCancelled {
+                result = Frame(code: UInt32(ReplyCode.workerFailed.rawValue), width: 0, height: 0, body: Data())
+            } else {
+                WorkerRun.slots.wait()
+                result = run.finish()
+                WorkerRun.slots.signal()
+            }
             lock.withLock { _ = running.removeValue(forKey: id) }
             answer.send(result)
         }
