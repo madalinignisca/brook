@@ -556,3 +556,36 @@ final class QuitCoordinatorTests: XCTestCase {
         XCTAssertEqual(replies, 1)
     }
 }
+
+/// The chat, offline and transfer calls: not used by the call tests (the Mac tests stopped
+/// building when the bindings grew them; they answer "not signed in" or are never called).
+extension FakeRealtime {
+    private var unused: LoginError { .NotAuthenticated }
+    func acknowledgeOutboxLost(n: UInt64) {}
+    func cachedChannels() async throws -> [FfiCachedChannel] { throw unused }
+    func cachedMessages(channelId: String, before: String?, limit: UInt32) async throws -> FfiCachedMessages { throw unused }
+    func cancelTransfer(transferId: UInt64) {}
+    func channelHistory(channelId: String, before: String?) async throws -> [FfiMessage] { throw unused }
+    func deleteMessage(channelId: String, messageId: String) async throws { throw unused }
+    func deletePending(clientId: String) async throws -> FfiDeleted { throw unused }
+    func downloadFile(transferId: UInt64, fileId: String, sha256: String, size: UInt64, destination: String) async throws { throw unused }
+    func editMessage(channelId: String, messageId: String, body: String) async throws -> FfiMessage { throw unused }
+    func enableLocalData(slot: any FfiKeySlot, dataDir: String) async -> Bool { false }
+    func loadHead(channelId: String, limit: UInt32) async throws { throw unused }
+    func loadOlder(channelId: String, limit: UInt32) async throws { throw unused }
+    func markRead(channelId: String, messageId: String?) async throws { throw unused }
+    func otherLocalUsers() async throws -> [FfiLocalUser] { throw unused }
+    func outboxLost() -> UInt64? { nil }
+    func pendingMessages(channelId: String) async throws -> [FfiPendingMessage] { throw unused }
+    func retrySend(clientId: String) async throws { throw unused }
+    func retryWithoutReply(clientId: String) async throws { throw unused }
+    func sendMessage(channelId: String, body: String, replyToId: String?) async throws -> FfiMessage { throw unused }
+    func sendQueued(channelId: String, body: String, replyToId: String?, clientId: String) async throws -> String { throw unused }
+    func sendQueuedWithFiles(channelId: String, body: String, replyToId: String?, clientId: String, files: [FfiOutgoingFile]) async throws -> FfiSendReceipt { throw unused }
+    func signOutAndForget() async throws { throw unused }
+    func subscribeCacheEvents(listener: any CacheEventListener) -> Subscription { fatalError("unused") }
+    func subscribeCacheState(listener: any CacheStateListener) -> Subscription { fatalError("unused") }
+    func subscribeTransfers(listener: any TransferListener) -> Subscription { fatalError("unused") }
+    func unsentCount() async -> UInt64 { 0 }
+    func wipeOtherLocalUsers() async throws { throw unused }
+}
