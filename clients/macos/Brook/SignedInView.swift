@@ -43,20 +43,29 @@ struct SignedInView: View {
             }
             .navigationSplitViewColumnWidth(min: 200, ideal: 240)
         } detail: {
-            if let channel = channels.channels.first(where: { $0.id == selection }) {
-                VStack(spacing: 16) {
-                    Text(channels.title(channel)).font(.title2)
-                    if let badge = channels.badge(channel) { Text(badge).foregroundStyle(.green) }
-                    Button {
-                        openWindow(id: "call")
-                        Task { await calls.join(channel, name: channels.title(channel), client: client) }
-                    } label: {
-                        Label("Join call", systemImage: "phone.fill")
+            if let channel = channels.channels.first(where: { $0.id == selection }),
+               let chat = client as? any ChatClient {
+                ChatView(channelId: channel.id, me: user.id, client: chat,
+                         timeline: timeline(for: channel.id, chat))
+                    .id(channel.id)  // a new conversation per channel
+                    .navigationTitle(channels.title(channel))
+                    .toolbar {
+                        ToolbarItem {
+                            Button {
+                                openWindow(id: "call")
+                                Task {
+                                    await calls.join(channel, name: channels.title(channel),
+                                                     client: client)
+                                }
+                            } label: {
+                                Label(channels.badge(channel) ?? "Join Call",
+                                      systemImage: "phone.fill")
+                            }
+                            .disabled(!channels.canJoin(channel) || calls.call != nil
+                                || calls.joining)
+                            .help(calls.joinError ?? (channels.ready ? "Join the call" : "Connecting…"))
+                        }
                     }
-                    .disabled(!channels.canJoin(channel) || calls.call != nil || calls.joining)
-                    if !channels.ready { Text("Connecting…").foregroundStyle(.secondary) }
-                    if let error = calls.joinError { Text(error).foregroundStyle(.red) }
-                }
             } else {
                 ContentUnavailableView {
                     Label("Signed in as \(user.displayName)", systemImage: "person.crop.circle.badge.checkmark")
@@ -128,6 +137,15 @@ struct SignedInView: View {
 }
 
 extension SignedInView {
+    /// The open channel's timeline, made once per selection and handed to the channel list,
+    /// which forwards it the message events.
+    fileprivate func timeline(for channelId: String, _ chat: any ChatClient) -> TimelineModel {
+        if let open = channels.timeline, open.channelId == channelId { return open }
+        let model = TimelineModel(channelId: channelId, client: chat)
+        channels.timeline = model
+        return model
+    }
+
     /// Whether two-factor sign-in is on decides which menu items show.
     fileprivate func refreshTotp() {
         guard let account = client as? any AccountClient else { return }

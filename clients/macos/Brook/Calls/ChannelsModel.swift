@@ -12,6 +12,8 @@ final class ChannelsModel {
     /// channel id → participants in its live call.
     private(set) var liveCalls: [String: UInt32] = [:]
     private(set) var error: String?
+    /// The open conversation, which takes the message events.
+    var timeline: TimelineModel?
 
     private let client: any FfiBrookClientProtocol
     private var events: Subscription?
@@ -45,7 +47,7 @@ final class ChannelsModel {
         case let .channelCall(channelId, callId, count):
             liveCalls[channelId] = callId != nil && count > 0 ? count : nil
         case .messageNew, .messageUpdate, .messageDelete, .resync:
-            break  // the timeline's (the chat view), not the channel list's
+            timeline?.apply(event)  // the open conversation's
         }
     }
 

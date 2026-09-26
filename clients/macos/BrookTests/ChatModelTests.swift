@@ -1,0 +1,139 @@
+import BrookCore
+import Foundation
+import Synchronization
+import XCTest
+
+@testable import Brook
+
+final class FakeChat: ChatClient, @unchecked Sendable {
+    var pages: [[FfiMessage]] = []
+    let sent = Mutex<[String]>([])
+    var sendFailure: Error?
+    var read: [String?] = []
+
+    func channelHistory(channelId: String, before: String?) async throws -> [FfiMessage] {
+        pages.isEmpty ? [] : pages.removeFirst()
+    }
+    func sendMessage(channelId: String, body: String, replyToId: String?) async throws -> FfiMessage {
+        sent.withLock { $0.append("\(body)|\(replyToId ?? "-")") }
+        if let sendFailure { throw sendFailure }
+        return msg("m9", body, channel: channelId)
+    }
+    func editMessage(channelId: String, messageId: String, body: String) async throws -> FfiMessage {
+        sent.withLock { $0.append("edit:\(messageId):\(body)") }
+        if let sendFailure { throw sendFailure }
+        return msg(messageId, body, channel: channelId)
+    }
+    func deleteMessage(channelId: String, messageId: String) async throws {}
+    func markRead(channelId: String, messageId: String?) async throws { read.append(messageId) }
+    func downloadFile(transferId: UInt64, fileId: String, sha256: String, size: UInt64,
+                      destination: String) async throws {}
+    func cancelTransfer(transferId: UInt64) {}
+    func subscribeTransfers(listener: TransferListener) -> Subscription {
+        fatalError("not used by these tests")
+    }
+}
+
+func msg(_ id: String, _ body: String, channel: String = "c", deleted: Bool = false) -> FfiMessage {
+    FfiMessage(id: id, channelId: channel, authorId: "u", authorHandle: "u", authorDisplayName: "U",
+               body: body, createdAt: "2026-09-26T10:00:00Z", clientId: nil, deleted: deleted,
+               editedAt: nil, replyToId: nil, replyTo: nil, attachments: [])
+}
+
+@MainActor
+final class TimelineModelTests: XCTestCase {
+    /// A history page and live events merge by id, in id (time) order, with no duplicates.
+    func testHistoryAndLiveEventsMergeByIdInOrder() async {
+        let chat = FakeChat()
+        chat.pages = [[msg("m1", "a"), msg("m3", "c")]]
+        let t = TimelineModel(channelId: "c", client: chat)
+        t.apply(.messageNew(message: msg("m2", "b")))  // before the page lands
+        await t.load()
+        t.apply(.messageNew(message: msg("m3", "c")))  // a duplicate of the page's
+        XCTAssertEqual(t.messages.map(\.id), ["m1", "m2", "m3"])
+        XCTAssertEqual(chat.read.last, "m3", "the newest shown wasn't marked read")
+    }
+
+    func testAnotherChannelsEventsAreIgnored() {
+        let t = TimelineModel(channelId: "c", client: FakeChat())
+        t.apply(.messageNew(message: msg("m1", "x", channel: "other")))
+        t.apply(.messageDelete(channelId: "other", messageId: "m1"))
+        XCTAssertTrue(t.messages.isEmpty)
+    }
+
+    /// An edit replaces in place; a delete leaves a tombstone that a late copy can't undo.
+    func testEditsReplaceAndDeletesStay() {
+        let t = TimelineModel(channelId: "c", client: FakeChat())
+        t.merge([msg("m1", "first")])
+        t.apply(.messageUpdate(message: msg("m1", "edited")))
+        XCTAssertEqual(t.messages.first?.body, "edited")
+        t.apply(.messageDelete(channelId: "c", messageId: "m1"))
+        XCTAssertEqual(t.messages.first?.deleted, true)
+        XCTAssertEqual(t.messages.first?.body, "")
+        t.merge([msg("m1", "edited")])  // a history page fetched before the delete
+        XCTAssertEqual(t.messages.first?.deleted, true, "a late copy brought it back")
+    }
+
+    /// An empty older page means the start of the channel; no more pages are asked for.
+    func testAnEmptyOlderPageIsTheStart() async {
+        let chat = FakeChat()
+        chat.pages = [[msg("m5", "x")], []]
+        let t = TimelineModel(channelId: "c", client: chat)
+        await t.load()
+        XCTAssertFalse(t.atStart)
+        await t.loadOlder()
+        XCTAssertTrue(t.atStart)
+    }
+}
+
+@MainActor
+final class ComposerModelTests: XCTestCase {
+    /// Sent: the box clears and the message reaches the timeline at once.
+    func testASendClearsAndHandsTheMessageOver() async {
+        let chat = FakeChat()
+        var got: [String] = []
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { got.append($0.id) })
+        c.reply(to: msg("q", "quoted"))
+        c.text = "hello"
+        await c.send()
+        XCTAssertEqual(c.text, "")
+        XCTAssertNil(c.replyingTo)
+        XCTAssertEqual(got, ["m9"])
+        XCTAssertEqual(chat.sent.withLock { $0 }, ["hello|q"])
+    }
+
+    /// A refusal gives the text and the reply back, and says why.
+    func testAFailedSendGivesTheTextBack() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.Api(code: "message.reply_target_gone", message: "")
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.reply(to: msg("q", "quoted"))
+        c.text = "hello"
+        await c.send()
+        XCTAssertEqual(c.text, "hello")
+        XCTAssertEqual(c.replyingTo?.id, "q")
+        XCTAssertEqual(c.error, "The message you replied to was deleted.")
+    }
+
+    /// A network failure may have delivered it: the text comes back, but the words don't
+    /// claim it wasn't sent.
+    func testANetworkFailureDoesntClaimItWasntSent() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.Network(message: "offline")
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hello"
+        await c.send()
+        XCTAssertEqual(c.text, "hello")
+        XCTAssertTrue(c.error?.contains("may not have been sent") == true, c.error ?? "")
+    }
+
+    func testAnEditSavesTheNewText() async {
+        let chat = FakeChat()
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.edit(msg("m1", "old"))
+        XCTAssertEqual(c.text, "old")
+        c.text = "new"
+        await c.send()
+        XCTAssertEqual(chat.sent.withLock { $0 }, ["edit:m1:new"])
+    }
+}
