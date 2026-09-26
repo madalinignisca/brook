@@ -141,6 +141,11 @@ impl Cache {
         self.state.subscribe()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_offline_for_tests(&self, offline: bool) {
+        self.state.send_modify(|s| s.offline = offline);
+    }
+
     /// The cache's database (the file cache keeps its rows here, in the cache's own
     /// transactions).
     pub(crate) fn db(&self) -> &Db {
