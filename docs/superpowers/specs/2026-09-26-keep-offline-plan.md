@@ -95,6 +95,15 @@ the wrong start, and a `200` after a partial, both give a new key.
 - `download_file` uses it with `CurrentToken`, so its behaviour doesn't change.
 - The loop also checks `flags.stopped()`, so a pause (`transfer.paused`) stops a download
   just as a cancel does.
+- **No content coding, ever** (production finding: a proxy gzipped download bodies, which
+  rewrote the ETag to `"<sha256>-gzip"` and sent a gzipped body under an identity
+  `Content-Range`):
+  - the transfer client never enables `reqwest`'s `gzip`, `brotli`, `deflate` or `zstd`,
+    and sends `Accept-Encoding: identity` explicitly on downloads;
+  - a test asserts the core crate's `reqwest` features exclude them;
+  - any `Content-Encoding` other than `identity` on a download response is a failed attempt
+    that can't be resumed: the sink `restart`s (a new key), and the attempt counts toward
+    `MAX_ATTEMPTS` as a transient error.
 - A `404` becomes `Error::Api { code: "file.gone" }` (was: `api(404)`). `download_file`
   keeps returning it, and `Save` shows it as today's "not found" text in the apps.
 
@@ -183,6 +192,8 @@ the wrong start, and a `200` after a partial, both give a new key.
   - a `404` gives `file.gone` and drops the file.
 - **Single flight:** a second `cache_file` joins; cancelling one caller keeps the other;
   cancelling both stops it and keeps the partial.
+- **Content coding:** a `206` or `200` carrying `Content-Encoding: gzip` restarts under a new
+  key and never appends those bytes; the request carries `Accept-Encoding: identity`.
 - **Tokens:** a session change mid-download pauses it and never sends another epoch's
   token (the test server checks the bearer).
 - **Open:** refuses ELF, `MZ`, `#!` and `.desktop`, and allows a PDF; the copy lands in the
