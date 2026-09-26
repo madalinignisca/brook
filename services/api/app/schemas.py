@@ -292,7 +292,11 @@ class ReplyExcerpt(BaseModel):
     id: uuid.UUID
     author_handle: str | None
     author_display_name: str | None
-    body: str  # truncated for display
+    body: str  # truncated for display; "(deleted)" once the target is deleted
+    # So clients needn't match that text: a deleted target, and how many files the
+    # target carries (a captionless file quotes as an empty body with files > 0).
+    deleted: bool = False
+    attachments: int = 0
 
 
 class ReactionToggle(BaseModel):

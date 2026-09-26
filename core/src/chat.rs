@@ -143,6 +143,13 @@ pub struct ReplyExcerpt {
     pub author_handle: Option<String>,
     /// Quoted author display name.
     pub author_display_name: Option<String>,
-    /// Quoted body (truncated server-side).
+    /// Quoted body (truncated server-side; "(deleted)" once the target is deleted: use
+    /// `deleted`, not the text).
     pub body: String,
+    /// The quoted message was deleted.
+    #[serde(default)]
+    pub deleted: bool,
+    /// How many files the quoted message has (a caption-less quote reads "a file").
+    #[serde(default)]
+    pub attachments: u32,
 }

@@ -500,6 +500,18 @@ async fn replies_follow_their_target() {
         })
         .await;
     assert_eq!(quote().await.as_deref(), Some("(deleted)"));
+    // The state, not only the text: a client labels the quote from these (#129).
+    assert_eq!(
+        cache
+            .one(
+                "SELECT json_extract(json, '$.reply_to.deleted') || '/' ||
+                        json_extract(json, '$.reply_to.attachments') FROM messages WHERE id = ?1",
+                "r1"
+            )
+            .await
+            .as_deref(),
+        Some("1/0")
+    );
     assert_eq!(
         cache
             .one(
@@ -602,6 +614,17 @@ async fn a_late_reply_never_quotes_deleted_words() {
             .await
             .as_deref(),
         Some("(deleted)")
+    );
+    assert_eq!(
+        cache
+            .one(
+                "SELECT json_extract(json, '$.reply_to.deleted') || '' FROM messages WHERE id = ?1",
+                "r1"
+            )
+            .await
+            .as_deref(),
+        Some("1"),
+        "the late reply's quote still reads as live"
     );
 }
 
