@@ -131,6 +131,28 @@ class RefreshToken(Base):
     replaced_by_id: Mapped[uuid.UUID | None] = mapped_column(default=None)
 
 
+class OwnerOffer(Base):
+    """A pending offer to make a member a channel owner (owner decision, 2026-09-26).
+
+    It waits here, however long, until the member accepts or declines, the offerer
+    withdraws it, or either of them leaves; accepting adds an owner (the offerer stays
+    one). One per member per channel. It rides on the channel object (``ChannelOut``),
+    so it reaches an offline member through ``/sync`` like a role does."""
+
+    __tablename__ = "owner_offers"
+
+    channel_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("channels.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    offered_by: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Channel(Base):
     """A conversation: a named ``channel`` or a 1:1 ``dm``.
 

@@ -206,6 +206,23 @@ class ChannelMember(UserSummary):
     role: str = "member"
 
 
+class OwnerOfferOut(BaseModel):
+    """A pending offer to make ``user_id`` an owner, from ``offered_by``. The recipient's
+    app highlights the channel and asks Accept or Decline when it's opened."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    user_id: uuid.UUID
+    offered_by: uuid.UUID
+    created_at: datetime
+
+
+class OwnerOfferIn(BaseModel):
+    """``POST /channels/{id}/owner-offers``: the member to offer ownership to."""
+
+    handle: str = Field(min_length=1, max_length=64)
+
+
 class ChannelOut(BaseModel):
     """A channel/DM the caller belongs to, with its members."""
 
@@ -216,6 +233,8 @@ class ChannelOut(BaseModel):
     created_by: uuid.UUID | None
     created_at: datetime
     members: list[ChannelMember]
+    # Pending ownership offers (members' view: who has been offered, by whom).
+    owner_offers: list[OwnerOfferOut] = Field(default_factory=list)
     unread_count: int = 0
     public: bool = False
     archived: bool = False

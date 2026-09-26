@@ -21,7 +21,17 @@ from typing import Any
 from sqlalchemy import event, insert, inspect, select, update
 from sqlalchemy.orm import Session
 
-from .models import Channel, File, Membership, Message, Reaction, SyncCounter, SyncTombstone, User
+from .models import (
+    Channel,
+    File,
+    Membership,
+    Message,
+    OwnerOffer,
+    Reaction,
+    SyncCounter,
+    SyncTombstone,
+    User,
+)
 
 log = logging.getLogger(__name__)
 
@@ -73,7 +83,15 @@ def _stamp(session: Session, _ctx: Any, _instances: Any) -> None:
     dead_files = [o for o in session.deleted if isinstance(o, File) and o.message_id is not None]
     ended = [o for o in session.deleted if isinstance(o, Membership)]
     dead_channels = [o for o in session.deleted if isinstance(o, Channel)]
-    if not (changed or reactions or dead_files or ended or dead_channels):
+    # Owner offers and roles are part of the channel object (ChannelOut): an offer made
+    # or resolved, or a role changed, re-stamps its channel so /sync delivers it.
+    offers = [o for o in (*session.new, *session.deleted) if isinstance(o, OwnerOffer)]
+    roles = [
+        m
+        for m in session.dirty
+        if isinstance(m, Membership) and inspect(m).attrs["role"].history.has_changes()
+    ]
+    if not (changed or reactions or dead_files or ended or dead_channels or offers or roles):
         return
     seq = _take_seq(session)
     # sync.hint only for changes with no live event of their own. Messages, reactions
@@ -101,6 +119,7 @@ def _stamp(session: Session, _ctx: Any, _instances: Any) -> None:
     # The member list is part of a channel's state: joining or leaving re-stamps it, so
     # channel.update events (and /sync) carry a seq that orders them.
     member_changes = {m.channel_id for m in (*session.new, *ended) if isinstance(m, Membership)}
+    member_changes |= {o.channel_id for o in offers} | {m.channel_id for m in roles}
     if member_changes:
         session.execute(update(Channel).where(Channel.id.in_(member_changes)).values(seq=seq))
     touched = {r.message_id for r in reactions} | {f.message_id for f in dead_files}

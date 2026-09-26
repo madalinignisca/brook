@@ -29,7 +29,7 @@ from sqlalchemy.orm import InstrumentedAttribute
 
 from ..db import get_session
 from ..deps import get_current_user
-from ..models import Channel, Membership, Message, SyncCounter, SyncTombstone, User
+from ..models import Channel, Membership, Message, OwnerOffer, SyncCounter, SyncTombstone, User
 from ..schemas import ChannelOut, MessageOut
 from .channels import (
     _attachments_for,
@@ -297,7 +297,15 @@ async def _channels_out(session: AsyncSession, channels: list[Channel]) -> list[
     for channel_id, member, role in rows:
         members.setdefault(channel_id, []).append(member)
         roles.setdefault(channel_id, {})[member.id] = role
-    return [_channel_out(c, members.get(c.id, []), roles=roles.get(c.id)) for c in channels]
+    offers: dict[uuid.UUID, list[OwnerOffer]] = {}
+    for offer in (
+        await session.scalars(select(OwnerOffer).where(OwnerOffer.channel_id.in_(ids)))
+    ).all():
+        offers.setdefault(offer.channel_id, []).append(offer)
+    return [
+        _channel_out(c, members.get(c.id, []), roles=roles.get(c.id), offers=offers.get(c.id))
+        for c in channels
+    ]
 
 
 async def _messages_out(
