@@ -21,8 +21,9 @@ pub use client::FfiBrookClient;
 pub use listener::{AuthStateListener, Subscription};
 pub use offline::{
     CacheEventListener, CacheStateListener, FfiCacheEvent, FfiCacheState, FfiCachedChannel,
-    FfiCachedMessages, FfiDeleted, FfiLocalUser, FfiMember, FfiMessage, FfiPendingMessage,
-    FfiPendingState,
+    FfiCachedMessages, FfiDeleted, FfiLocalUser, FfiMember, FfiMessage, FfiOutgoingFile,
+    FfiPendingFile, FfiPendingMessage, FfiPendingState, FfiQueuedFile, FfiSendReceipt,
+    FfiTransferEvent, FfiTransferState, TransferListener,
 };
 pub use types::{FfiAuthState, FfiChannel, FfiSession, FfiUser, LoginError, LoginResult};
 

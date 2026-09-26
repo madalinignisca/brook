@@ -190,3 +190,122 @@ fn the_cache_state_crosses_in_unix_milliseconds() {
         FfiCacheState::default()
     );
 }
+
+struct Transfers(std::sync::Mutex<mpsc::Sender<Option<FfiTransferEvent>>>);
+
+impl TransferListener for Transfers {
+    fn on_transfer(&self, event: FfiTransferEvent) {
+        let _ = self.0.lock().unwrap().send(Some(event));
+    }
+    fn on_resync(&self) {
+        let _ = self.0.lock().unwrap().send(None);
+    }
+}
+
+fn transfers(
+    rx: broadcast::Receiver<brook_core::TransferEvent>,
+) -> (Arc<Subscription>, mpsc::Receiver<Option<FfiTransferEvent>>) {
+    let (tx, got) = mpsc::channel();
+    let sub = deliver_transfers(rx, Arc::new(Transfers(std::sync::Mutex::new(tx))));
+    (sub, got)
+}
+
+#[test]
+fn transfer_states_cross_with_progress() {
+    let (tx, rx) = broadcast::channel(16);
+    let (_sub, got) = transfers(rx);
+    let states = [
+        brook_core::TransferState::Preparing,
+        brook_core::TransferState::Running,
+        brook_core::TransferState::Retrying { after_secs: 600 },
+        brook_core::TransferState::Done,
+        brook_core::TransferState::Cancelled,
+        brook_core::TransferState::Failed("file.too_large".into()),
+    ];
+    for s in states {
+        tx.send(brook_core::TransferEvent {
+            id: brook_core::TransferId(7),
+            done: 3,
+            total: 9,
+            state: s,
+        })
+        .unwrap();
+    }
+    let want = [
+        FfiTransferState::Preparing,
+        FfiTransferState::Running,
+        FfiTransferState::Retrying { after_secs: 600 },
+        FfiTransferState::Done,
+        FfiTransferState::Cancelled,
+        FfiTransferState::Failed {
+            code: "file.too_large".into(),
+        },
+    ];
+    for w in want {
+        let e = got.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!((e.transfer_id, e.done, e.total, e.state), (7, 3, 9, w));
+    }
+}
+
+/// Missed progress becomes one resync (re-read `pending_messages`), never a silent gap.
+#[test]
+fn missed_progress_is_a_resync() {
+    let (tx, rx) = broadcast::channel(2);
+    for n in 0..5 {
+        tx.send(brook_core::TransferEvent {
+            id: brook_core::TransferId(n),
+            done: 0,
+            total: 1,
+            state: brook_core::TransferState::Running,
+        })
+        .unwrap();
+    }
+    let (_sub, got) = transfers(rx);
+    assert_eq!(got.recv_timeout(Duration::from_secs(2)).unwrap(), None);
+}
+
+#[test]
+fn a_receipt_and_pending_files_keep_their_ids() {
+    let r = FfiSendReceipt::from(brook_core::SendReceipt {
+        client_id: "c".into(),
+        files: vec![brook_core::QueuedFile {
+            file_client_id: "f".into(),
+            transfer_id: brook_core::TransferId(42),
+            size: 5,
+        }],
+    });
+    assert_eq!(
+        r.files,
+        vec![FfiQueuedFile {
+            file_client_id: "f".into(),
+            transfer_id: 42,
+            size: 5
+        }]
+    );
+    let p = FfiPendingMessage::from(PendingMessage {
+        client_id: "c".into(),
+        channel_id: "ch".into(),
+        body: String::new(),
+        reply_to_id: None,
+        files: vec![brook_core::PendingFile {
+            file_client_id: "f".into(),
+            transfer_id: brook_core::TransferId(42),
+            filename: "a.pdf".into(),
+            size: 5,
+            uploaded: true,
+            error: Some("file.quota_exceeded".into()),
+        }],
+        state: PendingState::Pending,
+    });
+    assert_eq!(
+        p.files,
+        vec![FfiPendingFile {
+            file_client_id: "f".into(),
+            transfer_id: 42,
+            filename: "a.pdf".into(),
+            size: 5,
+            uploaded: true,
+            error: Some("file.quota_exceeded".into()),
+        }]
+    );
+}

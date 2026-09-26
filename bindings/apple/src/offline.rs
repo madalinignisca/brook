@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use brook_core::{CacheEvent, CacheState, Deleted, PendingState};
+use brook_core::{
+    CacheEvent, CacheState, Deleted, PendingState, TransferEvent, TransferId, TransferState,
+};
 use tokio::sync::broadcast::{self, error::RecvError};
 
 use crate::call::run;
@@ -113,6 +115,19 @@ pub enum FfiPendingState {
     },
 }
 
+/// A queued message's file. `transfer_id` carries its progress (`subscribe_transfers`) and
+/// cancels the message's sending (`cancel_transfer`); it's per process.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiPendingFile {
+    pub file_client_id: String,
+    pub transfer_id: u64,
+    pub filename: String,
+    pub size: u64,
+    pub uploaded: bool,
+    /// The server's refusal of this file, if it's the one that failed the message.
+    pub error: Option<String>,
+}
+
 /// A message that hasn't gone out, in send order.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiPendingMessage {
@@ -121,7 +136,125 @@ pub struct FfiPendingMessage {
     pub body: String,
     /// The quoted message, for a reply ("Replying to …").
     pub reply_to_id: Option<String>,
+    pub files: Vec<FfiPendingFile>,
     pub state: FfiPendingState,
+}
+
+/// A file to send with a queued message; `path` is read only during the call.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiOutgoingFile {
+    pub path: String,
+    /// The name as the user sees it.
+    pub filename: String,
+    /// Declared, untrusted.
+    pub content_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiQueuedFile {
+    pub file_client_id: String,
+    pub transfer_id: u64,
+    pub size: u64,
+}
+
+/// What `send_queued_with_files` queued.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiSendReceipt {
+    pub client_id: String,
+    pub files: Vec<FfiQueuedFile>,
+}
+
+impl From<brook_core::SendReceipt> for FfiSendReceipt {
+    fn from(r: brook_core::SendReceipt) -> Self {
+        Self {
+            client_id: r.client_id,
+            files: r
+                .files
+                .into_iter()
+                .map(|f| FfiQueuedFile {
+                    file_client_id: f.file_client_id,
+                    transfer_id: f.transfer_id.0,
+                    size: f.size,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Where a transfer is.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiTransferState {
+    /// Being copied into its encrypted snapshot (before any upload).
+    Preparing,
+    Running,
+    /// Waiting before the next attempt (the server asked, the network failed, or signed out).
+    Retrying {
+        after_secs: u64,
+    },
+    Done,
+    Cancelled,
+    Failed {
+        code: String,
+    },
+}
+
+/// Progress of one transfer.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiTransferEvent {
+    pub transfer_id: u64,
+    pub done: u64,
+    pub total: u64,
+    pub state: FfiTransferState,
+}
+
+impl From<TransferEvent> for FfiTransferEvent {
+    fn from(e: TransferEvent) -> Self {
+        Self {
+            transfer_id: e.id.0,
+            done: e.done,
+            total: e.total,
+            state: match e.state {
+                TransferState::Preparing => FfiTransferState::Preparing,
+                TransferState::Running => FfiTransferState::Running,
+                TransferState::Retrying { after_secs } => FfiTransferState::Retrying { after_secs },
+                TransferState::Done => FfiTransferState::Done,
+                TransferState::Cancelled => FfiTransferState::Cancelled,
+                TransferState::Failed(code) => FfiTransferState::Failed { code },
+            },
+        }
+    }
+}
+
+/// Implemented in Swift. Callbacks come one at a time from a runtime thread.
+#[uniffi::export(with_foreign)]
+pub trait TransferListener: Send + Sync {
+    fn on_transfer(&self, event: FfiTransferEvent);
+    /// Progress was missed (a slow listener): re-read `pending_messages` for the current
+    /// state of every file, then carry on with the events that follow.
+    fn on_resync(&self);
+}
+
+/// Deliver transfer events until cancelled or closed; missed ones become one `on_resync`.
+pub(crate) fn deliver_transfers(
+    mut rx: broadcast::Receiver<TransferEvent>,
+    listener: Arc<dyn TransferListener>,
+) -> Arc<Subscription> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cancelled);
+    let task = runtime().spawn(async move {
+        loop {
+            let next = rx.recv().await;
+            if flag.load(Ordering::SeqCst) {
+                break;
+            }
+            match next {
+                Ok(e) => listener.on_transfer(e.into()),
+                Err(RecvError::Lagged(_)) => listener.on_resync(),
+                Err(RecvError::Closed) => break,
+            }
+        }
+    });
+    Subscription::from_task(cancelled, task)
 }
 
 impl From<brook_core::PendingMessage> for FfiPendingMessage {
@@ -131,6 +264,18 @@ impl From<brook_core::PendingMessage> for FfiPendingMessage {
             channel_id: p.channel_id,
             body: p.body,
             reply_to_id: p.reply_to_id,
+            files: p
+                .files
+                .into_iter()
+                .map(|f| FfiPendingFile {
+                    file_client_id: f.file_client_id,
+                    transfer_id: f.transfer_id.0,
+                    filename: f.filename,
+                    size: f.size,
+                    uploaded: f.uploaded,
+                    error: f.error,
+                })
+                .collect(),
             state: match p.state {
                 PendingState::Pending => FfiPendingState::Pending,
                 PendingState::Sending => FfiPendingState::Sending,
@@ -371,6 +516,49 @@ impl FfiBrookClient {
         .await
     }
 
+    /// Queue a message with files (at most `max_files_per_message()`, each at most
+    /// `max_file_bytes()`, none empty; the body may be empty). Each file is copied into an
+    /// encrypted snapshot before this returns, so its path is read only now; call it off the
+    /// main thread. Progress (`Preparing`, then the upload) arrives on the receipt's transfer
+    /// ids; `cancel_transfer` on any of them cancels the message's sending. `client_id` is
+    /// required, as for `send_queued`; the same id again returns the stored receipt.
+    pub async fn send_queued_with_files(
+        &self,
+        channel_id: String,
+        body: String,
+        reply_to_id: Option<String>,
+        client_id: String,
+        files: Vec<FfiOutgoingFile>,
+    ) -> Result<FfiSendReceipt, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let files = files
+            .into_iter()
+            .map(|f| brook_core::OutgoingFile {
+                path: std::path::PathBuf::from(f.path),
+                filename: f.filename,
+                content_type: f.content_type,
+            })
+            .collect();
+        let receipt = run(async move {
+            inner
+                .send_queued_with_files(&channel_id, &body, reply_to_id, Some(client_id), files)
+                .await
+        })
+        .await?;
+        Ok(receipt.into())
+    }
+
+    /// Transfer progress of this client (filter by transfer id).
+    pub fn subscribe_transfers(&self, listener: Arc<dyn TransferListener>) -> Arc<Subscription> {
+        deliver_transfers(self.inner.transfer_events(), listener)
+    }
+
+    /// Stop a transfer; for a queued message's file, cancels the message's sending (Retry
+    /// resumes it).
+    pub fn cancel_transfer(&self, transfer_id: u64) {
+        self.inner.cancel_transfer(TransferId(transfer_id));
+    }
+
     /// A channel's messages that haven't gone out, in the order they will.
     pub async fn pending_messages(
         &self,
@@ -433,6 +621,18 @@ impl FfiBrookClient {
         let inner = Arc::clone(&self.inner);
         run(async move { inner.sign_out_and_forget().await }).await
     }
+}
+
+/// At most this many files per message.
+#[uniffi::export]
+pub fn max_files_per_message() -> u32 {
+    brook_core::MAX_FILES_PER_MESSAGE as u32
+}
+
+/// Each file at most this many bytes (the server's default).
+#[uniffi::export]
+pub fn max_file_bytes() -> u64 {
+    brook_core::MAX_FILE_BYTES
 }
 
 #[cfg(test)]
