@@ -427,6 +427,7 @@ version = "0.0.0"
 dependencies = [
  "brook-core",
  "brook-media-gst",
+ "gio 0.22.10",
  "glycin",
  "gstreamer",
  "gstreamer-webrtc",

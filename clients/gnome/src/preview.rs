@@ -84,11 +84,16 @@ pub fn in_flatpak() -> bool {
 /// `None`: no preview (glycin missing or refused, not sandboxed, over the caps, too slow).
 /// Runs on the Tokio runtime.
 pub async fn decode(bytes: Vec<u8>) -> Option<Pixels> {
+    // Cancelled however this ends (the timeout, or the caller dropping it): glycin then stops
+    // the sandboxed decoder, so a stuck one doesn't keep burning CPU.
+    let cancellable = glycin_gio::Cancellable::new();
+    let _cancel = CancelOnDrop(cancellable.clone());
     let work = async {
         let mut loader = glycin::Loader::new_vec(bytes);
         loader
             .sandbox_selector(selector(in_flatpak()))
-            .accepted_memory_formats(MemoryFormatSelection::R8g8b8a8);
+            .accepted_memory_formats(MemoryFormatSelection::R8g8b8a8)
+            .cancellable(cancellable.clone());
         let image = match loader.load().await {
             Ok(image) => image,
             Err(err) => {
@@ -134,6 +139,16 @@ pub async fn decode(bytes: Vec<u8>) -> Option<Pixels> {
         .await
         .ok()
         .flatten()
+}
+
+/// Cancels on drop.
+struct CancelOnDrop(glycin_gio::Cancellable);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        use glycin_gio::prelude::CancellableExt;
+        self.0.cancel();
+    }
 }
 
 fn log_once(why: &str) {
@@ -239,6 +254,19 @@ mod tests {
         let done = finish.borrow_mut().remove(0);
         done(); // "gone" is skipped, "c" runs
         assert_eq!(*log.borrow(), ["a", "b", "d", "c"]);
+    }
+
+    /// However a decode ends (the timeout, or its row going away), glycin's decoder is told
+    /// to stop.
+    #[test]
+    fn ending_a_decode_cancels_the_sandboxed_decoder() {
+        use glycin_gio::prelude::CancellableExt;
+        let c = glycin_gio::Cancellable::new();
+        {
+            let _guard = CancelOnDrop(c.clone());
+            assert!(!c.is_cancelled());
+        }
+        assert!(c.is_cancelled());
     }
 
     #[test]

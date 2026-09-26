@@ -26,6 +26,8 @@ oo7 = { version = "0.6", default-features = false, features = ["tokio", "native_
 # Inline image previews (#66): decoded only in glycin's sandbox (bubblewrap, or
 # flatpak-spawn --sandbox). Pixels are taken raw, so its gtk-rs generation doesn't matter.
 glycin = { version = "3.1", default-features = false, features = ["tokio"] }
+# glycin's own gio generation, only to hand it a Cancellable that ends a stuck decoder.
+glycin-gio = { package = "gio", version = "0.22" }
 
 [dev-dependencies]
 # Scans the rendered QR code back in tests.
