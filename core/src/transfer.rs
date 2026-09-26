@@ -321,6 +321,8 @@ pub fn is_transient(err: &Error) -> bool {
                     // The server's disk is at its floor: an admin frees space (Retry-After 600).
                     | "file.no_space"
             ) || code.starts_with("http_5")
+                // A timeout or rate limit with no code of ours (a proxy's): try later.
+                || matches!(code.as_str(), "http_408" | "http_429")
         }
         _ => false,
     }

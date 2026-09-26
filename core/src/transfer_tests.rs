@@ -538,6 +538,8 @@ fn transient_errors_are_the_retryable_ones() {
         "transfer.network",
         "transfer.paused",
         "file.no_space", // "try later" since #126 (Retry-After: 600)
+        "http_408",
+        "http_429",
         "http_502",
     ] {
         assert!(is_transient(&api(code)), "{code}");
