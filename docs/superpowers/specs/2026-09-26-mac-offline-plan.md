@@ -263,3 +263,27 @@ doesn't close them deterministically. A core `close_local_data()` for the sign-o
 await is its own PR.
 
 Measured: 11 more mutants, one per fix, each caught.
+
+## Implementation review, round 2
+
+Vibe: no objections, and it accepts the rebuttal. The second reviewer confirmed the round-1
+fixes and found new points, all settled without a round 3:
+- **A keep-data sign-out no longer waits for an enable.** It doesn't touch the stores, and
+  the next enable waits for it anyway. This partly reverses vibe's round-1 point, since
+  waiting could delay the logout by 30 s or more. Only removal waits, so what an enable
+  opens is removed too.
+- **`waitAll` returns at once when its waiter is cancelled** (`withTaskCancellationHandler`).
+- **A hung sign-out keeps later enables waiting, so the Mac stays online-only until
+  relaunch.** That's the safe side, since the stores directory has no lock. It's accepted,
+  and stated in `waitAll`.
+- **Only paging older is guarded,** so cache refills are never dropped. A load that brings
+  nothing the cache can vouch for also falls back to the network.
+- **The alert uses item-based presentation** (each alert has its own id), so the next one
+  re-presents without a deferral.
+- **A stopped feed queues nothing late.**
+- **The date formatters are made once.**
+- Not verified here: how the alert actually re-presents in the running app. That needs local
+  data, and so #79.
+
+Measured: 4 more mutants, each caught (38 in all). 188 Mac tests pass, and the decoder check
+passes on a plain build.
