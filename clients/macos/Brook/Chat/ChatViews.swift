@@ -88,6 +88,10 @@ struct ChatView: View {
             saves.stop()
             pending?.stopProgress()
         }
+        // Back in front: what arrived in this conversation meanwhile is read now.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            timeline.appBecameActive()
+        }
     }
 }
 
