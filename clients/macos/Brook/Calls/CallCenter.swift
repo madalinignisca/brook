@@ -38,10 +38,10 @@ final class CallCenter {
     /// Permissions first (microphone, then camera), so a prompt's human time never eats into
     /// the engine's capture budget; then the engine, the join, and the attachment. Quit is
     /// handled from the start: core may already be publishing before join_call returns.
-    func join(_ channel: FfiChannel, name: String, client: any FfiBrookClientProtocol) async {
+    func join(channelId: String, name: String, client: any FfiBrookClientProtocol) async {
         guard call == nil, joinTask == nil else { return }
         let mine = generation // when the join is accepted, not when its work starts
-        let task = Task { await self.performJoin(channel, name: name, client: client, generation: mine) }
+        let task = Task { await self.performJoin(channelId, name: name, client: client, generation: mine) }
         joinTask = task
         quit.leaveActiveCall = { [weak self] in await self?.shutdown() }
         await task.value
@@ -50,7 +50,7 @@ final class CallCenter {
     }
 
     private func performJoin(
-        _ channel: FfiChannel, name: String, client: any FfiBrookClientProtocol, generation mine: Int
+        _ channelId: String, name: String, client: any FfiBrookClientProtocol, generation mine: Int
     ) async {
         joining = true
         joinError = nil
@@ -59,7 +59,7 @@ final class CallCenter {
         let engine = makeEngine(plan)
         do {
             let handle = try await client.joinCall(
-                channelId: channel.id, engine: engine, publish: plan.publishes)
+                channelId: channelId, engine: engine, publish: plan.publishes)
             engine.attach(handle)
             let model = CallModel(channelName: name, plan: plan, handle: handle, media: engine)
             guard mine == generation else {

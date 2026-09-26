@@ -9,15 +9,22 @@ struct ChatView: View {
     @State var timeline: TimelineModel
     @State var composer: ComposerModel
     @State var saves: SaveModel
+    /// Unsent messages (with local data, #62).
+    let pending: PendingModel?
 
-    init(channelId: String, me: String, client: any ChatClient, timeline: TimelineModel) {
+    init(channelId: String, me: String, client: any ChatClient, timeline: TimelineModel,
+         pending: PendingModel? = nil) {
         self.channelId = channelId
         self.me = me
+        self.pending = pending
         _timeline = State(initialValue: timeline)
-        _composer = State(initialValue: ComposerModel(
+        let composer = ComposerModel(
             channelId: channelId, client: client, onMessage: { [weak timeline] in
                 timeline?.merge([$0])
-            }))
+            })
+        composer.pending = pending
+        pending?.timeline = timeline
+        _composer = State(initialValue: composer)
         _saves = State(initialValue: SaveModel(client: client))
     }
 
@@ -34,9 +41,14 @@ struct ChatView: View {
                                 .onAppear { Task { await timeline.loadOlder() } }
                         }
                         ForEach(timeline.messages, id: \.id) { message in
-                            MessageRow(message: message, mine: message.authorId == me,
-                                       saves: saves, composer: composer)
+                            MessageRow(message: message, author: timeline.authorName(message),
+                                       mine: message.authorId == me, saves: saves, composer: composer)
                                 .id(message.id)
+                        }
+                        if let pending {
+                            ForEach(pending.visible, id: \.clientId) { unsent in
+                                PendingRow(message: unsent, pending: pending)
+                            }
                         }
                     }
                     .padding(12)
@@ -45,7 +57,7 @@ struct ChatView: View {
                     if let newest { proxy.scrollTo(newest, anchor: .bottom) }
                 }
             }
-            if let error = timeline.error {
+            if let error = timeline.visibleError {
                 Text(error).foregroundStyle(.red).font(.caption).padding(.horizontal)
             }
             Divider()
@@ -53,14 +65,49 @@ struct ChatView: View {
         }
         .task {
             saves.start()
+            // Unsent bubbles don't wait for the network history.
+            async let bubbles: Void = pending?.reload() ?? ()
             await timeline.load()
+            await bubbles
         }
         .onDisappear { saves.stop() }
     }
 }
 
+/// An unsent message: dimmed while it's on its way, with its actions once it failed.
+struct PendingRow: View {
+    let message: FfiPendingMessage
+    let pending: PendingModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(message.body).foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Text(PendingModel.text(message)).font(.caption).foregroundStyle(.secondary)
+                ForEach(PendingModel.actions(message), id: \.self) { action in
+                    Button(Self.title(action), role: action == .delete ? .destructive : nil) {
+                        Task { await pending.perform(action, on: message) }
+                    }
+                    .buttonStyle(.link).font(.caption)
+                }
+            }
+        }
+        .opacity(PendingModel.actions(message).isEmpty ? 0.6 : 1)
+    }
+
+    static func title(_ action: PendingModel.Action) -> String {
+        switch action {
+        case .retry: "Retry"
+        case .sendWithoutQuote: "Send without the quote"
+        case .delete: "Delete"
+        }
+    }
+}
+
 struct MessageRow: View {
     let message: FfiMessage
+    /// The author's current name (a rename reaches cached rows through the timeline).
+    let author: String
     let mine: Bool
     let saves: SaveModel
     let composer: ComposerModel
@@ -68,7 +115,7 @@ struct MessageRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(message.authorDisplayName ?? message.authorHandle ?? "Someone").bold()
+                Text(author).bold()
                 Text(Self.time(message.createdAt)).font(.caption).foregroundStyle(.secondary)
                 if message.editedAt != nil, !message.deleted {
                     Text("edited").font(.caption).foregroundStyle(.secondary)

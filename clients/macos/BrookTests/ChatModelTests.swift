@@ -7,12 +7,34 @@ import XCTest
 
 final class FakeChat: ChatClient, @unchecked Sendable {
     var pages: [[FfiMessage]] = []
+
+    // ---- This device's local data (OfflineFakes.swift). Off: every call answers
+    // `local.unavailable`, as without the Keychain (#79).
+    var local = false
+    /// `loadHead`/`loadOlder` fail (offline).
+    var loadFails = false
+    /// Cached pages, handed out in order (the last one repeats).
+    var cachePages: [FfiCachedMessages] = []
+    /// What the cache was asked, in order ("cached:<before>", "loadHead", "loadOlder", …).
+    let cacheCalls = Mutex<[String]>([])
+    var users: [FfiMember] = []
+    /// Pending reads, handed out in order (the last one repeats).
+    var pendingReads: [[FfiPendingMessage]] = []
+    var queueFailure: Error?
+    let queued = Mutex<[String]>([]) // "clientId|body|reply"
+    var unsent: UInt64 = 0
+    var lost: UInt64?
+    let acknowledged = Mutex<[UInt64]>([])
+    var others: [FfiLocalUser] = []
+    let wiped = Mutex(0)
     let sent = Mutex<[String]>([])
     var sendFailure: Error?
     var read: [String?] = []
 
+    var historyFailure: Error?
     func channelHistory(channelId: String, before: String?) async throws -> [FfiMessage] {
-        pages.isEmpty ? [] : pages.removeFirst()
+        if let historyFailure { throw historyFailure }
+        return pages.isEmpty ? [] : pages.removeFirst()
     }
     func sendMessage(channelId: String, body: String, replyToId: String?) async throws -> FfiMessage {
         sent.withLock { $0.append("\(body)|\(replyToId ?? "-")") }
@@ -71,7 +93,9 @@ final class TimelineModelTests: XCTestCase {
     func testEditsReplaceAndDeletesStay() {
         let t = TimelineModel(channelId: "c", client: FakeChat())
         t.merge([msg("m1", "first")])
-        t.apply(.messageUpdate(message: msg("m1", "edited")))
+        var edit = msg("m1", "edited")
+        edit.editedAt = "2026-09-26T10:01:00Z" // a server edit always carries its time
+        t.apply(.messageUpdate(message: edit))
         XCTAssertEqual(t.messages.first?.body, "edited")
         t.apply(.messageDelete(channelId: "c", messageId: "m1"))
         XCTAssertEqual(t.messages.first?.deleted, true)

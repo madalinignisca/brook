@@ -167,6 +167,48 @@ final class FakeClient: FfiBrookClient, @unchecked Sendable {
     }
 
     override func signOutComplete() -> Bool { state.withLock { $0.signOutComplete } }
+
+    // MARK: Local data (#62): none of it reaches Rust; each call is recorded in order.
+
+    let localCalls = Mutex<[String]>([])
+    let enableResult = Mutex(true)
+    let enableGate = Gate()
+    let enableGated = Mutex(false)
+    let forgetGate = Gate()
+    let forgetGated = Mutex(false)
+    let forgetFails = Mutex(false)
+    let lost = Mutex<UInt64?>(nil)
+    private func note(_ call: String) { localCalls.withLock { $0.append(call) } }
+
+    override func subscribeCacheEvents(listener _: CacheEventListener) -> Subscription {
+        note("subscribeCacheEvents")
+        return FakeSubscription()
+    }
+    override func subscribeCacheState(listener _: CacheStateListener) -> Subscription {
+        note("subscribeCacheState")
+        return FakeSubscription()
+    }
+    override func enableLocalData(slot _: FfiKeySlot, dataDir _: String) async -> Bool {
+        note("enable")
+        if enableGated.withLock({ $0 }) { await enableGate.wait() }
+        note("enabled")
+        return enableResult.withLock { $0 }
+    }
+    override func outboxLost() -> UInt64? {
+        note("outboxLost")
+        return lost.withLock { $0 }
+    }
+    override func acknowledgeOutboxLost(n: UInt64) { note("ack:\(n)") }
+    override func signOutAndForget() async throws {
+        note("forget")
+        if forgetGated.withLock({ $0 }) { await forgetGate.wait() }
+        note("forgot")
+        if forgetFails.withLock({ $0 }) { throw LoginError.Api(code: "local.store", message: "") }
+    }
+    override func cachedChannels() async throws -> [FfiCachedChannel] { [] }
+    override func unsentCount() async -> UInt64 { 0 }
+    override func otherLocalUsers() async throws -> [FfiLocalUser] { [] }
+    override func wipeOtherLocalUsers() async throws { note("wipe") }
 }
 
 /// Records what the store asked the factory for, and hands out a prepared client.
