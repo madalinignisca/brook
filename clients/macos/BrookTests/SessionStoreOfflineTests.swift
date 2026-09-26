@@ -165,6 +165,28 @@ final class SessionStoreOfflineTests: XCTestCase {
         XCTAssertNil(store.feed)
     }
 
+    func testAKeepDataSignOutDoesntWaitForAnEnable() async {
+        let fake = signedIn()
+        fake.enableGated.withLock { $0 = true } // never released in time
+        let store = store(fake)
+        await store.signIn(server: "https://h", handle: "alice", password: "pw")
+        await until("enabling") { fake.localCalls.withLock { $0 }.contains("enable") }
+        store.signOut(removeData: false)
+        await until("logged out", timeout: 1) { fake.logouts == 1 }
+        fake.enableGate.open()
+    }
+
+    func testACancelledWaitEndsAtOnce() async {
+        let never = Task<Void, Never> { await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in } }
+        let started = Date()
+        let waiter = Task { await SessionStore.waitAll([never], upTo: .seconds(30)) }
+        try? await Task.sleep(for: .milliseconds(50))
+        waiter.cancel()
+        let settled = await waiter.value
+        XCTAssertFalse(settled)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2, "a cancelled wait ran on")
+    }
+
     func testSignOutResetsTheFeed() async {
         let fake = signedIn()
         let store = store(fake)
@@ -359,6 +381,18 @@ final class CacheFeedTests: XCTestCase {
         XCTAssertTrue(CacheFeed.noticeText(unknown).hasSuffix("which may have included unsent messages."))
         let none = [FfiLocalUser(origin: "o", userId: "u", unsent: 0)]
         XCTAssertEqual(CacheFeed.noticeText(none), "Another account's saved messages were removed from this Mac.")
+    }
+
+    func testAStoppedFeedQueuesNothingLate() async {
+        let chat = FakeChat()
+        chat.local = true
+        chat.lost = 1
+        chat.others = [FfiLocalUser(origin: "o", userId: "u", unsent: 0)]
+        let feed = CacheFeed(client: chat)
+        feed.stop()
+        feed.checkLost()
+        await feed.cleanUpOthers()
+        XCTAssertNil(feed.alert, "an alert after sign-out")
     }
 
     func testNoOthersNoWipeNoNotice() async {

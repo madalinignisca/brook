@@ -16,9 +16,17 @@ final class CacheFeed {
 
     /// What an alert says, one at a time: a loss of unsent messages (acknowledged exactly
     /// when dismissed), or the notice after other accounts' data went.
-    enum Alert: Equatable {
+    enum Alert: Equatable, Identifiable {
         case lost(UInt64)
         case notice(String)
+
+        /// Each alert is its own presentation (the next one re-presents).
+        var id: String {
+            switch self {
+            case let .lost(n): "lost-\(n)"
+            case let .notice(text): "notice-\(text)"
+            }
+        }
 
         var text: String {
             switch self {
@@ -43,6 +51,8 @@ final class CacheFeed {
     /// Other accounts' data: once per feed, retried at the next sync after a failure.
     private var cleanedUp = false
     private var cleaning = false
+    /// Stopped (signed out): nothing late may queue an alert.
+    private var stopped = false
 
     init(client: any OfflineClient) {
         self.client = client
@@ -59,6 +69,7 @@ final class CacheFeed {
 
     /// Signed out: nothing more arrives, and the banner and alerts reset.
     func stop() {
+        stopped = true
         subscriptions.forEach { $0.cancel() }
         subscriptions = []
         offline = false
@@ -108,7 +119,7 @@ final class CacheFeed {
 
     /// Queue a loss if there is one and none is queued.
     func checkLost() {
-        guard !alerts.contains(where: { if case .lost = $0 { true } else { false } }),
+        guard !stopped, !alerts.contains(where: { if case .lost = $0 { true } else { false } }),
               let n = client.outboxLost()
         else { return }
         alerts.append(.lost(n))
@@ -120,7 +131,7 @@ final class CacheFeed {
         guard !alerts.isEmpty else { return }
         if case let .lost(n) = alerts.removeFirst() {
             client.acknowledgeOutboxLost(n: n)
-            Task { @MainActor [weak self] in self?.checkLost() }
+            checkLost() // a newer loss: a new alert id, so it presents again
         }
     }
 
@@ -137,7 +148,7 @@ final class CacheFeed {
         }
         guard (try? await client.wipeOtherLocalUsers()) != nil else { return } // retried later
         cleanedUp = true
-        alerts.append(.notice(Self.noticeText(others)))
+        if !stopped { alerts.append(.notice(Self.noticeText(others))) }
     }
 
     /// Names their unsent messages (#46 §8: "wiped after their unsent count is surfaced").

@@ -110,9 +110,8 @@ struct SignedInView: View {
             }
         }
         // One alert at a time (a loss, or the other-accounts notice), in the order they came.
-        .alert(feed?.alert?.text ?? "", isPresented: Binding(
-            get: { feed?.alert != nil }, set: { if !$0 { feed?.dismiss() } })) {
-            Button("OK") {}
+        .alert(item: Binding(get: { feed?.alert }, set: { if $0 == nil { feed?.dismiss() } })) { alert in
+            Alert(title: Text(alert.text))
         }
         .onChange(of: selection, initial: true) { _, channelId in openTimeline(channelId) }
         .onChange(of: channels.closed) { _, closed in

@@ -74,7 +74,10 @@ final class TimelineModel {
     /// the cache can't vouch for it; the network's when there's no local data.
     func loadOlder() async {
         guard !atStart, !loading, let oldest = messages.first else { return }
-        if await readCache(before: oldest.id, loadIfIncomplete: true) { return }
+        loading = true // one older page at a time
+        let fromCache = await readCache(before: oldest.id, loadIfIncomplete: true)
+        loading = false
+        if fromCache { return }
         await fetch(before: oldest.id)
     }
 
@@ -94,22 +97,20 @@ final class TimelineModel {
     /// `before` is the start of the channel.
     @discardableResult
     private func readCache(before: String?, loadIfIncomplete: Bool) async -> Bool {
-        guard let cache, !loading else { return false }
-        loading = true
-        defer { loading = false }
+        guard let cache else { return false }
         do {
             var page = try await cache.cachedMessages(channelId: channelId, before: before, limit: Self.pageSize)
             if page.needsNetwork, loadIfIncomplete {
-                let loaded: Bool
                 if before == nil {
-                    loaded = (try? await cache.loadHead(channelId: channelId, limit: Self.pageSize)) != nil
+                    try? await cache.loadHead(channelId: channelId, limit: Self.pageSize)
                 } else {
-                    loaded = (try? await cache.loadOlder(channelId: channelId, limit: Self.pageSize)) != nil
+                    try? await cache.loadOlder(channelId: channelId, limit: Self.pageSize)
                 }
                 page = try await cache.cachedMessages(channelId: channelId, before: before, limit: Self.pageSize)
-                // The load failed and the cache has nothing more: the network path, which
-                // pages (or shows its error) instead of leaving paging stuck.
-                if !loaded, page.needsNetwork, page.messages.isEmpty { return false }
+                // Still nothing the cache can vouch for (the load failed, or brought
+                // nothing): the network path, which pages or shows its error, instead of
+                // paging getting stuck.
+                if page.needsNetwork, page.messages.isEmpty { return false }
             }
             if before != nil, page.messages.isEmpty, !page.needsNetwork { atStart = true }
             if !page.messages.isEmpty { fromCache = true }
@@ -193,12 +194,20 @@ final class TimelineModel {
     /// The server's RFC 3339 times, with or without fractional seconds (it drops zero ones,
     /// so they don't order as text: "…:00.5Z" < "…:00Z").
     private static func parseTime(_ s: String) -> Date? {
+        fractional.date(from: s) ?? whole.date(from: s)
+    }
+
+    // Formatters are costly to make; these are only read (thread-safe for reading).
+    nonisolated(unsafe) private static let fractional: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f.date(from: s) { return d }
+        return f
+    }()
+    nonisolated(unsafe) private static let whole: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
-        return f.date(from: s)
-    }
+        return f
+    }()
 
     private static func tombstone(_ m: FfiMessage) -> FfiMessage {
         var gone = m

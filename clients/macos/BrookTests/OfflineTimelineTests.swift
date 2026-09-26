@@ -63,6 +63,18 @@ final class OfflineTimelineTests: XCTestCase {
         XCTAssertEqual(t.messages.map(\.id), ["m3", "m5"], "paging stuck on a failed load")
     }
 
+    func testALoadThatBringsNothingAlsoFallsBackToTheNetwork() async {
+        let chat = FakeChat()
+        chat.local = true
+        chat.cachePages = [cachedPage([msg("m5", "newest")])]
+        let t = TimelineModel(channelId: "c", client: chat)
+        await t.load()
+        chat.cachePages = [cachedPage([], needsNetwork: true)] // before and after the load
+        chat.pages = [[msg("m3", "from the network")]]
+        await t.loadOlder()
+        XCTAssertEqual(t.messages.map(\.id), ["m3", "m5"], "paging stuck after a load that brought nothing")
+    }
+
     func testEditTimesWithAndWithoutFractionsOrderAsTimes() {
         XCTAssertTrue(TimelineModel.isNewer("2026-09-26T10:00:00.5Z", than: "2026-09-26T10:00:00Z"))
         XCTAssertFalse(TimelineModel.isNewer("2026-09-26T10:00:00Z", than: "2026-09-26T10:00:00.5Z"))

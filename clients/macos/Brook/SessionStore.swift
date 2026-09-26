@@ -280,20 +280,28 @@ final class SessionStore {
         }
     }
 
-    /// Whether every task ended within `limit`: resumes on whichever comes first, and never
-    /// joins a task that doesn't end.
+    /// Whether every task ended within `limit`: resumes on whichever comes first (or `false`
+    /// when the waiter is cancelled, as by a sign-out), and never joins a task that doesn't
+    /// end. A sign-out that never ends keeps every later enable waiting on it, and so this
+    /// Mac online-only until relaunch: the stores directory has no lock, so that's the safe
+    /// side.
     nonisolated static func waitAll(_ tasks: [Task<Void, Never>], upTo limit: Duration) async -> Bool {
         if tasks.isEmpty { return true }
-        return await withCheckedContinuation { (done: CheckedContinuation<Bool, Never>) in
-            let once = ResumeOnce(done)
-            Task {
-                for task in tasks { await task.value }
-                once.resume(true)
+        let box = ResumeBox<Bool>()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (done: CheckedContinuation<Bool, Never>) in
+                box.set(ResumeOnce(done))
+                Task {
+                    for task in tasks { await task.value }
+                    box.resume(true)
+                }
+                Task {
+                    try? await Task.sleep(for: limit)
+                    box.resume(false)
+                }
             }
-            Task {
-                try? await Task.sleep(for: limit)
-                once.resume(false)
-            }
+        } onCancel: {
+            box.resume(false)
         }
     }
 
@@ -378,10 +386,12 @@ final class SessionStore {
         phase = .signedOut(error: nil)
         let before = signIns
         _ = tracked { [weak self] in
-            // An enable still opening the stores finishes first, whichever way this goes.
-            await enabling?.value
             var removalFailed = false
             if removeData {
+                // What an enable still opening the stores opens is removed too. A keep-data
+                // sign-out doesn't wait: it never touches the stores, and the next enable
+                // waits for this task (and that one) anyway.
+                await enabling?.value
                 do { try await client.signOutAndForget() } catch { removalFailed = true }
             } else {
                 await client.logout() // core forgets the stored copy, then revokes (best effort)
@@ -484,6 +494,28 @@ final class DeliveryCount: Sendable {
             n += 1
             deliver(n)
         }
+    }
+}
+
+/// A `ResumeOnce` that may be resumed (cancelled) before it exists: the value is kept and
+/// delivered as soon as it's set.
+final class ResumeBox<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var once: ResumeOnce<T>?
+    private var early: T?
+    func set(_ once: ResumeOnce<T>) {
+        let value = lock.withLock { () -> T? in
+            self.once = once
+            return early
+        }
+        if let value { once.resume(value) }
+    }
+    func resume(_ value: T) {
+        let target = lock.withLock { () -> ResumeOnce<T>? in
+            if once == nil, early == nil { early = value }
+            return once
+        }
+        target?.resume(value)
     }
 }
 
