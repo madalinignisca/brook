@@ -318,14 +318,16 @@ impl BrookClient {
             }
             // Read (and a fence's cleanup) only as the slot's owner: a newer client's stored
             // session is never read, refreshed or deleted by an older one.
+            // The stored login's generation is read with its token: a fresh sign-in by a
+            // newer client during the refresh below would move it on (#120).
             let read = session.with_slot(|p| {
                 if p.fenced() {
                     let _ = p.clear(); // best effort; the fence keeps it unusable either way
                     return Ok(None);
                 }
-                p.load()
+                p.load().map(|s| s.map(|s| (s, p.family())))
             });
-            let stored = match read {
+            let (stored, family) = match read {
                 None => return RestoreOutcome::Superseded, // a newer client owns the slot
                 Some(Ok(Some(stored))) => stored,
                 Some(Ok(None)) => return RestoreOutcome::NotSignedIn,
@@ -361,13 +363,18 @@ impl BrookClient {
                 refresh_token: pair.refresh_token,
                 user: stored.user,
             };
-            // Refreshed from the stored token: the stored login, whoever owns it later.
-            session.mark_from_slot(&restored.refresh_token);
             let user = restored.user.clone();
-            // Install and re-store in one write section, only if still current.
-            match session.install_for_login(gen, restored.clone(), true).await {
+            // Install and re-store in one write section, only if still current. (Marked as
+            // the stored login only if the re-store lands: a fenced one is nobody's.)
+            match session
+                .install_for_login(gen, restored.clone(), Some(family))
+                .await
+            {
                 Install::Installed => RestoreOutcome::LoggedIn(user),
                 Install::Stale => {
+                    // Refreshed from the stored token: spared if that login is the owner's
+                    // now, revoked if nobody's (see `revoke_detached`).
+                    session.mark_family(&restored.refresh_token, family);
                     session.revoke_detached(restored.refresh_token);
                     RestoreOutcome::Superseded
                 }
@@ -465,8 +472,7 @@ impl BrookClient {
                     };
                     // A fresh login is a login of its own: whatever refused it, revoking it
                     // touches nobody else.
-                    if session.install_for_login(gen, new.clone(), false).await
-                        == Install::Installed
+                    if session.install_for_login(gen, new.clone(), None).await == Install::Installed
                     {
                         Ok(LoginOutcome::LoggedIn(new)) // LoggedIn published by the install
                     } else {
@@ -1142,7 +1148,12 @@ pub(crate) async fn refresh_once(
     let fresh = tokens.refresh_token.clone();
     Ok(
         match session
-            .commit_refresh(&refresh_token, tokens.access_token, tokens.refresh_token)
+            .commit_refresh(
+                &refresh_token,
+                tokens.access_token,
+                tokens.refresh_token,
+                true,
+            )
             .await
         {
             RefreshApplied::Committed => RefreshOutcome::Committed,

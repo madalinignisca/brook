@@ -214,7 +214,7 @@ impl Ctx {
         // one, not the one held at the start.
         match self
             .session
-            .commit_refresh(&used_refresh, pair.access_token, pair.refresh_token)
+            .commit_refresh(&used_refresh, pair.access_token, pair.refresh_token, false)
             .await
         {
             RefreshApplied::Committed => Ok(out.other_devices_signed_out),
@@ -254,7 +254,12 @@ impl Ctx {
         let fresh = out.pair.refresh_token.clone();
         match self
             .session
-            .commit_refresh(&used_refresh, out.pair.access_token, out.pair.refresh_token)
+            .commit_refresh(
+                &used_refresh,
+                out.pair.access_token,
+                out.pair.refresh_token,
+                false,
+            )
             .await
         {
             RefreshApplied::Committed => Ok(out.recovery_codes),

@@ -842,3 +842,41 @@ async fn a_restore_overtaken_by_a_sign_out_revokes_its_pair() {
     }
     panic!("the orphaned pair was never revoked");
 }
+
+/// A superseded client holding the stored login signs out without revoking it: the newer
+/// client restores that same login, and a logout ends a whole login (#116, #120).
+#[tokio::test]
+async fn a_superseded_logout_spares_the_stored_login() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    drop(signed_in(&server, &slot, dir.path(), "alice").await);
+    let (a, outcome) = relaunch(&server, &slot, dir.path()).await;
+    assert!(
+        matches!(outcome, RestoreOutcome::LoggedIn(_)),
+        "{outcome:?}"
+    );
+    let _b = client(&server, &slot, dir.path()); // takes the slot
+    a.logout().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        server.logouts().is_empty(),
+        "a superseded client revoked the stored login"
+    );
+}
+
+/// A restore whose re-store failed is fenced: nobody can restore it, so it's nobody's login,
+/// and a superseded client still revokes it.
+#[tokio::test]
+async fn an_unstored_restore_is_revoked_when_superseded() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    drop(signed_in(&server, &slot, dir.path(), "alice").await);
+    let a = client(&server, &slot, dir.path());
+    slot.fail_next("replace", KeySlotError::Unavailable);
+    assert!(matches!(a.restore().await, RestoreOutcome::LoggedIn(_)));
+    let _b = client(&server, &slot, dir.path());
+    a.logout().await;
+    assert_eq!(server.logouts().len(), 1, "a fenced restore was left live");
+}

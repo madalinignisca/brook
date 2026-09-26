@@ -174,11 +174,10 @@ impl SessionStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// `token` is of the login stored now (restored from the slot).
-    pub(crate) fn mark_from_slot(&self, token: &str) {
-        if let Some(p) = self.persistence.get() {
-            self.slot_tokens().insert(token.to_string(), p.family());
-        }
+    /// `token` is of the stored login of generation `family` (read with the stored token,
+    /// not later: a fresh sign-in meanwhile would have moved it on).
+    pub(crate) fn mark_family(&self, token: &str, family: u64) {
+        self.slot_tokens().insert(token.to_string(), family);
     }
 
     /// `token` was just written to the slot as a fresh login: a new generation.
@@ -386,13 +385,13 @@ impl SessionStore {
     /// Install login attempt `gen`'s session and publish `LoggedIn`, in the same write that
     /// checks the attempt is still current (a sign-out can't slip between install and publish).
     /// False: stale; the caller revokes the pair.
-    /// `restored`: the pair came from the stored token (it continues the stored login);
-    /// otherwise it's a fresh login, a new generation of the slot once stored.
+    /// `restored`: the generation of the stored login this pair was refreshed from (it
+    /// continues it); `None`: a fresh login, a new generation once stored.
     pub(crate) async fn install_for_login(
         &self,
         gen: u64,
         session: Session,
-        restored: bool,
+        restored: Option<u64>,
     ) -> Install {
         let rev = {
             let mut cell = self.cell.write().await;
@@ -406,8 +405,10 @@ impl SessionStore {
                     None => return Install::SlotTaken,
                     // Stored: the owner's login from now on, wherever this client goes.
                     // (A write that failed is fenced: nobody can restore it, so it isn't.)
-                    Some(true) if restored => self.mark_from_slot(&session.refresh_token),
-                    Some(true) => self.mark_new_login(&session.refresh_token),
+                    Some(true) => match restored {
+                        Some(family) => self.mark_family(&session.refresh_token, family),
+                        None => self.mark_new_login(&session.refresh_token),
+                    },
                     Some(false) => {}
                 }
                 cell.persisted = true;
@@ -515,18 +516,23 @@ impl SessionStore {
     }
 
     /// Apply rotated tokens only if the session still holds `rotated_from`.
+    ///
+    /// `rotation`: `refresh_token` is `rotated_from`'s successor (a refresh), so it's of the
+    /// same login. False for a password change's or TOTP activation's pair: the server
+    /// issues a new login then, which the stored one isn't.
     pub(crate) async fn commit_refresh(
         &self,
         rotated_from: &str,
         access_token: String,
         refresh_token: String,
+        rotation: bool,
     ) -> RefreshApplied {
-        // The successor of a stored-login token is of the stored login too, whatever
-        // becomes of it below.
         {
             let mut tokens = self.slot_tokens();
             if let Some(family) = tokens.remove(rotated_from) {
-                tokens.insert(refresh_token.clone(), family);
+                if rotation {
+                    tokens.insert(refresh_token.clone(), family);
+                }
             }
         }
         let rev = {
@@ -626,8 +632,7 @@ mod tests {
         let gen = store.reserve_login().await;
         let held = store.cell.write().await;
         let s = store.clone();
-        let install =
-            tokio::spawn(async move { s.install_for_login(gen, session(1), false).await });
+        let install = tokio::spawn(async move { s.install_for_login(gen, session(1), None).await });
         tokio::task::yield_now().await; // the install waits on the lock
         let s = store.clone();
         let out = tokio::spawn(async move { s.sign_out(false).await });
@@ -654,8 +659,7 @@ mod tests {
         let gen = store.reserve_login().await;
         let held = store.cell.write().await;
         let s = store.clone();
-        let install =
-            tokio::spawn(async move { s.install_for_login(gen, session(1), false).await });
+        let install = tokio::spawn(async move { s.install_for_login(gen, session(1), None).await });
         tokio::task::yield_now().await;
         let s = store.clone();
         let out = tokio::spawn(async move { s.sign_out(false).await });
@@ -678,7 +682,7 @@ mod tests {
         store.close_detached(); // no runtime captured: the cleanup task never exists
         assert_eq!(
             store
-                .commit_refresh("refresh-1", "access-2".into(), "refresh-2".into())
+                .commit_refresh("refresh-1", "access-2".into(), "refresh-2".into(), true)
                 .await,
             RefreshApplied::Discarded
         );
@@ -714,7 +718,7 @@ mod tests {
         let mut watch = store.watch();
         watch.mark_unchanged();
         let applied = store
-            .commit_refresh("refresh-1", "x".into(), "y".into())
+            .commit_refresh("refresh-1", "x".into(), "y".into(), true)
             .await;
         assert_eq!(applied, RefreshApplied::Discarded);
         assert!(!watch.has_changed().unwrap());
@@ -727,7 +731,7 @@ mod tests {
         store.replace(Some(session(1))).await;
         let before = store.snapshot().await.0;
         let applied = store
-            .commit_refresh("refresh-1", "access-9".into(), "refresh-9".into())
+            .commit_refresh("refresh-1", "access-9".into(), "refresh-9".into(), true)
             .await;
         assert_eq!(applied, RefreshApplied::Committed);
         let after = store.snapshot().await.0;
