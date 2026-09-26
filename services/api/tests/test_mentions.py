@@ -95,3 +95,13 @@ async def test_unread_mentions_are_counted_per_channel(client: httpx.AsyncClient
         await client.post(f"{CH}/{ch}/read", json={"message_id": newest}, headers=hc)
     ).status_code == 204
     assert await carols_count() == 0
+
+
+async def test_mentions_list_in_the_same_order_everywhere(client: httpx.AsyncClient) -> None:
+    # A cache compares rows: the same message must list its mentions identically in its
+    # live answer and in later reads, or every read looks like a change.
+    t = await _team(client)
+    sent = await _send(client, t["ch"], "@dave @carol @bob all of you", t["hb"])
+    expected = sorted([t["b"], t["c"], t["d"]])
+    assert sent["mentions"] == expected
+    assert (await _history_row(client, t["ch"], sent["id"], t["hc"]))["mentions"] == expected

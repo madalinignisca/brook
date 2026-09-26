@@ -1224,6 +1224,8 @@ async def _mentions_for(
     out: dict[uuid.UUID, list[uuid.UUID]] = {}
     for message_id, user_id in rows.all():
         out.setdefault(message_id, []).append(user_id)
+    for ids in out.values():
+        ids.sort(key=str)  # the order _mentions_in sends them in, whatever the rows' order
     return out
 
 
@@ -1238,7 +1240,9 @@ def _mentions_in(body: str, members: list[User]) -> tuple[list[uuid.UUID], bool]
         return [], False
     everyone = bool({"channel", "here"} & {t.lower() for t in tokens})
     by_handle = {m.handle: m.id for m in members}
-    specific = [by_handle[t] for t in tokens if t in by_handle]
+    # Sorted by id, as _mentions_for returns them: the same message lists its mentions in
+    # the same order in message.new, history and /sync (tokens come from a set).
+    specific = sorted({by_handle[t] for t in tokens if t in by_handle}, key=str)
     return specific, everyone
 
 
