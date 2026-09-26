@@ -15,6 +15,13 @@ Its session is the same login (token family) whenever both came from the same st
 3. The old client's next refresh presents T1, which is retired. The server reads that as
    reuse (theft) and ends the family, and with #116 that signs the new client out too.
 
+Step 2's grace works only while T1 is unused. Had the old client refreshed T1 again after
+losing the slot, the new client's restore of T would itself be the reuse verdict, which is
+why a client without the slot must send nothing at all (1 and 3 below). This was confirmed
+against the server's `_rotate` as deployed: a second use of T within the grace revokes the
+successor S (with `replaced_by_id` cleared), so presenting S afterwards falls through to the
+theft branch.
+
 The reverse order breaks the same way: the new client's refresh lands first, then the old
 client's in-flight refresh of T takes the grace and retires the new client's token.
 
