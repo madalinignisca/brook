@@ -168,7 +168,7 @@ final class TimelineModel {
             }
         case .resync:
             Task { await fetch(before: nil) }
-        case .ready, .channelCall:
+        case .ready, .channelCall, .channelUpdate, .channelDelete:
             break
         }
     }

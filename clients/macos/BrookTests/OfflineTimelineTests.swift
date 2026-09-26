@@ -114,7 +114,7 @@ final class OfflineTimelineTests: XCTestCase {
     func testARenameReachesCachedRows() async {
         let chat = FakeChat()
         chat.local = true
-        chat.users = [FfiMember(id: "u", handle: "u", displayName: "Robert")]
+        chat.users = [FfiMember(id: "u", handle: "u", displayName: "Robert", role: nil)]
         let t = TimelineModel(channelId: "c", client: chat)
         t.merge([msg("m1", "hi")]) // stored as "U"
         XCTAssertEqual(t.authorName(t.messages[0]), "U")

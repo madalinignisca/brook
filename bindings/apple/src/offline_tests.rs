@@ -97,7 +97,8 @@ fn a_cached_channel_keeps_its_unread_count_and_members() {
         vec![FfiMember {
             id: "u2".into(),
             handle: "bob".into(),
-            display_name: "Bob".into()
+            display_name: "Bob".into(),
+            role: None
         }]
     );
 }
@@ -479,6 +480,7 @@ fn a_cached_profile_crosses_with_its_names() {
         id: "bob".into(),
         handle: "bobby".into(),
         display_name: "Robert".into(),
+        role: None,
     });
     assert_eq!(
         (m.id.as_str(), m.handle.as_str(), m.display_name.as_str()),
@@ -509,5 +511,41 @@ fn a_user_keeps_their_status_line() {
     assert_eq!(
         crate::types::FfiUser::from(user).status_text.as_deref(),
         Some("away")
+    );
+}
+
+#[test]
+fn channel_events_cross_with_their_members() {
+    use crate::call::FfiServerEvent;
+    use crate::client::map_event;
+    use brook_core::ServerEvent;
+    let channel: brook_core::Channel = serde_json::from_value(json!({
+        "id": "c1", "kind": "channel", "name": "general", "topic": null,
+        "created_by": "u1", "created_at": "2026-06-18T00:00:00Z",
+        "members": [{"id": "u2", "handle": "bob", "display_name": "Bob", "role": "owner"}]
+    }))
+    .unwrap();
+    let Some(FfiServerEvent::ChannelUpdate { channel }) =
+        map_event(ServerEvent::ChannelUpdate(channel))
+    else {
+        panic!("channel.update didn't cross");
+    };
+    assert_eq!(channel.id, "c1");
+    assert_eq!(
+        channel.members,
+        vec![FfiMember {
+            id: "u2".into(),
+            handle: "bob".into(),
+            display_name: "Bob".into(),
+            role: Some("owner".into())
+        }]
+    );
+    assert_eq!(
+        map_event(ServerEvent::ChannelDelete {
+            channel_id: "c1".into()
+        }),
+        Some(FfiServerEvent::ChannelDelete {
+            channel_id: "c1".into()
+        })
     );
 }

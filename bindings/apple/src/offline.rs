@@ -26,6 +26,8 @@ pub struct FfiMember {
     pub id: String,
     pub handle: String,
     pub display_name: String,
+    /// `"owner"` or `"member"`; none when unknown.
+    pub role: Option<String>,
 }
 
 impl From<brook_core::ChannelMember> for FfiMember {
@@ -34,6 +36,7 @@ impl From<brook_core::ChannelMember> for FfiMember {
             id: m.id,
             handle: m.handle,
             display_name: m.display_name,
+            role: m.role,
         }
     }
 }
@@ -58,15 +61,7 @@ impl From<brook_core::Channel> for FfiCachedChannel {
             name: c.name,
             archived: c.archived,
             unread_count: c.unread_count,
-            members: c
-                .members
-                .into_iter()
-                .map(|m| FfiMember {
-                    id: m.id,
-                    handle: m.handle,
-                    display_name: m.display_name,
-                })
-                .collect(),
+            members: c.members.into_iter().map(Into::into).collect(),
         }
     }
 }

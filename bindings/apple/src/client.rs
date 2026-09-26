@@ -449,6 +449,8 @@ pub(crate) fn map_event(event: ServerEvent) -> Option<FfiServerEvent> {
             channel_id,
             message_id,
         },
+        ServerEvent::ChannelUpdate(c) => FfiServerEvent::ChannelUpdate { channel: c.into() },
+        ServerEvent::ChannelDelete { channel_id } => FfiServerEvent::ChannelDelete { channel_id },
         _ => return None,
     })
 }
