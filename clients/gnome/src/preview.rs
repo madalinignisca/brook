@@ -93,7 +93,8 @@ pub async fn decode(bytes: Vec<u8>) -> Option<Pixels> {
         loader
             .sandbox_selector(selector(in_flatpak()))
             .accepted_memory_formats(MemoryFormatSelection::R8g8b8a8)
-            .cancellable(cancellable.clone());
+            .cancellable(cancellable.clone())
+            .pool(own_pool());
         let image = match loader.load().await {
             Ok(image) => image,
             Err(err) => {
@@ -139,6 +140,16 @@ pub async fn decode(bytes: Vec<u8>) -> Option<Pixels> {
         .await
         .ok()
         .flatten()
+}
+
+/// A pool of its own for each decode. glycin's global pool keeps a decoder process for 30 s
+/// and gives it the next images too, so a hostile image that took over one process would see
+/// the images decoded after it. With a pool per image, no other image ever goes to that
+/// process, and it runs one operation at a time.
+fn own_pool() -> std::sync::Arc<glycin::Pool> {
+    let mut config = glycin::PoolConfig::new();
+    config.max_parallel_operations(1);
+    glycin::Pool::new(config)
 }
 
 /// Cancels on drop.
@@ -267,6 +278,14 @@ mod tests {
             assert!(!c.is_cancelled());
         }
         assert!(c.is_cancelled());
+    }
+
+    /// Every decode gets its own pool, never glycin's shared one.
+    #[test]
+    fn each_decode_gets_its_own_pool() {
+        let (a, b) = (own_pool(), own_pool());
+        assert!(!std::sync::Arc::ptr_eq(&a, &b));
+        assert!(!std::sync::Arc::ptr_eq(&a, &glycin::Pool::global()));
     }
 
     #[test]
