@@ -26,6 +26,15 @@ struct ChannelPowers {
 
     private var myRole: String? { members.first { $0.id == me }?.role }
 
+    /// A channel row's powers for this user: its members, their roles and its pending offers.
+    init(_ channel: ChannelRow, me: String, isAdmin: Bool) {
+        self.init(me: me, isAdmin: isAdmin, members: channel.members, offers: channel.ownerOffers)
+    }
+
+    init(me: String, isAdmin: Bool, members: [FfiMember], offers: [FfiOwnerOffer] = []) {
+        (self.me, self.isAdmin, self.members, self.offers) = (me, isAdmin, members, offers)
+    }
+
     /// Remove: an admin removes anyone, an owner anyone but another owner. Never yourself
     /// (that's Leave), and without roles (an older server) only an admin.
     func canRemove(_ member: FfiMember) -> Bool {

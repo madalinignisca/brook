@@ -14,6 +14,17 @@ private func offer(to user: String, by: String = "own") -> FfiOwnerOffer {
 private func api(_ code: String) -> LoginError { .Api(code: code, message: "") }
 
 final class OfferPowersTests: XCTestCase {
+    /// What the app builds from a channel row carries its offers (a row without them would
+    /// never show Withdraw).
+    func testARowsPowersCarryItsOffers() {
+        let row = ChannelRow(id: "c", name: "g", members: [member("own", "Owner", "owner"), member("m", "M")],
+                             ownerOffers: [offer(to: "m")])
+        let powers = ChannelPowers(row, me: "own", isAdmin: false)
+        XCTAssertTrue(powers.pending(row.members[1]))
+        XCTAssertTrue(powers.canWithdraw(row.members[1]))
+        XCTAssertFalse(powers.canOffer(row.members[1]))
+    }
+
     private let members = [member("own", "Owner", "owner"), member("m", "M"), member("o2", "O2", "owner")]
 
     func testMakeOwnerForAnOwnerOrAdminBesideANonOwnerWithoutAnOffer() {

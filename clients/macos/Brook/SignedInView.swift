@@ -272,7 +272,7 @@ extension SignedInView {
     }
 
     fileprivate func powers(_ channel: ChannelRow) -> ChannelPowers {
-        ChannelPowers(me: user.id, isAdmin: user.globalRole == "admin", members: channel.members)
+        ChannelPowers(channel, me: user.id, isAdmin: user.globalRole == "admin")
     }
 
     /// A new conversation for the selected channel, handed to the channel list, which

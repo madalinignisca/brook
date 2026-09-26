@@ -64,3 +64,10 @@ the sheet binding). `OfferPrompt` holds the presentation rules and is tested.
 
 Measured: 20 mutants caught, 1 equivalent ("unknown me": with no id the code compares
 against "", which no offer carries). 260 Mac tests pass.
+
+## PR review (GTK side): CHANGES, taken
+
+- **The app never passed the channel's offers into `ChannelPowers`**, so Withdraw and "Owner
+  offered" never showed. The models were tested with offers set directly, which hid it.
+  Powers are now built by `ChannelPowers(row, me:, isAdmin:)`, which carries the row's
+  offers, and a test builds them the way the app does. Caught under a mutant.
