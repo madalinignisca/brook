@@ -19,6 +19,9 @@ auth, storage or the wire.
    menu), for a channel but never a DM:
    - A confirmation first: "Leave <title>?". You'll stop receiving its messages, and a
      private channel needs an invitation to rejoin.
+   - If the roles say you're its only owner, the confirmation says so up front ("You're
+     its last owner…", as below) and Leave is disabled. The server's 409 still decides
+     when roles are missing or stale.
    - On success, the channel leaves the list and the selection clears. That happens
      through the server's `channel.delete` (item 1). The model doesn't
      remove it a second time.
@@ -31,9 +34,11 @@ auth, storage or the wire.
 3. **Members and Remove** (a "Members" popover from the chat toolbar, for a channel):
    - It lists each member's display name with the handle beside it (#183: names aren't
      unique). You come first, marked "(you)".
-   - "Remove" appears beside each member other than you, **only for a global admin**. The
-     server has no member roles in `ChannelOut` yet, so channel owners get it once
-     `ChannelMember.role` exists, as GTK does.
+   - "Remove" appears beside each member other than you, for a global admin, and for a
+     channel owner except beside another owner (only an admin removes an owner). Roles
+     come from #183's `members[].role` (#185). With no role (an older server) only an
+     admin gets Remove.
+   - Owners are marked "Owner".
    - There's a confirmation ("Remove <name> from <title>?"). The list refreshes from the
      server's `channel.update`, never optimistically.
    - Errors:
@@ -56,16 +61,17 @@ auth, storage or the wire.
 5. **Tests** (models against fakes, each watched failing under a mutant):
    - Leave: no Leave for a DM; the confirmation's error texts; `not_found` is silent;
      the list is changed only by the event.
-   - Members: you're first and marked; Remove only for an admin and never for yourself;
-     the error texts.
+   - Members: you're first and marked; Remove for an admin, and for an owner except
+     beside another owner, never for yourself, and nobody else without a role; the
+     error texts.
+   - Leave: the last-owner warning from the roles.
    - Profile: only changed fields are sent; clearing sends `""`; the local limits; Save
      disabled when nothing changed and while running; the returned name replaces the
      header's.
 
 ## Not doing
 
-- Channel owner roles in the UI (waiting for `ChannelMember.role`), transferring
-  ownership, and banning. The server says removal isn't a ban.
+- Transferring ownership, and banning. The server says removal isn't a ban.
 - Rejoining public channels (a channel browser is its own feature).
 - Avatars.
 - Updating the stored session user (#184's known gap).
@@ -77,3 +83,9 @@ auth, storage or the wire.
 - **Leaving from another device:** the `channel.delete` event already closes it here.
 - **A name the server refuses that the local check allows** (invisible characters): the
   server's text is shown, and the local check exists only for fast feedback.
+
+## After review: roles (#183, 8389556)
+
+The server added member roles after the review closed. Items 2, 3 and 5 now use them:
+Remove goes to owners too, and the last owner is warned before trying. Without a role,
+the behaviour is the one reviewed (admins only, and the server's 409).
