@@ -67,3 +67,19 @@ final class MentionCountTests: XCTestCase {
         XCTAssertNil(model.mentions(model.channels[0]))
     }
 }
+
+final class MentionRuleTests: XCTestCase {
+    func testOnlySomeoneElsesLiveMessageMentionsMe() {
+        var mine = msg("m1", "@channel", channel: "c")
+        mine.mentionEveryone = true
+        mine.authorId = "me"
+        XCTAssertFalse(NotificationPlanner.mentions(mine, me: "me"), "my own @channel")
+        var gone = msg("m2", "", channel: "c")
+        gone.mentions = ["me"]
+        gone.deleted = true
+        XCTAssertFalse(NotificationPlanner.mentions(gone, me: "me"), "a deleted one")
+        var named = msg("m3", "@me", channel: "c")
+        named.mentions = ["me"]
+        XCTAssertTrue(NotificationPlanner.mentions(named, me: "me"))
+    }
+}
