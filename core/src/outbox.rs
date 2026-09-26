@@ -838,6 +838,9 @@ impl Outbox {
         let sender = self.sender(channel_id)?;
         // Snapshots first (off the runtime's workers), each under its own new key.
         let chunk = self.chunk.load(Ordering::SeqCst);
+        // Whether this call made the row's flags: only then may a failure reset or drop them
+        // (a live row with this id, from a racing first call, may be using them).
+        let made_flags = !lock(&self.row_flags).contains_key(&client_id);
         let row_flags = self.flags(&client_id);
         let mut made: Vec<(OutgoingFile, String, snapshot::Written)> = vec![];
         let mut failed = None;
@@ -876,8 +879,8 @@ impl Outbox {
         if let Some(err) = failed {
             self.remove_snapshots(&names).await;
             self.drop_ids(&names);
-            if matches!(err, OutboxError::Cancelled) {
-                row_flags.cancel.store(false, Ordering::SeqCst); // this id may be sent again
+            if made_flags {
+                lock(&self.row_flags).remove(&client_id); // nothing was queued under this id
             }
             return Err(err);
         }
