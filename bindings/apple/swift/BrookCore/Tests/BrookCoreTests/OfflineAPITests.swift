@@ -64,4 +64,17 @@ final class OfflineAPITests: XCTestCase {
         }
         client.cancelTransfer(transferId: 1) // an unknown id is a no-op
     }
+
+    /// The chat calls cross, and answer "not signed in" without a session.
+    func testChatCallsNeedASession() async throws {
+        let client = try FfiBrookClient(baseUrl: "https://brook.invalid", allowInsecureHttp: false)
+        do {
+            _ = try await client.channelHistory(channelId: "c", before: nil)
+            XCTFail("history without a session")
+        } catch LoginError.NotAuthenticated {}
+        do {
+            _ = try await client.sendMessage(channelId: "c", body: "hi", replyToId: nil)
+            XCTFail("sent without a session")
+        } catch LoginError.NotAuthenticated {}
+    }
 }

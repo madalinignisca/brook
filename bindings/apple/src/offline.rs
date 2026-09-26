@@ -61,7 +61,46 @@ impl From<brook_core::Channel> for FfiCachedChannel {
     }
 }
 
-/// A cached message. A deleted one keeps its place with `deleted` set and an empty body.
+/// An attached file, as the server describes it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiFileInfo {
+    pub id: String,
+    /// The sanitised ASCII name to **save** under (safe on every OS).
+    pub filename: String,
+    /// The name as typed: display text only, never a filesystem name.
+    pub original_name: String,
+    pub size: u64,
+    /// Declared, untrusted: only for choosing an icon.
+    pub content_type: String,
+    /// Hex sha256, once committed (a download is checked against it).
+    pub sha256: Option<String>,
+}
+
+impl From<brook_core::FileInfo> for FfiFileInfo {
+    fn from(f: brook_core::FileInfo) -> Self {
+        Self {
+            id: f.id,
+            filename: f.filename,
+            original_name: f.original_name,
+            size: f.size,
+            content_type: f.content_type,
+            sha256: f.sha256,
+        }
+    }
+}
+
+/// The quoted message of a reply. Label it from `deleted` and `attachments`, not the text.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiReplyExcerpt {
+    pub id: String,
+    pub author_display_name: Option<String>,
+    pub body: String,
+    pub deleted: bool,
+    pub attachments: u32,
+}
+
+/// A message (cached or from the network). A deleted one keeps its place with `deleted` set
+/// and an empty body.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiMessage {
     pub id: String,
@@ -75,6 +114,12 @@ pub struct FfiMessage {
     /// The sender's outbox id: drop the pending row with this id once the message is here.
     pub client_id: Option<String>,
     pub deleted: bool,
+    /// ISO-8601, if it was edited.
+    pub edited_at: Option<String>,
+    pub reply_to_id: Option<String>,
+    pub reply_to: Option<FfiReplyExcerpt>,
+    /// In the order the sender gave them (none on a tombstone).
+    pub attachments: Vec<FfiFileInfo>,
 }
 
 impl From<brook_core::Message> for FfiMessage {
@@ -90,6 +135,20 @@ impl From<brook_core::Message> for FfiMessage {
             created_at: m.created_at,
             client_id: m.client_id,
             deleted,
+            edited_at: m.edited_at,
+            reply_to_id: m.reply_to_id,
+            reply_to: m.reply_to.map(|r| FfiReplyExcerpt {
+                id: r.id,
+                author_display_name: r.author_display_name,
+                body: r.body,
+                deleted: r.deleted,
+                attachments: r.attachments,
+            }),
+            attachments: if deleted {
+                vec![]
+            } else {
+                m.attachments.into_iter().map(Into::into).collect()
+            },
         }
     }
 }
