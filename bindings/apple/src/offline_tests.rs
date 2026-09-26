@@ -462,19 +462,6 @@ fn an_image_preview_crosses_whole_and_never_logs_its_bytes() {
 }
 
 #[test]
-fn another_users_unsent_count_crosses_including_unknown() {
-    let user = |unsent| brook_core::OtherLocalUser {
-        origin: "https://a".into(),
-        user_id: "u1".into(),
-        unsent,
-    };
-    assert_eq!(FfiLocalUser::from(user(Some(3))).unsent, Some(3));
-    assert_eq!(FfiLocalUser::from(user(None)).unsent, None);
-    let u = FfiLocalUser::from(user(Some(0)));
-    assert_eq!((u.origin.as_str(), u.user_id.as_str()), ("https://a", "u1"));
-}
-
-#[test]
 fn a_cached_profile_crosses_with_its_names() {
     let m = FfiMember::from(brook_core::ChannelMember {
         id: "bob".into(),
@@ -485,4 +472,17 @@ fn a_cached_profile_crosses_with_its_names() {
         (m.id.as_str(), m.handle.as_str(), m.display_name.as_str()),
         ("bob", "bobby", "Robert")
     );
+}
+
+#[test]
+fn another_users_unsent_count_crosses_including_unknown() {
+    let user = |unsent| brook_core::OtherLocalUser {
+        origin: "https://a".into(),
+        user_id: "u1".into(),
+        unsent,
+    };
+    assert_eq!(FfiLocalUser::from(user(Some(3))).unsent, Some(3));
+    assert_eq!(FfiLocalUser::from(user(None)).unsent, None);
+    let u = FfiLocalUser::from(user(Some(0)));
+    assert_eq!((u.origin.as_str(), u.user_id.as_str()), ("https://a", "u1"));
 }

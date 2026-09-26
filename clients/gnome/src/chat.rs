@@ -92,6 +92,15 @@ struct Chat {
     draft_id: Rc<RefCell<Option<String>>>,
     /// The chip whose button cancelled the copy: that file leaves, the others stay.
     cancelled_chip: Rc<Cell<Option<brook_core::TransferId>>>,
+    /// A text send that failed: what it was (channel, text, quoted message) and its outbox
+    /// id. Sending exactly that again reuses the id, so it can never become two messages.
+    text_draft: Rc<RefCell<Option<(Draft, String)>>>,
+    /// This user's local stores answered a cached call: `unsent_count` can be trusted (it
+    /// answers 0 while they're closed).
+    local_open: Rc<Cell<bool>>,
+    /// Current names of authors whose profile changed this session (from `cached_users`),
+    /// used for every row drawn afterwards too: stored message rows keep the old name.
+    author_names: Rc<RefCell<HashMap<String, String>>>,
 }
 
 /// The widgets of a rendered message we may mutate after an edit/delete/reaction.
@@ -116,6 +125,9 @@ struct MessageWidgets {
     file_rows: Rc<RefCell<Vec<(String, gtk::Widget)>>>,
     /// The message text as sent (markdown, not the rendered markup), for editing.
     source: Rc<RefCell<String>>,
+    /// Who wrote it, and the label showing their name (redrawn when their profile changes).
+    author_id: String,
+    author: gtk::Label,
     /// Hidden once the message is a tombstone: actions, quote, files, reactions.
     extras: Vec<gtk::Widget>,
     /// The quoted message's id, its author and the quote line, if this is a reply.
@@ -257,6 +269,9 @@ pub fn build(
         pending_ids: Rc::default(),
         draft_id: Rc::default(),
         cancelled_chip: Rc::default(),
+        text_draft: Rc::default(),
+        local_open: Rc::default(),
+        author_names: Rc::default(),
     });
     chat.progress.listen(&chat.client);
 
@@ -839,6 +854,14 @@ fn send_current(chat: &Rc<Chat>) {
         .map(str::to_string)
         .unwrap_or_default();
     set_reply(chat, None);
+    let client_id = draft_id(
+        &mut chat.text_draft.borrow_mut(),
+        Draft {
+            channel: channel_id.clone(),
+            body: body.clone(),
+            reply_to: reply_to.clone(),
+        },
+    );
 
     let chat = chat.clone();
     glib::spawn_future_local(async move {
@@ -850,7 +873,7 @@ fn send_current(chat: &Rc<Chat>) {
             let (body, reply_to) = (body.clone(), reply_to.clone());
             async move {
                 match client
-                    .send_queued(&channel_id, &body, reply_to.clone(), None)
+                    .send_queued(&channel_id, &body, reply_to.clone(), Some(client_id))
                     .await
                 {
                     Ok(_) => return Ok(true),
@@ -868,8 +891,13 @@ fn send_current(chat: &Rc<Chat>) {
             .await
             .unwrap_or(Err(brook_core::Error::UnexpectedResponse))
         {
-            Ok(true) => render_pending(&chat),
-            Ok(false) => {}
+            Ok(true) => {
+                chat.text_draft.replace(None);
+                render_pending(&chat);
+            }
+            Ok(false) => {
+                chat.text_draft.replace(None);
+            }
             Err(err) => {
                 tracing::warn!(%err, "failed to send message");
                 // Nothing was sent: give the text (and the reply) back, unless the
@@ -1045,6 +1073,29 @@ fn set_preparing(chat: &Rc<Chat>, on: bool) {
     }
 }
 
+/// What a text send is: an id is reused only for exactly the same one. Core answers a known
+/// id with the stored message, so a retry that changed any of these (the quote included)
+/// must be a new message, never the old one sent again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Draft {
+    channel: String,
+    body: String,
+    reply_to: Option<String>,
+}
+
+/// The outbox id for `this` send: the failed attempt's again when it's the same send, else a
+/// new one (remembered until the send succeeds).
+fn draft_id(draft: &mut Option<(Draft, String)>, this: Draft) -> String {
+    if let Some((was, id)) = draft.as_ref() {
+        if *was == this {
+            return id.clone();
+        }
+    }
+    let id = glib::uuid_string_random().to_string();
+    *draft = Some((this, id.clone()));
+    id
+}
+
 /// Convert a markdown message body to Pango markup (bold / italic / inline code /
 /// code block / link / strikethrough). Text is escaped; raw HTML is dropped.
 fn markdown_to_pango(text: &str) -> String {
@@ -1138,9 +1189,10 @@ fn is_safe_link(uri: &str) -> bool {
 
 /// Append a message row and scroll to the bottom.
 fn append_message(chat: &Rc<Chat>, message: &Message) {
-    let author = message
-        .author_display_name
-        .clone()
+    // A name that changed since the message was stored wins.
+    let current = chat.author_names.borrow().get(&message.author_id).cloned();
+    let author = current
+        .or_else(|| message.author_display_name.clone())
         .or_else(|| message.author_handle.clone())
         .unwrap_or_else(|| "Unknown".to_string());
 
@@ -1282,6 +1334,8 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
         channel_id: message.channel_id.clone(),
         reactions_box,
         reactions: Rc::new(RefCell::new(message.reactions.clone())),
+        author_id: message.author_id.clone(),
+        author: author_label.clone(),
         deleted: Rc::new(Cell::new(false)),
         has_files: Rc::new(Cell::new(!message.attachments.is_empty())),
         files_box,
@@ -2376,7 +2430,10 @@ fn render_pending(chat: &Rc<Chat>) {
             async move { client.pending_messages(&channel_id).await }
         });
         let pending = match handle.await {
-            Ok(Ok(pending)) => pending,
+            Ok(Ok(pending)) => {
+                chat.local_open.set(true);
+                pending
+            }
             _ => Vec::new(), // no local storage: nothing is ever queued
         };
         if chat.current.borrow().as_deref() != Some(channel_id.as_str()) {
@@ -2566,13 +2623,54 @@ fn spawn_cache_loop(chat: &Rc<Chat>) {
                     report_outbox_lost(&chat);
                 }
                 Ok(CacheEvent::OutboxLost) => report_outbox_lost(&chat),
+                // Profiles changed: authors on screen take their current names.
+                Ok(CacheEvent::Users(ids)) => redraw_authors(&chat, ids),
                 // Cached files changed (fetched, kept, evicted, gone): rows showing them
                 // re-read their state.
                 Ok(CacheEvent::Files(ids)) => crate::attachments::refresh_rows(&ids),
-                Ok(_) => {}
                 Err(RecvError::Closed) => break,
             }
         }
+    });
+}
+
+/// Put the cache's current names on the authors shown among `ids` (message rows keep the
+/// name they were stored with).
+fn redraw_authors(chat: &Rc<Chat>, ids: Vec<String>) {
+    let shown: Vec<String> = {
+        let rows = chat.message_rows.borrow();
+        ids.into_iter()
+            .filter(|id| rows.values().any(|w| w.author_id == *id))
+            .collect()
+    };
+    if shown.is_empty() {
+        return;
+    }
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let handle = chat.runtime.spawn({
+            let client = chat.client.clone();
+            async move { client.cached_users(&shown).await }
+        });
+        let Ok(Ok(users)) = handle.await else { return };
+        let names: HashMap<String, String> = users
+            .into_iter()
+            .map(|u| {
+                let name = if u.display_name.trim().is_empty() {
+                    u.handle
+                } else {
+                    u.display_name
+                };
+                (u.id, name)
+            })
+            .collect();
+        for widgets in chat.message_rows.borrow().values() {
+            if let Some(name) = names.get(&widgets.author_id) {
+                widgets.author.set_label(name);
+            }
+        }
+        // Rows drawn later (an older page, a redraw after a reset) use them too.
+        chat.author_names.borrow_mut().extend(names);
     });
 }
 
@@ -2613,6 +2711,7 @@ fn badges_from_cache(chat: &Rc<Chat>) {
             async move { client.cached_channels().await }
         });
         let Ok(Ok(cached)) = handle.await else { return };
+        chat.local_open.set(true);
         let current = chat.current.borrow().clone();
         let updates: Vec<(usize, i64)> = chat
             .channels
@@ -2710,24 +2809,42 @@ fn wipe_other_accounts(chat: &Rc<Chat>) {
         let handle = chat.runtime.spawn({
             let client = chat.client.clone();
             async move {
+                // Their unsent counts are read before the wipe (#46 §8), so the notice can
+                // say what went with it.
                 let others = client.other_local_users().await?;
                 if !others.is_empty() {
                     client.wipe_other_local_users().await?;
                 }
-                Ok::<_, brook_core::Error>(others.len())
+                Ok::<_, brook_core::Error>(others)
             }
         });
-        if let Ok(Ok(n)) = handle.await {
-            if n > 0 {
+        if let Ok(Ok(others)) = handle.await {
+            if !others.is_empty() {
+                let unsent: Vec<Option<u64>> = others.iter().map(|o| o.unsent).collect();
                 let alert = adw::AlertDialog::new(
                     Some("Saved Data Removed"),
-                    Some("Another account's saved messages were removed from this device."),
+                    Some(&others_removed_text(&unsent)),
                 );
+
                 alert.add_response("ok", "OK");
                 alert.present(Some(&chat.message_list));
             }
         }
     });
+}
+
+/// The notice after another account's saved data was removed: with its unsent messages when
+/// they could be counted, and a "may have" when any couldn't.
+fn others_removed_text(unsent: &[Option<u64>]) -> String {
+    let base = "Another account's saved messages were removed from this device";
+    if unsent.iter().any(Option::is_none) {
+        return format!("{base}. They may have included unsent messages.");
+    }
+    match unsent.iter().flatten().sum::<u64>() {
+        0 => format!("{base}."),
+        1 => format!("{base}, including 1 unsent message."),
+        n => format!("{base}, including {n} unsent messages."),
+    }
 }
 
 /// Sign Out, with "Remove this device's data" (ticked by default, #46 §8) and a warning
@@ -2747,12 +2864,13 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
             .label("Remove this device's data")
             .active(true)
             .build();
-        let body = sign_out_body(unsent, true);
+        let known = chat.local_open.get();
+        let body = sign_out_body(unsent, known, true);
         let dialog = adw::AlertDialog::new(Some("Sign Out?"), Some(&body));
         dialog.set_extra_child(Some(&remove));
         remove.connect_toggled({
             let dialog = dialog.clone();
-            move |check| dialog.set_body(&sign_out_body(unsent, check.is_active()))
+            move |check| dialog.set_body(&sign_out_body(unsent, known, check.is_active()))
         });
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("sign-out", "Sign Out");
@@ -2771,13 +2889,17 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
 }
 
 /// What signing out does to this device's data, in words.
-fn sign_out_body(unsent: u64, remove: bool) -> String {
+/// `known`: this user's stores answered a cached call, so `unsent` is a real count (it's 0
+/// while they're closed, which isn't the same as none).
+fn sign_out_body(unsent: u64, known: bool, remove: bool) -> String {
     let mut text = if remove {
         String::from("Saved messages and files are removed from this device.")
     } else {
         String::from("Saved messages stay on this device for your next sign-in.")
     };
-    if remove && unsent > 0 {
+    if remove && !known {
+        text.push_str(" Unsent messages on this device may be deleted.");
+    } else if remove && unsent > 0 {
         let what = if unsent == 1 {
             "1 message hasn't"
         } else {
@@ -2798,15 +2920,50 @@ mod offline_tests {
     use super::*;
 
     #[test]
+    fn a_failed_text_keeps_its_outbox_id_for_the_retry() {
+        let d = |channel: &str, body: &str, reply: Option<&str>| Draft {
+            channel: channel.into(),
+            body: body.into(),
+            reply_to: reply.map(str::to_string),
+        };
+        let mut draft = None;
+        let first = draft_id(&mut draft, d("c1", "hello", None));
+        assert_eq!(
+            draft_id(&mut draft, d("c1", "hello", None)),
+            first,
+            "the same send again"
+        );
+        let edited = draft_id(&mut draft, d("c1", "hello!", None));
+        assert_ne!(edited, first, "edited text is a new message");
+        let other = draft_id(&mut draft, d("c2", "hello!", None));
+        assert_ne!(other, edited, "another channel");
+        // Core would answer a reused id with the stored (unquoted) message.
+        let quoted = draft_id(&mut draft, d("c2", "hello!", Some("m1")));
+        assert_ne!(quoted, other, "a changed quote is a new message");
+        assert_ne!(draft_id(&mut draft, d("c2", "hello!", Some("m2"))), quoted);
+    }
+
+    #[test]
+    fn the_other_account_notice_says_what_went_with_it() {
+        assert!(others_removed_text(&[Some(0)]).ends_with("this device."));
+        assert!(others_removed_text(&[Some(1)]).contains("including 1 unsent message."));
+        assert!(others_removed_text(&[Some(2), Some(1)]).contains("including 3 unsent messages"));
+        assert!(others_removed_text(&[Some(2), None]).contains("may have included unsent"));
+    }
+
+    #[test]
     fn sign_out_warns_only_when_unsent_messages_would_go() {
-        assert!(sign_out_body(0, true).contains("removed from this device"));
-        assert!(!sign_out_body(0, true).contains("deleted"));
-        assert!(sign_out_body(1, true).contains("1 message hasn't been sent"));
-        assert!(sign_out_body(3, true).contains("3 messages haven't been sent"));
+        assert!(sign_out_body(0, true, true).contains("removed from this device"));
+        assert!(!sign_out_body(0, true, true).contains("deleted"));
+        assert!(sign_out_body(1, true, true).contains("1 message hasn't been sent"));
+        assert!(sign_out_body(3, true, true).contains("3 messages haven't been sent"));
         assert!(
-            !sign_out_body(3, false).contains("deleted"),
+            !sign_out_body(3, true, false).contains("deleted"),
             "kept messages aren't lost"
         );
+        // Stores not known to be open: a 0 isn't "none".
+        assert!(sign_out_body(0, false, true).contains("may be deleted"));
+        assert!(!sign_out_body(0, false, false).contains("deleted"));
     }
 
     #[test]
