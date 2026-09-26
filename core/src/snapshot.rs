@@ -279,6 +279,11 @@ impl Sealer {
         self.index
     }
 
+    /// Plaintext bytes taken but not sealed yet (part of the next chunk).
+    pub(crate) fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Every chunk is sealed, the last one flagged.
     pub(crate) fn is_complete(&self) -> bool {
         self.index == self.layout.chunks()

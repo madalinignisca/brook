@@ -141,6 +141,17 @@ impl Cache {
         self.state.subscribe()
     }
 
+    /// The cache's database (the file cache keeps its rows here, in the cache's own
+    /// transactions).
+    pub(crate) fn db(&self) -> &Db {
+        &self.db
+    }
+
+    /// A change notice from outside `apply` (the file cache's downloads and evictions).
+    pub(crate) fn announce(&self, event: CacheEvent) {
+        let _ = self.events.send(event);
+    }
+
     fn notify(&self, applied: Applied) {
         let sorted = |set: HashSet<String>| {
             let mut v: Vec<String> = set.into_iter().collect();

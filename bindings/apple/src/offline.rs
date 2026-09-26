@@ -331,6 +331,8 @@ pub enum FfiCacheEvent {
     Outbox { channel_id: String },
     /// Unsent messages were lost: read `outbox_lost`.
     OutboxLost,
+    /// Cached files whose state changed (downloaded, evicted, gone): re-read them.
+    Files { ids: Vec<String> },
 }
 
 impl From<CacheEvent> for FfiCacheEvent {
@@ -342,6 +344,7 @@ impl From<CacheEvent> for FfiCacheEvent {
             CacheEvent::Reset => Self::Reset,
             CacheEvent::Outbox(channel_id) => Self::Outbox { channel_id },
             CacheEvent::OutboxLost => Self::OutboxLost,
+            CacheEvent::Files(ids) => Self::Files { ids },
         }
     }
 }

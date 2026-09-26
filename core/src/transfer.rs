@@ -229,6 +229,10 @@ impl Transfers {
         self.events.subscribe()
     }
 
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<TransferEvent> {
+        self.events.subscribe()
+    }
+
     /// A lone transfer ended. A row's registrations stay until the row goes.
     fn forget(&self, id: TransferId) {
         self.cancelled
