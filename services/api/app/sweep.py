@@ -1,6 +1,7 @@
 """Attachment sweep (attachments spec §7): a periodic task inside the api.
 
-- pending files older than 1 h: rows, part files and any bytes go;
+- pending files older than 1 h, unless their upload is streaming right now: rows,
+  part files and any bytes go;
 - committed files never attached within 24 h go;
 - bytes on disk with no row (a crash between rename and commit, an account delete's
   cascade), and part files, go once they are older than the 1 h window, never earlier,
@@ -20,6 +21,7 @@ from sqlalchemy import delete, select
 from . import files as storage
 from .db import get_sessionmaker
 from .models import File, utcnow
+from .routers.files import uploads_in_flight
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +33,11 @@ INTERVAL_S = 600
 async def sweep_once() -> dict[str, int]:
     """One pass; returns what it removed (for logs and tests)."""
     now = utcnow()
+    # A slow upload can still be streaming an hour after its row was created: its age
+    # says nothing about whether it's alive. Skipping the PUTs in flight keeps the
+    # sweep from deleting a row under a live upload. (Single-node api: the registry is
+    # in-process. A lease in the database replaces this for scale-out, #85.)
+    busy = uploads_in_flight()
     async with get_sessionmaker()() as session:
         # The conditions are in the DELETE itself, not only in a prior SELECT: a file
         # attached (or committed) between a select and a delete must survive.
@@ -38,7 +45,11 @@ async def sweep_once() -> dict[str, int]:
             (
                 await session.scalars(
                     delete(File)
-                    .where(File.status == "pending", File.created_at < now - PENDING_TTL)
+                    .where(
+                        File.status == "pending",
+                        File.created_at < now - PENDING_TTL,
+                        File.id.not_in(busy),
+                    )
                     .returning(File.id)
                 )
             ).all()
