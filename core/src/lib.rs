@@ -30,6 +30,9 @@ mod coverage;
 #[cfg(test)]
 mod coverage_tests;
 mod error;
+mod file_rows;
+#[cfg(test)]
+mod file_rows_tests;
 mod keyslot;
 mod local;
 #[cfg(test)]

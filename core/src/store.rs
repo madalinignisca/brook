@@ -59,7 +59,7 @@ impl Kind {
     /// outbox is surfaced first).
     fn format(self) -> i64 {
         match self {
-            Kind::Cache => 2,  // 2: `removed.active` (the removal floor)
+            Kind::Cache => 3,  // 2: `removed.active` (the removal floor); 3: the file cache
             Kind::Index => 2,  // 2: `stores.doomed` (a wipe whose keys aren't gone yet)
             Kind::Outbox => 3, // 2: `outbox.reply_to_id`; 3: queued files, `deletions`
         }
@@ -67,14 +67,14 @@ impl Kind {
 
     fn schema(self) -> &'static str {
         match self {
-            Kind::Cache => CACHE_V1,
+            Kind::Cache => CACHE_SCHEMA,
             Kind::Outbox => OUTBOX_V3,
             Kind::Index => INDEX_V1,
         }
     }
 }
 
-const CACHE_V1: &str = "
+const CACHE_SCHEMA: &str = "
 CREATE TABLE meta(id INTEGER PRIMARY KEY CHECK (id = 1), format INTEGER NOT NULL,
                   cursor TEXT NOT NULL DEFAULT '0', generation INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE channels(id TEXT PRIMARY KEY, seq INTEGER NOT NULL, json TEXT NOT NULL);
@@ -90,8 +90,13 @@ CREATE INDEX messages_by_channel ON messages(channel_id, id);
 CREATE TABLE coverage(channel_id TEXT PRIMARY KEY, newest_id TEXT, oldest_id TEXT,
                       complete_to_start INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE files(file_id TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
-                   key BLOB NOT NULL, state TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0,
-                   last_opened TEXT);
+                   key BLOB NOT NULL, chunk INTEGER NOT NULL, state TEXT NOT NULL,
+                   done INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0,
+                   last_used TEXT);
+CREATE TABLE message_files(file_id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                           channel_id TEXT NOT NULL);
+CREATE INDEX message_files_by_message ON message_files(message_id);
+CREATE INDEX message_files_by_channel ON message_files(channel_id);
 CREATE TABLE deletions(path TEXT PRIMARY KEY);
 ";
 

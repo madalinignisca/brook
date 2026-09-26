@@ -34,6 +34,9 @@ pub enum CacheEvent {
     Removed(Vec<String>),
     /// Profiles that changed (display names, status): re-render those authors.
     Users(Vec<String>),
+    /// Cached files whose state changed (downloaded, evicted, gone, pinned): re-read
+    /// `file_state` for those shown.
+    Files(Vec<String>),
     /// The server reset the sync (`410`): the cache is being rebuilt.
     Reset,
     /// A channel's unsent messages changed (queued, sending, sent, failed, removed): re-read
@@ -99,6 +102,8 @@ pub(crate) struct Cache {
     /// Closing: no new syncs, and the debounced ones are aborted.
     closed: std::sync::atomic::AtomicBool,
     scheduled_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Signalled after a commit journalled file blobs: the file cache unlinks them.
+    pub(crate) files_dropped: Arc<tokio::sync::Notify>,
 }
 
 impl Cache {
@@ -122,6 +127,7 @@ impl Cache {
             again: std::sync::atomic::AtomicBool::new(false),
             closed: std::sync::atomic::AtomicBool::new(false),
             scheduled_tasks: std::sync::Mutex::default(),
+            files_dropped: Arc::default(),
         })
     }
 
@@ -153,6 +159,10 @@ impl Cache {
         }
         if !applied.users.is_empty() {
             let _ = self.events.send(CacheEvent::Users(sorted(applied.users)));
+        }
+        if !applied.dropped_files.is_empty() {
+            let _ = self.events.send(CacheEvent::Files(applied.dropped_files));
+            self.files_dropped.notify_one(); // the journal's blobs are unlinked after commit
         }
     }
 
@@ -246,15 +256,16 @@ impl Cache {
 
     /// Empty the synced tables and start the cursor over, in one transaction; bumps the
     /// generation so a history page requested before this can't land after it. Returns the
-    /// cursor it replaced. (`files` and `deletions` are left alone: nothing writes them yet.
-    /// The file cache, when it lands, must drop the old server's file rows here too, and
-    /// journal their blobs in `deletions` rather than orphan them.)
+    /// cursor it replaced. The old server's files go too, in the same transaction: their rows
+    /// dropped and their blobs journalled (the old ids mean nothing now).
     async fn reset_rows(&self) -> Result<String, StoreError> {
-        self.db
+        let result = self
+            .db
             .call(|c| {
                 let tx = c.transaction()?;
                 let was: String =
                     tx.query_row("SELECT cursor FROM meta WHERE id = 1", [], |r| r.get(0))?;
+                crate::file_rows::drop_all(&tx)?;
                 tx.execute_batch(
                     "DELETE FROM channels; DELETE FROM removed; DELETE FROM memberships;
                      DELETE FROM users; DELETE FROM messages; DELETE FROM coverage;
@@ -263,7 +274,11 @@ impl Cache {
                 tx.commit()?;
                 Ok(was)
             })
-            .await
+            .await;
+        if result.is_ok() {
+            self.files_dropped.notify_one();
+        }
+        result
     }
 
     /// Ask for a sync in `HINT_DEBOUNCE`; asks meanwhile join it.

@@ -96,6 +96,7 @@ pub(crate) async fn run_into(
         changed.channels.extend(applied.channels);
         changed.removed.extend(applied.removed);
         changed.users.extend(applied.users);
+        changed.dropped_files.extend(applied.dropped_files);
         if !more {
             return Ok(Synced::Done(Applied::default()));
         }
