@@ -130,6 +130,10 @@ pub struct FfiMessage {
     pub reply_to: Option<FfiReplyExcerpt>,
     /// In the order the sender gave them (none on a tombstone).
     pub attachments: Vec<FfiFileInfo>,
+    /// User ids mentioned (for "mentioned you" notifications).
+    pub mentions: Vec<String>,
+    /// `@channel` / `@here`: everyone in the channel was mentioned.
+    pub mention_everyone: bool,
 }
 
 impl From<brook_core::Message> for FfiMessage {
@@ -159,6 +163,8 @@ impl From<brook_core::Message> for FfiMessage {
             } else {
                 m.attachments.into_iter().map(Into::into).collect()
             },
+            mentions: m.mentions,
+            mention_everyone: m.mention_everyone,
         }
     }
 }

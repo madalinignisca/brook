@@ -4,3 +4,7 @@ import AppKit
 enum AppActivity {
     @MainActor static var isActive: Bool { NSApp?.isActive ?? true }
 }
+
+enum NSAppActivator {
+    @MainActor static func activate() { NSApp.activate() }
+}
