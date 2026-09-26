@@ -142,6 +142,23 @@ fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
     // The client for the server currently in use; replaced when the user logs
     // in to a different server. Dropping the old client ends its state watcher.
     let current: CurrentClient = Rc::default();
+    // Quitting removes the plaintext copies Open made (best-effort: the next start sweeps
+    // them too).
+    app.connect_shutdown({
+        let (current, runtime) = (current.clone(), runtime.clone());
+        move |_| {
+            let client = current.borrow().as_ref().map(|(_, c)| c.clone());
+            if let Some(client) = client {
+                runtime.block_on(async {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        client.clear_open_copies(),
+                    )
+                    .await;
+                });
+            }
+        }
+    });
 
     // Submit a login attempt on the Tokio runtime. Widgets are captured weakly so
     // this closure never forms a reference cycle with the button/entry that own it.
