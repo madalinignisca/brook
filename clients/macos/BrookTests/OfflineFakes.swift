@@ -88,6 +88,41 @@ extension FakeChat: OfflineClient {
         others = []
     }
 
+    func openFile(transferId: UInt64, fileId: String) async throws -> String {
+        record("open") // before the local check: a call without local data shows too
+        try need()
+        return try openResult.get()
+    }
+
+    func fileState(fileId: String) async throws -> FfiFileCacheState {
+        try need()
+        let answer = states.count > 1 ? states.removeFirst() : states[0]
+        if let gate = stateGate {
+            stateGate = nil
+            await gate.wait()
+        }
+        return answer
+    }
+
+    func pinFile(fileId: String) async throws {
+        try need()
+        pins.withLock { $0.append("pin") }
+        if let pinGate { await pinGate.wait() }
+        if let pinFailure { throw pinFailure }
+    }
+
+    func unpinFile(fileId: String) async throws {
+        try need()
+        pins.withLock { $0.append("unpin") }
+        if let pinFailure { throw pinFailure }
+    }
+
+    func previewFile(transferId: UInt64, fileId: String) async throws -> FfiImagePreview {
+        try need()
+        record("preview")
+        return try previewResult.get()
+    }
+
     func subscribeCacheEvents(listener: CacheEventListener) -> Subscription { FakeSubscription() }
     func subscribeCacheState(listener: CacheStateListener) -> Subscription { FakeSubscription() }
 }

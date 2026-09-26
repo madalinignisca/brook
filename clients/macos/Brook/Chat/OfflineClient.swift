@@ -22,6 +22,12 @@ protocol OfflineClient: AnyObject, Sendable {
     func acknowledgeOutboxLost(n: UInt64)
     func otherLocalUsers() async throws -> [FfiLocalUser]
     func wipeOtherLocalUsers() async throws
+    // The file cache (#149, #155): Open, keep available offline, previews.
+    func openFile(transferId: UInt64, fileId: String) async throws -> String
+    func fileState(fileId: String) async throws -> FfiFileCacheState
+    func pinFile(fileId: String) async throws
+    func unpinFile(fileId: String) async throws
+    func previewFile(transferId: UInt64, fileId: String) async throws -> FfiImagePreview
     func subscribeCacheEvents(listener: CacheEventListener) -> Subscription
     func subscribeCacheState(listener: CacheStateListener) -> Subscription
 }

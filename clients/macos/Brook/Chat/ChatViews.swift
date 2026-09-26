@@ -11,12 +11,17 @@ struct ChatView: View {
     @State var saves: SaveModel
     /// Unsent messages (with local data, #62).
     let pending: PendingModel?
+    /// The cache's notices (a file's state changing reaches its row).
+    let feed: CacheFeed?
+    private let client: any ChatClient
 
     init(channelId: String, me: String, client: any ChatClient, timeline: TimelineModel,
-         pending: PendingModel? = nil) {
+         pending: PendingModel? = nil, feed: CacheFeed? = nil) {
         self.channelId = channelId
         self.me = me
         self.pending = pending
+        self.feed = feed
+        self.client = client
         _timeline = State(initialValue: timeline)
         let composer = ComposerModel(
             channelId: channelId, client: client, onMessage: { [weak timeline] in
@@ -42,7 +47,8 @@ struct ChatView: View {
                         }
                         ForEach(timeline.messages, id: \.id) { message in
                             MessageRow(message: message, author: timeline.authorName(message),
-                                       mine: message.authorId == me, saves: saves, composer: composer)
+                                       mine: message.authorId == me, saves: saves, composer: composer,
+                                       makeRow: makeRow)
                                 .id(message.id)
                         }
                         if let pending {
@@ -82,6 +88,17 @@ struct ChatView: View {
             saves.stop()
             pending?.stopProgress()
         }
+    }
+}
+
+extension ChatView {
+    /// An attachment's Open, keep-offline and preview model, registered for the cache's
+    /// notices; nil without the offline client (tests of other views).
+    func makeRow(_ file: FfiFileInfo) -> FileRowModel? {
+        guard let offline = client as? any OfflineClient else { return nil }
+        let row = FileRowModel(file: file, client: offline)
+        feed?.register(row)
+        return row
     }
 }
 
@@ -126,6 +143,7 @@ struct MessageRow: View {
     let mine: Bool
     let saves: SaveModel
     let composer: ComposerModel
+    var makeRow: (FfiFileInfo) -> FileRowModel? = { _ in nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -148,7 +166,7 @@ struct MessageRow: View {
                 Text("Files removed").italic().foregroundStyle(.secondary)
             }
             ForEach(message.attachments, id: \.id) { file in
-                AttachmentRow(file: file, saves: saves)
+                AttachmentRow(file: file, saves: saves, makeRow: makeRow)
             }
         }
         .contextMenu {
@@ -184,8 +202,53 @@ struct MessageRow: View {
 struct AttachmentRow: View {
     let file: FfiFileInfo
     let saves: SaveModel
+    /// Open, keep offline and the preview (with local data; else nil: Save only).
+    @State private var row: FileRowModel?
+    let makeRow: (FfiFileInfo) -> FileRowModel?
+
+    init(file: FfiFileInfo, saves: SaveModel, makeRow: @escaping (FfiFileInfo) -> FileRowModel? = { _ in nil }) {
+        self.file = file
+        self.saves = saves
+        self.makeRow = makeRow
+    }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let row { previewView(row) }
+            line
+            if let message = row?.message {
+                Text(message).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .task {
+            if row == nil { row = makeRow(file) }
+            guard let row else { return }
+            row.onScreen = true
+            await row.reloadKeep()
+            await row.startPreview()
+        }
+        .onDisappear { row?.onScreen = false }
+    }
+
+    @ViewBuilder
+    private func previewView(_ row: FileRowModel) -> some View {
+        switch row.preview {
+        case let .shown(image):
+            Image(decorative: image, scale: 2)
+                .resizable().scaledToFit()
+                .frame(maxWidth: 360, maxHeight: 240, alignment: .leading)
+                .onTapGesture { Task { await row.open() } }
+                .accessibilityLabel("Preview of \(file.originalName). Opens the file.")
+        case .offer:
+            Button("Show preview") { Task { await row.showPreview() } }.font(.caption)
+        case .loading:
+            ProgressView().controlSize(.small)
+        case .none:
+            EmptyView()
+        }
+    }
+
+    private var line: some View {
         HStack(spacing: 8) {
             Image(systemName: Self.icon(file.contentType))
             VStack(alignment: .leading, spacing: 0) {
@@ -208,10 +271,27 @@ struct AttachmentRow: View {
             case nil:
                 saveButton
             }
+            if let row, row.hasLocalData, !row.gone {
+                Button("Open") { Task { await row.open() } }.disabled(row.opening)
+                Toggle(isOn: Binding(get: { row.keep != .off }, set: { _ in Task { await row.toggleKeep() } })) {
+                    Image(systemName: "arrow.down.circle")
+                }
+                .toggleStyle(.button).disabled(row.keepBusy)
+                .help(Self.keepHelp(row.keep))
+                .accessibilityLabel("Keep available offline")
+            }
         }
         .padding(8)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
         .frame(maxWidth: 420, alignment: .leading)
+    }
+
+    static func keepHelp(_ keep: FileRowModel.Keep) -> String {
+        switch keep {
+        case .off: "Keep available offline"
+        case .fetching: "Downloading for offline"
+        case .kept: "Available offline"
+        }
     }
 
     private var saveButton: some View {

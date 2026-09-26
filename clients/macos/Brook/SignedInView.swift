@@ -66,7 +66,7 @@ struct SignedInView: View {
             if let channel = channels.channels.first(where: { $0.id == selection }),
                let chat = client as? any ChatClient, let timeline, timeline.channelId == channel.id {
                 ChatView(channelId: channel.id, me: user.id, client: chat, timeline: timeline,
-                         pending: pending)
+                         pending: pending, feed: feed)
                     .id(channel.id)  // a new conversation per channel
                     .navigationTitle(channels.title(channel))
                     .toolbar {
