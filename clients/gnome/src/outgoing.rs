@@ -259,22 +259,43 @@ pub fn pick(parent: Option<&gtk::Window>, on_picked: impl Fn(Vec<gio::File>) + '
 
 /// What the composer needs to stage a picked file (off the GTK loop's critical path: a
 /// portal path answers asynchronously).
-pub async fn describe(file: &gio::File) -> Option<Staged> {
-    let path = file.path()?;
+/// Why a picked or dropped file can't be staged.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NotStaged {
+    Unreadable,
+    /// A folder, a named pipe, a device, a socket: only regular files are sent (a pipe would
+    /// hold the upload forever).
+    NotAFile,
+}
+
+/// Queried for staging; links are followed (`NONE`), so a link to a regular file is one.
+const STAGE_ATTRIBUTES: &str =
+    "standard::type,standard::display-name,standard::size,standard::content-type";
+
+/// Only regular files are staged.
+pub fn is_regular(info: &gio::FileInfo) -> bool {
+    info.file_type() == gio::FileType::Regular
+}
+
+pub async fn describe(file: &gio::File) -> Result<Staged, NotStaged> {
+    let path = file.path().ok_or(NotStaged::Unreadable)?;
     let info = file
         .query_info_future(
-            "standard::display-name,standard::size,standard::content-type",
+            STAGE_ATTRIBUTES,
             gio::FileQueryInfoFlags::NONE,
             glib::Priority::DEFAULT,
         )
         .await
-        .ok()?;
+        .map_err(|_| NotStaged::Unreadable)?;
+    if !is_regular(&info) {
+        return Err(NotStaged::NotAFile);
+    }
     let content_type = info
         .content_type()
         .and_then(|t| gio::content_type_get_mime_type(&t))
         .map(|m| m.to_string())
         .unwrap_or_else(|| "application/octet-stream".into());
-    Some(Staged {
+    Ok(Staged {
         path,
         name: info.display_name().to_string(),
         content_type,
@@ -286,6 +307,42 @@ pub async fn describe(file: &gio::File) -> Option<Staged> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A folder, a named pipe and a device aren't files to send; a regular file and a link
+    /// to one are.
+    #[test]
+    fn only_regular_files_are_staged() {
+        let dir = std::env::temp_dir().join(format!("brook-stage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note.txt");
+        std::fs::write(&file, b"hi").unwrap();
+        let link = dir.join("link.txt");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let fifo = dir.join("pipe");
+        let _ = std::fs::remove_file(&fifo);
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let regular = |p: &std::path::Path| {
+            let info = gio::File::for_path(p)
+                .query_info(
+                    STAGE_ATTRIBUTES,
+                    gio::FileQueryInfoFlags::NONE,
+                    gio::Cancellable::NONE,
+                )
+                .unwrap();
+            is_regular(&info)
+        };
+        assert!(regular(&file));
+        assert!(regular(&link), "a link to a file is followed");
+        assert!(!regular(&fifo), "a named pipe");
+        assert!(!regular(&dir), "a folder");
+        assert!(!regular(std::path::Path::new("/dev/zero")), "a device");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn limits_are_checked_when_a_file_is_added() {

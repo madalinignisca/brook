@@ -900,14 +900,17 @@ fn stage_files(chat: &Rc<Chat>, files: Vec<gtk::gio::File>) {
     let chat = chat.clone();
     glib::spawn_future_local(async move {
         for file in files {
-            let Some(staged) = crate::outgoing::describe(&file).await else {
-                show_send_error(&chat, "That file couldn't be read.");
-                continue;
+            let staged = match crate::outgoing::describe(&file).await {
+                Ok(staged) => staged,
+                Err(crate::outgoing::NotStaged::NotAFile) => {
+                    show_send_error(&chat, "Only files can be sent (not folders or devices).");
+                    continue;
+                }
+                Err(crate::outgoing::NotStaged::Unreadable) => {
+                    show_send_error(&chat, "That file couldn't be read.");
+                    continue;
+                }
             };
-            if staged.content_type == "inode/directory" {
-                show_send_error(&chat, "Folders can't be sent. Pick the files inside.");
-                continue;
-            }
             let count = chat.staged.borrow().len();
             if let Some(why) = crate::outgoing::refusal(count, &staged.name, staged.size) {
                 show_send_error(&chat, &why);
