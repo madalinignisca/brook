@@ -1,6 +1,6 @@
 # One refresh at a time per stored session (#120)
 
-Status: spec. Review dial: **Heavy** (auth: refresh-token rotation, family revocation).
+Status: spec, closed after review round 2. Review dial: **Heavy** (auth: refresh-token rotation, family revocation).
 
 ## The failure
 
@@ -42,15 +42,22 @@ login that displaces its session, and a stale restore.
 
 ## Done means
 
-1. **A client that isn't its slot's owner revokes nothing.** One predicate, "persistence
-   is on and this client doesn't own the slot", is checked inside the store's
-   `revoke_detached`. Every revoke path goes through it:
+1. **A client that isn't its slot's owner revokes nothing of the stored login.** The
+   exemption keys on where the token came from, not only on who owns the slot now. A
+   token is *from the slot* if it was restored from it, written to it while this client
+   owned it (a login or challenge installed with persistence), or rotated from such a
+   token. The session cell carries that as a flag, set at those installs and kept
+   through `commit_refresh`. `revoke_detached` skips a token only if persistence is on,
+   this client doesn't own the slot, **and** the token is from the slot. A fresh login's
+   pair that never installed (`Stale`, `SlotTaken`, a refused challenge) is always
+   revoked: it was never the owner's, and leaving it would keep it live for 7 days
+   (round 2). The paths covered:
    - a refresh or a password call whose fresh pair is discarded;
    - `logout()`;
    - a login that displaces a session;
    - restore's `Stale` branch.
-   Such tokens are held in memory only and expire; revoking them would end the owner's
-   login. A client without persistence revokes as before.
+   An exempt token is dropped rather than revoked: it belongs to the owner's login, and
+   revoking it would end that. A client without persistence revokes as before.
 2. **A client that isn't the owner never refreshes.** `refresh_once`, the one function
    every refresh goes through, checks ownership (a read-only `owns()`, never holding
    `OWNERS` across the keychain) under the slot lock, right before the request. Every
@@ -101,3 +108,12 @@ the refresh race), four revoke paths, the double lock on the password flows, and
 WebSocket recovery missing from the covered paths. All are taken above. Also taken: the
 exact local sign-out path, the definition of owner, a read-only `owns()`, and the
 password-change and URL-spelling notes.
+
+## Review round 2
+
+All round-1 points are fixed; the owner definition (4) is stated rather than changed, and
+that was accepted. New and taken: the revoke exemption keys on the token's origin (from the
+slot) rather than on ownership alone, so a fresh login's pair that never installed is still
+revoked. For the plan: `owns()` answers true when persistence is off. It must not be
+written as `with_slot(..).is_some()`, which would stop every client without persistence
+from refreshing; the last test catches that.
