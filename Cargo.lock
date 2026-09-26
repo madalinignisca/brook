@@ -383,6 +383,7 @@ dependencies = [
  "base64",
  "futures-util",
  "getrandom 0.3.4",
+ "libc",
  "reqwest",
  "ring",
  "rusqlite",
