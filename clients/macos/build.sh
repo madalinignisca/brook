@@ -26,4 +26,10 @@ fi
 xcodebuild -project "$HERE/Brook.xcodeproj" -scheme Brook -configuration "$config" \
   -derivedDataPath "$HERE/build" "${args[@]}"
 
+# The image decoder's sandbox and signing (previews spec §5), on every plain build.
+if [[ "${1:-}" != "test" ]]; then
+  "$HERE/check-decoder.sh" "$HERE/build/Build/Products/$config/Brook.app" \
+    $([[ "$config" == Release ]] && echo release)
+fi
+
 echo "app: $HERE/build/Build/Products/$config/Brook.app"
