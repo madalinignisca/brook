@@ -89,6 +89,7 @@ extension FakeChat: OfflineClient {
     }
 
     func openFile(transferId: UInt64, fileId: String) async throws -> String {
+        record("open") // before the local check: a call without local data shows too
         try need()
         return try openResult.get()
     }

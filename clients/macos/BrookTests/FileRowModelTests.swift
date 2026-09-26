@@ -93,6 +93,7 @@ final class FileRowModelTests: XCTestCase {
         await m.open()
         await m.startPreview()
         XCTAssertTrue(opened.urls.isEmpty)
+        XCTAssertFalse(chat.cacheCalls.withLock { $0 }.contains("open"), "Open asked core without local data")
         guard case .none = m.preview else { return XCTFail("a preview without local data") }
     }
 
