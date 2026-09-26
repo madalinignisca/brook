@@ -58,7 +58,8 @@ pub fn refusal(already: usize, name: &str, size: u64) -> Option<String> {
     if size > MAX_FILE_BYTES {
         return Some(format!(
             "{name} is larger than {}.",
-            glib::format_size(MAX_FILE_BYTES)
+            // The limit is binary (100 MiB): decimal units would say "104.9 MB".
+            glib::format_size_full(MAX_FILE_BYTES, glib::FormatSizeFlags::IEC_UNITS)
         ));
     }
     None
@@ -297,6 +298,8 @@ mod tests {
             .unwrap()
             .contains("up to"));
         assert!(refusal(0, "edge.bin", MAX_FILE_BYTES).is_none());
+        let limit = refusal(0, "big.iso", MAX_FILE_BYTES + 1).unwrap();
+        assert!(limit.contains("100") && limit.contains("MiB"), "{limit}");
     }
 
     #[test]
