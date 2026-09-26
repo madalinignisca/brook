@@ -76,3 +76,14 @@ whole channel JSON, so cached channels carry it too.
 
 Measured: 7 Swift and 5 Rust mutants, each caught. 230 Mac tests, 462 core tests and 31
 binding tests pass.
+
+## PR 2 implementation review, round 1 (vibe; Standard)
+
+No findings. Roles arrived before PR 2, so Remove and the last-owner warning use them
+(the spec's "After review" note).
+
+Not unit-tested: the SwiftUI views and their wiring (the context menu, the Members
+popover, the sheets, the header's name). The models behind them are tested.
+
+Measured: 19 mutants, each caught (two as hangs past 180 s: an overlapping removal and
+a save while busy). 248 Mac tests pass.

@@ -25,9 +25,18 @@ final class FakeAccount: AccountClient, @unchecked Sendable {
 
     // TOTP management: each call recorded; `failure` (when set) is thrown by all of them.
     var codes = (1 ... 10).map { String(format: "abcd-%04d", $0) }
+    var profile = FfiUser(id: "me", handle: "me", displayName: "Me", globalRole: "member", statusText: nil)
     func me() async throws -> FfiMe {
-        FfiMe(user: FfiUser(id: "me", handle: "me", displayName: "Me", globalRole: "member", statusText: nil),
-              totpEnabled: false, recoveryCodesLeft: nil)
+        FfiMe(user: profile, totpEnabled: false, recoveryCodesLeft: nil)
+    }
+    /// Records what was sent ("-" for an unchanged field); the server's answer applies it.
+    func updateProfile(displayName: String?, statusText: String?) async throws -> FfiMe {
+        calls.withLock { $0.append("profile:\(displayName ?? "-")|\(statusText ?? "-")") }
+        await gate?.wait()
+        if let failure { throw failure }
+        if let displayName { profile.displayName = displayName }
+        if let statusText { profile.statusText = statusText.isEmpty ? nil : statusText }
+        return FfiMe(user: profile, totpEnabled: false, recoveryCodesLeft: nil)
     }
     /// Tests only: the factor as sent (the type itself never renders its code).
     static func plain(_ factor: FfiSecondFactor) -> String {
