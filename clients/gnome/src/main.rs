@@ -56,12 +56,36 @@ fn init_logging() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+/// Brook's own looks on top of Adwaita's: a message that mentions you is tinted with the
+/// accent, and a channel badge counting mentions is filled with it.
+const STYLE: &str = "
+row.mentions-me { background-color: alpha(@accent_bg_color, 0.12); border-radius: 6px; }
+label.mention-badge {
+  background-color: @accent_bg_color; color: @accent_fg_color;
+  border-radius: 9px; padding: 0 6px;
+}
+";
+
+fn load_style() {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let css = gtk::CssProvider::new();
+    css.load_from_data(STYLE);
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &css,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
 fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
     // Dev-only: a call with yourself through the media engine, no server needed.
     if std::env::var("BROOK_CALL_LOOPBACK").as_deref() == Ok("1") {
         call::present_loopback(app, runtime);
         return;
     }
+    load_style();
     // Server: env override (dev/scripts) > last server that logged in > default.
     let initial_server = std::env::var("BROOK_SERVER")
         .ok()
