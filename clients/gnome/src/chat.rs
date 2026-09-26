@@ -1879,6 +1879,14 @@ fn show_alert(chat: &Rc<Chat>, heading: &str, body: &str) {
     alert.present(Some(&chat.message_list));
 }
 
+/// Whether a profile edit is within the server's lengths (#183): a display name of 1 to 64
+/// characters and a status line of at most 100, both trimmed. (Which characters are allowed
+/// is the server's to judge; it says so if one isn't.)
+fn profile_fits(name: &str, status: &str) -> bool {
+    let n = name.trim().chars().count();
+    (1..=64).contains(&n) && status.trim().chars().count() <= 100
+}
+
 /// Whether a viewer is offered Remove on a member, as the server allows it (#183): never
 /// themselves (that's Leave); a global admin removes anyone; a channel owner removes members
 /// but not other owners.
@@ -1926,7 +1934,7 @@ fn leave_channel_confirm(chat: &Rc<Chat>) {
         .unwrap_or_default();
     let dialog = adw::AlertDialog::new(
         Some(&format!("Leave {title}?")),
-        Some("You'll stop getting its messages. A member can add you back."),
+        Some("You'll stop getting its messages. An owner or an admin can add you back."),
     );
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("leave", "Leave");
@@ -1950,7 +1958,12 @@ fn leave_channel_confirm(chat: &Rc<Chat>) {
                     .await
                     .unwrap_or(Err(brook_core::Error::UnexpectedResponse));
                 if let Err(err) = result {
-                    show_alert(&chat, "Couldn't Leave", &membership_error_text(&err));
+                    // Not a member any more: already out, which is what leaving wanted.
+                    let already_out =
+                        matches!(&err, brook_core::Error::Api { code, .. } if code == "not_found");
+                    if !already_out {
+                        show_alert(&chat, "Couldn't Leave", &membership_error_text(&err));
+                    }
                 }
             });
         }
@@ -2094,6 +2107,24 @@ fn edit_profile_dialog(chat: &Rc<Chat>) {
         dialog.add_response("save", "Save");
         dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("save"));
+        // The server's lengths, checked as the user types: Save waits for a name that fits,
+        // so a refusal never throws the edit away.
+        let check: Rc<dyn Fn()> = Rc::new({
+            let (dialog, name, status) = (dialog.clone(), name.clone(), status.clone());
+            move || {
+                let ok = profile_fits(&name.text(), &status.text());
+                dialog.set_response_enabled("save", ok);
+            }
+        });
+        name.connect_changed({
+            let check = check.clone();
+            move |_| check()
+        });
+        status.connect_changed({
+            let check = check.clone();
+            move |_| check()
+        });
+        check();
         let (old_name, old_status) = (
             me.user.display_name,
             me.user.status_text.unwrap_or_default(),
@@ -3319,6 +3350,18 @@ fn sign_out_body(unsent: u64, known: bool, remove: bool) -> String {
 #[cfg(test)]
 mod offline_tests {
     use super::*;
+
+    #[test]
+    fn a_profile_fits_the_servers_lengths() {
+        assert!(profile_fits("Ana", ""));
+        assert!(!profile_fits("   ", ""), "a blank name");
+        assert!(
+            profile_fits(&"é".repeat(64), &"x".repeat(100)),
+            "characters, not bytes"
+        );
+        assert!(!profile_fits(&"a".repeat(65), ""));
+        assert!(!profile_fits("Ana", &"x".repeat(101)));
+    }
 
     #[test]
     fn remove_is_offered_as_the_server_allows_it() {
