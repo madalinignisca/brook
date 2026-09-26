@@ -108,6 +108,11 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
         .width_request(80)
         .visible(false)
         .build();
+    let open = gtk::Button::builder()
+        .icon_name("document-open-symbolic")
+        .tooltip_text("Open")
+        .css_classes(["flat"])
+        .build();
     let save = gtk::Button::builder()
         .icon_name("document-save-symbolic")
         .tooltip_text("Save…")
@@ -125,6 +130,7 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
         size.upcast_ref(),
         status.upcast_ref(),
         progress.upcast_ref(),
+        open.upcast_ref(),
         save.upcast_ref(),
         cancel.upcast_ref(),
     ] {
@@ -135,13 +141,75 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
     let Some(sha256) = file.sha256.clone().filter(|_| file.status == "committed") else {
         save.set_sensitive(false);
         save.set_tooltip_text(Some("Still uploading"));
+        open.set_sensitive(false);
         return row.upcast();
     };
 
+    // Open and Save each run under their own id; Cancel stops whichever is running.
     let transfer = TransferId::new();
+    let running = std::rc::Rc::new(std::cell::Cell::new(transfer));
     cancel.connect_clicked({
-        let client = client.clone();
-        move |_| client.cancel_transfer(transfer)
+        let (client, running) = (client.clone(), running.clone());
+        move |_| client.cancel_transfer(running.get())
+    });
+    open.connect_clicked({
+        let (client, runtime, file_id) = (client.clone(), runtime.clone(), file.id.clone());
+        let (save, cancel, progress, status, running) = (
+            save.clone(),
+            cancel.clone(),
+            progress.clone(),
+            status.clone(),
+            running.clone(),
+        );
+        move |button| {
+            let id = TransferId::new();
+            running.set(id);
+            button.set_sensitive(false);
+            cancel.set_visible(true);
+            progress.set_fraction(0.0);
+            progress.set_visible(true);
+            status.set_visible(false);
+            follow_progress(&client, id, &progress);
+            // Downloaded into this device's encrypted cache (it opens offline next time),
+            // then a private copy is handed to the system's app for its type.
+            let opened = runtime.spawn({
+                let (client, file_id) = (client.clone(), file_id.clone());
+                async move { client.open_file(id, &file_id).await }
+            });
+            let window = button.root().and_downcast::<gtk::Window>();
+            let (button, save, cancel, progress, status) = (
+                button.clone(),
+                save.clone(),
+                cancel.clone(),
+                progress.clone(),
+                status.clone(),
+            );
+            glib::spawn_future_local(async move {
+                let result = opened
+                    .await
+                    .unwrap_or(Err(brook_core::Error::UnexpectedResponse));
+                cancel.set_visible(false);
+                progress.set_visible(false);
+                button.set_sensitive(true);
+                match result {
+                    Ok(path) => {
+                        gtk::FileLauncher::new(Some(&gio::File::for_path(&path))).launch(
+                            window.as_ref(),
+                            gio::Cancellable::NONE,
+                            |_| {},
+                        );
+                    }
+                    Err(err) => {
+                        status.set_text(&open_error_text(&err));
+                        status.set_visible(true);
+                        if is_gone(&err) {
+                            button.set_visible(false);
+                            save.set_visible(false);
+                        }
+                    }
+                }
+            });
+        }
     });
     let file = file.clone();
     save.connect_clicked(move |button| {
@@ -164,6 +232,7 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
             progress.clone(),
             status.clone(),
         );
+        let running = running.clone();
         dialog.save(window.as_ref(), gio::Cancellable::NONE, move |chosen| {
             let Some(path) = chosen.ok().and_then(|f| f.path()) else {
                 return; // cancelled
@@ -173,27 +242,8 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
             progress.set_fraction(0.0);
             progress.set_visible(true);
             status.set_visible(false);
-
-            // Progress: the transfer's events, on the GTK loop.
-            let mut events = client.transfer_events();
-            let bar = progress.downgrade();
-            glib::spawn_future_local(async move {
-                while let Ok(event) = events.recv().await {
-                    if event.id != transfer {
-                        continue;
-                    }
-                    let Some(bar) = bar.upgrade() else { break };
-                    if event.total > 0 {
-                        bar.set_fraction(event.done as f64 / event.total as f64);
-                    }
-                    if !matches!(
-                        event.state,
-                        TransferState::Running | TransferState::Retrying { .. }
-                    ) {
-                        break;
-                    }
-                }
-            });
+            running.set(transfer);
+            follow_progress(&client, transfer, &progress);
 
             // Under Flatpak, replacing an existing file writes into it directly.
             let replaced_in_place = is_flatpak() && path.exists();
@@ -210,10 +260,24 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
                         code: "transfer.io".into(),
                         message: format!("{:?}", err.kind()),
                     };
-                    let mut sink = FileSink::create(&target).await.map_err(io)?;
-                    client
-                        .download_file(transfer, &file.id, &sha256, file.size, &mut sink)
-                        .await?;
+                    // From this device's cache when it's there (works offline), else from
+                    // the server as before. Either way into `target`, verified.
+                    let cached = match client.save_cached_file(&file.id, &target).await {
+                        Ok(saved) => saved,
+                        // No local data, or not a file the cache knows: download it.
+                        Err(brook_core::Error::Api { code, .. })
+                            if code == "local.unavailable" || code == "file.unknown" =>
+                        {
+                            false
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    if !cached {
+                        let mut sink = FileSink::create(&target).await.map_err(io)?;
+                        client
+                            .download_file(transfer, &file.id, &sha256, file.size, &mut sink)
+                            .await?;
+                    }
                     if target != path {
                         // Keep the replaced file's permissions, then swap it in and sync
                         // the directory so the rename itself survives a crash.
@@ -256,6 +320,53 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
     row.upcast()
 }
 
+/// Follow a transfer's progress on `bar` until it ends (on the GTK loop).
+fn follow_progress(client: &BrookClient, id: TransferId, bar: &gtk::ProgressBar) {
+    let mut events = client.transfer_events();
+    let bar = bar.downgrade();
+    glib::spawn_future_local(async move {
+        while let Ok(event) = events.recv().await {
+            if event.id != id {
+                continue;
+            }
+            let Some(bar) = bar.upgrade() else { break };
+            if event.total > 0 {
+                bar.set_fraction(event.done as f64 / event.total as f64);
+            }
+            if !matches!(
+                event.state,
+                TransferState::Running | TransferState::Retrying { .. }
+            ) {
+                break;
+            }
+        }
+    });
+}
+
+fn is_gone(err: &brook_core::Error) -> bool {
+    matches!(err, brook_core::Error::Api { code, .. } if code == "file.gone")
+}
+
+/// A failed Open, briefly.
+pub fn open_error_text(err: &brook_core::Error) -> String {
+    match err {
+        brook_core::Error::Api { code, .. } => match code.as_str() {
+            "file.open_refused" => "Can't be opened from Brook. Save it instead".into(),
+            "local.unavailable" => "Open needs this device's storage. Save it instead".into(),
+            "file.unknown" => "Not available yet. Try again in a moment".into(),
+            other => save_error_text_code(other),
+        },
+        _ => save_error_text(err),
+    }
+}
+
+fn save_error_text_code(code: &str) -> String {
+    save_error_text(&brook_core::Error::Api {
+        code: code.into(),
+        message: String::new(),
+    })
+}
+
 /// A failed save, briefly (the row's own label).
 pub fn save_error_text(err: &brook_core::Error) -> String {
     match err {
@@ -274,6 +385,19 @@ pub fn save_error_text(err: &brook_core::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_errors_say_what_to_do() {
+        let api = |code: &str| brook_core::Error::Api {
+            code: code.into(),
+            message: String::new(),
+        };
+        assert!(open_error_text(&api("file.open_refused")).contains("Save it instead"));
+        assert!(open_error_text(&api("local.unavailable")).contains("Save it instead"));
+        assert_eq!(open_error_text(&api("file.gone")), "No longer available");
+        assert_eq!(open_error_text(&api("transfer.cancelled")), "Cancelled");
+        assert!(is_gone(&api("file.gone")));
+    }
 
     #[test]
     fn a_clash_gets_a_number_before_the_whole_extension() {
