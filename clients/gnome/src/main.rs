@@ -139,7 +139,7 @@ fn build_ui(app: &adw::Application, runtime: &tokio::runtime::Handle) {
             usable: std::cell::Cell::new(false),
         }),
         signins: Rc::default(),
-        erasing: Rc::default(),
+        closing: Rc::default(),
     };
     // The client for the server currently in use; replaced when the user logs
     // in to a different server. Dropping the old client ends its state watcher.
@@ -338,6 +338,8 @@ fn back_to_password(ui: &LoginUi, message: &str) {
 
 /// Shown while a sign-out erases this device's data (sign-in waits for it).
 const ERASING: &str = "Removing this device's data…";
+/// Shown while a sign-out that keeps the data closes it (sign-in waits for that too).
+const CLOSING: &str = "Signing out…";
 
 /// Build a core client for `server`. Plain http is only allowed for loopback,
 /// or anywhere with the hidden dev opt-in `BROOK_ALLOW_INSECURE_HTTP=1`.
@@ -391,10 +393,10 @@ struct LoginUi {
     /// Bumped on every completed sign-in, so a late note from an older sign-out can
     /// tell that a newer sign-in happened meanwhile.
     signins: Rc<std::cell::Cell<u64>>,
-    /// A sign-out with "Remove this device's data" is still erasing: no sign-in until it's
-    /// done, since a new sign-in (another server's client) would open the same data directory
-    /// while it's being erased.
-    erasing: Rc<std::cell::Cell<bool>>,
+    /// A sign-out is still closing this device's data (erasing it, or closing its stores):
+    /// what the login view says meanwhile. No sign-in until it's done, since the next
+    /// sign-in's client would open the same data directory beside it.
+    closing: Rc<std::cell::Cell<Option<&'static str>>>,
 }
 
 /// Reactive UI: apply a client's observable auth state on the GTK main loop.
@@ -455,9 +457,9 @@ fn watch_auth_state(
                             "You were signed out. Please log in again."
                         });
                     }
-                    if ui.erasing.get() {
+                    if let Some(text) = ui.closing.get() {
                         login_button.set_sensitive(false);
-                        error_label.set_text(ERASING);
+                        error_label.set_text(text);
                     } else {
                         login_button.set_sensitive(true);
                     }
@@ -482,14 +484,16 @@ fn watch_auth_state(
                             let asked = ui.signed_out_by_user.clone();
                             let error_label = ui.error_label.clone();
                             let signins = ui.signins.clone();
-                            let (erasing, login_button) =
-                                (ui.erasing.clone(), ui.login_button.clone());
+                            let (closing, login_button) =
+                                (ui.closing.clone(), ui.login_button.clone());
+                            let current = current.clone();
                             move |remove_data: bool| {
                                 asked.set(true);
-                                erasing.set(remove_data);
+                                closing.set(Some(if remove_data { ERASING } else { CLOSING }));
                                 let at_sign_out = signins.get();
                                 let signins = signins.clone();
                                 let client = client.clone();
+                                let closed = client.clone();
                                 // Core ends the session at once and publishes
                                 // LoggedOut; the watcher above goes back to login.
                                 // "Remove this device's data" erases this user's
@@ -502,23 +506,39 @@ fn watch_auth_state(
                                     } else {
                                         client.logout().await;
                                     }
+                                    // Either way, this client's stores and index are closed
+                                    // before the next sign-in opens the same directory.
+                                    client.close_local_data().await;
                                     client.sign_out_complete()
                                 });
                                 let error_label = error_label.clone();
-                                let (erasing, login_button) =
-                                    (erasing.clone(), login_button.clone());
+                                let (closing, login_button) =
+                                    (closing.clone(), login_button.clone());
+                                let current = current.clone();
                                 glib::spawn_future_local(async move {
                                     // Both the keyring delete and its fallback failed:
                                     // the stored sign-in may still be usable here.
                                     // Only while no newer sign-in has completed.
                                     let forgot = done.await;
-                                    // The erase is over: signing in is possible again.
-                                    if erasing.replace(false) {
+                                    // Its local data is closed for good: the next sign-in
+                                    // gets a new client (which opens it again), even to the
+                                    // same server.
+                                    if let Some(current) = current.upgrade() {
+                                        let mut current = current.borrow_mut();
+                                        if current
+                                            .as_ref()
+                                            .is_some_and(|(_, c)| Arc::ptr_eq(c, &closed))
+                                        {
+                                            *current = None;
+                                        }
+                                    }
+                                    // Closed: signing in is possible again.
+                                    if let Some(text) = closing.replace(None) {
                                         if let Some(button) = login_button.upgrade() {
                                             button.set_sensitive(true);
                                         }
                                         if let Some(label) = error_label.upgrade() {
-                                            if label.text() == ERASING {
+                                            if label.text() == text {
                                                 label.set_text("");
                                             }
                                         }
