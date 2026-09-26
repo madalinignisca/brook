@@ -309,3 +309,53 @@ async fn an_old_outbox_that_cant_be_counted_is_a_loss() {
     let _s = local.open_user("https://a", "u1").await.unwrap();
     assert!(local.take_lost_unsent());
 }
+
+/// Other users are listed with how many messages their outbox holds unsent (#46 §8: the
+/// app names them before the wipe): counted when readable, `None` when not.
+#[tokio::test]
+async fn other_users_come_with_their_unsent_count() {
+    let root = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let local = open(root.path(), &slot).await;
+    for (user, states) in [
+        ("u1", vec!["pending", "failed", "accepted"]), // two not yet accepted
+        ("u2", vec![]),
+        ("u3", vec!["pending"]),
+    ] {
+        let s = local.open_user("https://a", user).await.unwrap();
+        ready(s.cache).close().await;
+        let outbox = ready(s.outbox);
+        let rows: Vec<String> = states.iter().map(|s| s.to_string()).collect();
+        let unreadable = user == "u3";
+        outbox
+            .call(move |c| {
+                for (n, state) in rows.iter().enumerate() {
+                    c.execute(
+                        "INSERT INTO outbox(client_id, channel_id, body, state, created_at)
+                         VALUES (?1, 'c', 'hi', ?2, 'now')",
+                        [format!("cid-{n}"), state.clone()],
+                    )?;
+                }
+                if unreadable {
+                    c.execute_batch("ALTER TABLE outbox RENAME TO elsewhere;")?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        outbox.close().await;
+    }
+    let s = local.open_user("https://a", "me").await.unwrap();
+    let mut others = local.others_with_unsent("https://a", "me").await.unwrap();
+    others.sort();
+    assert_eq!(
+        others,
+        vec![
+            ("https://a".to_string(), "u1".to_string(), Some(2)),
+            ("https://a".to_string(), "u2".to_string(), Some(0)),
+            ("https://a".to_string(), "u3".to_string(), None),
+        ]
+    );
+    ready(s.cache).close().await;
+    ready(s.outbox).close().await;
+}

@@ -17,6 +17,15 @@ use crate::offline::{Net, Offline};
 use crate::outbox::{Deleted, OutboxError, PendingMessage};
 use crate::{BrookClient, Channel, Error, KeySlot, Message, Result};
 
+/// Another user with data on this device, and how many messages their outbox holds
+/// unsent: `None` when that can't be read (say "may have included unsent messages").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtherLocalUser {
+    pub origin: String,
+    pub user_id: String,
+    pub unsent: Option<u64>,
+}
+
 /// A page of cached messages, newest first.
 #[derive(Debug, Clone)]
 pub struct CachedMessages {
@@ -225,14 +234,24 @@ impl BrookClient {
     }
 
     /// Other users with data on this device (#46 §8): after a different user signs in, the
-    /// app says so and then calls [`BrookClient::wipe_other_local_users`].
-    pub async fn other_local_users(&self) -> Result<Vec<(String, String)>> {
+    /// app names them, with their unsent messages, and then calls
+    /// [`BrookClient::wipe_other_local_users`].
+    pub async fn other_local_users(&self) -> Result<Vec<OtherLocalUser>> {
         let guard = self.offline.lock().await;
         let off = guard.as_ref().ok_or_else(unavailable)?;
         let (user, _) = self.who().await.ok_or_else(unavailable)?;
-        off.others(&self.origin(), &user)
+        let others = off
+            .others_with_unsent(&self.origin(), &user)
             .await
-            .map_err(|_| store_error())
+            .map_err(|_| store_error())?;
+        Ok(others
+            .into_iter()
+            .map(|(origin, user_id, unsent)| OtherLocalUser {
+                origin,
+                user_id,
+                unsent,
+            })
+            .collect())
     }
 
     /// Erase every other user's data on this device (everyone but whoever is signed in

@@ -84,7 +84,7 @@ pub use call_types::{
 };
 pub use chat::{Channel, ChannelMember, Message, ReactionSummary, ReplyExcerpt};
 pub use client::{BrookClient, LoginOutcome, RestoreOutcome, TotpChallenge};
-pub use client_offline::CachedMessages;
+pub use client_offline::{CachedMessages, OtherLocalUser};
 pub use config::CoreConfig;
 pub use error::{Error, Result};
 pub use files::{FileCacheState, FILE_CACHE_CAP};

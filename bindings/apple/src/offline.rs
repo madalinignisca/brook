@@ -373,6 +373,19 @@ impl From<Deleted> for FfiDeleted {
 pub struct FfiLocalUser {
     pub origin: String,
     pub user_id: String,
+    /// Messages their outbox holds unsent; nil when it can't be read (say "may have
+    /// included unsent messages").
+    pub unsent: Option<u64>,
+}
+
+impl From<brook_core::OtherLocalUser> for FfiLocalUser {
+    fn from(u: brook_core::OtherLocalUser) -> Self {
+        Self {
+            origin: u.origin,
+            user_id: u.user_id,
+            unsent: u.unsent,
+        }
+    }
 }
 
 /// A change notice: re-read what it names. Hints only; nothing depends on receiving one.
@@ -856,10 +869,7 @@ impl FfiBrookClient {
     pub async fn other_local_users(&self) -> Result<Vec<FfiLocalUser>, LoginError> {
         let inner = Arc::clone(&self.inner);
         let users = run(async move { inner.other_local_users().await }).await?;
-        Ok(users
-            .into_iter()
-            .map(|(origin, user_id)| FfiLocalUser { origin, user_id })
-            .collect())
+        Ok(users.into_iter().map(FfiLocalUser::from).collect())
     }
 
     /// Erase every other user's data on this device.
