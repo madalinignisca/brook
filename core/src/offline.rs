@@ -316,6 +316,7 @@ impl Offline {
         if let Some(a) = &mut self.active {
             a.session.send_replace(None);
             a.state_feed = None;
+            a.files.clear_open_copies(); // no plaintext copy outlives the session
         }
         self.state.reset();
     }

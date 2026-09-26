@@ -791,6 +791,17 @@ impl Downloader<'_> {
                             } else if etag.is_some_and(|e| e != validator) {
                                 return Err(integrity_error());
                             }
+                            // A continuation is trusted only with the file's own validator: a
+                            // 206 without it (a proxy that dropped the ETag and ignored
+                            // If-Range) may be other bytes, never appended to what's held.
+                            if status == StatusCode::PARTIAL_CONTENT
+                                && offset > 0
+                                && etag != Some(validator.as_str())
+                            {
+                                sink.restart().await.map_err(|e| io_error(&e))?;
+                                no_range = true;
+                                continue;
+                            }
                             if status == StatusCode::OK && offset > 0 {
                                 // If-Range didn't match (or no Range support): start over.
                                 sink.restart().await.map_err(|e| io_error(&e))?;
@@ -863,7 +874,18 @@ impl Downloader<'_> {
     ) -> std::result::Result<(), Streamed> {
         let mut stream = resp.bytes_stream();
         let mut last = Instant::now();
-        while let Some(chunk) = stream.next().await {
+        loop {
+            // A stalled body mustn't hold off a cancel or a pause (or a store closing).
+            let next = tokio::select! {
+                next = stream.next() => next,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if let Some(stop) = flags.stopped() {
+                        return Err(Streamed::Stopped(stop));
+                    }
+                    continue;
+                }
+            };
+            let Some(chunk) = next else { break };
             if let Some(stop) = flags.stopped() {
                 return Err(Streamed::Stopped(stop));
             }

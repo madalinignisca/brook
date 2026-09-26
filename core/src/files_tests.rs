@@ -528,6 +528,49 @@ async fn open_refuses_launchers_and_makes_a_private_copy() {
     assert!(!path.exists());
 }
 
+/// Open is an allowlist: a safe extension AND bytes of that kind. Everything else is Save
+/// only, including formats a denylist can't tell from documents by their bytes.
+#[test]
+fn open_allows_only_known_kinds_whose_bytes_match() {
+    use crate::files::openable;
+    let pdf = b"%PDF-1.7\n1 0 obj";
+    let zip = b"PK\x03\x04\x14\x00";
+    let ole = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1";
+    for (name, head) in [
+        ("report.pdf", pdf.as_slice()),
+        ("REPORT.PDF", pdf),
+        ("photo.jpg", b"\xff\xd8\xff\xe0"),
+        ("shot.png", b"\x89PNG\r\n\x1a\n...."),
+        ("notes.txt", b"shopping: milk, bread\n"),
+        ("readme.md", "# Titlu \u{0219}i text\n".as_bytes()),
+        ("plan.docx", zip),
+        ("sheet.ods", zip),
+        ("clip.mp4", b"\x00\x00\x00\x18ftypmp42"),
+        ("voice.ogg", b"OggS\x00\x02"),
+    ] {
+        assert!(openable(name, head), "{name} should open");
+    }
+    for (name, head) in [
+        ("app.jar", zip.as_slice()),      // a zip, like .docx: java -jar runs it
+        ("setup.msi", ole),               // OLE, like .doc: installs via Wine
+        ("old.doc", ole),                 // macros: Save only
+        ("macro.docm", zip),              // macro-enabled
+        ("page.html", b"<html><script>"), // script in a browser
+        ("logo.svg", b"<svg onload=x>"),  // script in a browser
+        ("app.flatpakref", b"[Flatpak Ref]"),
+        ("pkg.deb", b"!<arch>\n"),
+        ("pkg.rpm", b"\xed\xab\xee\xdb"),
+        ("report.pdf", zip),                     // the name lies about the bytes
+        ("notes.txt", b"<!DOCTYPE html><html>"), // markup posing as text
+        ("notes.txt", b"#!/bin/sh\nrm -rf ~"),   // a script posing as text
+        ("notes.txt", b"a\x00b"),                // binary posing as text
+        ("noextension", pdf),
+        ("archive.zip", zip),
+    ] {
+        assert!(!openable(name, head), "{name} must be Save only");
+    }
+}
+
 #[test]
 fn launchers_are_sniffed_from_their_bytes() {
     for head in [
@@ -603,4 +646,48 @@ async fn progress_arrives_under_the_callers_id() {
         }
     }
     assert_eq!(last, Some(TransferState::Done));
+}
+
+/// A journal entry for a file that has a row again (evicted, then cached anew) is stale:
+/// the sweep drops the entry and keeps the blob.
+#[tokio::test]
+async fn a_stale_journal_entry_never_unlinks_a_live_blob() {
+    let s = setup_with(&[(F1, bytes(MIB, 30), "a.bin")]).await;
+    s.files.cache_file(TransferId::new(), F1).await.unwrap();
+    // An entry left over from an earlier copy (an unlink that failed, say).
+    s.cache
+        .db()
+        .call(|c| {
+            c.execute(
+                "INSERT INTO deletions(path) VALUES (?1)",
+                [format!("files/{F1}")],
+            )
+        })
+        .await
+        .unwrap();
+    s.files.sweep_journal().await;
+    assert!(s.blob(F1).exists(), "a live blob was unlinked");
+    assert_eq!(s.files.state(F1).await.unwrap(), FileCacheState::Cached);
+    let dest = s._root.path().join("a.out");
+    assert_eq!(s.files.save_from_cache(F1, &dest).await.unwrap(), Some(()));
+}
+
+/// Markup anywhere in a `.txt` (GIO sniffs it as a subtype and opens a browser) is Save only.
+#[test]
+fn text_with_markup_anywhere_is_save_only() {
+    use crate::files::openable;
+    for head in [
+        "a few words first\n<html><script>alert(1)</script>".as_bytes(),
+        b"notes\n\n<svg onload=x>",
+        b"hi <!-- comment -->",
+        b"x <?xml version='1.0'?>",
+        b"closing </b> tag",
+    ] {
+        assert!(
+            !openable("notes.txt", head),
+            "{:?}",
+            String::from_utf8_lossy(head)
+        );
+    }
+    assert!(openable("notes.txt", b"a < b and 3<4, x <= y"));
 }
