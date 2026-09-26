@@ -12,6 +12,11 @@ pub struct ChannelMember {
     pub handle: String,
     /// Display name.
     pub display_name: String,
+    /// `owner` or `member` in this channel: who may remove others, and whether leaving
+    /// would take the last owner. None from a server before roles, or for a profile read
+    /// outside a channel (`cached_users`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// A channel or 1:1 DM the user belongs to.

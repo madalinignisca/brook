@@ -395,6 +395,11 @@ pub enum FfiServerEvent {
         call_id: Option<String>,
         participant_count: u32,
     },
+    /// A channel you're in changed (renamed, members joined or left, archived): replace
+    /// its row. Without local data this is the only way the list hears of it.
+    ChannelUpdate { channel: crate::types::FfiChannel },
+    /// You're no longer in this channel (it was deleted, you left, or you were removed).
+    ChannelDelete { channel_id: String },
 }
 
 #[uniffi::export(with_foreign)]

@@ -334,7 +334,7 @@ final class CacheFeedTests: XCTestCase {
     func testFeedEventsReachTheModelsTheyName() async {
         let chat = FakeChat()
         chat.local = true
-        chat.users = [FfiMember(id: "u", handle: "u", displayName: "Robert")]
+        chat.users = [FfiMember(id: "u", handle: "u", displayName: "Robert", role: nil)]
         let feed = CacheFeed(client: chat)
         let timeline = TimelineModel(channelId: "c", client: chat)
         timeline.merge([msg("m1", "hi")])
