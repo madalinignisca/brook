@@ -309,3 +309,80 @@ fn a_receipt_and_pending_files_keep_their_ids() {
         }]
     );
 }
+
+fn wire_message(extra: serde_json::Value) -> brook_core::Message {
+    let mut v = json!({
+        "id": "m1", "channel_id": "c", "author_id": "u1", "author_display_name": "Al",
+        "body": "hi", "created_at": "2026-09-26T10:00:00Z",
+    });
+    for (k, val) in extra.as_object().unwrap() {
+        v[k] = val.clone();
+    }
+    serde_json::from_value(v).unwrap()
+}
+
+#[test]
+fn a_message_keeps_its_edit_quote_and_files() {
+    let m = FfiMessage::from(wire_message(json!({
+        "edited_at": "2026-09-26T11:00:00Z",
+        "reply_to_id": "q",
+        "reply_to": { "id": "q", "author_display_name": "Bo", "body": "(deleted)",
+                      "deleted": true, "attachments": 0 },
+        "attachments": [{ "id": "f1", "channel_id": "c", "uploader_id": "u1",
+            "filename": "a.pdf", "original_name": "Ä.pdf", "size": 5,
+            "content_type": "application/pdf", "status": "committed", "sha256": "ab" }],
+    })));
+    assert_eq!(m.edited_at.as_deref(), Some("2026-09-26T11:00:00Z"));
+    assert_eq!(m.reply_to_id.as_deref(), Some("q"));
+    let q = m.reply_to.unwrap();
+    assert!(q.deleted);
+    assert_eq!(
+        (q.id.as_str(), q.author_display_name.as_deref()),
+        ("q", Some("Bo"))
+    );
+    assert_eq!(m.attachments.len(), 1);
+    let f = &m.attachments[0];
+    assert_eq!(
+        (f.filename.as_str(), f.original_name.as_str()),
+        ("a.pdf", "Ä.pdf")
+    );
+    assert_eq!((f.size, f.sha256.as_deref()), (5, Some("ab")));
+}
+
+#[test]
+fn a_tombstone_carries_no_files() {
+    let m = FfiMessage::from(wire_message(json!({
+        "deleted": true,
+        "attachments": [{ "id": "f1", "channel_id": "c", "uploader_id": "u1",
+            "filename": "a", "original_name": "a", "size": 1, "content_type": "x",
+            "status": "committed" }],
+    })));
+    assert!(m.deleted);
+    assert!(m.attachments.is_empty());
+}
+
+#[test]
+fn message_events_cross_and_others_are_skipped() {
+    use crate::call::FfiServerEvent;
+    use crate::client::map_event;
+    use brook_core::ServerEvent;
+    assert!(matches!(
+        map_event(ServerEvent::MessageNew(wire_message(json!({})))),
+        Some(FfiServerEvent::MessageNew { message }) if message.id == "m1"
+    ));
+    assert!(matches!(
+        map_event(ServerEvent::MessageUpdate(wire_message(json!({"body": "edited"})))),
+        Some(FfiServerEvent::MessageUpdate { message }) if message.body == "edited"
+    ));
+    assert_eq!(
+        map_event(ServerEvent::MessageDelete {
+            channel_id: "c".into(),
+            message_id: "m1".into()
+        }),
+        Some(FfiServerEvent::MessageDelete {
+            channel_id: "c".into(),
+            message_id: "m1".into()
+        })
+    );
+    assert_eq!(map_event(ServerEvent::Ready), Some(FfiServerEvent::Ready));
+}

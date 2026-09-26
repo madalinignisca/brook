@@ -18,7 +18,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$HERE/.itest.env"
 # Every integration suite that must run, with its test count. A suite that is skipped or
 # runs fewer tests fails the whole run.
-SUITES=("LoginIntegrationTests:2" "CallRoundTripTests:2" "LiveCallTests:1" "PasswordChangeIntegrationTests:3" "SignOutIntegrationTests:1" "TotpIntegrationTests:1")
+SUITES=("LoginIntegrationTests:2" "CallRoundTripTests:2" "LiveCallTests:1" "PasswordChangeIntegrationTests:3" "SignOutIntegrationTests:1" "TotpIntegrationTests:1" "ChatIntegrationTests:1")
 
 [[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE (see header of $0)" >&2; exit 1; }
 # `stat -f '%Lp'` is the BSD/macOS form (GNU stat uses `-c '%a'`); this script runs on the Mac.

@@ -378,6 +378,17 @@ pub trait CallStateListener: Send + Sync {
 pub enum FfiServerEvent {
     /// The socket authenticated; calls can be joined.
     Ready,
+    /// A message arrived.
+    MessageNew { message: crate::offline::FfiMessage },
+    /// A message was edited, or one of its files deleted: replace it whole.
+    MessageUpdate { message: crate::offline::FfiMessage },
+    /// A message was deleted: show it as deleted.
+    MessageDelete {
+        channel_id: String,
+        message_id: String,
+    },
+    /// Events were missed (a slow listener): reload what's shown.
+    Resync,
     /// A call started, changed size, or ended (`call_id` none) in a channel.
     ChannelCall {
         channel_id: String,
