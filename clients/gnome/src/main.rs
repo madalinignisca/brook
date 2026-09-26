@@ -14,6 +14,7 @@ mod attachments;
 mod call;
 mod chat;
 mod keyring;
+mod outgoing;
 mod prefs;
 mod totp;
 mod totp_ui;
