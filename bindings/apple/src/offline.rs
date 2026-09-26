@@ -419,6 +419,14 @@ pub enum FfiFileCacheState {
     },
     /// Complete: opens and saves with no connection.
     Cached,
+    /// Kept available offline: never evicted, downloaded whenever there's a connection.
+    /// `transfer` is the background download's id while it runs (its progress and cancel).
+    Pinned {
+        cached: bool,
+        done: u64,
+        size: u64,
+        transfer: Option<u64>,
+    },
 }
 
 impl From<brook_core::FileCacheState> for FfiFileCacheState {
@@ -427,6 +435,17 @@ impl From<brook_core::FileCacheState> for FfiFileCacheState {
             brook_core::FileCacheState::NotCached => Self::NotCached,
             brook_core::FileCacheState::Partial { done, size } => Self::Partial { done, size },
             brook_core::FileCacheState::Cached => Self::Cached,
+            brook_core::FileCacheState::Pinned {
+                cached,
+                done,
+                size,
+                transfer,
+            } => Self::Pinned {
+                cached,
+                done,
+                size,
+                transfer: transfer.map(|t| t.0),
+            },
         }
     }
 }

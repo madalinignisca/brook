@@ -402,4 +402,32 @@ fn file_cache_states_cross_with_their_progress() {
         FfiFileCacheState::from(S::Cached),
         FfiFileCacheState::Cached
     );
+    assert_eq!(
+        FfiFileCacheState::from(S::Pinned {
+            cached: false,
+            done: 3,
+            size: 7,
+            transfer: Some(brook_core::TransferId(9)),
+        }),
+        FfiFileCacheState::Pinned {
+            cached: false,
+            done: 3,
+            size: 7,
+            transfer: Some(9),
+        }
+    );
+    assert_eq!(
+        FfiFileCacheState::from(S::Pinned {
+            cached: true,
+            done: 7,
+            size: 7,
+            transfer: None,
+        }),
+        FfiFileCacheState::Pinned {
+            cached: true,
+            done: 7,
+            size: 7,
+            transfer: None,
+        }
+    );
 }
