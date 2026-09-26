@@ -23,6 +23,9 @@ qrcode = { version = "0.14", default-features = false }
 # Staying signed in (#58): the session and store keys in the desktop keyring (Secret
 # Service over D-Bus). Same ashpd/zbus majors as gst-media, so no duplicates.
 oo7 = { version = "0.6", default-features = false, features = ["tokio", "native_crypto"] }
+# Inline image previews (#66): decoded only in glycin's sandbox (bubblewrap, or
+# flatpak-spawn --sandbox). Pixels are taken raw, so its gtk-rs generation doesn't matter.
+glycin = { version = "3.1", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 # Scans the rendered QR code back in tests.

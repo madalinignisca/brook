@@ -16,6 +16,7 @@ mod chat;
 mod keyring;
 mod outgoing;
 mod prefs;
+mod preview;
 mod totp;
 mod totp_ui;
 
