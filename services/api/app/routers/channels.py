@@ -731,9 +731,31 @@ async def edit_message(
     # Edits don't re-resolve/re-notify mentions (mentions fire on the original send).
     files = await _attachments_for(session, [message_id])
     out = _message_out(message, user, reply, reactions, attachments=files.get(message_id))
-    member_ids = [m.id for m in await _members(session, channel_id)]
-    await hub.send_to_users(member_ids, _envelope("message.update", jsonable_encoder(out)))
+    await broadcast_message_update(session, hub, message_id)  # each member's own `me`
     return out
+
+
+async def broadcast_message_update(session: AsyncSession, hub: Hub, message_id: uuid.UUID) -> None:
+    """Fan out a message's current state as `message.update`, one frame per member.
+
+    Per member because a frame carries reactions with `me` (did *you* react), and caches
+    store the row whole: one frame for all would give every member the actor's `me`,
+    and since it carries the latest seq, no later sync would correct it. Call after the
+    change is committed, so the frames carry the seq the sync hook stamped."""
+    message = await session.get(Message, message_id, populate_existing=True)
+    if message is None or message.deleted_at is not None:
+        return  # a tombstone has its own event, message.delete
+    author = await session.get(User, message.author_id) if message.author_id else None
+    reply = None
+    if message.reply_to_id is not None:
+        quoted = await session.get(Message, message.reply_to_id)
+        if quoted is not None:
+            reply = await _quote(session, quoted)
+    files = (await _attachments_for(session, [message_id])).get(message_id)
+    for member in await _members(session, message.channel_id):
+        reactions = (await _reactions_for(session, [message_id], member.id)).get(message_id, [])
+        out = _message_out(message, author, reply, reactions, attachments=files)
+        await hub.send_to_users([member.id], _envelope("message.update", jsonable_encoder(out)))
 
 
 @router.delete("/{channel_id}/messages/{message_id}", status_code=status.HTTP_204_NO_CONTENT)
