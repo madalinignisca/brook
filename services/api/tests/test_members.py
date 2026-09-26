@@ -318,3 +318,18 @@ async def test_a_bad_request_is_a_clean_422_that_echoes_nothing(client: httpx.As
     r = await client.post(f"{AUTH}/register", json=body, headers=h)
     assert r.status_code == 422
     assert "input" not in r.text and '"sh"' not in r.text
+
+
+async def test_members_carry_their_role_everywhere_a_channel_is_listed(
+    client: httpx.AsyncClient,
+) -> None:
+    # Clients offer "Remove" to owners and warn before the last owner leaves: they need
+    # to know who owns the channel, from the channel list and from /sync alike.
+    t = await _team(client)
+    listed = (await client.get("/api/v1/channels", headers=t["hc"])).json()
+    (channel,) = [c for c in listed if c["id"] == t["ch"]]
+    roles = {m["handle"]: m["role"] for m in channel["members"]}
+    assert roles == {"bob": "owner", "carol": "member", "dave": "member"}
+    synced = (await client.get("/api/v1/sync", params={"since": "0"}, headers=t["hc"])).json()
+    (channel,) = [c for c in synced["channels"] if c["id"] == t["ch"]]
+    assert {m["handle"]: m["role"] for m in channel["members"]} == roles

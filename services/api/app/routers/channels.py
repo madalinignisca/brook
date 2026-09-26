@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Annotated, Any
 
@@ -28,6 +29,7 @@ from ..hub import Hub, get_hub
 from ..models import Channel, File, Membership, Message, Reaction, User, utcnow
 from ..schemas import (
     ChannelCreate,
+    ChannelMember,
     ChannelOut,
     ChannelPatch,
     FileOut,
@@ -110,7 +112,13 @@ async def _members(session: AsyncSession, channel_id: uuid.UUID) -> list[User]:
     return list((await session.scalars(stmt)).all())
 
 
-def _channel_out(channel: Channel, members: list[User], unread_count: int = 0) -> ChannelOut:
+def _channel_out(
+    channel: Channel,
+    members: list[User],
+    unread_count: int = 0,
+    roles: Mapping[uuid.UUID, str] | None = None,
+) -> ChannelOut:
+    roles = roles or {}
     return ChannelOut(
         id=channel.id,
         kind=channel.kind,
@@ -118,11 +126,33 @@ def _channel_out(channel: Channel, members: list[User], unread_count: int = 0) -
         topic=channel.topic,
         created_by=channel.created_by,
         created_at=channel.created_at,
-        members=[UserSummary.model_validate(m) for m in members],
+        members=[
+            ChannelMember(
+                **UserSummary.model_validate(m).model_dump(), role=roles.get(m.id, "member")
+            )
+            for m in members
+        ],
         unread_count=unread_count,
         public=channel.public,
         archived=channel.archived_at is not None,
         seq=channel.seq,
+    )
+
+
+async def _channel_out_for(
+    session: AsyncSession, channel: Channel, unread_count: int = 0
+) -> ChannelOut:
+    """A channel with its members and their roles, loaded together."""
+    rows = (
+        await session.execute(
+            select(User, Membership.role)
+            .join(Membership, Membership.user_id == User.id)
+            .where(Membership.channel_id == channel.id)
+            .order_by(User.handle)
+        )
+    ).all()
+    return _channel_out(
+        channel, [u for u, _ in rows], unread_count, roles={u.id: role for u, role in rows}
     )
 
 
@@ -210,7 +240,7 @@ async def list_channels(user: CurrentUser, session: Session) -> list[ChannelOut]
         ).all()
     )
     unread = await _unread_counts(session, user.id)
-    return [_channel_out(c, await _members(session, c.id), unread.get(c.id, 0)) for c in channels]
+    return [await _channel_out_for(session, c, unread.get(c.id, 0)) for c in channels]
 
 
 @router.get("/public", response_model=list[ChannelOut])
@@ -231,7 +261,7 @@ async def list_public_channels(user: CurrentUser, session: Session) -> list[Chan
             )
         ).all()
     )
-    return [_channel_out(c, await _members(session, c.id)) for c in channels]
+    return [await _channel_out_for(session, c) for c in channels]
 
 
 @router.get("/search", response_model=list[MessageOut])
@@ -292,7 +322,7 @@ async def create_channel(
         session.add(Membership(channel_id=channel.id, user_id=user.id, role="owner"))
         await session.commit()
         await session.refresh(channel)
-        return _channel_out(channel, await _members(session, channel.id))
+        return await _channel_out_for(session, channel)
 
     # kind == "dm"
     if not body.member:
@@ -311,7 +341,7 @@ async def create_channel(
         .where(Channel.id.in_(select(Membership.channel_id).where(Membership.user_id == other.id)))
     )
     if existing is not None:
-        return _channel_out(existing, await _members(session, existing.id))
+        return await _channel_out_for(session, existing)
 
     channel = Channel(kind="dm", created_by=user.id)
     session.add(channel)
@@ -326,7 +356,7 @@ async def create_channel(
     await session.refresh(channel)
     # Notify the other member so their client shows the new DM live.
     await _emit_channel_update(hub, session, channel)
-    return _channel_out(channel, await _members(session, channel.id))
+    return await _channel_out_for(session, channel)
 
 
 @router.post("/{channel_id}/members", status_code=status.HTTP_204_NO_CONTENT)
@@ -455,9 +485,8 @@ async def update_channel(
     await session.commit()
     await session.refresh(channel)
 
-    members = await _members(session, channel_id)
     await _emit_channel_update(hub, session, channel)
-    return _channel_out(channel, members)
+    return await _channel_out_for(session, channel)
 
 
 @router.delete("/{channel_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -507,15 +536,14 @@ async def join_channel(
         )
         await session.commit()
         await _emit_channel_update(hub, session, channel)
-    return _channel_out(channel, await _members(session, channel_id))
+    return await _channel_out_for(session, channel)
 
 
 async def _emit_channel_update(hub: Hub, session: AsyncSession, channel: Channel) -> None:
     """Broadcast a `channel.update` to a channel's members (membership/metadata changed)."""
     await session.refresh(channel)  # the seq a membership change just stamped on it
-    members = await _members(session, channel.id)
-    out = _channel_out(channel, members)
-    member_ids = [m.id for m in members]
+    out = await _channel_out_for(session, channel)
+    member_ids = [m.id for m in out.members]
     await hub.send_to_users(member_ids, _envelope("channel.update", jsonable_encoder(out)))
 
 

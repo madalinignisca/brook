@@ -285,17 +285,19 @@ async def _channels_out(session: AsyncSession, channels: list[Channel]) -> list[
     if not channels:
         return []
     ids = [c.id for c in channels]
-    pairs = (
+    rows = (
         await session.execute(
-            select(Membership.channel_id, User)
+            select(Membership.channel_id, User, Membership.role)
             .join(User, User.id == Membership.user_id)
             .where(Membership.channel_id.in_(ids))
         )
     ).all()
     members: dict[uuid.UUID, list[User]] = {}
-    for channel_id, member in pairs:
+    roles: dict[uuid.UUID, dict[uuid.UUID, str]] = {}
+    for channel_id, member, role in rows:
         members.setdefault(channel_id, []).append(member)
-    return [_channel_out(c, members.get(c.id, [])) for c in channels]
+        roles.setdefault(channel_id, {})[member.id] = role
+    return [_channel_out(c, members.get(c.id, []), roles=roles.get(c.id)) for c in channels]
 
 
 async def _messages_out(

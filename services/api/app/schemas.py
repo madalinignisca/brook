@@ -199,6 +199,13 @@ class ChannelCreate(BaseModel):
     public: bool = False
 
 
+class ChannelMember(UserSummary):
+    """A member as a channel lists them: who they are, and whether they own it (an owner
+    may remove members; the last owner can't leave, so clients warn before trying)."""
+
+    role: str = "member"
+
+
 class ChannelOut(BaseModel):
     """A channel/DM the caller belongs to, with its members."""
 
@@ -208,7 +215,7 @@ class ChannelOut(BaseModel):
     topic: str | None
     created_by: uuid.UUID | None
     created_at: datetime
-    members: list[UserSummary]
+    members: list[ChannelMember]
     unread_count: int = 0
     public: bool = False
     archived: bool = False
