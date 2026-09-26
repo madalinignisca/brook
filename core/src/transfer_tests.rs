@@ -968,3 +968,44 @@ fn reqwest_has_no_content_decoders() {
     }
     assert!(line.contains("default-features = false"), "{line}");
 }
+
+/// A 206 to a resume without the file's ETag (a proxy that dropped it and ignored If-Range)
+/// may be other bytes: never appended, the download starts over.
+#[tokio::test]
+async fn a_resume_without_the_etag_starts_over() {
+    let server = MockServer::start().await;
+    let client = signed_in(&server).await;
+    let digest = sha(BYTES);
+    let anonymous = ResponseTemplate::new(206)
+        .insert_header(
+            "content-range",
+            format!("bytes 6-{}/{}", BYTES.len() - 1, BYTES.len()).as_str(),
+        )
+        .set_body_bytes(&BYTES[6..]);
+    let plain = ResponseTemplate::new(200)
+        .insert_header("etag", format!("\"{digest}\"").as_str())
+        .set_body_bytes(BYTES);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/files/f1/content"))
+        .respond_with(Sequence(Mutex::new(vec![anonymous, plain])))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let restarts = Arc::new(Mutex::new(0));
+    let mut sink = MemSink {
+        held: BYTES[..6].to_vec(),
+        restarts: restarts.clone(),
+    };
+    client
+        .download_file(
+            TransferId::new(),
+            "f1",
+            &digest,
+            BYTES.len() as u64,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sink.held, BYTES);
+    assert_eq!(*restarts.lock().unwrap(), 1);
+}

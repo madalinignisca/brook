@@ -155,6 +155,9 @@ pub(crate) struct Files {
     closed: AtomicBool,
     /// `FILE_CACHE_CAP`, lowered by tests.
     cap: std::sync::atomic::AtomicU64,
+    /// Held by the journal sweep and by whoever makes a row and opens its blob: a sweep never
+    /// unlinks a blob that a new download of the same file has just opened.
+    blob_lock: tokio::sync::Mutex<()>,
 }
 
 impl Files {
@@ -182,6 +185,7 @@ impl Files {
             blobs,
             open_dir,
             cap: std::sync::atomic::AtomicU64::new(FILE_CACHE_CAP),
+            blob_lock: tokio::sync::Mutex::new(()),
             net,
             transfers,
             session,
@@ -211,9 +215,12 @@ impl Files {
     /// partial kept), so nothing writes into the store once this returns. Called before the
     /// cache and the outbox close, and so before any wipe erases the store.
     pub(crate) async fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-        for flight in lock(&self.flights).values() {
-            flight.flags.cancel.store(true, Ordering::SeqCst);
+        {
+            let flights = lock(&self.flights);
+            self.closed.store(true, Ordering::SeqCst);
+            for flight in flights.values() {
+                flight.flags.cancel.store(true, Ordering::SeqCst);
+            }
         }
         let sweeper = lock(&self.sweeper).take();
         if let Some(sweeper) = sweeper {
@@ -264,8 +271,25 @@ impl Files {
         }
         let caller = Arc::new(Flags::default());
         self.transfers.register(&[id], &caller);
-        let flight = self.join_or_start(file_id, &info, id, &caller);
-        let result = self.wait(&flight, id, &caller).await;
+        let mut result = Err(api_error("transfer.cancelled"));
+        for _ in 0..3 {
+            let flight = match self.join_or_start(file_id, &info, id, &caller) {
+                Ok(f) => f,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            result = self.wait(&flight, id, &caller).await;
+            // It met a download that was stopping (every earlier caller cancelled): this
+            // caller didn't, so it starts a new one once that ends.
+            let stopped_for_others = matches!(&result, Err(Error::Api { code, .. }) if code == "transfer.cancelled")
+                && !caller.cancel.load(Ordering::SeqCst)
+                && !self.closed.load(Ordering::SeqCst);
+            if !stopped_for_others {
+                break;
+            }
+        }
         self.transfers.unregister(&[id]);
         let state = match &result {
             Ok(()) => TransferState::Done,
@@ -308,12 +332,14 @@ impl Files {
         let mut head = vec![0u8; SNIFF];
         let n = read_up_to(&mut reader, &mut head).await?;
         head.truncate(n);
-        if !openable(&info.filename, &head) {
+        // Judged on the very name the copy gets.
+        let leaf = safe_leaf(&info.filename);
+        if !openable(&leaf, &head) {
             return Err(api_error("file.open_refused"));
         }
         let dir = open_dir.join(random_hex());
         create_private_dir(&dir).map_err(|e| io_err(&e))?;
-        let path = dir.join(safe_leaf(&info.filename));
+        let path = dir.join(&leaf);
         let written = async {
             let mut out = private_file(&path).await?;
             out.write_all(&head).await?;
@@ -333,7 +359,9 @@ impl Files {
 
     /// Save `file_id` to `destination`: decrypted from the cache when it's complete there
     /// (so it works offline), else `None` (the caller downloads it straight there, as
-    /// before: Save isn't Open, it doesn't cache).
+    /// before: Save isn't Open, it doesn't cache). `destination` is truncated first and removed
+    /// on failure: to replace a file, pass a temporary path and rename it over the file
+    /// afterwards (GTK's `.brook-part`, the Mac's `replaceItemAt`).
     pub(crate) async fn save_from_cache(
         &self,
         file_id: &str,
@@ -425,11 +453,19 @@ impl Files {
         info: &FileInfo,
         caller_id: TransferId,
         caller: &Arc<Flags>,
-    ) -> Arc<Flight> {
+    ) -> crate::Result<Arc<Flight>> {
         let mut flights = lock(&self.flights);
+        // Under the same lock `close` sets `closed` with: no download starts once close has
+        // begun, so every one it must join is already in `tasks`.
+        self.check_open()?;
         if let Some(flight) = flights.get(file_id) {
+            // One that's stopping (every caller cancelled) isn't joined: the caller waits
+            // it out and starts again (see `cache_file`).
+            if flight.flags.cancel.load(Ordering::SeqCst) {
+                return Ok(flight.clone());
+            }
             lock(&flight.callers).insert(caller_id, caller.clone());
-            return flight.clone();
+            return Ok(flight.clone());
         }
         let (done, _) = watch::channel(None);
         let flight = Arc::new(Flight {
@@ -452,7 +488,7 @@ impl Files {
                 .send_replace(Some(result.map_err(|e| Failure::of(&e))));
         });
         lock(&self.tasks).push(task);
-        flight
+        Ok(flight)
     }
 
     /// Wait for a shared download as one caller: its own cancel detaches it, and the
@@ -618,13 +654,25 @@ impl Files {
 
     /// Unlink the journalled blobs, then forget them (NotFound counts as done).
     pub(crate) async fn sweep_journal(&self) {
+        let _blobs = self.blob_lock.lock().await;
+        // A path whose file has a row again (evicted, then downloaded anew) is live: its entry
+        // is stale and goes, the blob stays.
         let Ok(paths) = self
             .cache
             .db()
             .call(|c| {
-                c.prepare("SELECT path FROM deletions")?
+                let tx = c.transaction()?;
+                tx.execute(
+                    "DELETE FROM deletions WHERE EXISTS
+                         (SELECT 1 FROM files WHERE 'files/' || files.file_id = deletions.path)",
+                    [],
+                )?;
+                let paths = tx
+                    .prepare("SELECT path FROM deletions")?
                     .query_map([], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<String>>>()
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                tx.commit()?;
+                Ok(paths)
             })
             .await
         else {
@@ -892,6 +940,9 @@ impl EncryptingSink {
     ) -> crate::Result<Self> {
         let id = snapshot::id_bytes(file_id).ok_or_else(|| api_error("file.unknown"))?;
         let chunk = CHUNK;
+        // No sweep runs between making the row and opening the blob (see `blob_lock`).
+        let holder = files.clone();
+        let _blob_guard = holder.blob_lock.lock().await;
         let existing = files.row(file_id).await?;
         let (key, chunk, done) = match existing {
             Some(r) if r.size == size && r.sha256 == sha256 && r.state == "partial" => {
@@ -904,12 +955,17 @@ impl EncryptingSink {
                     .cache
                     .db()
                     .call(move |c| {
-                        c.execute(
+                        let tx = c.transaction()?;
+                        // A journal entry left for this path by an earlier copy is stale now.
+                        tx.execute("DELETE FROM deletions WHERE path = 'files/' || ?1", [&fid])?;
+                        let made = tx.execute(
                             "INSERT OR REPLACE INTO files(file_id, sha256, size, key, chunk, state, done)
                              SELECT ?1, ?2, ?3, ?4, ?5, 'partial', 0
                              WHERE EXISTS (SELECT 1 FROM message_files WHERE file_id = ?1)",
                             params![fid, sha, size as i64, k, chunk as i64],
-                        )
+                        )?;
+                        tx.commit()?;
+                        Ok(made)
                     })
                     .await
                     .map_err(store_failed)?;
@@ -1203,22 +1259,13 @@ fn is_plain_text(head: &[u8]) -> bool {
         }
         Err(_) => return false,
     };
-    let start = text
-        .trim_start_matches('\u{feff}')
-        .trim_start()
-        .to_ascii_lowercase();
-    ![
-        "<!doctype",
-        "<html",
-        "<svg",
-        "<?xml",
-        "<script",
-        "<head",
-        "<body",
-        "<iframe",
-    ]
-    .iter()
-    .any(|tag| start.starts_with(tag))
+    // GIO prefers a sniffed subtype of the name's type (text/html and SVG under
+    // text/plain), and its rules match tags anywhere in the first bytes: refuse any
+    // tag-like `<` at all, not only at the start.
+    !text
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0] == b'<' && (w[1].is_ascii_alphabetic() || matches!(w[1], b'!' | b'?' | b'/')))
 }
 
 /// Open may hand this file to the system: its extension is on the list, its bytes are

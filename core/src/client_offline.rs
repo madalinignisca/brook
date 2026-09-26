@@ -434,6 +434,8 @@ impl BrookClient {
     /// ([`BrookClient::transfer_events`], [`BrookClient::cancel_transfer`]). The file is found
     /// in the cached messages: `file.unknown` if none lists it, `file.gone` if the server
     /// deleted it (it's dropped from the cache), `local.unavailable` without local data.
+    /// `transfer.paused`: the session ended (signed out, or another user); call again once
+    /// signed in, and it resumes.
     pub async fn cache_file(&self, id: crate::TransferId, file_id: &str) -> Result<()> {
         self.active_files().await?.cache_file(id, file_id).await
     }

@@ -647,3 +647,47 @@ async fn progress_arrives_under_the_callers_id() {
     }
     assert_eq!(last, Some(TransferState::Done));
 }
+
+/// A journal entry for a file that has a row again (evicted, then cached anew) is stale:
+/// the sweep drops the entry and keeps the blob.
+#[tokio::test]
+async fn a_stale_journal_entry_never_unlinks_a_live_blob() {
+    let s = setup_with(&[(F1, bytes(MIB, 30), "a.bin")]).await;
+    s.files.cache_file(TransferId::new(), F1).await.unwrap();
+    // An entry left over from an earlier copy (an unlink that failed, say).
+    s.cache
+        .db()
+        .call(|c| {
+            c.execute(
+                "INSERT INTO deletions(path) VALUES (?1)",
+                [format!("files/{F1}")],
+            )
+        })
+        .await
+        .unwrap();
+    s.files.sweep_journal().await;
+    assert!(s.blob(F1).exists(), "a live blob was unlinked");
+    assert_eq!(s.files.state(F1).await.unwrap(), FileCacheState::Cached);
+    let dest = s._root.path().join("a.out");
+    assert_eq!(s.files.save_from_cache(F1, &dest).await.unwrap(), Some(()));
+}
+
+/// Markup anywhere in a `.txt` (GIO sniffs it as a subtype and opens a browser) is Save only.
+#[test]
+fn text_with_markup_anywhere_is_save_only() {
+    use crate::files::openable;
+    for head in [
+        "a few words first\n<html><script>alert(1)</script>".as_bytes(),
+        b"notes\n\n<svg onload=x>",
+        b"hi <!-- comment -->",
+        b"x <?xml version='1.0'?>",
+        b"closing </b> tag",
+    ] {
+        assert!(
+            !openable("notes.txt", head),
+            "{:?}",
+            String::from_utf8_lossy(head)
+        );
+    }
+    assert!(openable("notes.txt", b"a < b and 3<4, x <= y"));
+}
