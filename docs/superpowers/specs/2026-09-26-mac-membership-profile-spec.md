@@ -26,8 +26,8 @@ auth, storage or the wire.
      through the server's `channel.delete` (item 1). The model doesn't
      remove it a second time.
    - Errors, as text in the confirmation:
-     - `channel.last_owner`: "You're its last owner. Delete the channel instead, or make
-       someone else an owner first";
+     - `channel.last_owner`: "You're its last owner. Delete the channel instead." (No route
+       makes someone else an owner, so the text doesn't suggest one.)
      - `authz.forbidden`: "You can't leave this channel";
      - `not_found`: nothing is shown, since you're already out;
      - otherwise the generic text.

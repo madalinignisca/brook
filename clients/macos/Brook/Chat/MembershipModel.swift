@@ -46,7 +46,7 @@ struct ChannelPowers {
 @MainActor
 @Observable
 final class LeaveModel {
-    static let lastOwner = "You're its last owner. Delete the channel instead, or make someone else an owner first."
+    static let lastOwner = "You're its last owner. Delete the channel instead."
 
     let channelId: String
     let title: String
