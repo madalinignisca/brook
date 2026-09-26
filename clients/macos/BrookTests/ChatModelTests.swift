@@ -142,6 +142,22 @@ final class ComposerModelTests: XCTestCase {
         await c.send()
         XCTAssertEqual(chat.sent.withLock { $0 }, ["edit:m1:new"])
     }
+
+    func testAnEditMayClearAFileMessagesCaptionButNotATextOnly() async {
+        let chat = FakeChat()
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.edit(msg("m1", "just text"))
+        c.text = "  "
+        XCTAssertFalse(c.canSend)
+        var withFile = msg("m2", "caption")
+        withFile.attachments = [FfiFileInfo(id: "f", filename: "a.png", originalName: "a.png",
+                                            size: 1, contentType: "image/png", sha256: "ab")]
+        c.edit(withFile)
+        c.text = ""
+        XCTAssertTrue(c.canSend)
+        await c.send()
+        XCTAssertEqual(chat.sent.withLock { $0 }, ["edit:m2:"])
+    }
 }
 
 @MainActor

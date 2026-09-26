@@ -139,8 +139,12 @@ final class ComposerModel {
         editing = nil
     }
 
+    /// A message needs text or files (#126), so an edit may clear the caption of a message
+    /// that has files, but not empty a text-only one.
     var canSend: Bool {
-        !sending && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard !sending else { return false }
+        let empty = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return !empty || editing?.attachments.isEmpty == false
     }
 
     /// Sends (or saves an edit). The box clears at once; on failure the text and the reply
