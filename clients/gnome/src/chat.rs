@@ -709,8 +709,8 @@ fn apply_channel_chrome(chat: &Rc<Chat>, channel_id: &str) {
     } else {
         "Channel"
     });
-    chat.channel_settings
-        .set_visible(!is_dm && *chat.is_admin.borrow());
+    // Every member of a channel may leave it; DMs can't be left.
+    chat.channel_settings.set_visible(!is_dm);
     // While files are being copied the composer waits (a reload mustn't unlock it).
     let open = !archived && !chat.preparing.get();
     chat.composer.set_sensitive(open);
@@ -1702,6 +1702,19 @@ fn main_menu_popover(chat: &Rc<Chat>) -> gtk::Popover {
         .label("Sign Out")
         .has_frame(false)
         .build();
+    let edit_profile = gtk::Button::builder()
+        .label("Edit Profile…")
+        .has_frame(false)
+        .build();
+    edit_profile.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        move |_| {
+            popover.popdown();
+            edit_profile_dialog(&chat);
+        }
+    });
+    menu.append(&edit_profile);
     menu.append(&change_password);
     menu.append(&two_factor);
     menu.append(&sign_out);
@@ -1768,11 +1781,41 @@ fn channel_settings_popover(chat: &Rc<Chat>) -> gtk::Popover {
         .has_frame(false)
         .css_classes(["error"])
         .build();
-    menu.append(&rename);
-    menu.append(&archive);
-    menu.append(&unarchive);
-    menu.append(&delete);
+    let members = gtk::Button::builder()
+        .label("Members…")
+        .has_frame(false)
+        .build();
+    let leave = gtk::Button::builder()
+        .label("Leave channel")
+        .has_frame(false)
+        .css_classes(["error"])
+        .build();
+    menu.append(&members);
+    // Renaming, archiving and deleting are for admins; everyone can see who's in and leave.
+    if *chat.is_admin.borrow() {
+        menu.append(&rename);
+        menu.append(&archive);
+        menu.append(&unarchive);
+        menu.append(&delete);
+    }
+    menu.append(&leave);
     popover.set_child(Some(&menu));
+    members.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        move |_| {
+            popover.popdown();
+            members_dialog(&chat);
+        }
+    });
+    leave.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        move |_| {
+            popover.popdown();
+            leave_channel_confirm(&chat);
+        }
+    });
 
     rename.connect_clicked({
         let chat = chat.clone();
@@ -1807,6 +1850,327 @@ fn channel_settings_popover(chat: &Rc<Chat>) -> gtk::Popover {
         }
     });
     popover
+}
+
+/// Why leaving, removing or a profile change was refused, briefly.
+fn membership_error_text(err: &brook_core::Error) -> String {
+    match err {
+        brook_core::Error::Api { code, .. } => match code.as_str() {
+            "channel.last_owner" => {
+                "The last owner can't leave. Delete the channel instead.".into()
+            }
+            "channel.dm" => "A direct message can't be left.".into(),
+            "authz.forbidden" => "Only an admin or the channel's owner can do that.".into(),
+            "not_found" => "That member isn't in this channel any more.".into(),
+            "profile.invalid" => {
+                "That name or status can't be used (it's empty, too long, or has invisible characters)."
+                    .into()
+            }
+            _ => "That didn't work. Try again.".into(),
+        },
+        brook_core::Error::NotAuthenticated => "You were signed out.".into(),
+        _ => "Couldn't reach the server.".into(),
+    }
+}
+
+fn show_alert(chat: &Rc<Chat>, heading: &str, body: &str) {
+    let alert = adw::AlertDialog::new(Some(heading), Some(body));
+    alert.add_response("ok", "OK");
+    alert.present(Some(&chat.message_list));
+}
+
+/// Whether a profile edit is within the server's lengths (#183): a display name of 1 to 64
+/// characters and a status line of at most 100, both trimmed. (Which characters are allowed
+/// is the server's to judge; it says so if one isn't.)
+fn profile_fits(name: &str, status: &str) -> bool {
+    let n = name.trim().chars().count();
+    (1..=64).contains(&n) && status.trim().chars().count() <= 100
+}
+
+/// Whether a viewer is offered Remove on a member, as the server allows it (#183): never
+/// themselves (that's Leave); a global admin removes anyone; a channel owner removes members
+/// but not other owners.
+fn may_remove(admin: bool, my_role: Option<&str>, their_role: Option<&str>, is_me: bool) -> bool {
+    if is_me {
+        return false;
+    }
+    admin || (my_role == Some("owner") && their_role != Some("owner"))
+}
+
+/// "Leave channel": confirm, then leave. The server's `channel.delete` to us closes it.
+fn leave_channel_confirm(chat: &Rc<Chat>) {
+    let Some(channel_id) = chat.current.borrow().clone() else {
+        return;
+    };
+    let me = chat.me.borrow().clone().unwrap_or_default();
+    // The last owner can't leave (the server refuses): say so before asking.
+    let owners: Vec<String> = chat
+        .channels
+        .borrow()
+        .iter()
+        .find(|c| c.id == channel_id)
+        .map(|c| {
+            c.members
+                .iter()
+                .filter(|m| m.role.as_deref() == Some("owner"))
+                .map(|m| m.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if owners.len() == 1 && owners[0] == me {
+        show_alert(
+            chat,
+            "You're the Last Owner",
+            "The last owner can't leave. Delete the channel instead.",
+        );
+        return;
+    }
+    let title = chat
+        .channels
+        .borrow()
+        .iter()
+        .find(|c| c.id == channel_id)
+        .map(|c| c.title(&me))
+        .unwrap_or_default();
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("Leave {title}?")),
+        Some("You'll stop getting its messages. An owner or an admin can add you back."),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("leave", "Leave");
+    dialog.set_response_appearance("leave", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.connect_response(None, {
+        let chat = chat.clone();
+        move |_, response| {
+            if response != "leave" {
+                return;
+            }
+            let chat = chat.clone();
+            let channel_id = channel_id.clone();
+            glib::spawn_future_local(async move {
+                let result = chat
+                    .runtime
+                    .spawn({
+                        let client = chat.client.clone();
+                        async move { client.leave_channel(&channel_id).await }
+                    })
+                    .await
+                    .unwrap_or(Err(brook_core::Error::UnexpectedResponse));
+                if let Err(err) = result {
+                    // Not a member any more: already out, which is what leaving wanted.
+                    let already_out =
+                        matches!(&err, brook_core::Error::Api { code, .. } if code == "not_found");
+                    if !already_out {
+                        show_alert(&chat, "Couldn't Leave", &membership_error_text(&err));
+                    }
+                }
+            });
+        }
+    });
+    dialog.present(Some(&chat.message_list));
+}
+
+/// "Members": who's in the open channel; for a global admin, each can be removed.
+fn members_dialog(chat: &Rc<Chat>) {
+    let Some(channel_id) = chat.current.borrow().clone() else {
+        return;
+    };
+    let me = chat.me.borrow().clone().unwrap_or_default();
+    let members = chat
+        .channels
+        .borrow()
+        .iter()
+        .find(|c| c.id == channel_id)
+        .map(|c| c.members.clone())
+        .unwrap_or_default();
+    // The server's rules (#183): an owner or an admin removes others; only an admin
+    // removes an owner. The server decides anyway; this only offers what it would allow.
+    let admin = *chat.is_admin.borrow();
+    let my_role = members
+        .iter()
+        .find(|m| m.id == me)
+        .and_then(|m| m.role.clone());
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    for member in members {
+        let subtitle = match member.role.as_deref() {
+            Some("owner") => format!("@{} · owner", member.handle),
+            _ => format!("@{}", member.handle),
+        };
+        let row = adw::ActionRow::builder()
+            .title(glib::markup_escape_text(&member.display_name).as_str())
+            .subtitle(glib::markup_escape_text(&subtitle).as_str())
+            .build();
+        if may_remove(
+            admin,
+            my_role.as_deref(),
+            member.role.as_deref(),
+            member.id == me,
+        ) {
+            let remove = gtk::Button::builder()
+                .label("Remove")
+                .valign(gtk::Align::Center)
+                .css_classes(["flat", "error"])
+                .build();
+            remove.connect_clicked({
+                let (chat, channel_id, member) = (chat.clone(), channel_id.clone(), member.clone());
+                move |button| {
+                    button.set_sensitive(false);
+                    let (chat, channel_id, user_id) =
+                        (chat.clone(), channel_id.clone(), member.id.clone());
+                    let button = button.clone();
+                    glib::spawn_future_local(async move {
+                        let result = chat
+                            .runtime
+                            .spawn({
+                                let client = chat.client.clone();
+                                async move { client.remove_member(&channel_id, &user_id).await }
+                            })
+                            .await
+                            .unwrap_or(Err(brook_core::Error::UnexpectedResponse));
+                        match result {
+                            // The channel.update echo refreshes the list; this row goes.
+                            Ok(()) => button.set_label("Removed"),
+                            Err(err) => {
+                                button.set_sensitive(true);
+                                show_alert(&chat, "Couldn't Remove", &membership_error_text(&err));
+                            }
+                        }
+                    });
+                }
+            });
+            row.add_suffix(&remove);
+        }
+        list.append(&row);
+    }
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_height(120)
+        .max_content_height(360)
+        .propagate_natural_height(true)
+        .child(&list)
+        .build();
+    let dialog = adw::AlertDialog::builder()
+        .heading("Members")
+        .extra_child(&scroller)
+        .build();
+    dialog.add_response("close", "Close");
+    dialog.present(Some(&chat.message_list));
+}
+
+/// "Edit Profile": your display name and status line (the handle, which signs in, stays).
+fn edit_profile_dialog(chat: &Rc<Chat>) {
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let me = chat
+            .runtime
+            .spawn({
+                let client = chat.client.clone();
+                async move { client.me().await }
+            })
+            .await;
+        let Ok(Ok(me)) = me else {
+            show_alert(
+                &chat,
+                "Couldn't Load Your Profile",
+                "Try again in a moment.",
+            );
+            return;
+        };
+        let name = adw::EntryRow::builder()
+            .title("Display name")
+            .text(&me.user.display_name)
+            .build();
+        let status = adw::EntryRow::builder()
+            .title("Status")
+            .text(me.user.status_text.as_deref().unwrap_or(""))
+            .build();
+        let handle = adw::ActionRow::builder()
+            .title("Handle")
+            .subtitle(glib::markup_escape_text(&format!("@{}", me.user.handle)).as_str())
+            .build();
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        list.append(&name);
+        list.append(&status);
+        list.append(&handle);
+        let dialog = adw::AlertDialog::builder()
+            .heading("Edit Profile")
+            .extra_child(&list)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("save", "Save");
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("save"));
+        // The server's lengths, checked as the user types: Save waits for a name that fits,
+        // so a refusal never throws the edit away.
+        let check: Rc<dyn Fn()> = Rc::new({
+            let (dialog, name, status) = (dialog.clone(), name.clone(), status.clone());
+            move || {
+                let ok = profile_fits(&name.text(), &status.text());
+                dialog.set_response_enabled("save", ok);
+            }
+        });
+        name.connect_changed({
+            let check = check.clone();
+            move |_| check()
+        });
+        status.connect_changed({
+            let check = check.clone();
+            move |_| check()
+        });
+        check();
+        let (old_name, old_status) = (
+            me.user.display_name,
+            me.user.status_text.unwrap_or_default(),
+        );
+        dialog.connect_response(None, {
+            let chat = chat.clone();
+            move |_, response| {
+                if response != "save" {
+                    return;
+                }
+                // Only what changed is sent (omitted fields stay).
+                let (new_name, new_status) = (name.text().to_string(), status.text().to_string());
+                let name_change = (new_name.trim() != old_name.trim()).then_some(new_name);
+                let status_change = (new_status.trim() != old_status.trim()).then_some(new_status);
+                if name_change.is_none() && status_change.is_none() {
+                    return;
+                }
+                let chat = chat.clone();
+                glib::spawn_future_local(async move {
+                    let result = chat
+                        .runtime
+                        .spawn({
+                            let client = chat.client.clone();
+                            async move {
+                                client
+                                    .update_profile(
+                                        name_change.as_deref(),
+                                        status_change.as_deref(),
+                                    )
+                                    .await
+                            }
+                        })
+                        .await
+                        .unwrap_or(Err(brook_core::Error::UnexpectedResponse));
+                    if let Err(err) = result {
+                        show_alert(
+                            &chat,
+                            "Couldn't Save Your Profile",
+                            &membership_error_text(&err),
+                        );
+                    }
+                });
+            }
+        });
+        dialog.present(Some(&chat.message_list));
+    });
 }
 
 /// PATCH the current channel (rename/archive). The `channel.update` echo refreshes.
@@ -2986,6 +3350,46 @@ fn sign_out_body(unsent: u64, known: bool, remove: bool) -> String {
 #[cfg(test)]
 mod offline_tests {
     use super::*;
+
+    #[test]
+    fn a_profile_fits_the_servers_lengths() {
+        assert!(profile_fits("Ana", ""));
+        assert!(!profile_fits("   ", ""), "a blank name");
+        assert!(
+            profile_fits(&"é".repeat(64), &"x".repeat(100)),
+            "characters, not bytes"
+        );
+        assert!(!profile_fits(&"a".repeat(65), ""));
+        assert!(!profile_fits("Ana", &"x".repeat(101)));
+    }
+
+    #[test]
+    fn remove_is_offered_as_the_server_allows_it() {
+        // Never yourself.
+        assert!(!may_remove(true, Some("owner"), Some("owner"), true));
+        // An admin removes anyone, owners included.
+        assert!(may_remove(true, None, Some("owner"), false));
+        assert!(may_remove(true, Some("member"), Some("member"), false));
+        // An owner removes members, not other owners.
+        assert!(may_remove(false, Some("owner"), Some("member"), false));
+        assert!(may_remove(false, Some("owner"), None, false));
+        assert!(!may_remove(false, Some("owner"), Some("owner"), false));
+        // A member removes no one; unknown roles offer nothing.
+        assert!(!may_remove(false, Some("member"), Some("member"), false));
+        assert!(!may_remove(false, None, None, false));
+    }
+
+    #[test]
+    fn membership_refusals_read_as_sentences() {
+        let api = |code: &str| brook_core::Error::Api {
+            code: code.into(),
+            message: String::new(),
+        };
+        assert!(membership_error_text(&api("channel.last_owner")).contains("Delete the channel"));
+        assert!(membership_error_text(&api("authz.forbidden")).contains("owner"));
+        assert!(membership_error_text(&api("profile.invalid")).contains("invisible"));
+        assert!(membership_error_text(&api("something.new")).contains("Try again"));
+    }
 
     #[test]
     fn a_notification_says_what_arrived() {
