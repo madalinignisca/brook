@@ -19,6 +19,10 @@ pub struct User {
     pub display_name: String,
     /// Global role (`admin` or `member`).
     pub global_role: String,
+    /// The line under the name the user sets (`PATCH /auth/me`); none when unset or from a
+    /// server before it. Not `status`: that's the account state (active or disabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_text: Option<String>,
 }
 
 /// An authenticated session: tokens plus the resolved user.

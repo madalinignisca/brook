@@ -26,7 +26,7 @@ final class FakeAccount: AccountClient, @unchecked Sendable {
     // TOTP management: each call recorded; `failure` (when set) is thrown by all of them.
     var codes = (1 ... 10).map { String(format: "abcd-%04d", $0) }
     func me() async throws -> FfiMe {
-        FfiMe(user: FfiUser(id: "me", handle: "me", displayName: "Me", globalRole: "member"),
+        FfiMe(user: FfiUser(id: "me", handle: "me", displayName: "Me", globalRole: "member", statusText: nil),
               totpEnabled: false, recoveryCodesLeft: nil)
     }
     /// Tests only: the factor as sent (the type itself never renders its code).

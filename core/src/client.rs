@@ -635,6 +635,36 @@ impl BrookClient {
         Ok(())
     }
 
+    /// Remove `user_id` from a channel, or leave it (`user_id` = yourself): a channel owner or
+    /// a global admin removes others; only a global admin removes an owner. Refused:
+    /// `channel.last_owner` (409: delete the channel instead), `channel.dm` (422: a DM can't
+    /// be left), `authz.forbidden` (403), `not_found` (404). The removal then arrives as
+    /// usual: `channel.delete` to the removed user (core drops the channel and its cache),
+    /// `channel.update` to everyone else.
+    pub async fn remove_member(&self, channel_id: &str, user_id: &str) -> Result<()> {
+        let token = self.access_token().await?;
+        let url = self
+            .base
+            .join(&format!("api/v1/channels/{channel_id}/members/{user_id}"))?;
+        let resp = self.http.delete(url).bearer_auth(token).send().await?;
+        if !resp.status().is_success() {
+            return Err(api_error(resp).await);
+        }
+        Ok(())
+    }
+
+    /// Leave a channel ([`BrookClient::remove_member`] with yourself).
+    pub async fn leave_channel(&self, channel_id: &str) -> Result<()> {
+        let me = self
+            .session
+            .snapshot()
+            .await
+            .1
+            .map(|s| s.user.id)
+            .ok_or(Error::NotAuthenticated)?;
+        self.remove_member(channel_id, &me).await
+    }
+
     /// Mark a channel read up to `message_id` (or its latest message if `None`).
     pub async fn mark_read(&self, channel_id: &str, message_id: Option<&str>) -> Result<()> {
         let token = self.access_token().await?;
@@ -865,7 +895,7 @@ struct ApiErrorContent {
 }
 
 /// Map a non-2xx response into a structured [`Error`].
-async fn api_error(resp: reqwest::Response) -> Error {
+pub(crate) async fn api_error(resp: reqwest::Response) -> Error {
     let status = resp.status();
     // Redirects are never followed (see `BrookClient::new`), and a redirect's body is not
     // an API error envelope: report the status only, never content the redirecting party
@@ -1309,6 +1339,137 @@ mod tests {
         let client = client_for(server).await;
         client.login("alice", "supersecret").await.unwrap();
         client
+    }
+
+    #[tokio::test]
+    async fn remove_member_deletes_that_membership() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/channels/c1/members/u2"))
+            .and(wiremock::matchers::header("authorization", "Bearer a"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client.remove_member("c1", "u2").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn leave_channel_removes_yourself() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/channels/c1/members/u1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client.leave_channel("c1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn leave_channel_signed_out_sends_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let err = client_for(&server)
+            .await
+            .leave_channel("c1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotAuthenticated), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn remove_member_refusal_carries_the_server_code() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/channels/c1/members/u1"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": { "code": "channel.last_owner", "message": "last owner" }
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client.leave_channel("c1").await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Api { code, .. } if code == "channel.last_owner"),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_profile_sends_only_the_given_fields() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/auth/me"))
+            .and(wiremock::matchers::body_json(json!({ "status_text": "" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "u1", "handle": "alice", "display_name": "Alice", "global_role": "admin",
+                "status": "active", "status_text": null, "created_at": "2026-06-18T00:00:00Z",
+                "totp_enabled": true, "recovery_codes_left": 8
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let me = client.update_profile(None, Some("")).await.unwrap();
+        assert_eq!(me.user.status_text, None);
+        assert!(me.totp_enabled);
+    }
+
+    #[tokio::test]
+    async fn update_profile_answers_the_new_profile() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/auth/me"))
+            .and(wiremock::matchers::body_json(
+                json!({ "display_name": "Al", "status_text": "away" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "u1", "handle": "alice", "display_name": "Al", "global_role": "admin",
+                "status": "active", "status_text": "away", "created_at": "2026-06-18T00:00:00Z",
+                "totp_enabled": false, "recovery_codes_left": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let me = client
+            .update_profile(Some("Al"), Some("away"))
+            .await
+            .unwrap();
+        assert_eq!(me.user.display_name, "Al");
+        assert_eq!(me.user.status_text.as_deref(), Some("away"));
+    }
+
+    #[tokio::test]
+    async fn update_profile_refusal_is_profile_invalid() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/auth/me"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "error": { "code": "profile.invalid", "message": "too long" }
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client.update_profile(Some(""), None).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Api { code, .. } if code == "profile.invalid"),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
