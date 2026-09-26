@@ -396,22 +396,128 @@ async fn refresh_now(c: &BrookClient) {
     let _ = refresher(c).refresh(seen).await;
 }
 
-/// An older client's rotation after a newer sign-in in another client never overwrites it.
+/// A client that no longer owns the slot never refreshes (#120): it sends nothing and ends
+/// its session locally, and the newer sign-in stays as stored. Its own login isn't the
+/// stored one any more (bob's fresh sign-in replaced it), so that one is revoked, not left
+/// live on the server.
 #[tokio::test]
-async fn an_older_clients_rotation_never_overwrites_a_newer_sign_in() {
+async fn a_superseded_client_sends_no_refresh_and_signs_out() {
     let server = TestServer::start().await; // Rotate: any token rotates
     let dir = tempfile::tempdir().unwrap();
     let slot = Arc::new(InMemoryKeySlot::default());
     let alice = signed_in(&server, &slot, dir.path(), "alice").await;
     let bob = signed_in(&server, &slot, dir.path(), "bob").await;
     let bobs = held_token(&bob).await;
-    refresh_now(&alice).await;
-    assert_ne!(held_token(&alice).await, bobs);
+    let before = server.refresh_calls();
+    let seen = alice.session.snapshot().await.0;
+    let _ = refresher(&alice).refresh(seen).await;
     assert_eq!(
-        stored_token(&slot, &server),
-        Some(bobs),
-        "alice's rotation overwrote bob"
+        server.refresh_calls(),
+        before,
+        "a superseded client refreshed"
     );
+    assert!(
+        alice.session.snapshot().await.1.is_none(),
+        "still signed in"
+    );
+    assert_eq!(stored_token(&slot, &server), Some(bobs.clone()));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        server.logouts().len(),
+        1,
+        "alice's orphaned login wasn't revoked"
+    );
+    assert!(!server.logouts().contains(&bobs), "bob's login was revoked");
+}
+
+/// The shipped trigger (#120): the previous attempt's client, signed in from the stored
+/// login, is dropped while its refresh is in flight; the next client restores that same
+/// login. The dropped client's fresh pair belongs to the owner's login now: it's dropped,
+/// never revoked (a logout ends the whole login, #116).
+#[tokio::test]
+async fn a_dropped_clients_refresh_never_revokes_the_stored_login() {
+    let server = TestServer::start().await; // Rotate
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    drop(signed_in(&server, &slot, dir.path(), "alice").await);
+    let (a, outcome) = relaunch(&server, &slot, dir.path()).await;
+    assert!(
+        matches!(outcome, RestoreOutcome::LoggedIn(_)),
+        "{outcome:?}"
+    );
+    let gate = server.gate_refresh();
+    let before = server.refresh_calls();
+    let seen = a.session.snapshot().await.0;
+    let r = refresher(&a);
+    let inflight = tokio::spawn(async move { r.refresh(seen).await });
+    for _ in 0..300 {
+        if server.refresh_calls() > before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        server.refresh_calls() > before,
+        "a's refresh never reached the server"
+    );
+    drop(a);
+    let b = client(&server, &slot, dir.path()); // takes the slot
+    gate.add_permits(1);
+    let _ = inflight.await;
+    tokio::time::sleep(Duration::from_millis(200)).await; // a detached revoke would be out
+    assert!(
+        server.logouts().is_empty(),
+        "the dropped client revoked the stored login"
+    );
+    gate.add_permits(10);
+    let outcome = b.restore().await;
+    assert!(
+        matches!(outcome, RestoreOutcome::LoggedIn(_)),
+        "{outcome:?}"
+    );
+}
+
+/// A fresh login refused because a newer client took the slot is still revoked: it was
+/// never stored, so it's nobody's login.
+#[tokio::test]
+async fn a_fresh_login_that_lost_the_slot_is_still_revoked() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let old = client(&server, &slot, dir.path());
+    let gate = server.gate_login();
+    let o = old.clone();
+    let login = tokio::spawn(async move { o.login("alice", "pw").await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _newer = client(&server, &slot, dir.path()); // takes the slot
+    gate.add_permits(1);
+    let _ = login.await;
+    for _ in 0..100 {
+        if !server.logouts().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        server.logouts().len(),
+        1,
+        "an unstored fresh pair was left live"
+    );
+}
+
+/// A login whose keychain write failed was never stored: superseded, its logout still
+/// revokes it.
+#[tokio::test]
+async fn an_unstored_login_is_revoked_when_superseded() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let c = client(&server, &slot, dir.path());
+    slot.fail_next("replace", KeySlotError::Unavailable);
+    c.login("alice", "pw").await.unwrap();
+    let _newer = client(&server, &slot, dir.path());
+    c.logout().await;
+    assert_eq!(server.logouts().len(), 1, "an unstored login was left live");
 }
 
 /// An older client's rejection after a newer sign-in never deletes the newer one.
@@ -735,4 +841,109 @@ async fn a_restore_overtaken_by_a_sign_out_revokes_its_pair() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("the orphaned pair was never revoked");
+}
+
+/// A superseded client holding the stored login signs out without revoking it: the newer
+/// client restores that same login, and a logout ends a whole login (#116, #120).
+#[tokio::test]
+async fn a_superseded_logout_spares_the_stored_login() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    drop(signed_in(&server, &slot, dir.path(), "alice").await);
+    let (a, outcome) = relaunch(&server, &slot, dir.path()).await;
+    assert!(
+        matches!(outcome, RestoreOutcome::LoggedIn(_)),
+        "{outcome:?}"
+    );
+    let _b = client(&server, &slot, dir.path()); // takes the slot
+    a.logout().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        server.logouts().is_empty(),
+        "a superseded client revoked the stored login"
+    );
+}
+
+/// A restore whose re-store failed is fenced: nobody can restore it, so it's nobody's login,
+/// and a superseded client still revokes it.
+#[tokio::test]
+async fn an_unstored_restore_is_revoked_when_superseded() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    drop(signed_in(&server, &slot, dir.path(), "alice").await);
+    let a = client(&server, &slot, dir.path());
+    slot.fail_next("replace", KeySlotError::Unavailable);
+    assert!(matches!(a.restore().await, RestoreOutcome::LoggedIn(_)));
+    let _b = client(&server, &slot, dir.path());
+    a.logout().await;
+    assert_eq!(server.logouts().len(), 1, "a fenced restore was left live");
+}
+
+/// A password change on the owner stores a new login: once a newer client restores it,
+/// the old client's logout must spare it, not end it (#120, review round 2).
+#[tokio::test]
+async fn a_password_change_stores_a_login_the_old_client_spares() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let a = signed_in(&server, &slot, dir.path(), "alice").await;
+    a.change_password("pw", "pw2", false).await.unwrap();
+    let (_b, outcome) = relaunch(&server, &slot, dir.path()).await;
+    assert!(
+        matches!(outcome, RestoreOutcome::LoggedIn(_)),
+        "{outcome:?}"
+    );
+    a.logout().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        server.logouts().is_empty(),
+        "the old client ended the login it had stored"
+    );
+}
+
+/// Every path that writes the stored login marks its token at the slot's current
+/// generation (#140): an unmarked stored token defaults to *revoke*, so a superseded client
+/// would end the owner's login. Covers a password login, a refresh, both kinds of password
+/// change, a TOTP activation, a restore and a TOTP sign-in.
+#[tokio::test]
+async fn every_stored_write_marks_its_token() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let check = |c: &BrookClient, what: &'static str| {
+        let stored = stored_token(&slot, &server).expect("nothing stored");
+        assert!(
+            c.session.marked_current(&stored),
+            "{what} left the stored token unmarked"
+        );
+    };
+    let a = signed_in(&server, &slot, dir.path(), "alice").await;
+    check(&a, "a login");
+    refresh_now(&a).await;
+    check(&a, "a refresh");
+    a.totp_enroll("pw").await.unwrap(); // (the test server checks against its own "pw")
+    a.totp_activate("123456").await.unwrap();
+    check(&a, "a TOTP activation");
+    a.change_password("pw", "pw2", false).await.unwrap();
+    check(&a, "a password change");
+    a.change_password("pw2", "pw3", true).await.unwrap();
+    check(&a, "a password change signing out other devices");
+    drop(a);
+    let (b, outcome) = relaunch(&server, &slot, dir.path()).await;
+    assert!(
+        matches!(outcome, RestoreOutcome::LoggedIn(_)),
+        "{outcome:?}"
+    );
+    check(&b, "a restore");
+    drop(b);
+    // A TOTP sign-in stores through its own path (`install_for_challenge`).
+    server.enable_totp("carol", &["rc-1"]);
+    let c = client(&server, &slot, dir.path());
+    let LoginOutcome::TotpRequired(challenge) = c.login("carol", "pw").await.unwrap() else {
+        panic!("carol signed in without the second factor");
+    };
+    c.complete_totp(&challenge, "123456").await.unwrap();
+    check(&c, "a TOTP sign-in");
 }

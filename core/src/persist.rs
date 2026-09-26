@@ -39,6 +39,17 @@ impl std::fmt::Debug for Stored {
 /// a new client for every attempt, so the owner is always the current attempt's client.)
 static OWNERS: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(Mutex::default);
 
+/// One refresh at a time per slot, process-wide (#120): every client refreshing a token of
+/// the stored login goes through its slot's lock, so an old client's refresh in flight
+/// finishes before a new owner's restore reads the stored token.
+static SLOT_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(Mutex::default);
+
+/// Which login each slot holds, as a generation: a fresh login (password, TOTP) written to
+/// the slot starts a new one; a restore continues it. A client's token is the stored login's
+/// only while its generation is the slot's current one (#120).
+static FAMILIES: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(Mutex::default);
+
 pub(crate) struct Persistence {
     slot: Arc<dyn KeySlot>,
     name: String,
@@ -80,6 +91,40 @@ impl Persistence {
         Self::owners().insert(self.name.clone(), owner);
     }
 
+    /// Whether client `owner` owns this slot (a map read; no keychain call under the lock).
+    pub(crate) fn owns(&self, owner: u64) -> bool {
+        Self::owners().get(&self.name) == Some(&owner)
+    }
+
+    fn families() -> std::sync::MutexGuard<'static, HashMap<String, u64>> {
+        FAMILIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A fresh login is now stored: a new generation.
+    pub(crate) fn new_family(&self) -> u64 {
+        let mut f = Self::families();
+        let next = f.get(&self.name).copied().unwrap_or(0) + 1;
+        f.insert(self.name.clone(), next);
+        next
+    }
+
+    /// The generation of the login stored now.
+    pub(crate) fn family(&self) -> u64 {
+        Self::families().get(&self.name).copied().unwrap_or(0)
+    }
+
+    /// This slot's refresh lock (see `SLOT_LOCKS`).
+    pub(crate) fn slot_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        SLOT_LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(self.name.clone())
+            .or_default()
+            .clone()
+    }
+
     /// Run `op` on the slot only if client `owner` owns it. None: a newer client owns it and
     /// nothing was done.
     pub(crate) fn guarded<T>(&self, owner: u64, op: impl FnOnce(&Self) -> T) -> Option<T> {
@@ -104,18 +149,22 @@ impl Persistence {
     }
 
     /// Mirror an installed or committed session. On success the fence (if any) is lifted; on
-    /// failure the stored copy is stale, so it is fenced.
-    pub(crate) fn write(&self, session: &Session) {
+    /// failure the stored copy is stale, so it is fenced. Whether it landed.
+    pub(crate) fn write(&self, session: &Session) -> bool {
         let stored = Stored {
             user: session.user.clone(),
             refresh_token: session.refresh_token.clone(),
         };
         let bytes = Zeroizing::new(serde_json::to_vec(&stored).unwrap_or_default());
         match self.slot.replace(self.name.clone(), bytes.to_vec()) {
-            Ok(()) => self.lift_fence(),
+            Ok(()) => {
+                self.lift_fence();
+                true
+            }
             Err(err) => {
                 tracing::warn!(%err, "storing the session failed; fencing the stale copy");
                 let _ = self.write_fence();
+                false
             }
         }
     }

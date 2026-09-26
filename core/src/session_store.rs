@@ -11,6 +11,7 @@
 //! Every mutation is compare-and-set against what the caller read, so a slow refresh
 //! (success *or* failure) can never overwrite or erase a newer login.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -95,6 +96,19 @@ pub(crate) struct SessionStore {
     persistence: Arc<OnceLock<crate::persist::Persistence>>,
     /// Whether the last sign-out made the stored copy unusable (deleted or fenced).
     sign_out_complete: Arc<AtomicBool>,
+    /// Refresh tokens of the stored login (#120): restored from the slot, written to it
+    /// while this client owned it, or rotated from one of those. Once another client owns
+    /// the slot, they're its login too: this client drops them, never revokes them (a
+    /// logout ends the whole login since #116). Keyed by the token itself, so the check
+    /// always judges the token that was sent.
+    /// Each with the slot generation it belongs to (`persist::FAMILIES`).
+    slot_tokens: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+}
+
+/// The refresh lock, then (with persistence) the slot's: always in that order (#120).
+pub(crate) struct Flight {
+    _refresh: tokio::sync::OwnedMutexGuard<()>,
+    _slot: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 static NEXT_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -113,6 +127,7 @@ impl SessionStore {
             id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             persistence: Arc::default(),
             sign_out_complete: Arc::new(AtomicBool::new(true)),
+            slot_tokens: Arc::default(),
         }
     }
 
@@ -128,6 +143,60 @@ impl SessionStore {
         op: impl FnOnce(&crate::persist::Persistence) -> T,
     ) -> Option<T> {
         self.persistence.get()?.guarded(self.id, op)
+    }
+
+    /// Take the refresh lock, then the slot's (with persistence): the only order either is
+    /// taken in, so there is no cycle between clients.
+    pub(crate) async fn flight(&self) -> Flight {
+        let refresh = self.refresh_lock.clone().lock_owned().await;
+        let slot = match self.persistence.get() {
+            Some(p) => Some(p.slot_lock().lock_owned().await),
+            None => None,
+        };
+        Flight {
+            _refresh: refresh,
+            _slot: slot,
+        }
+    }
+
+    /// Whether this client may use the stored login: always without persistence; with it,
+    /// only as the slot's owner.
+    pub(crate) fn owns(&self) -> bool {
+        match self.persistence.get() {
+            Some(p) => p.owns(self.id),
+            None => true,
+        }
+    }
+
+    fn slot_tokens(&self) -> std::sync::MutexGuard<'_, HashMap<String, u64>> {
+        self.slot_tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `token` is of the stored login of generation `family` (read with the stored token,
+    /// not later: a fresh sign-in meanwhile would have moved it on).
+    pub(crate) fn mark_family(&self, token: &str, family: u64) {
+        self.slot_tokens().insert(token.to_string(), family);
+    }
+
+    /// Whether `token` is marked as the stored login's current generation (tests: every
+    /// stored write must mark, or a superseded client would revoke it; #140).
+    #[cfg(test)]
+    pub(crate) fn marked_current(&self, token: &str) -> bool {
+        let family = self.slot_tokens().get(token).copied();
+        matches!(
+            (family, self.persistence.get()),
+            (Some(f), Some(p)) if f == p.family()
+        )
+    }
+
+    /// `token` was just written to the slot as a fresh login: a new generation.
+    fn mark_new_login(&self, token: &str) {
+        if let Some(p) = self.persistence.get() {
+            let family = p.new_family();
+            self.slot_tokens().insert(token.to_string(), family);
+        }
     }
 
     pub(crate) fn persistence(&self) -> Option<&crate::persist::Persistence> {
@@ -179,10 +248,21 @@ impl SessionStore {
     /// (bounded by the client's request timeout); errors are logged by kind only.
     /// Returns the task, for a caller that wants to wait on it a while (dropping the handle
     /// leaves it running).
+    ///
+    /// A token of the stored login is dropped instead when this client no longer owns the
+    /// slot: it's the owner's login now, and revoking it would end that (#116, #120).
     pub(crate) fn revoke_detached(
         &self,
         refresh_token: String,
     ) -> Option<tokio::task::JoinHandle<()>> {
+        let family = self.slot_tokens().remove(&refresh_token);
+        if let (Some(family), Some(p)) = (family, self.persistence.get()) {
+            // The owner's login: spare it. A login the slot has moved on from (a fresh sign-in
+            // replaced it) is nobody's, and goes as usual.
+            if !self.owns() && family == p.family() {
+                return None;
+            }
+        }
         let (Some(runtime), Some((http, base))) =
             (self.detached.runtime.get(), self.detached.http.get())
         else {
@@ -272,7 +352,15 @@ impl SessionStore {
             let mut cell = self.cell.write().await;
             // Refused when a newer client owns the slot: it can't bring back a replaced sign-in.
             let owns = || match self.persistence.get() {
-                Some(_) => self.with_slot(|p| p.write(&session)).is_some(),
+                Some(_) => match self.with_slot(|p| p.write(&session)) {
+                    Some(landed) => {
+                        if landed {
+                            self.mark_new_login(&session.refresh_token);
+                        }
+                        true
+                    }
+                    None => false,
+                },
                 None => true,
             };
             if !self.is_closed() && cell.login_gen == gen && cell.challenge_open && owns() {
@@ -308,7 +396,14 @@ impl SessionStore {
     /// Install login attempt `gen`'s session and publish `LoggedIn`, in the same write that
     /// checks the attempt is still current (a sign-out can't slip between install and publish).
     /// False: stale; the caller revokes the pair.
-    pub(crate) async fn install_for_login(&self, gen: u64, session: Session) -> Install {
+    /// `restored`: the generation of the stored login this pair was refreshed from (it
+    /// continues it); `None`: a fresh login, a new generation once stored.
+    pub(crate) async fn install_for_login(
+        &self,
+        gen: u64,
+        session: Session,
+        restored: Option<u64>,
+    ) -> Install {
         let rev = {
             let mut cell = self.cell.write().await;
             if self.is_closed() || cell.login_gen != gen {
@@ -317,8 +412,15 @@ impl SessionStore {
             if self.persistence.get().is_some() {
                 // Refused when a newer client owns the slot, so a late restore or login can't
                 // bring back a sign-in that was replaced or signed out.
-                if self.with_slot(|p| p.write(&session)).is_none() {
-                    return Install::SlotTaken;
+                match self.with_slot(|p| p.write(&session)) {
+                    None => return Install::SlotTaken,
+                    // Stored: the owner's login from now on, wherever this client goes.
+                    // (A write that failed is fenced: nobody can restore it, so it isn't.)
+                    Some(true) => match restored {
+                        Some(family) => self.mark_family(&session.refresh_token, family),
+                        None => self.mark_new_login(&session.refresh_token),
+                    },
+                    Some(false) => {}
                 }
                 cell.persisted = true;
             }
@@ -425,12 +527,25 @@ impl SessionStore {
     }
 
     /// Apply rotated tokens only if the session still holds `rotated_from`.
+    ///
+    /// `rotation`: `refresh_token` is `rotated_from`'s successor (a refresh), so it's of the
+    /// same login. False for a password change's or TOTP activation's pair: the server
+    /// issues a new login then, which the stored one isn't.
     pub(crate) async fn commit_refresh(
         &self,
         rotated_from: &str,
         access_token: String,
         refresh_token: String,
+        rotation: bool,
     ) -> RefreshApplied {
+        // The sent token's generation, taken off now; where the new token goes is decided
+        // below, by what happens to it.
+        let inherited = self.slot_tokens().remove(rotated_from);
+        let carry = |me: &Self| {
+            if let (true, Some(family)) = (rotation, inherited) {
+                me.mark_family(&refresh_token, family);
+            }
+        };
         let rev = {
             let mut cell = self.cell.write().await;
             if self.is_closed() {
@@ -443,6 +558,7 @@ impl SessionStore {
                 } else {
                     None
                 };
+                carry(self);
                 return if stored == Some(true) {
                     RefreshApplied::Stored
                 } else {
@@ -452,16 +568,29 @@ impl SessionStore {
             match cell.session.as_mut() {
                 Some(s) if s.refresh_token == rotated_from => {
                     s.access_token = access_token;
-                    s.refresh_token = refresh_token;
+                    s.refresh_token = refresh_token.clone();
                     // Rotation made the stored token dead: follow it (unless a newer client
                     // owns the slot now). Not `with_slot`: `s` borrows the cell.
-                    if let Some(p) = self.persistence.get() {
-                        p.guarded(self.id, |p| p.write(s));
+                    let landed = self
+                        .persistence
+                        .get()
+                        .map(|p| p.guarded(self.id, |p| p.write(s)));
+                    match landed {
+                        None => {}                 // no persistence
+                        Some(None) => carry(self), // not the owner: the owner's login still
+                        // The owner's write landed: a refresh continues the stored login; a
+                        // password change or TOTP activation stored a new one.
+                        Some(Some(true)) if rotation => carry(self),
+                        Some(Some(true)) => self.mark_new_login(&refresh_token),
+                        Some(Some(false)) => {} // fenced: nobody can restore it
                     }
                     cell.rev.credential_rev += 1;
                     cell.rev
                 }
-                _ => return RefreshApplied::Discarded,
+                _ => {
+                    carry(self);
+                    return RefreshApplied::Discarded;
+                }
             }
         };
         *self.refresh_not_before.lock().unwrap() = None; // the wait is over: it worked
@@ -528,7 +657,7 @@ mod tests {
         let gen = store.reserve_login().await;
         let held = store.cell.write().await;
         let s = store.clone();
-        let install = tokio::spawn(async move { s.install_for_login(gen, session(1)).await });
+        let install = tokio::spawn(async move { s.install_for_login(gen, session(1), None).await });
         tokio::task::yield_now().await; // the install waits on the lock
         let s = store.clone();
         let out = tokio::spawn(async move { s.sign_out(false).await });
@@ -555,7 +684,7 @@ mod tests {
         let gen = store.reserve_login().await;
         let held = store.cell.write().await;
         let s = store.clone();
-        let install = tokio::spawn(async move { s.install_for_login(gen, session(1)).await });
+        let install = tokio::spawn(async move { s.install_for_login(gen, session(1), None).await });
         tokio::task::yield_now().await;
         let s = store.clone();
         let out = tokio::spawn(async move { s.sign_out(false).await });
@@ -578,7 +707,7 @@ mod tests {
         store.close_detached(); // no runtime captured: the cleanup task never exists
         assert_eq!(
             store
-                .commit_refresh("refresh-1", "access-2".into(), "refresh-2".into())
+                .commit_refresh("refresh-1", "access-2".into(), "refresh-2".into(), true)
                 .await,
             RefreshApplied::Discarded
         );
@@ -614,7 +743,7 @@ mod tests {
         let mut watch = store.watch();
         watch.mark_unchanged();
         let applied = store
-            .commit_refresh("refresh-1", "x".into(), "y".into())
+            .commit_refresh("refresh-1", "x".into(), "y".into(), true)
             .await;
         assert_eq!(applied, RefreshApplied::Discarded);
         assert!(!watch.has_changed().unwrap());
@@ -627,7 +756,7 @@ mod tests {
         store.replace(Some(session(1))).await;
         let before = store.snapshot().await.0;
         let applied = store
-            .commit_refresh("refresh-1", "access-9".into(), "refresh-9".into())
+            .commit_refresh("refresh-1", "access-9".into(), "refresh-9".into(), true)
             .await;
         assert_eq!(applied, RefreshApplied::Committed);
         let after = store.snapshot().await.0;
