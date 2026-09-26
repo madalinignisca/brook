@@ -99,6 +99,9 @@ struct Chat {
     /// This user's local stores answered a cached call: `unsent_count` can be trusted (it
     /// answers 0 while they're closed).
     local_open: Rc<Cell<bool>>,
+    /// A message arrived in the open conversation while the window wasn't focused: it's
+    /// marked read when the window is focused again, not before.
+    read_owed: Rc<Cell<bool>>,
     /// Current names of authors whose profile changed this session (from `cached_users`),
     /// used for every row drawn afterwards too: stored message rows keep the old name.
     author_names: Rc<RefCell<HashMap<String, String>>>,
@@ -273,6 +276,24 @@ pub fn build(
         text_draft: Rc::default(),
         local_open: Rc::default(),
         author_names: Rc::default(),
+        read_owed: Rc::default(),
+    });
+    // Focusing the window again reads what arrived in the open conversation meanwhile.
+    chat.message_list.connect_realize({
+        let chat = Rc::downgrade(&chat);
+        move |list| {
+            let Some(window) = list.root().and_downcast::<gtk::Window>() else {
+                return;
+            };
+            let chat = chat.clone();
+            window.connect_is_active_notify(move |window| {
+                if let Some(chat) = chat.upgrade() {
+                    if window.is_active() {
+                        read_what_arrived(&chat);
+                    }
+                }
+            });
+        }
     });
     chat.progress.listen(&chat.client);
 
@@ -485,10 +506,15 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         .borrow()
                         .as_deref()
                         .is_some_and(|c| c == message.channel_id);
-                    if is_current {
+                    if is_current && window_focused(&chat) {
                         append_message(&chat, &message);
                         mark_read(&chat, message.channel_id.clone(), Some(message.id.clone()));
                     } else {
+                        if is_current {
+                            // Shown, but not seen yet: read once the window is focused.
+                            append_message(&chat, &message);
+                            chat.read_owed.set(true);
+                        }
                         // Bump the unread badge for the channel that received it.
                         let idx = chat
                             .channels
@@ -2016,6 +2042,31 @@ fn clear_typing(chat: &Rc<Chat>) {
     }
 }
 
+/// Whether the user can be looking at the open conversation: its window is focused.
+fn window_focused(chat: &Rc<Chat>) -> bool {
+    chat.message_list
+        .root()
+        .and_downcast::<gtk::Window>()
+        .is_some_and(|w| w.is_active())
+}
+
+/// The window is focused again: what arrived in the open conversation meanwhile is read, and
+/// its badge clears.
+fn read_what_arrived(chat: &Rc<Chat>) {
+    if !chat.read_owed.replace(false) {
+        return;
+    }
+    let Some(current) = chat.current.borrow().clone() else {
+        return;
+    };
+    mark_read(chat, current.clone(), None);
+    let idx = chat.channels.borrow().iter().position(|c| c.id == current);
+    if let Some(idx) = idx {
+        chat.channels.borrow_mut()[idx].unread_count = 0;
+        update_badge(chat, idx);
+    }
+}
+
 /// Mark a channel read (up to `message_id`, or its latest) on the server.
 fn mark_read(chat: &Rc<Chat>, channel_id: String, message_id: Option<String>) {
     let chat = chat.clone();
@@ -2728,8 +2779,9 @@ fn badges_from_cache(chat: &Rc<Chat>) {
             .enumerate()
             .filter_map(|(i, c)| {
                 let fresh = cached.iter().find(|f| f.id == c.id)?;
-                // The open channel is being read: its badge stays clear.
-                let unread = if current.as_deref() == Some(c.id.as_str()) {
+                // The open channel is being read: its badge stays clear, unless the window
+                // is in the background (then what arrived there isn't read yet).
+                let unread = if current.as_deref() == Some(c.id.as_str()) && !chat.read_owed.get() {
                     0
                 } else {
                     fresh.unread_count
