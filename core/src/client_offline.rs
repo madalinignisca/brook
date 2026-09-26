@@ -448,6 +448,19 @@ impl BrookClient {
         self.active_files().await?.open_file(id, file_id).await
     }
 
+    /// An image attachment's bytes for a **sandboxed** decoder: only PNG, JPEG, GIF or WebP
+    /// (sniffed from the bytes), at most `PREVIEW_MAX_BYTES` (checked before anything is
+    /// fetched), with the header's size within `PREVIEW_MAX_SIDE` / `PREVIEW_MAX_PIXELS`.
+    /// Fetched into the file cache (progress and cancel under `id`), decrypted into memory,
+    /// never written to disk. `file.preview_refused` otherwise.
+    pub async fn preview_file(
+        &self,
+        id: crate::TransferId,
+        file_id: &str,
+    ) -> Result<crate::ImagePreview> {
+        self.active_files().await?.preview_file(id, file_id).await
+    }
+
     /// Save `file_id` to `destination` from the file cache, if it's complete there (so it
     /// works offline). `Ok(false)`: not cached; download it as before
     /// ([`BrookClient::download_file`]). A failed save leaves nothing at `destination`.

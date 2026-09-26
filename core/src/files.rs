@@ -138,6 +138,7 @@ fn api_error(code: &str) -> Error {
         "file.unknown" => "no cached message has this file",
         "file.gone" => "the file was deleted",
         "file.open_refused" => "this kind of file is only saved, never opened",
+        "file.preview_refused" => "no preview for this file",
         "transfer.cancelled" => "the transfer was cancelled",
         "local.unavailable" => "offline storage isn't available",
         _ => "the file couldn't be cached",
@@ -549,6 +550,45 @@ impl Files {
 
     /// Cache `file_id`, then decrypt it into this store's Open directory under its safe name,
     /// in a fresh subdirectory. Refused for executables and launchers (sniffed, never by name).
+    /// An image attachment's bytes for a sandboxed decoder (previews spec §2): refused over
+    /// `PREVIEW_MAX_BYTES` before anything is fetched, fetched only into this cache, decrypted
+    /// into memory, its kind sniffed and its header's size capped. `file.preview_refused`
+    /// for anything else.
+    pub(crate) async fn preview_file(
+        self: &Arc<Self>,
+        id: TransferId,
+        file_id: &str,
+    ) -> crate::Result<crate::preview::ImagePreview> {
+        use crate::preview::{dimensions, sniff, within_caps, ImagePreview, PREVIEW_MAX_BYTES};
+        let info = self.lookup(file_id).await?;
+        if info.size > PREVIEW_MAX_BYTES {
+            return Err(api_error("file.preview_refused"));
+        }
+        self.cache_file(id, file_id).await?;
+        let row = self
+            .row(file_id)
+            .await?
+            .ok_or_else(|| api_error("file.gone"))?;
+        let source = self.source(file_id, &row)?;
+        let mut reader = source_reader(&source).await?;
+        let mut bytes = Vec::with_capacity(row.size as usize);
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| io_err(&e))?;
+        let kind = sniff(&bytes).ok_or_else(|| api_error("file.preview_refused"))?;
+        let (width, height) = dimensions(kind, &bytes)
+            .filter(|(w, h)| within_caps(*w, *h))
+            .ok_or_else(|| api_error("file.preview_refused"))?;
+        self.touch(file_id).await;
+        Ok(ImagePreview {
+            kind,
+            width,
+            height,
+            bytes,
+        })
+    }
+
     pub(crate) async fn open_file(
         self: &Arc<Self>,
         id: TransferId,
