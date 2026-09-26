@@ -50,15 +50,29 @@ final class ChannelsOfflineTests: XCTestCase {
         XCTAssertEqual(model.channels.map(\.unread), [4, 0], "the open channel's badge moved")
     }
 
-    func testARemovedChannelGoesClosesAndNeverComesBackFromAnOlderRead() async {
+    func testARemovedChannelGoesAndAnOlderReadCantBringItBack() async {
         let client = FakeRealtime(channels: [channel("c1", "general"), channel("c2", "random")])
         let model = ChannelsModel(client: client)
         await model.start()
         model.openChannel = "c2"
+        let gate = Gate()
+        client.listGate = gate
+        let older = Task { await model.reloadList() } // started before the removal
+        for _ in 0 ..< 20 { await Task.yield() }
         model.cacheRemoved(["c2"])
         XCTAssertEqual(model.channels.map(\.id), ["c1"])
         XCTAssertEqual(model.closed, "c2")
-        await model.reloadList() // the server's list still has it (not caught up yet)
-        XCTAssertEqual(model.channels.map(\.id), ["c1"], "an older list brought it back")
+        gate.open()
+        await older.value
+        XCTAssertEqual(model.channels.map(\.id), ["c1"], "a read from before the removal brought it back")
+    }
+
+    func testAChannelReaddedLaterComesBack() async {
+        let client = FakeRealtime(channels: [channel("c1", "general"), channel("c2", "random")])
+        let model = ChannelsModel(client: client)
+        await model.start()
+        model.cacheRemoved(["c2"])
+        await model.reloadList() // after the removal: re-added since
+        XCTAssertEqual(model.channels.map(\.id), ["c1", "c2"], "a re-added channel stayed hidden")
     }
 }

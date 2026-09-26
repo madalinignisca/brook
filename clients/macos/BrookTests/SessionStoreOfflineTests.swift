@@ -115,16 +115,54 @@ final class SessionStoreOfflineTests: XCTestCase {
         await until("removed") { fake.localCalls.withLock { $0 }.contains("forgot") }
     }
 
-    func testAFailedRemovalWarnsAndWinsOverTheIncompleteOne() async {
+    private func warning(removalFails: Bool, complete: Bool) async -> String? {
+        defaults.removeObject(forKey: Settings.lastServerKey) // each run a fresh launch, not a restore
         let fake = signedIn()
         let store = store(fake)
         await store.signIn(server: "https://h", handle: "alice", password: "pw")
         await until("on") { store.localData == .on }
-        fake.forgetFails.withLock { $0 = true }
-        fake.setSignOutComplete(false)
+        fake.forgetFails.withLock { $0 = removalFails }
+        fake.setSignOutComplete(complete)
         store.signOut(removeData: true)
-        await until("warned") { store.signOutWarning != nil }
-        XCTAssertEqual(store.signOutWarning, SessionStore.Message.removalIncomplete)
+        await until("signed out") { fake.localCalls.withLock { $0 }.contains("forgot") }
+        try? await Task.sleep(for: .milliseconds(50))
+        return store.signOutWarning
+    }
+
+    func testAFailedRemovalAndAnIncompleteSignOutAreBothSaid() async {
+        let both = await warning(removalFails: true, complete: false)
+        XCTAssertEqual(both, SessionStore.Message.removalAndSignOutIncomplete)
+        let removal = await warning(removalFails: true, complete: true)
+        XCTAssertEqual(removal, SessionStore.Message.removalIncomplete)
+        let fine = await warning(removalFails: false, complete: true)
+        XCTAssertNil(fine)
+    }
+
+    func testEveryUnfinishedSignOutIsWaitedForNotOnlyTheLatest() async {
+        let fake = signedIn()
+        let store = store(fake, wait: .milliseconds(300))
+        await store.signIn(server: "https://h", handle: "alice", password: "pw")
+        await until("on") { store.localData == .on }
+        fake.forgetGated.withLock { $0 = true } // this erase hangs
+        store.signOut(removeData: true)
+        await store.signIn(server: "https://h", handle: "alice", password: "pw") // A: gives up
+        await until("A gave up", timeout: 2) { store.localData == .off }
+        store.signOut(removeData: false)
+        await store.signIn(server: "https://h", handle: "alice", password: "pw") // B
+        try? await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(fake.localCalls.withLock { $0 }.filter { $0 == "enable" }.count, 1,
+                       "B enabled while the first erase was still running")
+        fake.forgetGate.open()
+    }
+
+    func testAFailedEnableIsOnlineOnlyWithNoSheetAndNoFeed() async {
+        let fake = signedIn()
+        fake.enableResult.withLock { $0 = false }
+        let store = store(fake)
+        await store.signIn(server: "https://h", handle: "alice", password: "pw")
+        await until("failed") { store.localData == .failed }
+        XCTAssertFalse(store.offersRemoval, "a sheet offering to remove data that isn't there")
+        XCTAssertNil(store.feed)
     }
 
     func testSignOutResetsTheFeed() async {
@@ -203,20 +241,102 @@ final class CacheFeedTests: XCTestCase {
         XCTAssertFalse(feed.offline)
     }
 
-    func testOneLossAtATimeAcknowledgedExactlyThenANewerOneShows() {
+    func testOneLossAtATimeAcknowledgedExactlyThenANewerOneShows() async {
         let chat = FakeChat()
         chat.lost = 3
         let feed = CacheFeed(client: chat)
         feed.checkLost()
-        XCTAssertTrue(feed.lostAlert)
+        XCTAssertEqual(feed.alert, .lost(3))
         chat.lost = 5 // a newer loss while 3 is on screen
         feed.checkLost()
-        feed.dismissLost()
+        XCTAssertEqual(feed.alerts, [.lost(3)], "two loss alerts queued")
+        feed.dismiss()
         XCTAssertEqual(chat.acknowledged.withLock { $0 }, [3], "acknowledged something not shown")
-        XCTAssertTrue(feed.lostAlert, "the newer loss didn't show")
-        feed.dismissLost()
+        await settle()
+        XCTAssertEqual(feed.alert, .lost(5), "the newer loss didn't show")
+        feed.dismiss()
+        await settle()
         XCTAssertEqual(chat.acknowledged.withLock { $0 }, [3, 5])
-        XCTAssertFalse(feed.lostAlert)
+        XCTAssertNil(feed.alert)
+    }
+
+    func testALossAndTheOtherAccountsNoticeShowOneAfterTheOther() async {
+        let chat = FakeChat()
+        chat.local = true
+        chat.lost = 1
+        chat.others = [FfiLocalUser(origin: "o", userId: "u", unsent: 0)]
+        let feed = CacheFeed(client: chat)
+        feed.checkLost()
+        feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: 1, offline: false))
+        await settle()
+        XCTAssertEqual(feed.alerts.count, 2)
+        XCTAssertEqual(feed.alert, .lost(1))
+        feed.dismiss()
+        XCTAssertEqual(feed.alert?.text, "Another account's saved messages were removed from this Mac.")
+    }
+
+    func testAFailedCleanUpIsRetriedAtTheNextSync() async {
+        let chat = FakeChat() // not local yet: otherLocalUsers fails
+        chat.others = [FfiLocalUser(origin: "o", userId: "u", unsent: 0)]
+        let feed = CacheFeed(client: chat)
+        feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: 1, offline: false))
+        await settle()
+        XCTAssertEqual(chat.wiped.withLock { $0 }, 0)
+        chat.local = true
+        feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: 2, offline: false))
+        await settle()
+        XCTAssertEqual(chat.wiped.withLock { $0 }, 1, "never retried")
+    }
+
+    func testFeedEventsReachTheModelsTheyName() async {
+        let chat = FakeChat()
+        chat.local = true
+        chat.users = [FfiMember(id: "u", handle: "u", displayName: "Robert")]
+        let feed = CacheFeed(client: chat)
+        let timeline = TimelineModel(channelId: "c", client: chat)
+        timeline.merge([msg("m1", "hi")])
+        let pending = PendingModel(channelId: "c", client: chat)
+        let realtime = FakeRealtime(channels: [channel("c", "general"), channel("d", "other")])
+        let channels = ChannelsModel(client: realtime)
+        await channels.start()
+        channels.openChannel = "c"
+        (feed.timeline, feed.pending, feed.channels) = (timeline, pending, channels)
+
+        feed.handle(.outbox(channelId: "other"))
+        await settle()
+        XCTAssertFalse(chat.cacheCalls.withLock { $0 }.contains("pending"), "another channel's outbox")
+        feed.handle(.outbox(channelId: "c"))
+        await settle()
+        XCTAssertTrue(chat.cacheCalls.withLock { $0 }.contains("pending"))
+
+        feed.handle(.channels(ids: ["c"]))
+        await settle()
+        XCTAssertTrue(chat.cacheCalls.withLock { $0 }.contains("cached:-"), "the open channel wasn't refilled")
+
+        feed.handle(.users(ids: ["u"]))
+        await settle()
+        XCTAssertEqual(timeline.authorName(timeline.messages[0]), "Robert")
+
+        feed.handle(.removed(ids: ["c"]))
+        XCTAssertEqual(channels.channels.map(\.id), ["d"])
+        XCTAssertEqual(channels.closed, "c")
+    }
+
+    func testEventsFromABackgroundQueueArriveOnTheMainThread() async {
+        let chat = FakeChat()
+        chat.local = true
+        let feed = CacheFeed(client: chat)
+        let pending = PendingModel(channelId: "c", client: chat)
+        feed.pending = pending
+        let bridge = CacheEventBridge(feed)
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                for _ in 0 ..< 20 { bridge.onCacheEvent(event: .outbox(channelId: "c")) }
+                done.resume()
+            }
+        }
+        await settle()
+        XCTAssertFalse(chat.cacheCalls.withLock { $0 }.isEmpty) // delivered (and on main: no crash)
     }
 
     func testOtherAccountsGoAtTheFirstSyncWithTheirUnsentNamed() async {
@@ -231,7 +351,7 @@ final class CacheFeedTests: XCTestCase {
         feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: 1, offline: false))
         await settle()
         XCTAssertEqual(chat.wiped.withLock { $0 }, 1)
-        XCTAssertEqual(feed.notice, "Another account's saved messages were removed from this Mac, including 3 unsent messages.")
+        XCTAssertEqual(feed.alert?.text, "Another account's saved messages were removed from this Mac, including 3 unsent messages.")
     }
 
     func testNoticeWordingForUnknownAndNone() {
@@ -248,7 +368,7 @@ final class CacheFeedTests: XCTestCase {
         feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: 1, offline: false))
         await settle()
         XCTAssertEqual(chat.wiped.withLock { $0 }, 0)
-        XCTAssertNil(feed.notice)
+        XCTAssertNil(feed.alert)
     }
 
     func testAResetReloadsTheListAndRechecksLosses() async {
@@ -261,6 +381,6 @@ final class CacheFeedTests: XCTestCase {
         feed.handle(.reset)
         await settle()
         XCTAssertEqual(realtime.order.withLock { $0 }, ["list"])
-        XCTAssertTrue(feed.lostAlert)
+        XCTAssertEqual(feed.alert, .lost(1))
     }
 }

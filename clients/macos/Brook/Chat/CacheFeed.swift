@@ -13,10 +13,24 @@ final class CacheFeed {
         didSet { timeline?.offline = offline }
     }
     private(set) var lastSynced: Int64?
-    /// An alert for lost unsent messages is up (one at a time).
-    private(set) var lostAlert = false
-    /// Said once after other accounts' data was removed.
-    var notice: String?
+
+    /// What an alert says, one at a time: a loss of unsent messages (acknowledged exactly
+    /// when dismissed), or the notice after other accounts' data went.
+    enum Alert: Equatable {
+        case lost(UInt64)
+        case notice(String)
+
+        var text: String {
+            switch self {
+            case .lost: CacheFeed.lostText
+            case let .notice(text): text
+            }
+        }
+    }
+
+    /// Alerts waiting, the first on screen.
+    private(set) var alerts: [Alert] = []
+    var alert: Alert? { alerts.first }
 
     weak var channels: ChannelsModel?
     weak var timeline: TimelineModel? {
@@ -26,9 +40,9 @@ final class CacheFeed {
 
     private let client: any OfflineClient
     private var subscriptions: [Subscription] = []
-    /// The loss on screen: acknowledged exactly, so a newer one still shows.
-    private var shownLoss: UInt64?
+    /// Other accounts' data: once per feed, retried at the next sync after a failure.
     private var cleanedUp = false
+    private var cleaning = false
 
     init(client: any OfflineClient) {
         self.client = client
@@ -49,9 +63,7 @@ final class CacheFeed {
         subscriptions = []
         offline = false
         lastSynced = nil
-        lostAlert = false
-        shownLoss = nil
-        notice = nil
+        alerts = []
     }
 
     func handle(_ event: FfiCacheEvent) {
@@ -86,38 +98,46 @@ final class CacheFeed {
         offline = state.offline
         lastSynced = state.lastSyncedUnixMs
         // Other accounts' data goes at this user's first completed sync (#46 §8).
-        if lastSynced != nil, !cleanedUp {
-            cleanedUp = true
+        if lastSynced != nil, !cleanedUp, !cleaning {
+            cleaning = true
             Task { await cleanUpOthers() }
         }
     }
 
     // ---- Lost unsent messages ----
 
-    /// Show a loss if there is one and none is on screen.
+    /// Queue a loss if there is one and none is queued.
     func checkLost() {
-        guard shownLoss == nil, let n = client.outboxLost() else { return }
-        shownLoss = n
-        lostAlert = true
+        guard !alerts.contains(where: { if case .lost = $0 { true } else { false } }),
+              let n = client.outboxLost()
+        else { return }
+        alerts.append(.lost(n))
     }
 
-    /// The alert was dismissed: that loss is acknowledged, then a newer one may show.
-    func dismissLost() {
-        if let n = shownLoss { client.acknowledgeOutboxLost(n: n) }
-        shownLoss = nil
-        lostAlert = false
-        checkLost()
+    /// The alert on screen was dismissed: a loss is acknowledged for exactly the one shown,
+    /// then a newer one may queue, after this update (so the alert shows again).
+    func dismiss() {
+        guard !alerts.isEmpty else { return }
+        if case let .lost(n) = alerts.removeFirst() {
+            client.acknowledgeOutboxLost(n: n)
+            Task { @MainActor [weak self] in self?.checkLost() }
+        }
     }
 
-    static let lostText = "Some unsent messages on this Mac couldn't be recovered."
+    nonisolated static let lostText = "Some unsent messages on this Mac couldn't be recovered."
 
     // ---- Other accounts ----
 
     func cleanUpOthers() async {
-        guard let others = try? await client.otherLocalUsers(), !others.isEmpty,
-              (try? await client.wipeOtherLocalUsers()) != nil
-        else { return }
-        notice = Self.noticeText(others)
+        defer { cleaning = false }
+        guard let others = try? await client.otherLocalUsers() else { return } // retried later
+        guard !others.isEmpty else {
+            cleanedUp = true
+            return
+        }
+        guard (try? await client.wipeOtherLocalUsers()) != nil else { return } // retried later
+        cleanedUp = true
+        alerts.append(.notice(Self.noticeText(others)))
     }
 
     /// Names their unsent messages (#46 §8: "wiped after their unsent count is surfaced").

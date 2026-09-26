@@ -46,6 +46,7 @@ final class SessionStore {
         static let signOutIncomplete = "This Mac couldn't forget your saved sign-in, so Brook may sign you in again at the next launch. Sign in and out again to retry."
         static let secondInstance = "Brook is already open. This window won't remember your sign-in."
         static let removalIncomplete = "Brook couldn't remove all of this Mac's data. Sign in and out again to retry."
+        static let removalAndSignOutIncomplete = "Brook couldn't remove all of this Mac's data, and may sign you in again at the next launch. Sign in and out again to retry."
     }
 
     typealias ClientFactory = (_ server: String, _ allowInsecureHttp: Bool) throws -> FfiBrookClient
@@ -187,8 +188,22 @@ final class SessionStore {
     /// The last sign-out (it may still be erasing) and the last enable (it may still be
     /// opening stores): the next sign-in's enable waits for both, since the stores directory
     /// has no lock.
-    @ObservationIgnored private var signOutTask: Task<Void, Never>?
     @ObservationIgnored private var enableTask: Task<Void, Never>?
+    /// Every sign-out and enable that hasn't finished yet, whoever started it: each new
+    /// enable waits for all of them, not only the latest (a wait that timed out passes its
+    /// unfinished tasks on).
+    @ObservationIgnored private var unsettled: [UUID: Task<Void, Never>] = [:]
+
+    /// Start `body` as a task that stays in `unsettled` until it ends.
+    private func tracked(_ body: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
+        let id = UUID()
+        let task = Task { [weak self] in
+            await body()
+            self?.unsettled[id] = nil
+        }
+        unsettled[id] = task // before the task can run: it's on this actor
+        return task
+    }
     /// The longest a sign-in waits for them; after that it stays online-only.
     private let localDataWait: Duration
 
@@ -232,10 +247,10 @@ final class SessionStore {
     /// subscribe, switch on, then read losses. Dropped if the attempt moved on meanwhile.
     private func startLocalData(_ client: FfiBrookClient, slot: FfiKeySlot, dataDir: String) {
         let mine = attempt
-        let previous = [signOutTask, enableTask].compactMap { $0 }
+        let previous = Array(unsettled.values)
         let limit = localDataWait
         localData = .enabling
-        enableTask = Task { [weak self] in
+        enableTask = tracked { [weak self] in
             let settled = await Self.waitAll(previous, upTo: limit)
             // A sign-out or a newer sign-in meanwhile decides first: nothing to log.
             guard let self, mine == self.attempt, !Task.isCancelled else { return }
@@ -258,6 +273,8 @@ final class SessionStore {
                 feed.checkLost()
             } else {
                 Self.log("this device's data couldn't be opened: online only")
+                feed.stop()
+                if self.feed === feed { self.feed = nil }
                 self.localData = .failed
             }
         }
@@ -360,23 +377,26 @@ final class SessionStore {
         end()
         phase = .signedOut(error: nil)
         let before = signIns
-        signOutTask = Task {
+        _ = tracked { [weak self] in
+            // An enable still opening the stores finishes first, whichever way this goes.
+            await enabling?.value
             var removalFailed = false
             if removeData {
-                await enabling?.value
                 do { try await client.signOutAndForget() } catch { removalFailed = true }
             } else {
                 await client.logout() // core forgets the stored copy, then revokes (best effort)
             }
             // A sign-in completed since replaced the stored copy: then it's moot. Its own
             // value, not the form's error: typing into the form meanwhile must not hide it.
-            guard before == signIns else { return }
-            if removalFailed {
-                signOutWarning = Message.removalIncomplete
-            } else if !client.signOutComplete() {
-                // Both the keychain delete and the fence failed: the next launch could sign
-                // in again.
-                signOutWarning = Message.signOutIncomplete
+            guard let self, before == self.signIns else { return }
+            // Both the keychain delete and the fence failed: the next launch could sign in
+            // again. Checked whether or not the removal worked.
+            let incomplete = !client.signOutComplete()
+            switch (removalFailed, incomplete) {
+            case (true, true): self.signOutWarning = Message.removalAndSignOutIncomplete
+            case (true, false): self.signOutWarning = Message.removalIncomplete
+            case (false, true): self.signOutWarning = Message.signOutIncomplete
+            case (false, false): break
             }
         }
     }

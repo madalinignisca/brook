@@ -109,12 +109,9 @@ struct SignedInView: View {
                 SignOutSheet(model: SignOutModel(client: offline), signOut: signOutChoosing)
             }
         }
-        .alert(CacheFeed.lostText, isPresented: Binding(
-            get: { feed?.lostAlert == true }, set: { if !$0 { feed?.dismissLost() } })) {
-            Button("OK") {}
-        }
-        .alert(feed?.notice ?? "", isPresented: Binding(
-            get: { feed?.notice != nil }, set: { if !$0 { feed?.notice = nil } })) {
+        // One alert at a time (a loss, or the other-accounts notice), in the order they came.
+        .alert(feed?.alert?.text ?? "", isPresented: Binding(
+            get: { feed?.alert != nil }, set: { if !$0 { feed?.dismiss() } })) {
             Button("OK") {}
         }
         .onChange(of: selection, initial: true) { _, channelId in openTimeline(channelId) }

@@ -65,8 +65,10 @@ struct ChatView: View {
         }
         .task {
             saves.start()
+            // Unsent bubbles don't wait for the network history.
+            async let bubbles: Void = pending?.reload() ?? ()
             await timeline.load()
-            await pending?.reload()
+            await bubbles
         }
         .onDisappear { saves.stop() }
     }

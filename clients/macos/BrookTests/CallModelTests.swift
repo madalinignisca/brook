@@ -20,13 +20,15 @@ final class FakeSubscription: Subscription, @unchecked Sendable {
 final class FakeRealtime: FfiBrookClientProtocol, @unchecked Sendable {
     let order = Mutex<[String]>([])
     let listener = Mutex<ServerEventListener?>(nil)
-    let channels: [FfiChannel]
+    var channels: [FfiChannel]
     init(channels: [FfiChannel]) { self.channels = channels }
     /// For the offline tests (#62): a failing realtime start or network list, and the cache's
     /// channels (nil: `local.unavailable`).
     var realtimeFails = false
     var listFails = false
     var cached: [FfiCachedChannel]?
+    /// Holds the network list until opened (a read that finishes late).
+    var listGate: Gate?
 
     func subscribeEvents(listener: ServerEventListener) -> Subscription {
         order.withLock { $0.append("subscribe") }
@@ -39,8 +41,10 @@ final class FakeRealtime: FfiBrookClientProtocol, @unchecked Sendable {
     }
     func listChannels() async throws -> [FfiChannel] {
         order.withLock { $0.append("list") }
+        let snapshot = channels
+        if let listGate { await listGate.wait() }
         if listFails { throw LoginError.Network(message: "offline") }
-        return channels
+        return snapshot
     }
     /// nil: joining fails. Set: join waits for the gate, then returns a handle.
     var joinGate: Gate?

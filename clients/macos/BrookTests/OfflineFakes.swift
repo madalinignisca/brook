@@ -22,8 +22,16 @@ extension FakeChat: OfflineClient {
         return cachePages.count > 1 ? cachePages.removeFirst() : cachePages[0]
     }
 
-    func loadHead(channelId: String, limit: UInt32) async throws { try need(); record("loadHead") }
-    func loadOlder(channelId: String, limit: UInt32) async throws { try need(); record("loadOlder") }
+    func loadHead(channelId: String, limit: UInt32) async throws {
+        try need()
+        record("loadHead")
+        if loadFails { throw LoginError.Network(message: "offline") }
+    }
+    func loadOlder(channelId: String, limit: UInt32) async throws {
+        try need()
+        record("loadOlder")
+        if loadFails { throw LoginError.Network(message: "offline") }
+    }
 
     func cachedUsers(ids: [String]) async throws -> [FfiMember] {
         try need()

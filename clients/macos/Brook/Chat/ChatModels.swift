@@ -94,16 +94,22 @@ final class TimelineModel {
     /// `before` is the start of the channel.
     @discardableResult
     private func readCache(before: String?, loadIfIncomplete: Bool) async -> Bool {
-        guard let cache else { return false }
+        guard let cache, !loading else { return false }
+        loading = true
+        defer { loading = false }
         do {
             var page = try await cache.cachedMessages(channelId: channelId, before: before, limit: Self.pageSize)
             if page.needsNetwork, loadIfIncomplete {
+                let loaded: Bool
                 if before == nil {
-                    try? await cache.loadHead(channelId: channelId, limit: Self.pageSize)
+                    loaded = (try? await cache.loadHead(channelId: channelId, limit: Self.pageSize)) != nil
                 } else {
-                    try? await cache.loadOlder(channelId: channelId, limit: Self.pageSize)
+                    loaded = (try? await cache.loadOlder(channelId: channelId, limit: Self.pageSize)) != nil
                 }
                 page = try await cache.cachedMessages(channelId: channelId, before: before, limit: Self.pageSize)
+                // The load failed and the cache has nothing more: the network path, which
+                // pages (or shows its error) instead of leaving paging stuck.
+                if !loaded, page.needsNetwork, page.messages.isEmpty { return false }
             }
             if before != nil, page.messages.isEmpty, !page.needsNetwork { atStart = true }
             if !page.messages.isEmpty { fromCache = true }
@@ -172,14 +178,26 @@ final class TimelineModel {
         messages = byId.values.sorted { $0.id < $1.id }
     }
 
-    /// `a` is a later edit than `b` (nil: never edited, older than any edit). Timestamps are
-    /// the server's RFC 3339 UTC strings, which order as text.
-    private static func isNewer(_ a: String?, than b: String?) -> Bool {
-        switch (a, b) {
-        case (nil, _): false
+    /// Whether `incoming`'s body replaces `shown`'s: a later edit (nil: never edited, older
+    /// than any edit), or neither ever edited (the incoming copy, as for every other field).
+    static func isNewer(_ incoming: String?, than shown: String?) -> Bool {
+        switch (incoming, shown) {
+        case (nil, nil): true
+        case (nil, .some): false
         case (.some, nil): true
-        case let (.some(a), .some(b)): a > b
+        case let (.some(a), .some(b)):
+            if let da = parseTime(a), let db = parseTime(b) { da > db } else { a > b }
         }
+    }
+
+    /// The server's RFC 3339 times, with or without fractional seconds (it drops zero ones,
+    /// so they don't order as text: "…:00.5Z" < "…:00Z").
+    private static func parseTime(_ s: String) -> Date? {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: s) { return d }
+        f.formatOptions = [.withInternetDateTime]
+        return f.date(from: s)
     }
 
     private static func tombstone(_ m: FfiMessage) -> FfiMessage {

@@ -11,6 +11,8 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     // ---- This device's local data (OfflineFakes.swift). Off: every call answers
     // `local.unavailable`, as without the Keychain (#79).
     var local = false
+    /// `loadHead`/`loadOlder` fail (offline).
+    var loadFails = false
     /// Cached pages, handed out in order (the last one repeats).
     var cachePages: [FfiCachedMessages] = []
     /// What the cache was asked, in order ("cached:<before>", "loadHead", "loadOlder", …).

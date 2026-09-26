@@ -25,9 +25,10 @@ final class ChannelsModel {
 
     private let client: any FfiBrookClientProtocol
     private var events: Subscription?
-    /// Channels the cache said this user was removed from: filtered out of every later read,
-    /// so an older list landing after the removal can't bring one back.
-    private var removed: Set<String> = []
+    /// Channels the cache said this user was removed from, with the newest read number at
+    /// that moment: a read that started before the removal can't bring one back, and a later
+    /// read (re-added since) can.
+    private var removedAt: [String: Int] = [:]
     /// Each list read's number: only the newest one to finish applies.
     private var generation = 0
 
@@ -70,7 +71,7 @@ final class ChannelsModel {
             return
         }
         error = nil
-        channels = rows.filter { !removed.contains($0.id) }.map { row in
+        channels = rows.filter { removedAt[$0.id].map { mine > $0 } ?? true }.map { row in
             var row = row
             if row.id == openChannel { row.unread = 0 }
             return row
@@ -96,8 +97,8 @@ final class ChannelsModel {
 
     /// Removed from these channels: gone from the list, and the open one closes.
     func cacheRemoved(_ ids: [String]) {
-        removed.formUnion(ids)
-        channels.removeAll { removed.contains($0.id) }
+        for id in ids { removedAt[id] = generation }
+        channels.removeAll { ids.contains($0.id) }
         if let open = openChannel, ids.contains(open) {
             closed = open
             timeline = nil

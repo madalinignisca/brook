@@ -50,6 +50,25 @@ final class OfflineTimelineTests: XCTestCase {
         XCTAssertTrue(t.atStart)
     }
 
+    func testAFailedLoadOfAnIncompletePageFallsBackToTheNetwork() async {
+        let chat = FakeChat()
+        chat.local = true
+        chat.cachePages = [cachedPage([msg("m5", "newest")])]
+        let t = TimelineModel(channelId: "c", client: chat)
+        await t.load()
+        chat.cachePages = [cachedPage([], needsNetwork: true)]
+        chat.loadFails = true
+        chat.pages = [[msg("m3", "from the network")]]
+        await t.loadOlder()
+        XCTAssertEqual(t.messages.map(\.id), ["m3", "m5"], "paging stuck on a failed load")
+    }
+
+    func testEditTimesWithAndWithoutFractionsOrderAsTimes() {
+        XCTAssertTrue(TimelineModel.isNewer("2026-09-26T10:00:00.5Z", than: "2026-09-26T10:00:00Z"))
+        XCTAssertFalse(TimelineModel.isNewer("2026-09-26T10:00:00Z", than: "2026-09-26T10:00:00.5Z"))
+        XCTAssertTrue(TimelineModel.isNewer(nil, than: nil), "never-edited copies: the incoming one")
+    }
+
     func testWithoutLocalDataItsTheNetworkAsBefore() async {
         let chat = FakeChat()
         chat.pages = [[msg("m1", "network")]]
@@ -99,7 +118,9 @@ final class OfflineTimelineTests: XCTestCase {
         let t = TimelineModel(channelId: "c", client: chat)
         await t.load()
         XCTAssertNotNil(t.error)
-        t.offline = true
+        let feed = CacheFeed(client: chat)
+        feed.timeline = t
+        feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: nil, offline: true))
         XCTAssertNil(t.visibleError, "an error over messages that are showing")
         t.offline = false
         XCTAssertNotNil(t.visibleError)
