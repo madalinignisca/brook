@@ -58,6 +58,13 @@ def _create_allowed(user_id: uuid.UUID) -> int | None:
 # (up to the declared size) outside every quota and floor: K x 100 MB from one create.
 _in_flight: set[uuid.UUID] = set()
 _in_flight_per_user: dict[uuid.UUID, int] = {}
+
+
+def uploads_in_flight() -> frozenset[uuid.UUID]:
+    """Files whose PUT is streaming right now (the sweep leaves them alone)."""
+    return frozenset(_in_flight)
+
+
 MAX_UPLOADS_PER_USER = 3
 FREE_CHECK_EVERY = 8 * 1024 * 1024  # re-check the disk floor while streaming
 # An upload that sends nothing for this long is dropped, freeing its in-flight slot.
