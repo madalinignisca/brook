@@ -42,7 +42,7 @@ struct Chat {
     channel_list: gtk::ListBox,
     channels: Rc<RefCell<Vec<Channel>>>,
     /// Unread badge label per sidebar row, parallel to `channels`.
-    badges: Rc<RefCell<Vec<gtk::Label>>>,
+    badges: Rc<RefCell<Vec<Badge>>>,
     /// message id -> its widgets, for live edit/delete of the open channel.
     message_rows: Rc<RefCell<HashMap<String, MessageWidgets>>>,
     /// The message id currently being replied to (quote-reply), if any.
@@ -2538,7 +2538,7 @@ fn channel_row(
     is_dm: bool,
     (unread, mentions): (i64, i64),
     offered: bool,
-) -> (gtk::ListBoxRow, gtk::Label) {
+) -> (gtk::ListBoxRow, Badge) {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -2557,9 +2557,14 @@ fn channel_row(
         .xalign(0.0)
         .hexpand(true)
         .build();
-    let badge = gtk::Label::builder()
-        .css_classes(["caption-heading", "accent"])
-        .build();
+    let badge = Badge {
+        mentions: gtk::Label::builder()
+            .css_classes(["caption-heading", "mention-badge"])
+            .build(),
+        unread: gtk::Label::builder()
+            .css_classes(["caption-heading", "accent"])
+            .build(),
+    };
     show_badge(&badge, unread, mentions);
     row.append(&icon);
     row.append(&label);
@@ -2574,7 +2579,8 @@ fn channel_row(
                 .build(),
         );
     }
-    row.append(&badge);
+    row.append(&badge.mentions);
+    row.append(&badge.unread);
     (gtk::ListBoxRow::builder().child(&row).build(), badge)
 }
 
@@ -2590,33 +2596,41 @@ fn update_badge(chat: &Rc<Chat>, idx: usize) {
     }
 }
 
-/// A channel's badge: its unread count, marked "@" and stronger when any of those mention
-/// you. Hidden with nothing unread.
-fn show_badge(badge: &gtk::Label, unread: i64, mentions: i64) {
-    let (text, mentioned) = badge_text(unread, mentions);
-    badge.set_label(&text);
-    badge.set_visible(!text.is_empty());
-    if mentioned {
-        badge.add_css_class("mention-badge");
-        badge.set_tooltip_text(Some(&match mentions {
-            1 => "1 unread message mentions you".to_string(),
-            n => format!("{n} unread messages mention you"),
-        }));
-    } else {
-        badge.remove_css_class("mention-badge");
-        badge.set_tooltip_text(None);
-    }
+/// A channel's counts in the sidebar: "@M" in a filled accent pill for unread messages
+/// that mention you, beside the plain unread count (as on the Mac).
+struct Badge {
+    mentions: gtk::Label,
+    unread: gtk::Label,
 }
 
-/// The badge's text and whether it marks a mention: "" for nothing unread, "N", or "@ N"
-/// (never fewer unread than mentions: a count that lags shows the mentions).
-fn badge_text(unread: i64, mentions: i64) -> (String, bool) {
-    let unread = unread.max(mentions).max(0);
-    match (unread, mentions > 0) {
-        (0, _) => (String::new(), false),
-        (n, true) => (format!("@ {n}"), true),
-        (n, false) => (n.to_string(), false),
-    }
+/// Show a channel's counts; each is hidden at zero.
+fn show_badge(badge: &Badge, unread: i64, mentions: i64) {
+    let (mention_text, unread_text) = badge_texts(unread, mentions);
+    badge.mentions.set_visible(!mention_text.is_empty());
+    badge.mentions.set_label(&mention_text);
+    let tip = match mentions {
+        m if m <= 0 => None,
+        1 => Some("1 unread message mentions you".to_string()),
+        m => Some(format!("{m} unread messages mention you")),
+    };
+    badge.mentions.set_tooltip_text(tip.as_deref());
+    badge.unread.set_visible(!unread_text.is_empty());
+    badge.unread.set_label(&unread_text);
+}
+
+/// The two badges' texts: "@M" for unread mentions and "N" for unread messages, "" for
+/// none (never fewer unread than mentions: a count that lags shows the mentions).
+fn badge_texts(unread: i64, mentions: i64) -> (String, String) {
+    let mentions = mentions.max(0);
+    let unread = unread.max(mentions);
+    let text = |n: i64, prefix: &str| {
+        if n > 0 {
+            format!("{prefix}{n}")
+        } else {
+            String::new()
+        }
+    };
+    (text(mentions, "@"), text(unread, ""))
 }
 
 /// Show a desktop notification via the GApplication (`org.gtk.Notifications`).
@@ -4095,7 +4109,7 @@ mod ownership_question_tests {
 
 #[cfg(test)]
 mod mention_tests {
-    use super::{badge_text, mentions_me};
+    use super::{badge_texts, mentions_me};
     use brook_core::Message;
 
     fn message(author: &str, mentions: &[&str], everyone: bool) -> Message {
@@ -4125,11 +4139,11 @@ mod mention_tests {
     }
 
     #[test]
-    fn the_badge_says_how_many_unread_and_marks_mentions() {
-        assert_eq!(badge_text(0, 0), (String::new(), false));
-        assert_eq!(badge_text(3, 0), ("3".into(), false));
-        assert_eq!(badge_text(3, 1), ("@ 3".into(), true));
+    fn the_badges_say_how_many_mention_you_and_how_many_are_unread() {
+        assert_eq!(badge_texts(0, 0), (String::new(), String::new()));
+        assert_eq!(badge_texts(3, 0), (String::new(), "3".into()));
+        assert_eq!(badge_texts(3, 1), ("@1".into(), "3".into()));
         // A count that lags the mentions never shows fewer.
-        assert_eq!(badge_text(0, 2), ("@ 2".into(), true));
+        assert_eq!(badge_texts(0, 2), ("@2".into(), "2".into()));
     }
 }

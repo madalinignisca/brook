@@ -57,7 +57,7 @@ fn init_logging() {
 }
 
 /// Brook's own looks on top of Adwaita's: a message that mentions you is tinted with the
-/// accent, and a channel badge counting mentions is filled with it.
+/// accent, and a channel's "@M" mention count is a filled accent pill.
 const STYLE: &str = "
 row.mentions-me { background-color: alpha(@accent_bg_color, 0.12); border-radius: 6px; }
 label.mention-badge {
