@@ -180,6 +180,17 @@ impl SessionStore {
         self.slot_tokens().insert(token.to_string(), family);
     }
 
+    /// Whether `token` is marked as the stored login's current generation (tests: every
+    /// stored write must mark, or a superseded client would revoke it; #140).
+    #[cfg(test)]
+    pub(crate) fn marked_current(&self, token: &str) -> bool {
+        let family = self.slot_tokens().get(token).copied();
+        matches!(
+            (family, self.persistence.get()),
+            (Some(f), Some(p)) if f == p.family()
+        )
+    }
+
     /// `token` was just written to the slot as a fresh login: a new generation.
     fn mark_new_login(&self, token: &str) {
         if let Some(p) = self.persistence.get() {
