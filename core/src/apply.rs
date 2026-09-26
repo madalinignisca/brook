@@ -211,7 +211,9 @@ pub(crate) fn apply(tx: &Transaction<'_>, me: &str, batch: &Batch) -> rusqlite::
             // A reply landing after its target was deleted takes "(deleted)" from the cached
             // tombstone: deletion is final, whatever the reply's own (older) quote says.
             tx.execute(
-                "UPDATE messages SET json = json_set(json, '$.reply_to.body', '(deleted)')
+                "UPDATE messages SET json = json_set(json, '$.reply_to.body', '(deleted)',
+                                                     '$.reply_to.deleted', json('true'),
+                                                     '$.reply_to.attachments', 0)
                  WHERE id = ?1 AND json_type(json, '$.reply_to') = 'object'
                    AND EXISTS (SELECT 1 FROM messages t
                                WHERE t.id = json_extract(messages.json, '$.reply_to_id')
@@ -276,16 +278,29 @@ fn refresh_excerpts(
     target: &str,
     body: Option<&str>,
 ) -> rusqlite::Result<()> {
-    let excerpt: String = match body {
-        Some(b) => b.chars().take(140).collect(),
-        None => "(deleted)".to_string(),
-    };
-    tx.execute(
-        "UPDATE messages SET json = json_set(json, '$.reply_to.body', ?2)
-         WHERE json_extract(json, '$.reply_to_id') = ?1
-           AND json_type(json, '$.reply_to') = 'object'",
-        params![target, excerpt],
-    )?;
+    match body {
+        // An edit: the text changes; its files (and so the quote's count) don't.
+        Some(b) => {
+            let excerpt: String = b.chars().take(140).collect();
+            tx.execute(
+                "UPDATE messages SET json = json_set(json, '$.reply_to.body', ?2)
+                 WHERE json_extract(json, '$.reply_to_id') = ?1
+                   AND json_type(json, '$.reply_to') = 'object'",
+                params![target, excerpt],
+            )?;
+        }
+        // Deleted: as the server's excerpt of a deleted target reads (#129).
+        None => {
+            tx.execute(
+                "UPDATE messages SET json = json_set(json, '$.reply_to.body', '(deleted)',
+                                                     '$.reply_to.deleted', json('true'),
+                                                     '$.reply_to.attachments', 0)
+                 WHERE json_extract(json, '$.reply_to_id') = ?1
+                   AND json_type(json, '$.reply_to') = 'object'",
+                params![target],
+            )?;
+        }
+    }
     Ok(())
 }
 
