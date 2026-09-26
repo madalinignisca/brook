@@ -272,7 +272,11 @@ async def list_public_channels(user: CurrentUser, session: Session) -> list[Chan
             )
         ).all()
     )
-    return [await _channel_out_for(session, c) for c in channels]
+    # Pending ownership offers are the members' business: not shown to someone browsing.
+    return [
+        (await _channel_out_for(session, c)).model_copy(update={"owner_offers": []})
+        for c in channels
+    ]
 
 
 @router.get("/search", response_model=list[MessageOut])

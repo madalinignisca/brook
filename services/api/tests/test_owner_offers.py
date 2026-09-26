@@ -165,3 +165,47 @@ def test_the_recipient_hears_the_offer_live(sync_client: TestClient) -> None:
             if f["type"] == "message.new" and f["data"]["body"] == "probe":
                 break
     assert [o["user_id"] for o in updates[-1]["data"]["owner_offers"]] == [b]
+
+
+async def test_only_the_recipient_can_answer_an_offer(client: httpx.AsyncClient) -> None:
+    """The property everything hinges on: an offer to carol is carol's alone. Another
+    member, and the one who offered, get 404 on accept and decline; the offer stays
+    and nobody's role changes. (A lookup by channel instead of by caller passed every
+    other test: the auth review's mutant.)"""
+    t = await _team(client)
+    hb, hc, hd, ch = t["hb"], t["hc"], t["hd"], t["ch"]
+    assert (await _offer(client, ch, "carol", hb)).status_code == 201
+    for who in (hd, hb):  # another member; the offerer (an owner already)
+        for answer in ("accept", "decline"):
+            r = await client.post(f"{CH}/{ch}/owner-offers/{answer}", headers=who)
+            assert r.status_code == 404 and r.json()["error"]["code"] == "offer.not_found"
+    channel = await _channel(client, ch, hc)
+    assert [o["user_id"] for o in channel["owner_offers"]] == [t["c"]]
+    assert _roles(channel) == {"bob": "owner", "carol": "member", "dave": "member"}
+
+
+async def test_an_outsider_learns_nothing_on_any_offer_route(client: httpx.AsyncClient) -> None:
+    t = await _team(client)
+    ch = t["ch"]
+    assert (await _offer(client, ch, "carol", t["hb"])).status_code == 201
+    he, _ = await _user(client, "eve", t["ha"])
+    for r in (
+        await client.post(f"{CH}/{ch}/owner-offers/accept", headers=he),
+        await client.post(f"{CH}/{ch}/owner-offers/decline", headers=he),
+        await client.delete(f"{CH}/{ch}/owner-offers/{t['c']}", headers=he),
+    ):
+        assert r.status_code == 404 and r.json()["error"]["code"] == "not_found"
+
+
+async def test_a_public_listing_shows_no_offers(client: httpx.AsyncClient) -> None:
+    ha, _ = await _user(client, "alice")
+    await _user(client, "bob", ha)
+    he, _ = await _user(client, "eve", ha)
+    ch = (
+        await client.post(CH, json={"kind": "channel", "name": "town", "public": True}, headers=ha)
+    ).json()["id"]
+    await client.post(f"{CH}/{ch}/members", json={"handle": "bob"}, headers=ha)
+    assert (await _offer(client, ch, "bob", ha)).status_code == 201
+    listed = (await client.get(f"{CH}/public", headers=he)).json()
+    (town,) = [c for c in listed if c["id"] == ch]
+    assert town["owner_offers"] == []  # members see it; someone browsing doesn't
