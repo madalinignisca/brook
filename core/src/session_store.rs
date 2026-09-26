@@ -639,6 +639,7 @@ mod tests {
                 handle: "alice".into(),
                 display_name: "Alice".into(),
                 global_role: "member".into(),
+                status_text: None,
             },
         }
     }

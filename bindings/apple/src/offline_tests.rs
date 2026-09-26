@@ -498,3 +498,16 @@ fn another_users_unsent_count_crosses_including_unknown() {
     let u = FfiLocalUser::from(user(Some(0)));
     assert_eq!((u.origin.as_str(), u.user_id.as_str()), ("https://a", "u1"));
 }
+
+#[test]
+fn a_user_keeps_their_status_line() {
+    let user: brook_core::User = serde_json::from_value(json!({
+        "id": "u1", "handle": "alice", "display_name": "Alice", "global_role": "member",
+        "status": "active", "status_text": "away"
+    }))
+    .unwrap();
+    assert_eq!(
+        crate::types::FfiUser::from(user).status_text.as_deref(),
+        Some("away")
+    );
+}

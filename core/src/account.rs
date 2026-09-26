@@ -384,6 +384,52 @@ impl BrookClient {
         })
     }
 
+    /// Change your display name and/or status line (`None`: unchanged; `Some("")` clears the
+    /// status). Refused with `profile.invalid` (422): a name of 1 to 64 characters and a
+    /// status of up to 100, with no control or text-direction characters. The handle never
+    /// changes. Answers the updated profile; others see it through `/sync`.
+    pub async fn update_profile(
+        &self,
+        display_name: Option<&str>,
+        status_text: Option<&str>,
+    ) -> Result<Me> {
+        #[derive(Deserialize)]
+        struct MeOut {
+            #[serde(flatten)]
+            user: crate::User,
+            #[serde(default)]
+            totp_enabled: bool,
+            recovery_codes_left: Option<u32>,
+        }
+        let mut body = serde_json::Map::new();
+        if let Some(name) = display_name {
+            body.insert("display_name".into(), json!(name));
+        }
+        if let Some(status) = status_text {
+            body.insert("status_text".into(), json!(status));
+        }
+        let body = serde_json::Value::Object(body);
+        let epoch = self.session.snapshot().await.0.epoch;
+        let url = self.base.join("api/v1/auth/me")?;
+        let (resp, _) = self
+            .ctx()
+            .send(epoch, OnExpired::SingleFlight, |access| {
+                self.http.patch(url.clone()).bearer_auth(access).json(&body)
+            })
+            .await?;
+        // Not `account_error`: its 422 means a refused password. Here the server's own code
+        // (`profile.invalid`) is the answer. A 401 never gets here (`send` answers it).
+        if !resp.status().is_success() {
+            return Err(crate::client::api_error(resp).await);
+        }
+        let out: MeOut = resp.json().await.map_err(|_| Error::UnexpectedResponse)?;
+        Ok(Me {
+            user: out.user,
+            totp_enabled: out.totp_enabled,
+            recovery_codes_left: out.recovery_codes_left,
+        })
+    }
+
     /// Start turning TOTP on: the password is re-checked (wrong: `auth.invalid_credentials`),
     /// and the enrolment's URI is returned once (409 `conflict` if TOTP is already on).
     pub async fn totp_enroll(&self, password: &str) -> Result<TotpEnrollment> {

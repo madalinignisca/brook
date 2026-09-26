@@ -234,6 +234,23 @@ impl FfiBrookClient {
         run(async move { inner.mark_read(&channel_id, message_id.as_deref()).await }).await
     }
 
+    /// Remove a member (a channel owner or an admin), or yourself. Errors carry the server's
+    /// code: `channel.last_owner`, `channel.dm`, `authz.forbidden`, `not_found`.
+    pub async fn remove_member(
+        &self,
+        channel_id: String,
+        user_id: String,
+    ) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.remove_member(&channel_id, &user_id).await }).await
+    }
+
+    /// Leave a channel (`remove_member` with yourself).
+    pub async fn leave_channel(&self, channel_id: String) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.leave_channel(&channel_id).await }).await
+    }
+
     /// Save an attachment to `destination` (the path a save panel chose), checked against
     /// `sha256`. Progress and cancel go by `transfer_id` (`subscribe_transfers`,
     /// `cancel_transfer`). A failed or cancelled download leaves no file behind;
@@ -339,6 +356,23 @@ impl FfiBrookClient {
     pub async fn me(&self) -> Result<FfiMe, LoginError> {
         let inner = Arc::clone(&self.inner);
         Ok(run(async move { inner.me().await }).await?.into())
+    }
+
+    /// Change the display name and/or the status line (nil: unchanged; "" clears the
+    /// status). `profile.invalid` when refused. Answers the updated profile.
+    pub async fn update_profile(
+        &self,
+        display_name: Option<String>,
+        status_text: Option<String>,
+    ) -> Result<FfiMe, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        Ok(run(async move {
+            inner
+                .update_profile(display_name.as_deref(), status_text.as_deref())
+                .await
+        })
+        .await?
+        .into())
     }
 
     /// Start turning TOTP on (the password is re-checked).
