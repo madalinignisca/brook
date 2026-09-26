@@ -108,8 +108,16 @@ where this spec says "as GTK", it means that code's behaviour. The Mac has a tim
 7. **Other accounts' saved data** (#46 §8: one Mac's cache never crosses accounts):
    - At this user's first completed sync (`lastSyncedUnixMs` set), once per signed-in
      client, the app reads `otherLocalUsers()`.
-   - If it isn't empty, it calls `wipeOtherLocalUsers()` and says "Another account's saved
-     messages were removed from this Mac", as GTK does.
+   - If it isn't empty, it calls `wipeOtherLocalUsers()` and then says so, naming unsent
+     messages as #46 §8 requires ("wiped after their unsent count is surfaced"):
+     - "Another account's saved messages were removed from this Mac, including 3 unsent
+       messages." (the sum of the known counts);
+     - "…, which may have included unsent messages." when any count couldn't be read;
+     - "Another account's saved messages were removed from this Mac." when every count is 0.
+
+     The counts come from `otherLocalUsers()`, which gains an `unsent: UInt64?` per
+     account, read from that account's outbox, or nil if it can't be read. That's a small
+     core and binding change, in its own PR, which GTK can use too.
    - An account counts as other by server and user. Signing in to a second server removes
      the first server's saved data, unsent messages included. That follows from the same
      decision, and the sheet from item 6 was the chance to keep it.
@@ -159,7 +167,8 @@ where this spec says "as GTK", it means that code's behaviour. The Mac has a tim
   would be a second path around the gate.
 - Sending files from the Mac (its own spec, next), previews in the row, and "Keep
   available offline": after #79.
-- Any core change.
+- Any other core change (the one exception is the unsent count per other account,
+  item 7).
 
 ## Where it fails
 
@@ -220,3 +229,9 @@ round-1 fixes and raised four points, all taken:
 - The next sign-in waits for an erasing sign-out.
 
 Nothing disputed: closed.
+
+## Review by the server side
+
+Taken: the other-accounts notice now names their unsent messages before the wipe, as
+#46 §8 requires. That needs `otherLocalUsers()` to carry a count, a small core change in
+its own PR. GTK's #110 has the same gap, and the same API closes it.
