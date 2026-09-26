@@ -97,6 +97,10 @@ struct MessageWidgets {
     has_files: bool,
     /// The message text as sent (markdown, not the rendered markup), for editing.
     source: Rc<RefCell<String>>,
+    /// Hidden once the message is a tombstone: actions, quote, files, reactions.
+    extras: Vec<gtk::Widget>,
+    /// The quoted message's id, its author and the quote line, if this is a reply.
+    quote: Option<(String, String, gtk::Label)>,
 }
 
 /// Build the chat view. `is_admin` controls whether channel creation is offered.
@@ -452,10 +456,12 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     }
                 }
                 Ok(ServerEvent::MessageDelete { message_id, .. }) => {
-                    let removed = chat.message_rows.borrow_mut().remove(&message_id);
-                    if let Some(widgets) = removed {
-                        chat.message_list.remove(&widgets.row);
+                    // The row stays as a tombstone, as history and the cache show it.
+                    let shown = chat.message_rows.borrow().get(&message_id).cloned();
+                    if let Some(widgets) = shown {
+                        show_deleted(&widgets);
                     }
+                    mark_quotes_deleted(&chat, &message_id);
                     // If we were replying to this message, the reply target is gone.
                     if chat.replying_to.borrow().as_deref() == Some(message_id.as_str()) {
                         set_reply(&chat, None);
@@ -935,7 +941,9 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
         .borrow()
         .as_deref()
         .is_some_and(|me| me == message.author_id);
-    header.append(&message_actions_button(chat, message, is_own));
+    let actions = message_actions_button(chat, message, is_own);
+    header.append(&actions);
+    let mut extras: Vec<gtk::Widget> = vec![actions.upcast(), edited_label.clone().upcast()];
 
     let body_label = gtk::Label::builder()
         .label(markdown_to_pango(&message.body))
@@ -955,6 +963,7 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
     });
     row.append(&header);
     // Quoted-reply preview above the body, if this message is a reply.
+    let mut quote_widgets = None;
     if let Some(reply) = &message.reply_to {
         let who = reply
             .author_display_name
@@ -962,28 +971,30 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
             .or_else(|| reply.author_handle.clone())
             .unwrap_or_else(|| "Unknown".to_string());
         let quote = gtk::Label::builder()
-            .label(format!("\u{21b3} {who}: {}", reply.body))
+            .label(quote_text(
+                &who,
+                &reply.body,
+                reply.deleted,
+                reply.attachments,
+            ))
             .xalign(0.0)
             .wrap(true)
             .css_classes(["caption", "dim-label"])
             .build();
         row.append(&quote);
+        extras.push(quote.clone().upcast());
+        quote_widgets = Some((reply.id.clone(), who, quote));
     }
     // A file sent without a caption has no text line (the server allows an empty body
     // when files are attached).
     body_label.set_visible(!(message.body.trim().is_empty() && !message.attachments.is_empty()));
     row.append(&body_label);
-    let deleted = Rc::new(Cell::new(false));
-    if message.is_deleted() {
-        show_deleted(&body_label, &deleted);
-    }
     // Attached files (a tombstone has none): shown, and saved only on request.
     for file in &message.attachments {
-        row.append(&crate::attachments::attachment_row(
-            file,
-            chat.client.clone(),
-            chat.runtime.clone(),
-        ));
+        let file_row =
+            crate::attachments::attachment_row(file, chat.client.clone(), chat.runtime.clone());
+        row.append(&file_row);
+        extras.push(file_row.upcast());
     }
 
     // Reactions row: chips + a quick-react picker.
@@ -999,6 +1010,7 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
     reactions_wrapper.append(&reactions_box);
     reactions_wrapper.append(&react_button(chat, &message.channel_id, &message.id));
     row.append(&reactions_wrapper);
+    extras.push(reactions_wrapper.upcast());
 
     let list_row = gtk::ListBoxRow::builder()
         .activatable(false)
@@ -1018,20 +1030,25 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
         drop_pending_bubble(chat, cid);
     }
     keep_pending_last(chat);
-    chat.message_rows.borrow_mut().insert(
-        message.id.clone(),
-        MessageWidgets {
-            row: list_row,
-            body: body_label,
-            edited: edited_label,
-            channel_id: message.channel_id.clone(),
-            reactions_box,
-            reactions: Rc::new(RefCell::new(message.reactions.clone())),
-            deleted: deleted.clone(),
-            has_files: !message.attachments.is_empty(),
-            source: Rc::new(RefCell::new(message.body.clone())),
-        },
-    );
+    let widgets = MessageWidgets {
+        row: list_row,
+        body: body_label,
+        edited: edited_label,
+        channel_id: message.channel_id.clone(),
+        reactions_box,
+        reactions: Rc::new(RefCell::new(message.reactions.clone())),
+        deleted: Rc::new(Cell::new(false)),
+        has_files: !message.attachments.is_empty(),
+        source: Rc::new(RefCell::new(message.body.clone())),
+        extras,
+        quote: quote_widgets,
+    };
+    if message.is_deleted() {
+        show_deleted(&widgets);
+    }
+    chat.message_rows
+        .borrow_mut()
+        .insert(message.id.clone(), widgets);
     render_reactions(chat, &message.id);
 
     // Scroll to bottom after layout settles.
@@ -2306,7 +2323,8 @@ fn fill_from_cache(chat: &Rc<Chat>, channel_id: String) {
                 None => append_message(&chat, message),
                 // Deleted while on screen, and no live event said so.
                 Some(widgets) if message.is_deleted() && !widgets.deleted.get() => {
-                    show_deleted(&widgets.body, &widgets.deleted);
+                    show_deleted(&widgets);
+                    mark_quotes_deleted(&chat, &message.id);
                 }
                 Some(_) => {}
             }
@@ -2643,16 +2661,48 @@ struct Quoted {
 }
 
 /// Show a row's text line as a tombstone.
-fn show_deleted(body: &gtk::Label, deleted: &Cell<bool>) {
-    body.set_markup("<i>Message deleted</i>");
-    body.add_css_class("dim-label");
-    body.set_visible(true);
-    deleted.set(true);
+fn show_deleted(widgets: &MessageWidgets) {
+    widgets.body.set_markup("<i>Message deleted</i>");
+    widgets.body.add_css_class("dim-label");
+    widgets.body.set_visible(true);
+    for extra in &widgets.extras {
+        extra.set_visible(false);
+    }
+    widgets.source.replace(String::new());
+    widgets.deleted.set(true);
+}
+
+/// Replies on screen that quote a message just deleted say so (only the target itself
+/// gets `message.delete`; the next history or sync read carries the server's flag).
+fn mark_quotes_deleted(chat: &Rc<Chat>, target: &str) {
+    for widgets in chat.message_rows.borrow().values() {
+        if let Some((id, who, label)) = &widgets.quote {
+            if id == target {
+                label.set_label(&quote_text(who, "", true, 0));
+            }
+        }
+    }
+}
+
+/// The quote line above a reply, from the server's excerpt flags (not its text).
+fn quote_text(who: &str, body: &str, deleted: bool, files: u32) -> String {
+    let what = if deleted {
+        "a deleted message".to_string()
+    } else if !body.trim().is_empty() {
+        body.to_string()
+    } else {
+        match files {
+            0 => "an empty message".to_string(),
+            1 => "a file".to_string(),
+            n => format!("{n} files"),
+        }
+    };
+    format!("\u{21b3} {who}: {what}")
 }
 
 #[cfg(test)]
 mod reply_excerpt_tests {
-    use super::{reply_excerpt, Quoted};
+    use super::{quote_text, reply_excerpt, Quoted};
 
     fn quoted(text: &str, deleted: bool, has_files: bool) -> Quoted {
         Quoted {
@@ -2679,5 +2729,15 @@ mod reply_excerpt_tests {
                 .count(),
             80
         );
+    }
+
+    #[test]
+    fn a_sent_quote_follows_the_server_flags() {
+        let q = |body, deleted, files| quote_text("Ana", body, deleted, files);
+        assert_eq!(q("hello", false, 0), "\u{21b3} Ana: hello");
+        assert_eq!(q("(deleted)", true, 0), "\u{21b3} Ana: a deleted message");
+        assert_eq!(q("", false, 1), "\u{21b3} Ana: a file");
+        assert_eq!(q(" ", false, 3), "\u{21b3} Ana: 3 files");
+        assert_eq!(q("see this", false, 2), "\u{21b3} Ana: see this");
     }
 }
