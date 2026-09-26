@@ -71,6 +71,9 @@ class User(Base):
     password_hash: Mapped[str | None] = mapped_column(String(255), default=None)
     global_role: Mapped[str] = mapped_column(String(16), default="member")
     status: Mapped[str] = mapped_column(String(16), default="active")
+    # The profile's status line, set by the user (PATCH /auth/me). Not ``status``, which
+    # is the account's state (active or disabled) and gates sign-in.
+    status_text: Mapped[str] = mapped_column(String(100), default="", server_default="")
     # Sync change sequence (sync spec §2), stamped automatically by app/sync.py.
     seq: Mapped[int] = mapped_column(BigInteger, default=0, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

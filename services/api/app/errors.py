@@ -80,7 +80,14 @@ async def _validation_exception(_request: Request, exc: Exception) -> JSONRespon
         422,
         "validation.error",
         "Request validation failed",
-        details={"errors": jsonable_encoder(val_exc.errors())},
+        # Without "input": the submitted value isn't echoed back (a too-short password
+        # would be), and a lone surrogate in it made this response itself fail to encode
+        # (a 500 instead of the 422).
+        details={
+            "errors": jsonable_encoder(
+                [{k: v for k, v in e.items() if k != "input"} for e in val_exc.errors()]
+            )
+        },
     )
 
 

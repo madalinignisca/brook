@@ -331,3 +331,54 @@ async def test_logout_catches_the_token_of_an_inflight_refresh(client: httpx.Asy
     assert (
         await client.post(f"{AUTH}/refresh", json={"refresh_token": raw_new})
     ).status_code == 401
+
+
+async def test_two_owners_leaving_at_once_leave_one_behind(client: httpx.AsyncClient) -> None:
+    """The last-owner rule under a race: both owners leave at once. Each must see the
+    other's departure before counting, so exactly one leaves (204) and one stays (409).
+    Without the channel-row lock taken *before* the count, both count two owners and both
+    go: the re-stamp's UPDATE serialises them only after the count was read."""
+    from app.models import Membership
+
+    alice_id, pair = await _alice(client)
+    ha = {"Authorization": f"Bearer {pair['access_token']}"}
+    ch = (
+        await client.post("/api/v1/channels", json={"kind": "channel", "name": "g"}, headers=ha)
+    ).json()["id"]  # alice (admin) is its owner
+    body = {"handle": "bob", "display_name": "Bob", "password": PW}
+    await client.post(f"{AUTH}/register", json=body, headers=ha)
+    await client.post(f"/api/v1/channels/{ch}/members", json={"handle": "bob"}, headers=ha)
+    bob = await client.post(f"{AUTH}/login", json={"handle": "bob", "password": PW})
+    hb = {"Authorization": f"Bearer {bob.json()['access_token']}"}
+    bob_id = uuid.UUID((await client.get(f"{AUTH}/me", headers=hb)).json()["id"])
+    cid = uuid.UUID(ch)
+    async with db.get_sessionmaker()() as s:
+        await s.execute(
+            update(Membership)
+            .where(Membership.channel_id == cid, Membership.user_id == bob_id)
+            .values(role="owner")
+        )
+        await s.commit()
+
+    from app.models import Channel
+
+    async with db.get_sessionmaker()() as holder:
+        # Park both leaves at the start line: the holder has the channel row.
+        await holder.execute(select(Channel.id).where(Channel.id == cid).with_for_update())
+        a = asyncio.create_task(
+            client.delete(f"/api/v1/channels/{ch}/members/{alice_id}", headers=ha)
+        )
+        b = asyncio.create_task(
+            client.delete(f"/api/v1/channels/{ch}/members/{bob_id}", headers=hb)
+        )
+        await asyncio.sleep(SETTLE)
+        await holder.rollback()
+    codes = sorted([(await a).status_code, (await b).status_code])
+    assert codes == [204, 409], codes
+    async with db.get_sessionmaker()() as check:
+        owners = await check.scalar(
+            select(func.count())
+            .select_from(Membership)
+            .where(Membership.channel_id == cid, Membership.role == "owner")
+        )
+        assert owners == 1

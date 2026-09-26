@@ -154,7 +154,18 @@ class UserOut(BaseModel):
     display_name: str
     global_role: str
     status: str
+    status_text: str = ""
     created_at: datetime
+
+
+class ProfilePatch(BaseModel):
+    """``PATCH /auth/me``: change your own profile. Omitted fields stay as they are.
+
+    ``display_name`` 1..64 characters, ``status_text`` 0..100 ("" clears it), both after
+    trimming; control characters and bidirectional overrides are refused (routers/auth)."""
+
+    display_name: str | None = Field(default=None, max_length=256)
+    status_text: str | None = Field(default=None, max_length=400)
 
 
 class MeOut(UserOut):
@@ -188,6 +199,13 @@ class ChannelCreate(BaseModel):
     public: bool = False
 
 
+class ChannelMember(UserSummary):
+    """A member as a channel lists them: who they are, and whether they own it (an owner
+    may remove members; the last owner can't leave, so clients warn before trying)."""
+
+    role: str = "member"
+
+
 class ChannelOut(BaseModel):
     """A channel/DM the caller belongs to, with its members."""
 
@@ -197,7 +215,7 @@ class ChannelOut(BaseModel):
     topic: str | None
     created_by: uuid.UUID | None
     created_at: datetime
-    members: list[UserSummary]
+    members: list[ChannelMember]
     unread_count: int = 0
     public: bool = False
     archived: bool = False
