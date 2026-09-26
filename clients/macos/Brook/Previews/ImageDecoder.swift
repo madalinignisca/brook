@@ -31,6 +31,10 @@ actor ImageDecoder {
     private var running = 0
     private var waiting: [Waiting] = []
     private var disabled = false
+    /// Requests in a row that got no answer at all. One can be a broker killed under memory
+    /// pressure (it relaunches); several mean the service can't be reached.
+    private var unreachable = 0
+    static let unreachableLimit = 3
     private let log = Logger(subsystem: "dev.brook.Brook", category: "previews")
 
     /// A thumbnail for `bytes` (`FfiImagePreview`'s), or nil: no preview, whatever the
@@ -43,9 +47,11 @@ actor ImageDecoder {
         let reply = await send(bytes, kind)
         switch reply {
         case .none:
-            disableOnce("the decoder couldn't be reached")
+            unreachable += 1
+            if unreachable >= Self.unreachableLimit { disableOnce("the decoder couldn't be reached") }
             return nil
         case let .some((code, w, h, rgba)):
+            unreachable = 0
             return PreviewValidator.image(code: code, width: w, height: h, rgba: rgba, header: header)
         }
     }
@@ -91,13 +97,14 @@ actor ImageDecoder {
         defer { connection.invalidate() } // ends the worker if it's still running
         return await withCheckedContinuation { (done: CheckedContinuation<(Int, Int, Int, Data)?, Never>) in
             let once = OnceBox(done)
+            let timer = Task {
+                try? await Task.sleep(for: timeout)
+                if !Task.isCancelled { once.resume((ReplyCode.timeout.rawValue, 0, 0, Data())) }
+            }
+            once.onResume = { timer.cancel() } // no sleeping task left behind
             let proxy = connection.remoteObjectProxyWithErrorHandler { _ in once.resume(nil) }
             guard let decoder = proxy as? ImageDecoding else { return once.resume(nil) }
             decoder.decode(bytes, kind: Int(kind.rawValue)) { code, w, h, rgba in once.resume((code, w, h, rgba)) }
-            Task {
-                try? await Task.sleep(for: timeout)
-                once.resume((ReplyCode.timeout.rawValue, 0, 0, Data()))
-            }
         }
     }
 
@@ -115,12 +122,19 @@ actor ImageDecoder {
 private final class OnceBox<T: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<T, Never>?
+    /// Runs once, on the first resume.
+    var onResume: (@Sendable () -> Void)? {
+        get { lock.withLock { hook } }
+        set { lock.withLock { hook = newValue } }
+    }
+    private var hook: (@Sendable () -> Void)?
     init(_ c: CheckedContinuation<T, Never>) { continuation = c }
     func resume(_ value: T) {
-        let c = lock.withLock { () -> CheckedContinuation<T, Never>? in
-            defer { continuation = nil }
-            return continuation
+        let (c, h) = lock.withLock { () -> (CheckedContinuation<T, Never>?, (@Sendable () -> Void)?) in
+            defer { continuation = nil; hook = nil }
+            return (continuation, continuation == nil ? nil : hook)
         }
         c?.resume(returning: value)
+        h?()
     }
 }

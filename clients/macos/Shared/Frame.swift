@@ -91,7 +91,8 @@ struct Frame: Equatable {
         case .ready: break
         }
         var extra: UInt8 = 0
-        let r = Darwin.read(fd, &extra, 1)
+        var r: Int
+        repeat { r = Darwin.read(fd, &extra, 1) } while r < 0 && errno == EINTR
         guard r == 0 else { return .failure(.malformed) }
         return .success(Frame(code: code, width: width, height: height, body: body))
     }

@@ -54,33 +54,45 @@ final class Broker: NSObject, NSXPCListenerDelegate {
     }
 }
 
-/// One connection's requests: each runs on its own, and ends its worker when the connection
-/// goes.
+/// One connection's requests: each runs on its own, and every worker of the connection is
+/// ended when it goes (including one being spawned at that moment).
 final class Session: NSObject, ImageDecoding, @unchecked Sendable {
     private let lock = NSLock()
     private var running: [UUID: WorkerRun] = [:]
+    private var cancelled = false
     private static let queue = DispatchQueue(label: "dev.brook.decode", attributes: .concurrent)
 
     func decode(_ bytes: Data, kind: Int, reply: @escaping (Int, Int, Int, Data) -> Void) {
         // Returns at once: NSXPC delivers on the connection's serial queue, and a blocking
-        // decode would start the next request's deadline late.
+        // decode would start the next request's deadline late. The broker's only writer to a
+        // worker is this, so the worker's own 16 MiB check never meets more than this cap.
         let answer = ReplyOnce(reply)
         guard let code = ImageKindCode(request: kind), bytes.count <= PreviewCaps.maxInputBytes else {
             return answer.send(.refused)
         }
         let id = UUID()
+        let run = WorkerRun(kind: code, bytes: bytes)
+        let admitted = lock.withLock { () -> Bool in
+            guard !cancelled else { return false }
+            running[id] = run
+            return true
+        }
+        guard admitted else { return answer.send(.workerFailed) }
         Self.queue.async { [self] in
-            let run = WorkerRun(kind: code, bytes: bytes)
-            lock.withLock { running[id] = run }
+            WorkerRun.slots.wait()
             let result = run.finish()
+            WorkerRun.slots.signal()
             lock.withLock { _ = running.removeValue(forKey: id) }
             answer.send(result)
         }
     }
 
     func cancelAll() {
-        let runs = lock.withLock { Array(running.values) }
-        for run in runs { run.kill() }
+        let runs = lock.withLock { () -> [WorkerRun] in
+            cancelled = true
+            return Array(running.values)
+        }
+        for run in runs { run.cancel() }
     }
 }
 
@@ -103,8 +115,9 @@ final class ReplyOnce: @unchecked Sendable {
 
 // Start: an empty temp directory (a worker of an earlier run could have left files there),
 // then listen.
-if let items = try? FileManager.default.contentsOfDirectory(atPath: NSTemporaryDirectory()) {
-    for item in items { try? FileManager.default.removeItem(atPath: NSTemporaryDirectory() + item) }
+let tmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+if let items = try? FileManager.default.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil) {
+    for item in items { try? FileManager.default.removeItem(at: item) }
 }
 let requirement = peerRequirement()
 let broker = Broker()

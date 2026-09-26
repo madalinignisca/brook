@@ -174,3 +174,41 @@ Rebutted (vibe):
   streams rather than decoding the whole image; content that doesn't compress will cost
   more, within the 40 MP cap. Measured with `/usr/bin/time -l` on an ad-hoc copy of the
   worker, outside the sandbox. The decode code is the same.
+
+## Implementation review, round 1
+
+Two reviewers (vibe, and a second model standing in while codex is unavailable).
+
+Taken:
+- **A worker that replies and then lingers is bounded.** The broker waits for its exit
+  without reaping (`waitid` with `WNOWAIT`), and kills it at the deadline even after a good
+  frame, which then counts as a failure. Tested with a Debug `linger` kind.
+- **Cancel races.** The session refuses new runs once it's cancelled. A run cancelled
+  while its worker is being spawned kills the worker the moment its pid is known.
+- **No kill after exit.** The pid is cleared once `waitid` sees the exit, before the reap,
+  so a kill never reaches a reused pid.
+- **`wait4`'s return is checked.** Anything other than the child's pid is a failure.
+- **An `EINTR` on the final EOF read is retried.**
+- **The "group is empty" assertion couldn't fail.** The probe now reports whether it leads
+  its own process group.
+- **The unknown-kind test sends a valid PNG,** so a kind that wrapped to `png` would show
+  as a decode.
+- **Previews go off only after three unanswered requests in a row.** One can be a broker
+  killed under memory pressure.
+- **The timeout task is cancelled** when a reply comes.
+- **At most 2 workers per broker,** whatever the clients ask.
+- **Workers get an empty environment.**
+- **Release re-signs the worker with a secure timestamp** (notarization).
+- **Small fixes:** the temp directory is joined as a URL, and the spawn setup's return
+  values are checked.
+
+Rebutted (vibe):
+- **File actions leaked on a `pipe` failure.** They're created after both pipes.
+- **The child's pipe ends leaked on a spawn failure.** They're closed unconditionally, right
+  after the spawn.
+- **A `poll` error counted as ready.** The `read` that follows then fails, and the frame
+  is refused as malformed. That's the right outcome.
+
+Noted: the fake-client stubs in `CallModelTests.swift` are the separate #158 fix, merged
+into this branch so it builds. The 40 MP peak was measured outside the sandbox (see
+"Measured").

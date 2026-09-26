@@ -49,4 +49,23 @@ final class ImageDecoderQueueTests: XCTestCase {
         for t in tasks { await t.value }
         XCTAssertEqual(gate.order, [1, 2, 5, 4])
     }
+
+    /// One unanswered request (a broker killed under memory pressure) doesn't turn previews
+    /// off; three in a row do, and then nothing more is sent.
+    func testPreviewsGoOffOnlyAfterRepeatedSilence() async {
+        final class Count: @unchecked Sendable {
+            let lock = NSLock()
+            var sent = 0
+        }
+        let count = Count()
+        let decoder = ImageDecoder(send: { _, _ in
+            count.lock.withLock { count.sent += 1 }
+            return nil
+        })
+        for _ in 0 ..< 2 { _ = await decoder.thumbnail(bytes: Data(), kind: .png, header: (1, 1), alive: { true }) }
+        XCTAssertEqual(count.lock.withLock { count.sent }, 2)
+        _ = await decoder.thumbnail(bytes: Data(), kind: .png, header: (1, 1), alive: { true }) // the third
+        _ = await decoder.thumbnail(bytes: Data(), kind: .png, header: (1, 1), alive: { true })
+        XCTAssertEqual(count.lock.withLock { count.sent }, 3, "a request was sent after previews went off")
+    }
 }

@@ -27,7 +27,8 @@ limit(RLIMIT_CPU, 10)
 let allowed = [UTType.png, .jpeg, .gif, .webP].map(\.identifier) as CFArray
 if CGImageSourceSetAllowableTypes(allowed) != noErr { _exit(1) }
 
-// 3. The request: `kind`, then the bytes to EOF, never more than core's cap.
+// 3. The request: `kind`, then the bytes to EOF, never more than core's cap (the broker, the
+//    only writer, has already refused anything bigger; this is the second check).
 let input = FileHandle.standardInput.readDataToEndOfFile()
 guard input.count >= 1, input.count - 1 <= PreviewCaps.maxInputBytes,
       let kind = ImageKindCode(rawValue: input[input.startIndex])
@@ -37,6 +38,12 @@ let bytes = input.dropFirst()
 #if DEBUG
 if kind == .hang {
     while true {} // the broker's deadline must end this
+}
+if kind == .linger {
+    let one = Frame(code: 0, width: 1, height: 1, body: Data(count: 4)).encoded()
+    FileHandle.standardOutput.write(one)
+    close(1)
+    while true { sleep(60) }
 }
 if kind == .probe {
     FileHandle.standardOutput.write(Frame(code: UInt32(ReplyCode.report.rawValue), width: 0, height: 0,
@@ -53,7 +60,7 @@ case .jpeg: uti = .jpeg
 case .gif: uti = .gif
 case .webp: uti = .webP
 #if DEBUG
-case .hang, .probe: _exit(1)
+case .hang, .probe, .linger: _exit(1)
 #endif
 }
 let hint = [kCGImageSourceTypeIdentifierHint: uti.identifier] as CFDictionary

@@ -124,11 +124,12 @@ targets:
           set -euo pipefail
           worker="${TARGET_BUILD_DIR}/${EXECUTABLE_FOLDER_PATH}/BrookImageWorker"
           [ -f "$worker" ] || { echo "error: $worker not embedded"; exit 1; }
-          flags=()
-          [ "${CONFIGURATION}" = "Release" ] && flags+=(--options=runtime)
-          codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" ${flags[@]+"${flags[@]}"} \
-            --entitlements "${SRCROOT}/BrookImageWorker/BrookImageWorker.entitlements" \
-            --timestamp=none "$worker"
+          # Release: the hardened runtime and a secure timestamp (notarization needs both on
+          # every executable); Debug: no timestamp (offline, fast).
+          flags=(--timestamp=none)
+          [ "${CONFIGURATION}" = "Release" ] && flags=(--options=runtime --timestamp)
+          codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" "${flags[@]}" \
+            --entitlements "${SRCROOT}/BrookImageWorker/BrookImageWorker.entitlements" "$worker"
           touch "${DERIVED_FILE_DIR}/worker-resigned.stamp"
     settings:
       base:

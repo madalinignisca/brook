@@ -41,6 +41,7 @@ final class ImageDecoderServiceTests: XCTestCase {
         XCTAssertEqual(p["cpu"], "10/10")
         XCTAssertEqual(p["nproc"], "0/0")
         XCTAssertEqual(p["brokerClient"], "no", "the worker used the broker as a client")
+        XCTAssertEqual(p["ownGroup"], "1", "the worker doesn't lead its own process group")
         XCTAssertEqual(p["ppid"], p["brokerPid"], "the worker isn't the broker's child")
     }
 
@@ -62,8 +63,15 @@ final class ImageDecoderServiceTests: XCTestCase {
         XCTAssertEqual(r.code, ReplyCode.timeout.rawValue)
         XCTAssert((7 ... 9.5).contains(took), "took \(took) s")
         let p = report(r.body)
-        XCTAssertNotNil(p["reaped"])
-        XCTAssertEqual(p["group"], "empty")
+        XCTAssertGreaterThan(p["reaped"].flatMap { Int32($0) } ?? -1, 0, "the worker wasn't reaped")
+    }
+
+    func testAWorkerThatRepliesAndLingersIsEndedByTheDeadline() async {
+        let started = Date()
+        let r = await decode(Data(), kind: .linger)
+        let took = Date().timeIntervalSince(started)
+        XCTAssertEqual(r.code, ReplyCode.workerFailed.rawValue, "a good frame from a worker that stayed")
+        XCTAssert((7 ... 9.5).contains(took), "took \(took) s")
     }
 
     func testTwoHungWorkersRunTogether() async {
@@ -188,15 +196,17 @@ final class ImageDecoderServiceTests: XCTestCase {
     }
 
     func testAnUnknownKindNeverReachesAWorker() async {
-        let r = await ImageDecoder.request(bytes: Data(), kind: .png).map { $0 } // sanity: reachable
-        XCTAssertNotNil(r)
+        // A valid PNG: had 257 wrapped to png (1) as a byte, it would decode with code 0.
+        let png = encode(.png)
+        let itself = await decode(png, kind: .png)
+        XCTAssertEqual(itself.code, 0, "the PNG itself decodes")
         let connection = NSXPCConnection(serviceName: imageDecoderServiceName)
         connection.remoteObjectInterface = ImageDecoder.interface()
         connection.resume()
         defer { connection.invalidate() }
         let code: Int = await withCheckedContinuation { done in
             let proxy = connection.remoteObjectProxyWithErrorHandler { _ in done.resume(returning: -1) }
-            (proxy as? ImageDecoding)?.decode(Data(), kind: 256 + 1) { code, _, _, _ in done.resume(returning: code) }
+            (proxy as? ImageDecoding)?.decode(png, kind: 256 + 1) { code, _, _, _ in done.resume(returning: code) }
         }
         XCTAssertEqual(code, ReplyCode.refused.rawValue, "a kind that wraps to png as a byte")
     }

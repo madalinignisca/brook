@@ -23,6 +23,8 @@ enum ImageKindCode: UInt8 {
     case hang = 200
     /// Reports what its sandbox allows, as a text line in the frame's bytes.
     case probe = 201
+    /// Replies with a good frame, then stays: the broker must still end it by the deadline.
+    case linger = 202
     #endif
 
     /// Only the kinds this build knows: anything else, and any `Int` that isn't a byte,

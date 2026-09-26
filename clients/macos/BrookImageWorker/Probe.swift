@@ -5,7 +5,7 @@ import Foundation
 /// What this worker's sandbox and limits allow, one `key=value` per line (Debug only; the
 /// broker's tests read it). Every value that should be refused names the errno it got.
 func probeReport() -> String {
-    var lines = ["pid=\(getpid())", "ppid=\(getppid())"]
+    var lines = ["pid=\(getpid())", "ppid=\(getppid())", "ownGroup=\(getpgrp() == getpid() ? 1 : 0)"]
 
     // The network: a public address.
     let fd = socket(AF_INET, SOCK_STREAM, 0)
