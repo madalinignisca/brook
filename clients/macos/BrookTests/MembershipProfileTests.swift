@@ -19,6 +19,28 @@ final class FakeMembership: MembershipClient, @unchecked Sendable {
         await gate?.wait()
         if let failure { throw failure }
     }
+    func offerOwnership(channelId: String, handle: String) async throws -> FfiChannel {
+        calls.withLock { $0.append("offer:\(channelId):\(handle)") }
+        await gate?.wait()
+        if let failure { throw failure }
+        return channel(channelId, "general")
+    }
+    func withdrawOwnershipOffer(channelId: String, userId: String) async throws {
+        calls.withLock { $0.append("withdraw:\(channelId):\(userId)") }
+        await gate?.wait()
+        if let failure { throw failure }
+    }
+    func acceptOwnership(channelId: String) async throws -> FfiChannel {
+        calls.withLock { $0.append("accept:\(channelId)") }
+        await gate?.wait()
+        if let failure { throw failure }
+        return channel(channelId, "general")
+    }
+    func declineOwnership(channelId: String) async throws {
+        calls.withLock { $0.append("decline:\(channelId)") }
+        await gate?.wait()
+        if let failure { throw failure }
+    }
 }
 
 private func member(_ id: String, _ name: String, _ role: String? = "member") -> FfiMember {
@@ -127,7 +149,7 @@ final class MembersModelTests: XCTestCase {
         await model.remove("u2")
         XCTAssertEqual(client.calls.withLock { $0 }, ["remove:c1:u2"])
         XCTAssertNil(model.error)
-        XCTAssertNil(model.removing)
+        XCTAssertNil(model.busy)
     }
 
     func testEachRefusalSaysWhyAndAlreadyGoneIsSilent() async {
@@ -149,7 +171,7 @@ final class MembersModelTests: XCTestCase {
         client.gate = gate
         let model = MembersModel(channelId: "c1", client: client)
         let first = Task { await model.remove("u2") }
-        while model.removing == nil { await Task.yield() }
+        while model.busy == nil { await Task.yield() }
         await model.remove("u3")
         gate.open()
         await first.value
