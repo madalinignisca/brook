@@ -30,6 +30,13 @@ user-set cache size (the cap is a constant, §5).
 - Files have no `seq` of their own. They ride on their message: the message's `attachments`
   list, its tombstone (`deleted_at`) and its channel's removal are how core learns a file
   went.
+- A message's `attachments` list can only shrink after send, never grow:
+  - an edit touches only `body`;
+  - `DELETE /files/{id}` (the uploader, or a channel owner) removes an attached file's row
+    and bytes at once, and restamps its message;
+  - the message then arrives by `/sync` and by a live `message.update` with the current
+    list.
+- `GET` on a removed or pending file is `404` (never `403`).
 
 ## 3. Storage
 
@@ -160,7 +167,7 @@ journalled. Pinned files go too, and the UI shows them as gone.
 | Cause | Detected by | Effect |
 |---|---|---|
 | Its message deleted | a tombstone applied (live, `/sync`, history) | its files dropped |
-| Its message edited to drop a file | the message's `attachments` no longer lists it | that file dropped |
+| The file deleted from its message (`DELETE /files/{id}` by its uploader or a channel owner; an edit never changes files) | the message arrives (`message.update`, `/sync`, history) with that file missing from `attachments`, applied through the seq guard | that file dropped |
 | Its channel removed, or I left it | channel removal applied | the channel's files dropped |
 | A `404` on download | `cache_file` / the fetcher | that file dropped (`file.gone`) |
 | `410 sync.reset` | `Cache::reset_rows` | every file row dropped and its blob journalled in `deletions`, **in the same transaction** as the other resets (the old server's ids mean nothing) |
@@ -182,6 +189,8 @@ journalled. Pinned files go too, and the UI shows them as gone.
   "Not downloaded: available when you're back online". Pinning still works and fetches later.
 - `file.open_refused`: "This file can't be opened from Brook. Save it instead." Save stays.
 - On quit the app calls `clear_open_copies()`.
+- A `message.update` redraws the message's attachment rows from its `attachments`, so a
+  file deleted from a message disappears on screen too. Today only the body is updated.
 
 ## 8. Tests
 
