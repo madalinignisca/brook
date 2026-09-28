@@ -80,16 +80,17 @@ pub fn error_text(err: &Error) -> String {
 }
 
 /// An error that means the action already happened: leaving a channel you're no longer in,
-/// or answering or withdrawing an offer that's gone. Nothing to report.
+/// removing someone already gone, or answering or withdrawing an offer that's gone. Nothing
+/// to report: the re-listed channel shows how things are.
 pub fn already_so(err: &Error, action: Action) -> bool {
     let Error::Api { code, .. } = err else {
         return false;
     };
     match action {
-        Action::Leave => code == "not_found",
+        Action::Leave | Action::Remove => code == "not_found",
         Action::Answer | Action::Withdraw => code == "offer.not_found",
         Action::Offer => code == "channel.already_owner",
-        Action::Remove | Action::Profile => false,
+        Action::Profile => false,
     }
 }
 
@@ -211,7 +212,8 @@ mod tests {
         assert!(already_so(&api("offer.not_found"), Action::Answer));
         assert!(already_so(&api("offer.not_found"), Action::Withdraw));
         assert!(already_so(&api("channel.already_owner"), Action::Offer));
-        assert!(!already_so(&api("not_found"), Action::Remove));
+        assert!(already_so(&api("not_found"), Action::Remove));
+        assert!(!already_so(&api("authz.forbidden"), Action::Remove));
         assert!(!already_so(&api("channel.last_owner"), Action::Leave));
         assert!(!already_so(&Error::UnexpectedResponse, Action::Leave));
     }
