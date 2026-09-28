@@ -125,9 +125,15 @@ pub mod qobject {
         #[qinvokable]
         fn withdraw_ownership_offer(self: Pin<&mut Self>, channel_id: &QString, user_id: &QString);
 
-        /// Accept (`true`) or decline your pending offer in a channel.
+        /// Accept (`true`) or decline your pending offer in a channel. `key` names the offer
+        /// asked about; the result echoes it, so a late one never touches a newer question.
         #[qinvokable]
-        fn answer_ownership(self: Pin<&mut Self>, channel_id: &QString, accept: bool);
+        fn answer_ownership(
+            self: Pin<&mut Self>,
+            channel_id: &QString,
+            accept: bool,
+            key: &QString,
+        );
 
         /// Fetch your current profile: `profile_loaded` or `action_failed`.
         #[qinvokable]
@@ -173,12 +179,13 @@ pub mod qobject {
         #[qsignal]
         fn action_failed(self: Pin<&mut Self>, heading: QString, text: QString);
         /// An action went through (or had already happened): "leave", "remove", "offer",
-        /// "withdraw", "answer" or "profile".
+        /// "withdraw", "answer" or "profile". `tag`: the channel, or for an answer its key.
         #[qsignal]
-        fn action_done(self: Pin<&mut Self>, action: QString, channel_id: QString);
-        /// Answering an ownership offer failed: the question stays, with the reason.
+        fn action_done(self: Pin<&mut Self>, action: QString, tag: QString);
+        /// Answering an ownership offer failed: the question stays, with the reason. `key`:
+        /// the offer answered.
         #[qsignal]
-        fn ownership_answer_failed(self: Pin<&mut Self>, channel_id: QString, text: QString);
+        fn ownership_answer_failed(self: Pin<&mut Self>, key: QString, text: QString);
         #[qsignal]
         fn profile_loaded(self: Pin<&mut Self>, json: QString);
 
@@ -670,13 +677,12 @@ impl qobject::ChatController {
         );
     }
 
-    fn answer_ownership(self: Pin<&mut Self>, channel_id: &QString, accept: bool) {
+    fn answer_ownership(self: Pin<&mut Self>, channel_id: &QString, accept: bool, key: &QString) {
         let channel_id = channel_id.to_string();
-        let cid = channel_id.clone();
         run_action(
             self.qt_thread(),
             Action::Answer,
-            cid,
+            key.to_string(),
             move |client| async move {
                 if accept {
                     client.accept_ownership(&channel_id).await.map(|_| ())
@@ -781,14 +787,10 @@ fn role(role: &str) -> Option<&str> {
 
 /// Run a membership action: on success (or when it had already happened) `action_done`,
 /// otherwise the reason (`ownership_answer_failed` for an answer, which keeps its question
-/// open, else `action_failed`). The channels are re-listed either way, so the UI shows the
-/// server's state after it.
-fn run_action<F, Fut>(
-    qt: cxx_qt::CxxQtThread<Controller>,
-    action: Action,
-    channel_id: String,
-    call: F,
-) where
+/// open, else `action_failed`). Both carry `tag` back (the channel, or an answer's offer key).
+/// The channels are re-listed either way, so the UI shows the server's state after it.
+fn run_action<F, Fut>(qt: cxx_qt::CxxQtThread<Controller>, action: Action, tag: String, call: F)
+where
     F: FnOnce(std::sync::Arc<brook_core::BrookClient>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = brook_core::Result<()>> + Send + 'static,
 {
@@ -806,12 +808,12 @@ fn run_action<F, Fut>(
             }
         };
         let _ = qt.queue(move |mut this: Pin<&mut Controller>| {
-            let cid = QString::from(channel_id.as_str());
+            let tag = QString::from(tag.as_str());
             match failure {
-                None => this.as_mut().action_done(QString::from(action.name()), cid),
+                None => this.as_mut().action_done(QString::from(action.name()), tag),
                 Some(text) if action == Action::Answer => this
                     .as_mut()
-                    .ownership_answer_failed(cid, QString::from(text.as_str())),
+                    .ownership_answer_failed(tag, QString::from(text.as_str())),
                 Some(text) => this
                     .as_mut()
                     .action_failed(QString::from(action.failed()), QString::from(text.as_str())),

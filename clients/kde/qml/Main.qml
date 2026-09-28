@@ -231,6 +231,7 @@ Kirigami.ApplicationWindow {
                                    "The last owner can't leave. Delete the channel instead.");
                     return;
                 }
+                leaveDialog.cid = page.currentChannel;
                 leaveDialog.title = "Leave " + page.channelNameById(page.currentChannel) + "?";
                 leaveDialog.open();
             }
@@ -429,15 +430,17 @@ Kirigami.ApplicationWindow {
                 function onAction_failed(heading, text) {
                     page.showAlert(heading, text);
                 }
-                function onAction_done(action, cid) {
-                    if (action === "answer" && cid === offerDialog.cid) {
+                // An answer's result names the offer it answered: a late one for an offer
+                // since replaced leaves the newer question alone.
+                function onAction_done(action, tag) {
+                    if (action === "answer" && offerDialog.showing && tag === offerDialog.key) {
                         page.answeredOffer = offerDialog.key;
                         offerDialog.showing = false;
                         offerDialog.close();
                     }
                 }
-                function onOwnership_answer_failed(cid, text) {
-                    if (cid !== offerDialog.cid)
+                function onOwnership_answer_failed(key, text) {
+                    if (!offerDialog.showing || key !== offerDialog.key)
                         return;
                     offerDialog.busy = false;
                     offerDialog.failed = true;
@@ -933,23 +936,26 @@ Kirigami.ApplicationWindow {
 
             Kirigami.PromptDialog {
                 id: leaveDialog
+                // The channel asked about, kept: the open one can change while this is up.
+                property string cid: ""
                 subtitle: "You'll stop getting its messages. An owner or an admin can add you back."
                 standardButtons: Controls.Dialog.Ok | Controls.Dialog.Cancel
-                onAccepted: chat.leave_channel(page.currentChannel)
+                onAccepted: chat.leave_channel(cid)
             }
 
             // Remove or offer ownership: confirmed first.
             Kirigami.PromptDialog {
                 id: memberConfirm
+                property string cid: ""
                 property string action: ""
                 property string uid: ""
                 property string handle: ""
                 standardButtons: Controls.Dialog.Ok | Controls.Dialog.Cancel
                 onAccepted: {
                     if (action === "remove")
-                        chat.remove_member(page.currentChannel, uid);
+                        chat.remove_member(cid, uid);
                     else
-                        chat.offer_ownership(page.currentChannel, handle);
+                        chat.offer_ownership(cid, handle);
                 }
             }
 
@@ -996,6 +1002,7 @@ Kirigami.ApplicationWindow {
                                         memberConfirm.handle = modelData.handle;
                                         memberConfirm.title = "Offer " + modelData.display_name + " ownership?";
                                         memberConfirm.subtitle = "They'll be asked when they next open this channel.";
+                                        memberConfirm.cid = page.currentChannel;
                                         memberConfirm.open();
                                     }
                                 }
@@ -1009,6 +1016,7 @@ Kirigami.ApplicationWindow {
                                     memberConfirm.uid = modelData.id;
                                     memberConfirm.title = "Remove " + modelData.display_name + "?";
                                     memberConfirm.subtitle = "They'll stop getting this channel's messages.";
+                                    memberConfirm.cid = page.currentChannel;
                                     memberConfirm.open();
                                 }
                             }
@@ -1048,7 +1056,7 @@ Kirigami.ApplicationWindow {
                         enabled: !offerDialog.busy
                         onTriggered: {
                             offerDialog.busy = true;
-                            chat.answer_ownership(offerDialog.cid, false);
+                            chat.answer_ownership(offerDialog.cid, false, offerDialog.key);
                         }
                     },
                     Kirigami.Action {
@@ -1056,7 +1064,7 @@ Kirigami.ApplicationWindow {
                         enabled: !offerDialog.busy
                         onTriggered: {
                             offerDialog.busy = true;
-                            chat.answer_ownership(offerDialog.cid, true);
+                            chat.answer_ownership(offerDialog.cid, true, offerDialog.key);
                         }
                     }
                 ]
