@@ -2261,6 +2261,11 @@ fn members_dialog(chat: &Rc<Chat>) {
                         match result {
                             // The channel.update echo refreshes the list; this row goes.
                             Ok(()) => button.set_label("Removed"),
+                            // Already gone (removed elsewhere, or they left): what Remove
+                            // wanted, so nothing to report (as on the Mac).
+                            Err(brook_core::Error::Api { code, .. }) if code == "not_found" => {
+                                button.set_label("Removed")
+                            }
                             Err(err) => {
                                 button.set_sensitive(true);
                                 show_alert(&chat, "Couldn't Remove", &membership_error_text(&err));
