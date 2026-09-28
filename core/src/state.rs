@@ -11,7 +11,9 @@ pub enum AuthState {
     LoggedOut,
     /// A login attempt is in flight.
     Authenticating,
-    /// Logged in as the given user.
+    /// Logged in as the given user, as of the sign-in: a later profile change doesn't
+    /// re-publish it (clients read `LoggedIn` as a sign-in). The current profile is the
+    /// restore outcome's, `update_profile`'s answer, and `current_user_id` / `is_admin`.
     LoggedIn(User),
     /// The last attempt failed, with a human-readable reason.
     Failed(String),

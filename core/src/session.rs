@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 
 /// A Brook user as returned by the API (`UserOut`).
 ///
-/// Full-field equality is deliberate: the auth state is published on a watch
-/// channel, which only notifies receivers when the value changes — so comparing
-/// every field ensures metadata updates (e.g. display name) reach the UI.
+/// Full-field equality is deliberate: a re-login as the same user with a changed profile is a
+/// different auth state. A profile change within a session isn't re-published there (see
+/// `AuthState::LoggedIn`); `session.user` and the calls that change it carry it.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct User {
     /// Stable user id.

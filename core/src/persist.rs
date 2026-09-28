@@ -208,6 +208,36 @@ impl Persistence {
         self.slot.replace(self.name.clone(), bytes.to_vec()).is_ok()
     }
 
+    /// Re-store `session`'s user beside the same refresh token: a profile change, not a
+    /// credential one. Unlike [`Persistence::write`], it never fences (a failure leaves a
+    /// restorable copy with an older name) and never lifts a fence (a fenced slot may hold a
+    /// token no family marks, #140). It writes only when the stored record still holds this
+    /// session's token: a failed or empty read, or another token, skips it. Runs under the
+    /// owner guard, which holds `OWNERS` across the read and the write.
+    pub(crate) fn rewrite_user(&self, session: &Session) -> bool {
+        if self.fenced() {
+            return false;
+        }
+        let Ok(Some(stored)) = self.load() else {
+            return false;
+        };
+        if stored.refresh_token != session.refresh_token {
+            return false;
+        }
+        let next = Stored {
+            user: session.user.clone(),
+            refresh_token: stored.refresh_token,
+        };
+        let bytes = Zeroizing::new(serde_json::to_vec(&next).unwrap_or_default());
+        match self.slot.replace(self.name.clone(), bytes.to_vec()) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(%err, "re-storing the profile failed; the stored one stays");
+                false
+            }
+        }
+    }
+
     /// Whether this origin is fenced. Fails closed: an unreadable fence directory is a fence.
     pub(crate) fn fenced(&self) -> bool {
         match fs::metadata(&self.fence) {
