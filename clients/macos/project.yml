@@ -49,6 +49,12 @@ targets:
         # entitlements declared below (notarization rejects get-task-allow).
         Release:
           CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          # Staying signed in and the offline cache keep their keys in the data-protection
+          # Keychain, which a Developer ID app may use only with a provisioning profile (#79).
+          # None by default (Signing.xcconfig): Local.xcconfig names the profile, and build.sh
+          # then adds the keychain entitlements to the generated Brook.entitlements for that
+          # build. App only: the decoder shares Signing.xcconfig but has no keychain.
+          PROVISIONING_PROFILE_SPECIFIER: $(BROOK_APP_PROFILE)
           # Xcode skips the hardened runtime for ad-hoc ("-") signing; request it from codesign so
           # the Release build runs under the same restrictions as the notarized one. Not in Debug:
           # library validation there rejects Xcode's ad-hoc Brook.debug.dylib (no Team ID).

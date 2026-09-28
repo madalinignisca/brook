@@ -6,4 +6,10 @@
 // Local.xcconfig:
 //   CODE_SIGN_IDENTITY = Developer ID Application
 //   DEVELOPMENT_TEAM = <your team id>
+//   BROOK_APP_PROFILE = <the Developer ID profile's name, for dev.brook.Brook>   (optional, #79)
+//
+// With BROOK_APP_PROFILE, build.sh release signs the app with that profile and the keychain
+// entitlements (staying signed in, the offline cache). Without it, the app keeps its keys in
+// memory: it works, but signs in by hand each launch.
+BROOK_APP_PROFILE =
 #include? "Local.xcconfig"
