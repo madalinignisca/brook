@@ -258,6 +258,8 @@ pub struct FfiChannel {
     pub kind: String,
     pub name: Option<String>,
     pub archived: bool,
+    /// Unread messages mentioning you or everyone (`GET /channels` only; 0 on an update).
+    pub unread_mentions: i64,
     /// Current members (Members, and who Remove is offered for).
     pub members: Vec<crate::offline::FfiMember>,
     /// Pending ownership offers: one to you highlights the channel and asks when opened.
@@ -290,6 +292,7 @@ impl From<brook_core::Channel> for FfiChannel {
             kind: c.kind,
             name: c.name,
             archived: c.archived,
+            unread_mentions: c.unread_mentions,
             members: c.members.into_iter().map(Into::into).collect(),
             owner_offers: c.owner_offers.into_iter().map(Into::into).collect(),
         }

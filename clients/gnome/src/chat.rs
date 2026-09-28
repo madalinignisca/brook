@@ -42,7 +42,7 @@ struct Chat {
     channel_list: gtk::ListBox,
     channels: Rc<RefCell<Vec<Channel>>>,
     /// Unread badge label per sidebar row, parallel to `channels`.
-    badges: Rc<RefCell<Vec<gtk::Label>>>,
+    badges: Rc<RefCell<Vec<Badge>>>,
     /// message id -> its widgets, for live edit/delete of the open channel.
     message_rows: Rc<RefCell<HashMap<String, MessageWidgets>>>,
     /// The message id currently being replied to (quote-reply), if any.
@@ -522,7 +522,12 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                             .iter()
                             .position(|c| c.id == message.channel_id);
                         if let Some(idx) = idx {
-                            chat.channels.borrow_mut()[idx].unread_count += 1;
+                            let mentioned =
+                                mentions_me(&message, chat.me.borrow().as_deref().unwrap_or(""));
+                            let mut channels = chat.channels.borrow_mut();
+                            channels[idx].unread_count += 1;
+                            channels[idx].unread_mentions += i64::from(mentioned);
+                            drop(channels);
                             update_badge(&chat, idx);
                         }
                         // Desktop notification — only when we know who we are and
@@ -666,7 +671,7 @@ fn refresh_channels(chat: &Rc<Chat>, select: Option<String>) {
             let (row, badge) = channel_row(
                 &channel.title(&me),
                 channel.is_dm(),
-                channel.unread_count,
+                (channel.unread_count, channel.unread_mentions),
                 channel.owner_offer_for(&me).is_some(),
             );
             chat.channel_list.append(&row);
@@ -791,7 +796,9 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
         .iter()
         .position(|c| c.id == channel_id);
     if let Some(idx) = idx {
-        chat.channels.borrow_mut()[idx].unread_count = 0;
+        let mut channels = chat.channels.borrow_mut();
+        (channels[idx].unread_count, channels[idx].unread_mentions) = (0, 0);
+        drop(channels);
         update_badge(chat, idx);
     }
     mark_read(chat, channel_id.to_string(), None);
@@ -1383,6 +1390,10 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
         extras,
         quote: quote_widgets,
     };
+    let me = chat.me.borrow().clone().unwrap_or_default();
+    if mentions_me(message, &me) {
+        widgets.row.add_css_class("mentions-me");
+    }
     if message.is_deleted() {
         show_deleted(&widgets);
     }
@@ -2525,9 +2536,9 @@ fn delete_channel_confirm(chat: &Rc<Chat>) {
 fn channel_row(
     title: &str,
     is_dm: bool,
-    unread: i64,
+    (unread, mentions): (i64, i64),
     offered: bool,
-) -> (gtk::ListBoxRow, gtk::Label) {
+) -> (gtk::ListBoxRow, Badge) {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -2546,11 +2557,15 @@ fn channel_row(
         .xalign(0.0)
         .hexpand(true)
         .build();
-    let badge = gtk::Label::builder()
-        .label(unread.to_string())
-        .css_classes(["caption-heading", "accent"])
-        .visible(unread > 0)
-        .build();
+    let badge = Badge {
+        mentions: gtk::Label::builder()
+            .css_classes(["caption-heading", "mention-badge"])
+            .build(),
+        unread: gtk::Label::builder()
+            .css_classes(["caption-heading", "accent"])
+            .build(),
+    };
+    show_badge(&badge, unread, mentions);
     row.append(&icon);
     row.append(&label);
     // An ownership offer waits for this user here: highlighted until it's answered.
@@ -2564,17 +2579,58 @@ fn channel_row(
                 .build(),
         );
     }
-    row.append(&badge);
+    row.append(&badge.mentions);
+    row.append(&badge.unread);
     (gtk::ListBoxRow::builder().child(&row).build(), badge)
 }
 
-/// Refresh a single row's badge from the channel's current `unread_count`.
+/// Refresh a single row's badge from the channel's current unread and mention counts.
 fn update_badge(chat: &Rc<Chat>, idx: usize) {
-    let count = chat.channels.borrow().get(idx).map(|c| c.unread_count);
-    if let (Some(count), Some(badge)) = (count, chat.badges.borrow().get(idx)) {
-        badge.set_label(&count.to_string());
-        badge.set_visible(count > 0);
+    let counts = chat
+        .channels
+        .borrow()
+        .get(idx)
+        .map(|c| (c.unread_count, c.unread_mentions));
+    if let (Some((unread, mentions)), Some(badge)) = (counts, chat.badges.borrow().get(idx)) {
+        show_badge(badge, unread, mentions);
     }
+}
+
+/// A channel's counts in the sidebar: "@M" in a filled accent pill for unread messages
+/// that mention you, beside the plain unread count (as on the Mac).
+struct Badge {
+    mentions: gtk::Label,
+    unread: gtk::Label,
+}
+
+/// Show a channel's counts; each is hidden at zero.
+fn show_badge(badge: &Badge, unread: i64, mentions: i64) {
+    let (mention_text, unread_text) = badge_texts(unread, mentions);
+    badge.mentions.set_visible(!mention_text.is_empty());
+    badge.mentions.set_label(&mention_text);
+    let tip = match mentions {
+        m if m <= 0 => None,
+        1 => Some("1 unread message mentions you".to_string()),
+        m => Some(format!("{m} unread messages mention you")),
+    };
+    badge.mentions.set_tooltip_text(tip.as_deref());
+    badge.unread.set_visible(!unread_text.is_empty());
+    badge.unread.set_label(&unread_text);
+}
+
+/// The two badges' texts: "@M" for unread mentions and "N" for unread messages, "" for
+/// none (never fewer unread than mentions: a count that lags shows the mentions).
+fn badge_texts(unread: i64, mentions: i64) -> (String, String) {
+    let mentions = mentions.max(0);
+    let unread = unread.max(mentions);
+    let text = |n: i64, prefix: &str| {
+        if n > 0 {
+            format!("{prefix}{n}")
+        } else {
+            String::new()
+        }
+    };
+    (text(mentions, "@"), text(unread, ""))
 }
 
 /// Show a desktop notification via the GApplication (`org.gtk.Notifications`).
@@ -2663,6 +2719,16 @@ fn clear_typing(chat: &Rc<Chat>) {
     }
 }
 
+/// Whether a message calls for this user's attention: someone else's, not deleted, naming
+/// them or everyone. Mentions are stored with the message (#195), so cached rows and
+/// history carry them as well as live ones.
+fn mentions_me(message: &Message, me: &str) -> bool {
+    !me.is_empty()
+        && message.author_id != me
+        && !message.is_deleted()
+        && (message.mention_everyone || message.mentions.iter().any(|m| m == me))
+}
+
 /// A notification's text for someone else's message: what they wrote, "mentioned you" when
 /// it names this user (or everyone), and "sent a file" for files with no text.
 fn notification_body(message: &Message, me: &str, author: &str) -> String {
@@ -2697,7 +2763,9 @@ fn read_what_arrived(chat: &Rc<Chat>) {
     mark_read(chat, current.clone(), None);
     let idx = chat.channels.borrow().iter().position(|c| c.id == current);
     if let Some(idx) = idx {
-        chat.channels.borrow_mut()[idx].unread_count = 0;
+        let mut channels = chat.channels.borrow_mut();
+        (channels[idx].unread_count, channels[idx].unread_mentions) = (0, 0);
+        drop(channels);
         update_badge(chat, idx);
     }
 }
@@ -3407,7 +3475,7 @@ fn badges_from_cache(chat: &Rc<Chat>) {
         let Ok(Ok(cached)) = handle.await else { return };
         chat.local_open.set(true);
         let current = chat.current.borrow().clone();
-        let updates: Vec<(usize, i64)> = chat
+        let updates: Vec<(usize, (i64, i64))> = chat
             .channels
             .borrow()
             .iter()
@@ -3416,16 +3484,18 @@ fn badges_from_cache(chat: &Rc<Chat>) {
                 let fresh = cached.iter().find(|f| f.id == c.id)?;
                 // The open channel is being read: its badge stays clear, unless the window
                 // is in the background (then what arrived there isn't read yet).
-                let unread = if current.as_deref() == Some(c.id.as_str()) && !chat.read_owed.get() {
-                    0
+                let counts = if current.as_deref() == Some(c.id.as_str()) && !chat.read_owed.get() {
+                    (0, 0)
                 } else {
-                    fresh.unread_count
+                    (fresh.unread_count, fresh.unread_mentions)
                 };
-                (unread != c.unread_count).then_some((i, unread))
+                (counts != (c.unread_count, c.unread_mentions)).then_some((i, counts))
             })
             .collect();
-        for (i, unread) in updates {
-            chat.channels.borrow_mut()[i].unread_count = unread;
+        for (i, (unread, mentions)) in updates {
+            let mut channels = chat.channels.borrow_mut();
+            (channels[i].unread_count, channels[i].unread_mentions) = (unread, mentions);
+            drop(channels);
             update_badge(&chat, i);
         }
     });
@@ -3915,6 +3985,8 @@ fn show_deleted(widgets: &MessageWidgets) {
     }
     widgets.source.replace(String::new());
     widgets.deleted.set(true);
+    // A tombstone mentions nobody (the server drops its mentions too).
+    widgets.row.remove_css_class("mentions-me");
 }
 
 /// Replies on screen that quote a message just deleted say so (only the target itself
@@ -4032,5 +4104,46 @@ mod ownership_question_tests {
             created_at: "2026-09-26T10:00:00Z".into(),
         };
         assert_eq!(offer_key("c1", &offer), "c1|own|2026-09-26T10:00:00Z");
+    }
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::{badge_texts, mentions_me};
+    use brook_core::Message;
+
+    fn message(author: &str, mentions: &[&str], everyone: bool) -> Message {
+        serde_json::from_value(serde_json::json!({
+            "id": "m1", "channel_id": "c", "author_id": author, "body": "hi",
+            "created_at": "2026-09-26T10:00:00Z",
+            "mentions": mentions, "mention_everyone": everyone
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_message_mentions_me_by_name_or_everyone_but_never_my_own() {
+        assert!(mentions_me(&message("bo", &["me"], false), "me"));
+        assert!(mentions_me(&message("bo", &[], true), "me"));
+        assert!(!mentions_me(&message("bo", &["someone"], false), "me"));
+        assert!(!mentions_me(&message("me", &["me"], true), "me"));
+        // Identity not known yet: nothing is claimed.
+        assert!(!mentions_me(&message("bo", &[], true), ""));
+    }
+
+    #[test]
+    fn a_deleted_message_mentions_nobody() {
+        let mut m = message("bo", &["me"], true);
+        m.deleted_at = Some("2026-09-26T10:01:00Z".into());
+        assert!(!mentions_me(&m, "me"));
+    }
+
+    #[test]
+    fn the_badges_say_how_many_mention_you_and_how_many_are_unread() {
+        assert_eq!(badge_texts(0, 0), (String::new(), String::new()));
+        assert_eq!(badge_texts(3, 0), (String::new(), "3".into()));
+        assert_eq!(badge_texts(3, 1), ("@1".into(), "3".into()));
+        // A count that lags the mentions never shows fewer.
+        assert_eq!(badge_texts(0, 2), ("@2".into(), "2".into()));
     }
 }

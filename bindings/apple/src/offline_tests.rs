@@ -90,8 +90,11 @@ fn a_cached_channel_keeps_its_unread_count_and_members() {
     }))
     .unwrap();
     ch.unread_count = 3;
-    let f = FfiCachedChannel::from(ch);
+    ch.unread_mentions = 2;
+    let f = FfiCachedChannel::from(ch.clone());
     assert_eq!(f.unread_count, 3);
+    assert_eq!(f.unread_mentions, 2);
+    assert_eq!(crate::types::FfiChannel::from(ch).unread_mentions, 2);
     assert_eq!(
         f.members,
         vec![FfiMember {

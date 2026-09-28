@@ -35,6 +35,11 @@ pub struct Channel {
     /// Unread messages for the current user (server-computed).
     #[serde(default)]
     pub unread_count: i64,
+    /// Of those, the ones mentioning the current user or everyone. Like `unread_count`, only
+    /// `GET /channels` sends it (a `channel.update` or `/sync` channel says 0, never to be
+    /// taken as a count); the cache counts its own (`cached_channels`).
+    #[serde(default)]
+    pub unread_mentions: i64,
     /// Whether the channel is public (browsable + self-joinable).
     #[serde(default)]
     pub public: bool,

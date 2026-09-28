@@ -190,7 +190,7 @@ struct GrantedNothing: AuthorizationSource {
 }
 
 func channel(_ id: String, _ name: String) -> FfiChannel {
-    FfiChannel(id: id, kind: "public", name: name, archived: false, members: [], ownerOffers: [])
+    FfiChannel(id: id, kind: "public", name: name, archived: false, unreadMentions: 0, members: [], ownerOffers: [])
 }
 
 /// Let main-queue deliveries (the event/state bridges hop through it) run.
