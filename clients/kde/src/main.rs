@@ -7,6 +7,7 @@
 pub mod app;
 pub mod chat;
 pub mod login;
+pub mod membership;
 
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QUrl};
 

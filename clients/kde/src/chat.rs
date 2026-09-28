@@ -13,6 +13,7 @@ use cxx_qt_lib::QString;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::app;
+use crate::membership::{self, Action};
 
 /// Generation of the realtime listener. Each `start()` (a new chat page, e.g.
 /// after signing in again) bumps it; an older loop sees the change at its next
@@ -107,6 +108,79 @@ pub mod qobject {
         /// Show a desktop notification (freedesktop D-Bus).
         #[qinvokable]
         fn notify(self: Pin<&mut Self>, summary: &QString, body: &QString);
+
+        /// Leave a channel (not a DM). Its `channel.delete` to us closes it.
+        #[qinvokable]
+        fn leave_channel(self: Pin<&mut Self>, channel_id: &QString);
+
+        /// Remove a member (an owner or an admin). The `channel.update` redraws the list.
+        #[qinvokable]
+        fn remove_member(self: Pin<&mut Self>, channel_id: &QString, user_id: &QString);
+
+        /// Offer a member ownership (#190), by handle.
+        #[qinvokable]
+        fn offer_ownership(self: Pin<&mut Self>, channel_id: &QString, handle: &QString);
+
+        /// Withdraw the pending offer to a member.
+        #[qinvokable]
+        fn withdraw_ownership_offer(self: Pin<&mut Self>, channel_id: &QString, user_id: &QString);
+
+        /// Accept (`true`) or decline your pending offer in a channel.
+        #[qinvokable]
+        fn answer_ownership(self: Pin<&mut Self>, channel_id: &QString, accept: bool);
+
+        /// Fetch your current profile: `profile_loaded` or `action_failed`.
+        #[qinvokable]
+        fn load_profile(self: Pin<&mut Self>);
+
+        /// Save a profile edit, sending only what changed from the loaded one.
+        #[qinvokable]
+        fn save_profile(
+            self: Pin<&mut Self>,
+            old_name: &QString,
+            old_status: &QString,
+            name: &QString,
+            status: &QString,
+        );
+
+        /// Whether Remove is offered on a member (roles are "" when unknown).
+        #[qinvokable]
+        fn may_remove(
+            self: Pin<&mut Self>,
+            my_role: &QString,
+            their_role: &QString,
+            is_me: bool,
+        ) -> bool;
+
+        /// Whether "Make owner…" (or Withdraw) is offered on a member.
+        #[qinvokable]
+        fn may_offer(
+            self: Pin<&mut Self>,
+            my_role: &QString,
+            their_role: &QString,
+            is_me: bool,
+        ) -> bool;
+
+        /// Whether a profile edit is within the server's lengths.
+        #[qinvokable]
+        fn profile_fits(self: Pin<&mut Self>, name: &QString, status: &QString) -> bool;
+
+        /// Whether a message (as JSON) mentions you: highlighted, and counted in a badge.
+        #[qinvokable]
+        fn mentions_me(self: Pin<&mut Self>, message_json: &QString) -> bool;
+
+        /// An action was refused: an alert's heading and text.
+        #[qsignal]
+        fn action_failed(self: Pin<&mut Self>, heading: QString, text: QString);
+        /// An action went through (or had already happened): "leave", "remove", "offer",
+        /// "withdraw", "answer" or "profile".
+        #[qsignal]
+        fn action_done(self: Pin<&mut Self>, action: QString, channel_id: QString);
+        /// Answering an ownership offer failed: the question stays, with the reason.
+        #[qsignal]
+        fn ownership_answer_failed(self: Pin<&mut Self>, channel_id: QString, text: QString);
+        #[qsignal]
+        fn profile_loaded(self: Pin<&mut Self>, json: QString);
 
         #[qsignal]
         fn channels_loaded(self: Pin<&mut Self>, json: QString);
@@ -546,6 +620,205 @@ impl qobject::ChatController {
     fn notify(self: Pin<&mut Self>, summary: &QString, body: &QString) {
         show_notification(summary.to_string(), body.to_string());
     }
+
+    fn leave_channel(self: Pin<&mut Self>, channel_id: &QString) {
+        let channel_id = channel_id.to_string();
+        let cid = channel_id.clone();
+        run_action(
+            self.qt_thread(),
+            Action::Leave,
+            cid,
+            move |client| async move { client.leave_channel(&channel_id).await },
+        );
+    }
+
+    fn remove_member(self: Pin<&mut Self>, channel_id: &QString, user_id: &QString) {
+        let (channel_id, user_id) = (channel_id.to_string(), user_id.to_string());
+        let cid = channel_id.clone();
+        run_action(
+            self.qt_thread(),
+            Action::Remove,
+            cid,
+            move |client| async move { client.remove_member(&channel_id, &user_id).await },
+        );
+    }
+
+    fn offer_ownership(self: Pin<&mut Self>, channel_id: &QString, handle: &QString) {
+        let (channel_id, handle) = (channel_id.to_string(), handle.to_string());
+        let cid = channel_id.clone();
+        run_action(
+            self.qt_thread(),
+            Action::Offer,
+            cid,
+            move |client| async move {
+                client
+                    .offer_ownership(&channel_id, &handle)
+                    .await
+                    .map(|_| ())
+            },
+        );
+    }
+
+    fn withdraw_ownership_offer(self: Pin<&mut Self>, channel_id: &QString, user_id: &QString) {
+        let (channel_id, user_id) = (channel_id.to_string(), user_id.to_string());
+        let cid = channel_id.clone();
+        run_action(
+            self.qt_thread(),
+            Action::Withdraw,
+            cid,
+            move |client| async move { client.withdraw_ownership_offer(&channel_id, &user_id).await },
+        );
+    }
+
+    fn answer_ownership(self: Pin<&mut Self>, channel_id: &QString, accept: bool) {
+        let channel_id = channel_id.to_string();
+        let cid = channel_id.clone();
+        run_action(
+            self.qt_thread(),
+            Action::Answer,
+            cid,
+            move |client| async move {
+                if accept {
+                    client.accept_ownership(&channel_id).await.map(|_| ())
+                } else {
+                    client.decline_ownership(&channel_id).await
+                }
+            },
+        );
+    }
+
+    fn load_profile(self: Pin<&mut Self>) {
+        let qt = self.qt_thread();
+        app::runtime().spawn(async move {
+            let Some(client) = app::client().await else {
+                return;
+            };
+            match client.me().await {
+                Ok(me) => {
+                    let json = serde_json::to_string(&me.user).unwrap_or_else(|_| "{}".into());
+                    let _ = qt.queue(move |mut this: Pin<&mut Controller>| {
+                        this.as_mut().profile_loaded(QString::from(json.as_str()));
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "loading the profile failed");
+                    let _ = qt.queue(move |mut this: Pin<&mut Controller>| {
+                        this.as_mut().action_failed(
+                            QString::from("Couldn't Load Your Profile"),
+                            QString::from("Try again in a moment."),
+                        );
+                    });
+                }
+            }
+        });
+    }
+
+    fn save_profile(
+        self: Pin<&mut Self>,
+        old_name: &QString,
+        old_status: &QString,
+        name: &QString,
+        status: &QString,
+    ) {
+        let (old_name, old_status) = (old_name.to_string(), old_status.to_string());
+        let (name, status) = (name.to_string(), status.to_string());
+        if !membership::profile_fits(&name, &status) {
+            return;
+        }
+        let (name, status) =
+            membership::profile_changes((&old_name, &old_status), (&name, &status));
+        if name.is_none() && status.is_none() {
+            return;
+        }
+        run_action(
+            self.qt_thread(),
+            Action::Profile,
+            String::new(),
+            move |client| async move {
+                client
+                    .update_profile(name.as_deref(), status.as_deref())
+                    .await
+                    .map(|_| ())
+            },
+        );
+    }
+
+    fn may_remove(
+        self: Pin<&mut Self>,
+        my_role: &QString,
+        their_role: &QString,
+        is_me: bool,
+    ) -> bool {
+        let (mine, theirs) = (my_role.to_string(), their_role.to_string());
+        membership::may_remove(*self.admin(), role(&mine), role(&theirs), is_me)
+    }
+
+    fn may_offer(
+        self: Pin<&mut Self>,
+        my_role: &QString,
+        their_role: &QString,
+        is_me: bool,
+    ) -> bool {
+        let (mine, theirs) = (my_role.to_string(), their_role.to_string());
+        membership::may_offer(*self.admin(), role(&mine), role(&theirs), is_me)
+    }
+
+    fn profile_fits(self: Pin<&mut Self>, name: &QString, status: &QString) -> bool {
+        membership::profile_fits(&name.to_string(), &status.to_string())
+    }
+
+    fn mentions_me(self: Pin<&mut Self>, message_json: &QString) -> bool {
+        let me = self.my_id().to_string();
+        serde_json::from_str::<brook_core::Message>(&message_json.to_string())
+            .is_ok_and(|m| membership::mentions_me(&m, &me))
+    }
+}
+
+/// A role from QML, where "" is none (an older server, or not a member).
+fn role(role: &str) -> Option<&str> {
+    (!role.is_empty()).then_some(role)
+}
+
+/// Run a membership action: on success (or when it had already happened) `action_done`,
+/// otherwise the reason (`ownership_answer_failed` for an answer, which keeps its question
+/// open, else `action_failed`). The channels are re-listed either way, so the UI shows the
+/// server's state after it.
+fn run_action<F, Fut>(
+    qt: cxx_qt::CxxQtThread<Controller>,
+    action: Action,
+    channel_id: String,
+    call: F,
+) where
+    F: FnOnce(std::sync::Arc<brook_core::BrookClient>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = brook_core::Result<()>> + Send + 'static,
+{
+    app::runtime().spawn(async move {
+        let Some(client) = app::client().await else {
+            return;
+        };
+        let result = call(client.clone()).await;
+        let failure = match &result {
+            Ok(()) => None,
+            Err(err) if membership::already_so(err, action) => None,
+            Err(err) => {
+                tracing::warn!(%err, ?action, "membership action failed");
+                Some(membership::error_text(err))
+            }
+        };
+        let _ = qt.queue(move |mut this: Pin<&mut Controller>| {
+            let cid = QString::from(channel_id.as_str());
+            match failure {
+                None => this.as_mut().action_done(QString::from(action.name()), cid),
+                Some(text) if action == Action::Answer => this
+                    .as_mut()
+                    .ownership_answer_failed(cid, QString::from(text.as_str())),
+                Some(text) => this
+                    .as_mut()
+                    .action_failed(QString::from(action.failed()), QString::from(text.as_str())),
+            }
+        });
+        emit_channels(&client, &qt).await;
+    });
 }
 
 /// Show a desktop notification on a plain OS thread (NOT tokio `spawn_blocking`:
