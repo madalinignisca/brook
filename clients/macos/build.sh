@@ -15,6 +15,7 @@ command -v xcodegen >/dev/null || { echo "xcodegen not found (brew install xcode
 
 args=(build)
 config=Debug
+source "$HERE/notary-lib.sh"
 mode="${1:-}"
 notary_profile=""
 if [[ "$mode" == "release" || "$mode" == "notarize" ]]; then
@@ -25,10 +26,7 @@ if [[ "$mode" == "release" || "$mode" == "notarize" ]]; then
 fi
 if [[ "$mode" == "notarize" ]]; then
   # Before the long build: the profile's name (the credentials themselves stay in the keychain).
-  # The name only: a trailing `// comment`, spaces or a CRLF would otherwise become part of it and
-  # fail after the whole build.
-  notary_profile="$(sed -n 's/^BROOK_NOTARY_PROFILE *= *//p' "$HERE/Local.xcconfig" 2>/dev/null | head -1 \
-    | sed -e 's://.*$::' -e 's/[[:space:]]*$//' | tr -d '\r')"
+  notary_profile="$(read_notary_profile "$HERE/Local.xcconfig")"
   [[ -n "$notary_profile" ]] || {
     echo "notarize needs BROOK_NOTARY_PROFILE in Local.xcconfig (see the header of build.sh)" >&2; exit 1; }
 fi
@@ -76,21 +74,7 @@ app="$HERE/build/Build/Products/$config/Brook.app"
 if [[ "$mode" == "notarize" ]]; then
   zip="$HERE/build/Brook-notarize.zip"
   ditto -c -k --keepParent "$app" "$zip"
-  # JSON, so a rejection is caught here with its log, not as a confusing stapler failure after it.
-  # The exit status is kept, not left to `set -e`: a failed call's output is the diagnosis.
-  notary_rc=0
-  result="$(xcrun notarytool submit "$zip" --keychain-profile "$notary_profile" --wait --output-format json)" || notary_rc=$?
-  # "id|status" (a separator that isn't whitespace, so an empty id can't shift the status).
-  parsed="$(/usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("id","") + "|" + d.get("status",""))' <<<"$result" 2>/dev/null)" || parsed="|"
-  IFS='|' read -r sub_id sub_status <<<"$parsed" || true
-  if [[ "$notary_rc" -ne 0 || "$sub_status" != "Accepted" ]]; then
-    echo "notarization failed (status: ${sub_status:-unknown}, notarytool exit $notary_rc), submission ${sub_id:-?}" >&2
-    echo "$result" >&2
-    [[ -n "$sub_id" ]] && xcrun notarytool log "$sub_id" --keychain-profile "$notary_profile" >&2 || true
-    exit 1
-  fi
-  xcrun stapler staple "$app"
-  xcrun stapler validate "$app"
+  notarize_app "$app" "$zip" "$notary_profile" || exit 1
   spctl -a -vvv "$app"
   rm -f "$zip"
   # What to ship: the stapled app, zipped (the stapled ticket lets it open offline).
