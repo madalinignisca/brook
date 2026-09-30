@@ -39,7 +39,7 @@ clients never show and it can't react.
 9. **Typing, shown:** a line above the composer for someone else typing in the open channel:
    "Ann is typing…", "Ann and Bob are typing…", "Several people are typing…" (three or more); it
    clears 4 seconds after the last event from them, and when a message from them arrives.
-10. **Search** (online only, like GTK): a search field in the toolbar; Return searches message
+10. **Search** (online only, like GTK): a search field in the sidebar; Return searches message
     bodies across your channels (newest first); results show the channel, the author and an excerpt;
     choosing one opens that channel. Empty query clears. Offline, or a failure: "Search needs a
     connection."; no results: "No messages found."
@@ -79,3 +79,20 @@ Implementation review (vibe), PR A:
 Measured (PR A): 12 mutants and 4 binding mutants, each caught (one as a hang past 180 s; two
 rewritten because their first form didn't compile). 279 Mac tests, 35 binding tests.
 Not unit-tested: the chips and the context menu (SwiftUI).
+
+## PR A review, round 1 (codex, Claude review (Opus); Mac-only rule)
+
+Taken (both reviewers found the same two things):
+- **A toggle's answer could overwrite newer counts,** and two toggles on one message could
+  drop each other's reaction (the newer whole-list answer arriving before the older). Now one
+  toggle per message at a time, and the answer is used only if no reaction event for that
+  message arrived while it was in flight (the events carry the newer counts, your own echo
+  included). The first draft's claim that order never matters was wrong and is corrected in the
+  code's comment: the same event applied twice is harmless, but two *different* events for one
+  emoji can arrive out of order (the server doesn't order them), which lasts until the next
+  event, a re-read or the cache's sync. Ordering by `seq` needs core to pass it through; noted
+  for later, and asked of the server side.
+- **The reaction error now goes by itself** after 5 seconds.
+- §10 says the search field is in the sidebar (it was written "toolbar").
+
+Measured: 5 more mutants, each caught. 282 Mac tests.

@@ -89,7 +89,7 @@ final class TimelineReactionTests: XCTestCase {
         XCTAssertEqual(t.reactionError, "Couldn't react. Try again.")
     }
 
-    func testASecondTapOnTheSameEmojiWhileRunningSendsNothing() async {
+    func testASecondTapOnTheSameMessageWhileRunningSendsNothing() async {
         let chat = FakeChat()
         let gate = Gate()
         chat.reactionGate = gate
@@ -97,12 +97,51 @@ final class TimelineReactionTests: XCTestCase {
         let first = Task { await t.toggleReaction(t.messages[0], emoji: "👍") }
         while chat.toggles.withLock({ $0.isEmpty }) { await Task.yield() }
         await t.toggleReaction(t.messages[0], emoji: "👍") // in flight: sends nothing
-        let other = Task { await t.toggleReaction(t.messages[0], emoji: "🎉") } // its own toggle
-        while chat.toggles.withLock({ $0.count < 2 }) { await Task.yield() }
+        await t.toggleReaction(t.messages[0], emoji: "🎉") // the same message: nothing either
         gate.open()
         await first.value
-        await other.value
-        XCTAssertEqual(chat.toggles.withLock { $0 }, ["m1|👍", "m1|🎉"])
+        XCTAssertEqual(chat.toggles.withLock { $0 }, ["m1|👍"])
+        await t.toggleReaction(t.messages[1], emoji: "🎉") // another message is its own
+        XCTAssertEqual(chat.toggles.withLock { $0 }, ["m1|👍", "m2|🎉"])
+    }
+
+    /// The answer is a snapshot: an event that arrived while it was in flight is newer.
+    func testAnEventDuringTheToggleMakesItsOlderAnswerIgnored() async {
+        let chat = FakeChat()
+        let gate = Gate()
+        chat.reactionGate = gate
+        chat.reactionAnswer = [chip("👍", 4)] // the older snapshot
+        let t = timeline(chat)
+        let toggling = Task { await t.toggleReaction(t.messages[0], emoji: "👍") }
+        while chat.toggles.withLock({ $0.isEmpty }) { await Task.yield() }
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "bob", added: true, count: 5))
+        gate.open()
+        await toggling.value
+        XCTAssertEqual(t.messages[0].reactions, [chip("👍", 5)], "the older answer put the count back")
+    }
+
+    func testAnEventForAnotherMessageDoesNotMakeTheAnswerIgnored() async {
+        let chat = FakeChat()
+        let gate = Gate()
+        chat.reactionGate = gate
+        chat.reactionAnswer = [chip("👍", 1, me: true)]
+        let t = timeline(chat)
+        let toggling = Task { await t.toggleReaction(t.messages[0], emoji: "👍") }
+        while chat.toggles.withLock({ $0.isEmpty }) { await Task.yield() }
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m2", emoji: "🎉", userId: "bob", added: true, count: 1))
+        gate.open()
+        await toggling.value
+        XCTAssertEqual(t.messages[0].reactions, [chip("👍", 1, me: true)])
+    }
+
+    func testTheReactionErrorClears() async {
+        let chat = FakeChat()
+        chat.reactionFails = true
+        let t = timeline(chat)
+        await t.toggleReaction(t.messages[0], emoji: "👍")
+        XCTAssertNotNil(t.reactionError)
+        t.clearReactionError()
+        XCTAssertNil(t.reactionError)
     }
 
     func testADeletedMessageTakesNoReactions() async {

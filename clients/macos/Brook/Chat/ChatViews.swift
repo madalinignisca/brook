@@ -71,6 +71,11 @@ struct ChatView: View {
             if let reactionError = timeline.reactionError {
                 Text(reactionError).font(.callout).foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
+                    // Gone by itself after a few seconds (a later reaction clears it sooner).
+                    .task(id: reactionError) {
+                        try? await Task.sleep(for: .seconds(5))
+                        timeline.clearReactionError()
+                    }
             }
             ComposerView(composer: composer)
         }
