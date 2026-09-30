@@ -85,6 +85,8 @@ struct ChatView: View {
             composer.attach(urls.filter(\.isFileURL))
             return true
         }
+        // Archived: nothing writes (the composer is replaced, and Reply, Edit and dropped files are off).
+        .onChange(of: archived, initial: true) { _, archived in composer.readOnly = archived }
         .task {
             saves.start()
             pending?.startProgress()
@@ -184,9 +186,9 @@ struct MessageRow: View {
         }
         .contextMenu {
             if !message.deleted {
-                Button("Reply") { composer.reply(to: message) }
+                if !composer.readOnly { Button("Reply") { composer.reply(to: message) } }
                 if mine {
-                    Button("Edit") { composer.edit(message) }
+                    if !composer.readOnly { Button("Edit") { composer.edit(message) } }
                     Button("Delete", role: .destructive) {
                         Task { await composer.delete(message) }
                     }

@@ -172,11 +172,16 @@ final class ChannelsModel {
     /// created, joined or opened (the row may not have arrived through an event yet). One more
     /// read if the first didn't have it; a channel the list never gets is never selected.
     func reveal(_ id: String) async -> Bool {
+        await reveal(id) { await self.reloadList() }
+    }
+
+    /// `reveal` with the read it makes (tests give it reads that get superseded).
+    func reveal(_ id: String, read: () async -> Bool) async -> Bool {
         var misses = 0
         // A read superseded by a newer one (an event's, say) applies nothing: it isn't a miss,
         // and the loop reads again (a few times at most).
         for _ in 0..<4 {
-            let applied = await reloadList()
+            let applied = await read()
             if channels.contains(where: { $0.id == id }) { return true }
             if applied { misses += 1 }
             if misses == 2 { break }

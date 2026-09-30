@@ -636,6 +636,37 @@ mod tests {
         assert_eq!(session.user.handle, "alice");
     }
 
+    /// A channel created through the binding keeps its topic, public or not.
+    #[tokio::test]
+    async fn creating_a_channel_sends_its_topic_public_or_not() {
+        let server = mock_login_ok().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/channels"))
+            .and(wiremock::matchers::body_json(json!({
+                "kind": "channel", "name": "general", "topic": "all hands", "public": true
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "c1", "kind": "channel", "name": "general", "topic": "all hands",
+                "public": true, "created_by": "u1", "created_at": "2026-06-18T00:00:00Z",
+                "members": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = FfiBrookClient::new(server.uri(), false).unwrap();
+        client.login("alice".into(), "pw".into()).await.unwrap();
+
+        let made = client
+            .create_channel("general".into(), Some("all hands".into()), true)
+            .await
+            .unwrap();
+
+        // Through the binding (not core's call alone): the topic of a public channel survives,
+        // and what comes back carries them.
+        assert_eq!(made.topic.as_deref(), Some("all hands"));
+        assert!(made.is_public);
+    }
+
     /// Test 3: the server's error code reaches Swift verbatim.
     #[tokio::test]
     async fn rejected_login_maps_to_api_error_code() {

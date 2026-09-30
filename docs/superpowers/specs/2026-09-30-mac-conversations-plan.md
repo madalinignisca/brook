@@ -86,3 +86,25 @@ Taken:
 - The `open_dm` doc and the `not_found` comment now say what the server really answers.
 
 Measured: 5 more mutants, each caught. 288 Mac tests, core test for the topic with 2 mutants.
+
+## PR review, round 2 (codex and Claude review (Opus)); the last round
+
+Both said CHANGES. The Mac's archived channels (kept in the list in round 1) needed finishing, and
+two claimed fixes lacked tests. Taken:
+- **Join Call is disabled in an archived channel** (the server refuses a call there).
+- **Archived means read-only:** `ComposerModel.readOnly` refuses Reply, Edit, Send and attaching,
+  the drop handler follows `canAttach`, and the message menu hides Reply and Edit. (Deleting your
+  own message stays: the server allows it.) Unarchiving writes again. Tested on the model.
+- **A channel deleted elsewhere no longer dismisses an unrelated sheet:** `ManagementRules` (pure
+  functions, tested) clears only the Add Member and Rename sheets, the confirmation and the model,
+  and a finished call only drops its own model.
+- **`reveal` has a test that fails on the old two-read loop:** it takes the read as a parameter, so
+  the test gives it two superseded reads and then an applied one.
+- **A test through the binding** that a public channel's topic reaches the server (the core test
+  called core directly).
+- Not changed: offline, cached rows have no topic (`FfiCachedChannel` lacks it), so Rename opens with
+  an empty topic there; saving sends nothing for the topic, so nothing is lost.
+- Not unit-tested: the SwiftUI views (the menu hiding, the sidebar caption, the modifier).
+
+Measured: 13 more mutants, each caught (3 rewritten because their first form didn't compile).
+297 Mac tests, 35 binding tests.

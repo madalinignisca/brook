@@ -251,3 +251,26 @@ final class ChannelManagementModel {
         return "Couldn't do that. Try again."
     }
 }
+
+/// How the management sheet, confirmation and model (SignedInView's state) follow events, as pure
+/// functions so they can be tested: the views just apply their answers.
+enum ManagementRules {
+    /// A channel went away (deleted elsewhere): what to keep. The Add Member and Rename sheets, the
+    /// confirmation and the model were for it and go; an unrelated sheet (New Message, Browse…)
+    /// stays, with whatever was typed in it.
+    static func channelClosed(
+        _ id: String, managing: ChannelManagementModel?, sheet: ConversationSheet?, confirming: ManageConfirm?
+    ) -> (managing: ChannelManagementModel?, sheet: ConversationSheet?, confirming: ManageConfirm?) {
+        guard managing?.channel.id == id else { return (managing, sheet, confirming) }
+        let managementSheet = sheet == .addMember || sheet == .rename
+        return (nil, managementSheet ? nil : sheet, nil)
+    }
+
+    /// A call finished: drop its model, unless another was started meanwhile (a sheet opened
+    /// during the call holds the new one).
+    static func finished(
+        _ model: ChannelManagementModel, managing: ChannelManagementModel?
+    ) -> ChannelManagementModel? {
+        managing === model ? nil : managing
+    }
+}

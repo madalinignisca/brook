@@ -315,3 +315,110 @@ final class RevealTests: XCTestCase {
         XCTAssertFalse(revealed)
     }
 }
+
+@MainActor
+final class ArchivedChannelTests: XCTestCase {
+    func testAnArchivedChannelsComposerWritesNothing() async {
+        let chat = FakeChat()
+        let composer = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        composer.readOnly = true
+        composer.reply(to: msg("m1", "hi"))
+        XCTAssertNil(composer.replyingTo)
+        composer.edit(msg("m1", "hi"))
+        XCTAssertNil(composer.editing)
+        XCTAssertEqual(composer.text, "", "Edit filled the field of a read-only channel")
+        composer.text = "typed anyway"
+        await composer.send()
+        XCTAssertEqual(chat.sent.withLock { $0 }, [], "a message went into an archived channel")
+        XCTAssertFalse(composer.canAttach)
+    }
+
+    func testUnarchivingLetsItWriteAgain() async {
+        let chat = FakeChat()
+        let composer = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        composer.readOnly = true
+        composer.readOnly = false
+        composer.text = "hello"
+        await composer.send()
+        XCTAssertEqual(chat.sent.withLock { $0 }, ["hello|-"])
+    }
+}
+
+@MainActor
+final class ManagementRulesTests: XCTestCase {
+    private func model(_ id: String) -> ChannelManagementModel {
+        let row = ChannelRow(id: id, name: id, members: [FfiMember(id: "me", handle: "me", displayName: "Me", role: "owner")])
+        return ChannelManagementModel(channel: row, powers: ChannelPowers(row, me: "me", isAdmin: false),
+                                      client: FakeConversations())
+    }
+
+    func testAChannelGoingAwayClosesItsOwnSheetsAndConfirmation() {
+        let m = model("c1")
+        for sheet in [ConversationSheet.addMember, .rename] {
+            let out = ManagementRules.channelClosed("c1", managing: m, sheet: sheet, confirming: .delete)
+            XCTAssertNil(out.managing)
+            XCTAssertNil(out.sheet, "\(sheet)")
+            XCTAssertNil(out.confirming)
+        }
+    }
+
+    /// The finished model is still held after an Add Member sheet is cancelled; a New Message sheet
+    /// opened since must not be dismissed (it holds what was typed).
+    func testAnUnrelatedSheetSurvivesTheChannelGoingAway() {
+        let m = model("c1")
+        for sheet in [ConversationSheet.newMessage, .newChannel, .browse] {
+            let out = ManagementRules.channelClosed("c1", managing: m, sheet: sheet, confirming: nil)
+            XCTAssertEqual(out.sheet, sheet, "an unrelated sheet was dismissed")
+            XCTAssertNil(out.managing)
+        }
+    }
+
+    func testAnotherChannelGoingAwayChangesNothing() {
+        let m = model("c1")
+        let out = ManagementRules.channelClosed("c2", managing: m, sheet: .rename, confirming: .delete)
+        XCTAssertTrue(out.managing === m)
+        XCTAssertEqual(out.sheet, .rename)
+        XCTAssertEqual(out.confirming?.id, ManageConfirm.delete.id)
+    }
+
+    func testAFinishedCallOnlyDropsItsOwnModel() {
+        let old = model("c1"), newer = model("c1")
+        XCTAssertNil(ManagementRules.finished(old, managing: old))
+        XCTAssertTrue(ManagementRules.finished(old, managing: newer) === newer, "it dropped a newer model")
+        XCTAssertNil(ManagementRules.finished(old, managing: nil))
+    }
+}
+
+@MainActor
+final class RevealSupersededTests: XCTestCase {
+    /// Reads superseded by newer ones apply nothing: two of them must not use up the attempts, so
+    /// the third, which applies, finds the channel (the original two-read loop gave up here).
+    func testSupersededReadsAreNotMisses() async {
+        let client = FakeRealtime(channels: [channel("c1", "general"), channel("c2", "new")])
+        let model = ChannelsModel(client: client)
+        var reads = 0
+        let revealed = await model.reveal("c2") {
+            reads += 1
+            return reads < 3 ? false : await model.reloadList() // the first two were superseded
+        }
+        XCTAssertTrue(revealed)
+        XCTAssertEqual(reads, 3)
+    }
+
+    func testOnlyAppliedReadsThatLackTheChannelAreMisses() async {
+        let client = FakeRealtime(channels: [channel("c1", "general")])
+        let model = ChannelsModel(client: client)
+        var reads = 0
+        let revealed = await model.reveal("nope") { reads += 1; return await model.reloadList() }
+        XCTAssertFalse(revealed)
+        XCTAssertEqual(reads, 2, "two applied reads without it is the end")
+    }
+
+    func testItStopsAfterFourReadsEvenIfAllAreSuperseded() async {
+        let model = ChannelsModel(client: FakeRealtime(channels: []))
+        var reads = 0
+        let revealed = await model.reveal("x") { reads += 1; return false }
+        XCTAssertFalse(revealed)
+        XCTAssertEqual(reads, 4)
+    }
+}

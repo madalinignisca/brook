@@ -115,7 +115,7 @@ struct SignedInView: View {
                                 Label(channels.badge(channel) ?? "Join Call",
                                       systemImage: "phone.fill")
                             }
-                            .disabled(!channels.canJoin(channel) || calls.call != nil
+                            .disabled(channel.archived || !channels.canJoin(channel) || calls.call != nil
                                 || calls.joining)
                             .help(calls.joinError ?? (channels.ready ? "Join the call" : "Connecting…"))
                         }
@@ -211,10 +211,9 @@ struct SignedInView: View {
             if let closed, selection == closed { selection = nil } // removed from it (#62)
             // A sheet or confirmation for a channel that's gone would act on nothing (a
             // `not_found` reads as "done").
-            if let closed, managing?.channel.id == closed {
-                managing = nil
-                conversationSheet = nil
-                confirming = nil
+            if let closed {
+                (managing, conversationSheet, confirming) = ManagementRules.channelClosed(
+                    closed, managing: managing, sheet: conversationSheet, confirming: confirming)
             }
         }
         .toolbar {

@@ -205,7 +205,7 @@ struct ConversationPresentation: ViewModifier {
             await act(model)
             manageError = model.error
             // Only this model's: a sheet opened meanwhile holds another.
-            if managing === model { managing = nil }
+            managing = ManagementRules.finished(model, managing: managing)
         }
     }
 
