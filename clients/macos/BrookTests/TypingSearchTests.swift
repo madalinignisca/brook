@@ -257,6 +257,33 @@ final class SearchModelTests: XCTestCase {
         XCTAssertEqual(hits.map(\.id), ["new1"], "the older answer replaced the newer results")
     }
 
+    /// Editing the field while a search runs: its answer must not land under the new text.
+    func testEditingTheQueryWhileASearchRunsDropsItsAnswer() async {
+        let client = FakeSearch()
+        let gate = Gate()
+        client.gate = gate
+        client.answer = [msg("m1", "old")]
+        let model = SearchModel(client: client)
+        model.query = "old"
+        let first = Task { await model.submit() }
+        while client.queries.withLock({ $0.isEmpty }) { await Task.yield() }
+        model.query = "new" // typed on while it ran
+        gate.open()
+        await first.value
+        XCTAssertEqual(model.state, .idle, "the old answer landed under the new query")
+    }
+
+    func testEditingTheQueryHidesResultsForTheOldOne() async {
+        let client = FakeSearch()
+        client.answer = [msg("m1", "hi")]
+        let model = SearchModel(client: client)
+        model.query = "hi"
+        await model.submit()
+        XCTAssertTrue(model.isShowing)
+        model.query = "hit"
+        XCTAssertFalse(model.isShowing)
+    }
+
     func testClearResetsTheQueryAndHidesTheResults() async {
         let client = FakeSearch()
         client.answer = [msg("m1", "hi")]

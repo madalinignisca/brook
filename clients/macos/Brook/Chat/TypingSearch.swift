@@ -110,7 +110,15 @@ final class SearchModel {
 
     static let offlineText = "Search needs a connection."
 
-    var query = ""
+    /// Editing it drops whatever was in flight or showing: results under a different query would
+    /// mislead, and an older answer must not land on it. Return starts the next search.
+    var query = "" {
+        didSet {
+            guard query != oldValue else { return }
+            generation += 1
+            if state != .idle { state = .idle }
+        }
+    }
     private(set) var state: State = .idle
     private var generation = 0
     private let client: any SearchClient
