@@ -51,8 +51,11 @@ final class TimelineModel {
     private(set) var readOwed = false
     /// This user's id: a reaction event of theirs sets their own flag.
     let me: String
-    /// Why the last reaction didn't go through (cleared by the next one).
+    /// Why the last reaction didn't go through: cleared by the next one, or by itself after
+    /// `errorLifetime`.
     private(set) var reactionError: String?
+    private var reactionErrorSerial = 0
+    private let errorLifetime: Duration
     /// Messages whose reaction is being toggled: a second tap on the same message meanwhile sends
     /// nothing (answers then arrive in the order they were asked, and can't drop each other's).
     private var reacting: Set<String> = []
@@ -60,13 +63,30 @@ final class TimelineModel {
     /// if none arrived while it was in flight (the events carry the newer counts).
     private var reactionEvents: [String: Int] = [:]
 
-    func clearReactionError() { reactionError = nil }
+    func clearReactionError() {
+        reactionErrorSerial += 1
+        reactionError = nil
+    }
 
-    init(channelId: String, client: any ChatClient, me: String = "",
+    /// Show a failure, and take it down after `errorLifetime` unless a newer one replaced it.
+    private func failReaction() {
+        reactionErrorSerial += 1
+        let serial = reactionErrorSerial
+        reactionError = "Couldn't react. Try again."
+        let lifetime = errorLifetime
+        Task { [weak self] in
+            try? await Task.sleep(for: lifetime)
+            guard let self, reactionErrorSerial == serial else { return }
+            reactionError = nil
+        }
+    }
+
+    init(channelId: String, client: any ChatClient, me: String = "", errorLifetime: Duration = .seconds(5),
          isActive: @escaping @MainActor () -> Bool = { AppActivity.isActive }) {
         self.channelId = channelId
         self.client = client
         self.me = me
+        self.errorLifetime = errorLifetime
         self.isActive = isActive
     }
 
@@ -76,7 +96,7 @@ final class TimelineModel {
     func toggleReaction(_ message: FfiMessage, emoji: String) async {
         guard !message.deleted, reacting.insert(message.id).inserted else { return }
         defer { reacting.remove(message.id) }
-        reactionError = nil
+        clearReactionError()
         let seen = reactionEvents[message.id, default: 0]
         do {
             let summary = try await client.toggleReaction(
@@ -86,7 +106,7 @@ final class TimelineModel {
                 messages[i].reactions = summary
             }
         } catch {
-            reactionError = "Couldn't react. Try again."
+            failReaction()
         }
     }
 

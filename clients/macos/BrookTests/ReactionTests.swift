@@ -160,6 +160,31 @@ final class TimelineReactionTests: XCTestCase {
         XCTAssertEqual(t.messages[0].reactions, [chip("👍", 1, me: true)])
     }
 
+    /// Not by the test calling `clear`: the error takes itself down after its lifetime.
+    func testTheReactionErrorExpiresByItself() async {
+        let chat = FakeChat()
+        chat.reactionFails = true
+        let t = TimelineModel(channelId: "c", client: chat, me: "me", errorLifetime: .milliseconds(60))
+        t.merge([msg("m1", "hi")])
+        await t.toggleReaction(t.messages[0], emoji: "👍")
+        XCTAssertNotNil(t.reactionError)
+        for _ in 0..<200 where t.reactionError != nil { try? await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertNil(t.reactionError, "it never went away")
+    }
+
+    /// A newer error isn't taken down by an older one's timer.
+    func testANewerErrorIsNotClearedByAnOlderTimer() async {
+        let chat = FakeChat()
+        chat.reactionFails = true
+        let t = TimelineModel(channelId: "c", client: chat, me: "me", errorLifetime: .milliseconds(150))
+        t.merge([msg("m1", "hi")])
+        await t.toggleReaction(t.messages[0], emoji: "👍") // timer 1 at +150 ms
+        try? await Task.sleep(for: .milliseconds(100))
+        await t.toggleReaction(t.messages[0], emoji: "👍") // timer 2 at +250 ms
+        try? await Task.sleep(for: .milliseconds(80)) // +180: timer 1 has fired
+        XCTAssertNotNil(t.reactionError, "the older timer cleared the newer error")
+    }
+
     func testTheReactionErrorClears() async {
         let chat = FakeChat()
         chat.reactionFails = true

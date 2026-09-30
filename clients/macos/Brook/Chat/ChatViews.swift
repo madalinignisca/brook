@@ -71,13 +71,7 @@ struct ChatView: View {
             if let reactionError = timeline.reactionError {
                 Text(reactionError).font(.callout).foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
-                    // Gone by itself after a few seconds (a later reaction clears it sooner).
-                    .task(id: reactionError) {
-                        // Only after the full 5 s: a cancelled sleep (the error replaced, or the
-                        // view gone) must not clear a newer error early.
-                        guard (try? await Task.sleep(for: .seconds(5))) != nil else { return }
-                        timeline.clearReactionError()
-                    }
+                    // Gone by itself after a few seconds, or by the next reaction (the model's).
             }
             ComposerView(composer: composer)
         }
