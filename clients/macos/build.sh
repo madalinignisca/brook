@@ -77,10 +77,15 @@ if [[ "$mode" == "notarize" ]]; then
   zip="$HERE/build/Brook-notarize.zip"
   ditto -c -k --keepParent "$app" "$zip"
   # JSON, so a rejection is caught here with its log, not as a confusing stapler failure after it.
-  result="$(xcrun notarytool submit "$zip" --keychain-profile "$notary_profile" --wait --output-format json)"
-  read -r sub_id sub_status < <(/usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("id",""), d.get("status",""))' <<<"$result")
-  if [[ "$sub_status" != "Accepted" ]]; then
-    echo "notarization ${sub_status:-failed}: submission ${sub_id:-?}" >&2
+  # The exit status is kept, not left to `set -e`: a failed call's output is the diagnosis.
+  notary_rc=0
+  result="$(xcrun notarytool submit "$zip" --keychain-profile "$notary_profile" --wait --output-format json)" || notary_rc=$?
+  # "id|status" (a separator that isn't whitespace, so an empty id can't shift the status).
+  parsed="$(/usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("id","") + "|" + d.get("status",""))' <<<"$result" 2>/dev/null)" || parsed="|"
+  IFS='|' read -r sub_id sub_status <<<"$parsed" || true
+  if [[ "$notary_rc" -ne 0 || "$sub_status" != "Accepted" ]]; then
+    echo "notarization failed (status: ${sub_status:-unknown}, notarytool exit $notary_rc), submission ${sub_id:-?}" >&2
+    echo "$result" >&2
     [[ -n "$sub_id" ]] && xcrun notarytool log "$sub_id" --keychain-profile "$notary_profile" >&2 || true
     exit 1
   fi
