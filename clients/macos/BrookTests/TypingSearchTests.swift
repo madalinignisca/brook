@@ -6,6 +6,15 @@ import XCTest
 
 private let t0 = Date(timeIntervalSince1970: 1_000_000)
 
+/// A settable clock (Mutex is noncopyable, so a small class holds it).
+private final class Clock: @unchecked Sendable {
+    private let value = Mutex(t0)
+    var now: Date {
+        get { value.withLock { $0 } }
+        set { value.withLock { $0 = newValue } }
+    }
+}
+
 final class TypingStateTests: XCTestCase {
     func testTheLineNamesOneTwoOrMany() {
         var s = TypingState()
@@ -73,6 +82,19 @@ final class TimelineTypingTests: XCTestCase {
         XCTAssertEqual(t.typing.line(now: t0), "Bob is typing…")
     }
 
+    /// Through the model, with its clock: a notice 0.5 s after their message is the late one.
+    func testALateNoticeAfterTheirMessageIsIgnoredByTheTimeline() {
+        let clock = Clock()
+        let t = timeline { clock.now }
+        t.apply(.messageNew(message: msg("m1", "hi"))) // from "u"
+        clock.now = t0.addingTimeInterval(0.5)
+        t.apply(.typing(channelId: "c", userId: "u", displayName: "U"))
+        XCTAssertNil(t.typing.line(now: clock.now))
+        clock.now = t0.addingTimeInterval(3)
+        t.apply(.typing(channelId: "c", userId: "u", displayName: "U"))
+        XCTAssertNotNil(t.typing.line(now: clock.now))
+    }
+
     func testTheirMessageClearsIt() {
         let t = timeline { t0 }
         t.apply(.typing(channelId: "c", userId: "u", displayName: "U"))
@@ -84,15 +106,6 @@ final class TimelineTypingTests: XCTestCase {
 
 @MainActor
 final class TypingSenderTests: XCTestCase {
-    /// A settable clock (Mutex is noncopyable, so a small class holds it).
-    private final class Clock: @unchecked Sendable {
-        private let value = Mutex(t0)
-        var now: Date {
-            get { value.withLock { $0 } }
-            set { value.withLock { $0 = newValue } }
-        }
-    }
-
     private func sender(_ chat: FakeChat, _ clock: Clock) -> TypingSender {
         TypingSender(channelId: "c", client: chat, now: { clock.now })
     }
@@ -122,6 +135,19 @@ final class TypingSenderTests: XCTestCase {
         s.draftChanged("   \n")
         await settle()
         XCTAssertEqual(chat.typed.withLock { $0 }, [])
+    }
+
+    /// A failed edit puts its text back: that's the app writing the field, not typing.
+    func testPuttingAFailedEditsTextBackIsNotTyping() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.Timeout
+        let composer = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        composer.edit(msg("m1", "old"))
+        composer.text = "edited" // the user's change, while editing: not announced either
+        await composer.send()
+        await settle()
+        XCTAssertEqual(chat.typed.withLock { $0 }, [], "the restored text was announced as typing")
+        XCTAssertEqual(composer.text, "edited", "the failed edit's text came back")
     }
 
     func testChoosingEditSendsNothing() async {
@@ -282,6 +308,28 @@ final class SearchModelTests: XCTestCase {
         XCTAssertTrue(model.isShowing)
         model.query = "hit"
         XCTAssertFalse(model.isShowing)
+    }
+
+    func testHitsInChannelsTheListLacksAreNotListed() async {
+        let client = FakeSearch()
+        client.answer = [msg("a", "x", channel: "known"), msg("b", "x", channel: "gone")]
+        let model = SearchModel(client: client, known: { $0 == "known" })
+        model.query = "x"
+        await model.submit()
+        guard case let .results(hits) = model.state else { return XCTFail("\(model.state)") }
+        XCTAssertEqual(hits.map(\.channelId), ["known"])
+        client.answer = [msg("c", "x", channel: "gone")]
+        await model.submit()
+        XCTAssertEqual(model.state, .none, "every hit was filtered out: nothing found")
+    }
+
+    func testTheCapCountsTheServersPageNotTheFilteredList() async {
+        let client = FakeSearch()
+        client.answer = (0..<50).map { msg("m\($0)", "x", channel: $0 == 0 ? "known" : "gone") }
+        let model = SearchModel(client: client, known: { $0 == "known" })
+        model.query = "x"
+        await model.submit()
+        XCTAssertTrue(model.capped, "a full server page of 50 may have older matches")
     }
 
     func testClearResetsTheQueryAndHidesTheResults() async {

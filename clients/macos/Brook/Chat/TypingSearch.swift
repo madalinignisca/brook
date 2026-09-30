@@ -10,7 +10,10 @@ struct TypingState {
     static let lifetime: TimeInterval = 4
 
     /// A typing notice that arrives this soon after their message is the notice that was sent
-    /// just before it (two requests, no ordering between them): not a new one.
+    /// just before it (two requests, no ordering between them): not a new one. (A genuine first
+    /// notice for their next message can be dropped by it, and the sender's 3 s throttle then
+    /// delays the next; the line appears up to about 3 s late, a fair price for never showing a
+    /// stale one.)
     static let afterMessage: TimeInterval = 2
 
     private var seen: [String: (name: String, at: Date)] = [:]
@@ -117,22 +120,26 @@ final class SearchModel {
             guard query != oldValue else { return }
             generation += 1
             if state != .idle { state = .idle }
+            capped = false
         }
     }
     private(set) var state: State = .idle
+    /// The server returned as many as it will: there may be older matches it won't show.
+    private(set) var capped = false
     private var generation = 0
     private let client: any SearchClient
+    /// Whether the list has this channel: a hit in one it doesn't would open an empty pane, so it
+    /// isn't listed (and if none are, the search reads as "No messages found.").
+    private let known: (String) -> Bool
 
-    init(client: any SearchClient) { self.client = client }
+    init(client: any SearchClient, known: @escaping (String) -> Bool = { _ in true }) {
+        self.client = client
+        self.known = known
+    }
 
     /// The results list replaces the channel list while a search is showing.
     var isShowing: Bool { state != .idle }
 
-    /// The server returned as many as it will: there may be older matches it won't show.
-    var capped: Bool {
-        if case let .results(hits) = state { return hits.count >= Self.resultCap }
-        return false
-    }
 
     func submit() async {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -148,7 +155,9 @@ final class SearchModel {
         do {
             let found = try await client.searchMessages(query: q)
             guard mine == generation else { return } // a newer search (or a clear) came meanwhile
-            state = found.isEmpty ? .none : .results(found.map(SearchHit.init))
+            let hits = found.filter { known($0.channelId) }.map(SearchHit.init)
+            capped = found.count >= Self.resultCap // the server's page, before any filtering
+            state = hits.isEmpty ? .none : .results(hits)
         } catch {
             guard mine == generation else { return }
             state = .failed
@@ -159,5 +168,6 @@ final class SearchModel {
         generation += 1
         query = ""
         state = .idle
+        capped = false
     }
 }

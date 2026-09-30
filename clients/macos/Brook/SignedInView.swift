@@ -53,8 +53,12 @@ struct SignedInView: View {
         self.client = client
         self.calls = calls
         self.signOut = signOut
-        _channels = State(initialValue: ChannelsModel(client: client, me: user.id, notifier: MacNotifier.shared))
-        _search = State(initialValue: (client as? any SearchClient).map(SearchModel.init))
+        let channelsModel = ChannelsModel(client: client, me: user.id, notifier: MacNotifier.shared)
+        _channels = State(initialValue: channelsModel)
+        // Hits are listed only for channels the list has (a hit elsewhere would open an empty pane).
+        _search = State(initialValue: (client as? any SearchClient).map { search in
+            SearchModel(client: search, known: { id in channelsModel.channels.contains { $0.id == id } })
+        })
     }
     @Environment(\.openWindow) private var openWindow
 
@@ -92,7 +96,6 @@ struct SignedInView: View {
             }
             .modifier(SearchPresentation(
                 model: search, title: { id in channels.channels.first { $0.id == id }.map(channels.title) ?? "a channel" },
-                known: { id in channels.channels.contains { $0.id == id } },
                 onOpen: { id in selection = id; search?.clear() }))
             .navigationSplitViewColumnWidth(min: 200, ideal: 240)
         } detail: {
