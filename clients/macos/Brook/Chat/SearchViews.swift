@@ -6,6 +6,8 @@ struct SearchResultsView: View {
     let model: SearchModel
     /// A channel's title, for a hit's channel.
     let title: (String) -> String
+    /// Whether the list has this channel: a hit in one it doesn't would open an empty pane.
+    let known: (String) -> Bool
     let onOpen: (String) -> Void
 
     var body: some View {
@@ -22,7 +24,7 @@ struct SearchResultsView: View {
             Text("Search terms can be up to \(SearchModel.queryLimit) characters.").foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         case let .results(hits):
-            List(hits) { hit in
+            List(hits.filter { known($0.channelId) }) { hit in
                 Button { onOpen(hit.channelId) } label: {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("\(title(hit.channelId)) · \(hit.author)").font(.caption).foregroundStyle(.secondary)
@@ -45,6 +47,7 @@ struct SearchResultsView: View {
 struct SearchPresentation: ViewModifier {
     let model: SearchModel?
     let title: (String) -> String
+    let known: (String) -> Bool
     let onOpen: (String) -> Void
 
     @ViewBuilder func body(content: Content) -> some View {
@@ -52,7 +55,7 @@ struct SearchPresentation: ViewModifier {
             content
                 .overlay {
                     if model.isShowing {
-                        SearchResultsView(model: model, title: title, onOpen: onOpen).background(.background)
+                        SearchResultsView(model: model, title: title, known: known, onOpen: onOpen).background(.background)
                     }
                 }
                 .searchable(

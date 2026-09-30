@@ -92,6 +92,7 @@ struct SignedInView: View {
             }
             .modifier(SearchPresentation(
                 model: search, title: { id in channels.channels.first { $0.id == id }.map(channels.title) ?? "a channel" },
+                known: { id in channels.channels.contains { $0.id == id } },
                 onOpen: { id in selection = id; search?.clear() }))
             .navigationSplitViewColumnWidth(min: 200, ideal: 240)
         } detail: {

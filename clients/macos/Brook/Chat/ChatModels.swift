@@ -162,7 +162,7 @@ final class TimelineModel {
             typing.note(userId: userId, name: name, at: now())
         case let .messageNew(message), let .messageUpdate(message):
             guard message.channelId == channelId else { return }
-            if case .messageNew = event { typing.clear(userId: message.authorId) }
+            if case .messageNew = event { typing.clear(userId: message.authorId, at: now()) }
             merge([message])
             if case .messageNew = event {
                 if isActive() {
@@ -251,8 +251,9 @@ final class TimelineModel {
 @Observable
 final class ComposerModel {
     var text = "" {
-        // Not while editing: choosing Edit fills the field without the user typing.
-        didSet { if text != oldValue, editing == nil { typing.draftChanged(text) } }
+        // Not while editing (choosing Edit fills the field without the user typing), and not when
+        // the app puts a failed message's text back (`restore`).
+        didSet { if text != oldValue, editing == nil, !restoring { typing.draftChanged(text) } }
     }
     private(set) var replyingTo: FfiMessage?
     private(set) var editing: FfiMessage?
@@ -263,6 +264,14 @@ final class ComposerModel {
     private let client: any ChatClient
     /// Tells the server you're typing (throttled).
     private let typing: TypingSender
+    /// The app is putting a failed message's text back: that isn't typing.
+    private var restoring = false
+
+    private func restore(_ typed: String) {
+        restoring = true
+        text = typed
+        restoring = false
+    }
     /// Where a sent or edited message goes (the timeline, before the live event arrives).
     private let onMessage: (FfiMessage) -> Void
     /// The channel's unsent bubbles, re-read after a message is queued.
@@ -367,7 +376,7 @@ final class ComposerModel {
                 draft = nil // no local data (yet): sent directly below, as before
             } catch {
                 if text.isEmpty { // unless something new was typed meanwhile
-                    text = typed
+                    restore(typed)
                     replyingTo = reply
                 }
                 self.error = Self.explainQueued(error)
@@ -387,7 +396,7 @@ final class ComposerModel {
             onMessage(message)
         } catch {
             if text.isEmpty {  // unless something new was typed meanwhile
-                text = typed
+                restore(typed)
                 replyingTo = reply
                 self.editing = editing
             }

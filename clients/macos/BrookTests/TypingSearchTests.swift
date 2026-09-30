@@ -37,8 +37,25 @@ final class TypingStateTests: XCTestCase {
     func testAMessageFromThemClearsIt() {
         var s = TypingState()
         s.note(userId: "a", name: "Ann", at: t0)
-        s.clear(userId: "a")
+        s.clear(userId: "a", at: t0)
         XCTAssertNil(s.line(now: t0))
+    }
+
+    func testANoticeRightAfterTheirMessageIsTheOneSentJustBeforeItAndIsIgnored() {
+        var s = TypingState()
+        s.clear(userId: "a", at: t0) // their message arrived
+        s.note(userId: "a", name: "Ann", at: t0.addingTimeInterval(0.5)) // the late notice
+        XCTAssertNil(s.line(now: t0.addingTimeInterval(0.5)))
+        s.note(userId: "a", name: "Ann", at: t0.addingTimeInterval(2)) // typing the next one
+        XCTAssertNotNil(s.line(now: t0.addingTimeInterval(2)))
+    }
+
+    func testAMessageFromSomeoneElseLeavesTheOthersTyping() {
+        var s = TypingState()
+        s.note(userId: "a", name: "Ann", at: t0)
+        s.note(userId: "b", name: "Bob", at: t0)
+        s.clear(userId: "b", at: t0)
+        XCTAssertEqual(s.line(now: t0), "Ann is typing…")
     }
 }
 
@@ -107,6 +124,14 @@ final class TypingSenderTests: XCTestCase {
         XCTAssertEqual(chat.typed.withLock { $0 }, [])
     }
 
+    func testChoosingEditSendsNothing() async {
+        let chat = FakeChat()
+        let composer = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        composer.edit(msg("m1", "my old text"))
+        await settle()
+        XCTAssertEqual(chat.typed.withLock { $0 }, [], "filling the field to edit isn't typing")
+    }
+
     func testTheComposerTellsTheServerWhileTyping() async {
         let chat = FakeChat()
         let composer = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
@@ -121,9 +146,16 @@ private final class FakeSearch: SearchClient, @unchecked Sendable {
     var answer: [FfiMessage] = []
     var fails = false
     var gate: Gate?
+    /// Holds only the first search (the later ones answer at once).
+    var firstGate: Gate?
+    var answers: [String: [FfiMessage]] = [:]
+    private let calls = Mutex(0)
     func searchMessages(query: String) async throws -> [FfiMessage] {
+        let n = calls.withLock { c -> Int in c += 1; return c }
         queries.withLock { $0.append(query) }
+        if n == 1 { await firstGate?.wait() }
         await gate?.wait()
+        if let special = answers[query] { return special }
         if fails { throw LoginError.Timeout }
         return answer
     }
@@ -206,6 +238,23 @@ final class SearchModelTests: XCTestCase {
         client.answer = [msg("only", "hit")]
         await model.submit()
         XCTAssertFalse(model.capped)
+    }
+
+    func testAnOlderSearchFinishingAfterANewerOneDoesNotReplaceIt() async {
+        let client = FakeSearch()
+        let gate = Gate()
+        client.firstGate = gate
+        client.answers = ["old": [msg("old1", "old")], "new": [msg("new1", "new")]]
+        let model = SearchModel(client: client)
+        model.query = "old"
+        let first = Task { await model.submit() }
+        while client.queries.withLock({ $0.isEmpty }) { await Task.yield() }
+        model.query = "new"
+        await model.submit() // the newer search resolves first
+        gate.open()
+        await first.value // then the older one finishes
+        guard case let .results(hits) = model.state else { return XCTFail("\(model.state)") }
+        XCTAssertEqual(hits.map(\.id), ["new1"], "the older answer replaced the newer results")
     }
 
     func testClearResetsTheQueryAndHidesTheResults() async {

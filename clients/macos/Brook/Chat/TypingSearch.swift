@@ -9,15 +9,22 @@ import Observation
 struct TypingState {
     static let lifetime: TimeInterval = 4
 
+    /// A typing notice that arrives this soon after their message is the notice that was sent
+    /// just before it (two requests, no ordering between them): not a new one.
+    static let afterMessage: TimeInterval = 2
+
     private var seen: [String: (name: String, at: Date)] = [:]
+    private var lastMessage: [String: Date] = [:]
 
     mutating func note(userId: String, name: String, at: Date) {
+        if let sent = lastMessage[userId], at.timeIntervalSince(sent) < Self.afterMessage { return }
         seen[userId] = (name, at)
     }
 
     /// A message from them: they're done typing.
-    mutating func clear(userId: String) {
+    mutating func clear(userId: String, at: Date) {
         seen[userId] = nil
+        lastMessage[userId] = at
     }
 
     /// "Ann is typing…", "Ann and Bob are typing…", "Several people are typing…"; nil when nobody.
