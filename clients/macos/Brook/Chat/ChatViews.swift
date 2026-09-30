@@ -13,11 +13,14 @@ struct ChatView: View {
     let pending: PendingModel?
     /// The cache's notices (a file's state changing reaches its row).
     let feed: CacheFeed?
+    /// An archived channel is read-only.
+    let archived: Bool
     private let client: any ChatClient
 
     init(channelId: String, me: String, client: any ChatClient, timeline: TimelineModel,
-         pending: PendingModel? = nil, feed: CacheFeed? = nil) {
+         pending: PendingModel? = nil, feed: CacheFeed? = nil, archived: Bool = false) {
         self.channelId = channelId
+        self.archived = archived
         self.me = me
         self.pending = pending
         self.feed = feed
@@ -47,7 +50,8 @@ struct ChatView: View {
                         }
                         ForEach(timeline.messages, id: \.id) { message in
                             MessageRow(message: message, author: timeline.authorName(message),
-                                       mine: message.authorId == me, saves: saves, composer: composer,
+                                       mine: message.authorId == me, me: me, saves: saves, composer: composer,
+                                       onReact: { emoji in Task { await timeline.toggleReaction(message, emoji: emoji) } },
                                        makeRow: makeRow)
                                 .id(message.id)
                         }
@@ -66,8 +70,26 @@ struct ChatView: View {
             if let error = timeline.visibleError {
                 Text(error).foregroundStyle(.red).font(.caption).padding(.horizontal)
             }
+            // Re-evaluated every second, so "typing…" expires by itself.
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                if let line = timeline.typing.line(now: context.date) {
+                    Text(line).font(.callout).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
+                }
+            }
             Divider()
-            ComposerView(composer: composer)
+            if let reactionError = timeline.reactionError {
+                Text(reactionError).font(.callout).foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
+                    // Gone by itself after a few seconds, or by the next reaction (the model's).
+            }
+            if archived {
+                Text("This channel is archived. An owner or admin can unarchive it.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity).padding(10)
+            } else {
+                ComposerView(composer: composer)
+            }
         }
         // Files dropped anywhere on the conversation join the next message (not while
         // editing, and only with this Mac's storage).
@@ -76,6 +98,8 @@ struct ChatView: View {
             composer.attach(urls.filter(\.isFileURL))
             return true
         }
+        // Archived: nothing writes (the composer is replaced, and Reply, Edit and dropped files are off).
+        .onChange(of: archived, initial: true) { _, archived in composer.readOnly = archived }
         .task {
             saves.start()
             pending?.startProgress()
@@ -145,8 +169,12 @@ struct MessageRow: View {
     /// The author's current name (a rename reaches cached rows through the timeline).
     let author: String
     let mine: Bool
+    /// This user's id (a message that mentions them is tinted).
+    var me: String = ""
     let saves: SaveModel
     let composer: ComposerModel
+    /// Toggle this user's reaction with an emoji.
+    var onReact: (String) -> Void = { _ in }
     var makeRow: (FfiFileInfo) -> FileRowModel? = { _ in nil }
 
     var body: some View {
@@ -172,12 +200,35 @@ struct MessageRow: View {
             ForEach(message.attachments, id: \.id) { file in
                 AttachmentRow(file: file, saves: saves, makeRow: makeRow)
             }
+            if !message.deleted, !message.reactions.isEmpty {
+                HStack(spacing: 4) {
+                    ForEach(message.reactions, id: \.emoji) { reaction in
+                        Button { onReact(reaction.emoji) } label: {
+                            Text("\(reaction.emoji) \(reaction.count)").font(.callout)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(reaction.me ? .accentColor : .secondary)
+                        .accessibilityLabel("\(reaction.emoji), \(reaction.count)\(reaction.me ? ", including you" : "")")
+                    }
+                }
+            }
         }
+        // A message that mentions you is tinted.
+        .padding(.vertical, 2).padding(.horizontal, 6)
+        .background(NotificationPlanner.mentions(message, me: me) ? Color.accentColor.opacity(0.12) : .clear,
+                    in: RoundedRectangle(cornerRadius: 6))
         .contextMenu {
             if !message.deleted {
-                Button("Reply") { composer.reply(to: message) }
+                if !composer.readOnly {
+                    Menu("React") {
+                        ForEach(ReactionRules.quick, id: \.self) { emoji in
+                            Button(emoji) { onReact(emoji) }
+                        }
+                    }
+                    Button("Reply") { composer.reply(to: message) }
+                }
                 if mine {
-                    Button("Edit") { composer.edit(message) }
+                    if !composer.readOnly { Button("Edit") { composer.edit(message) } }
                     Button("Delete", role: .destructive) {
                         Task { await composer.delete(message) }
                     }

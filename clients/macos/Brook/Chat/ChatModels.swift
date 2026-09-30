@@ -9,6 +9,8 @@ protocol ChatClient: AnyObject, Sendable {
     func editMessage(channelId: String, messageId: String, body: String) async throws -> FfiMessage
     func deleteMessage(channelId: String, messageId: String) async throws
     func markRead(channelId: String, messageId: String?) async throws
+    func sendTyping(channelId: String) async throws
+    func toggleReaction(channelId: String, messageId: String, emoji: String) async throws -> [FfiReaction]
     func downloadFile(transferId: UInt64, fileId: String, sha256: String, size: UInt64,
                       destination: String) async throws
     func cancelTransfer(transferId: UInt64)
@@ -48,12 +50,70 @@ final class TimelineModel {
     private let isActive: @MainActor () -> Bool
     /// Messages arrived while the app was in the background: read when it's active again.
     private(set) var readOwed = false
+    /// Who's typing here (never this user: `me` is filtered out).
+    private(set) var typing = TypingState()
+    private let now: () -> Date
+    /// This user's id: a reaction event of theirs sets their own flag.
+    let me: String
+    /// Why the last reaction didn't go through: cleared by the next one, or by itself after
+    /// `errorLifetime`.
+    private(set) var reactionError: String?
+    private var reactionErrorSerial = 0
+    private let errorLifetime: Duration
+    /// Messages whose reaction is being toggled: a second tap on the same message meanwhile sends
+    /// nothing (answers then arrive in the order they were asked, and can't drop each other's).
+    private var reacting: Set<String> = []
+    /// Live reaction events seen per message: a toggle's answer is a snapshot, and is used only
+    /// if none arrived while it was in flight (the events carry the newer counts).
+    private var reactionEvents: [String: Int] = [:]
 
-    init(channelId: String, client: any ChatClient,
+    func clearReactionError() {
+        reactionErrorSerial += 1
+        reactionError = nil
+    }
+
+    /// Show a failure, and take it down after `errorLifetime` unless a newer one replaced it.
+    private func failReaction() {
+        reactionErrorSerial += 1
+        let serial = reactionErrorSerial
+        reactionError = "Couldn't react. Try again."
+        let lifetime = errorLifetime
+        Task { [weak self] in
+            try? await Task.sleep(for: lifetime)
+            guard let self, reactionErrorSerial == serial else { return }
+            reactionError = nil
+        }
+    }
+
+    init(channelId: String, client: any ChatClient, me: String = "", now: @escaping () -> Date = Date.init,
+         errorLifetime: Duration = .seconds(5),
          isActive: @escaping @MainActor () -> Bool = { AppActivity.isActive }) {
         self.channelId = channelId
         self.client = client
+        self.me = me
+        self.now = now
+        self.errorLifetime = errorLifetime
         self.isActive = isActive
+    }
+
+    /// Toggle your reaction. The answer is the message's whole summary from your side, and replaces
+    /// its row's unless a reaction event for the message arrived meanwhile: the answer is then
+    /// older than what the events say (your own echo included), so it's left out.
+    func toggleReaction(_ message: FfiMessage, emoji: String) async {
+        guard !message.deleted, reacting.insert(message.id).inserted else { return }
+        defer { reacting.remove(message.id) }
+        clearReactionError()
+        let seen = reactionEvents[message.id, default: 0]
+        do {
+            let summary = try await client.toggleReaction(
+                channelId: channelId, messageId: message.id, emoji: emoji)
+            if reactionEvents[message.id, default: 0] == seen,
+               let i = messages.firstIndex(where: { $0.id == message.id }) {
+                messages[i].reactions = summary
+            }
+        } catch {
+            failReaction()
+        }
     }
 
     /// The app became active: what arrived meanwhile is read now.
@@ -150,8 +210,12 @@ final class TimelineModel {
     /// A live event, if it's this channel's.
     func apply(_ event: FfiServerEvent) {
         switch event {
+        case let .typing(channel, userId, name):
+            guard channel == channelId, userId != me else { return }
+            typing.note(userId: userId, name: name, at: now())
         case let .messageNew(message), let .messageUpdate(message):
             guard message.channelId == channelId else { return }
+            if case .messageNew = event { typing.clear(userId: message.authorId, at: now()) }
             merge([message])
             if case .messageNew = event {
                 if isActive() {
@@ -168,6 +232,12 @@ final class TimelineModel {
             }
         case .resync:
             Task { await fetch(before: nil) }
+        case let .reactionUpdate(channel, messageId, emoji, userId, added, count):
+            guard channel == channelId, let i = messages.firstIndex(where: { $0.id == messageId }) else { return }
+            reactionEvents[messageId, default: 0] += 1
+            messages[i].reactions = ReactionRules.applying(
+                emoji: emoji, count: count, added: added, byMe: !me.isEmpty && userId == me,
+                to: messages[i].reactions)
         case .ready, .channelCall, .channelUpdate, .channelDelete:
             break
         }
@@ -239,7 +309,11 @@ final class TimelineModel {
 @MainActor
 @Observable
 final class ComposerModel {
-    var text = ""
+    var text = "" {
+        // Not while editing (choosing Edit fills the field without the user typing), and not when
+        // the app puts a failed message's text back (`restore`).
+        didSet { if text != oldValue, editing == nil, !restoring { typing.draftChanged(text) } }
+    }
     private(set) var replyingTo: FfiMessage?
     private(set) var editing: FfiMessage?
     private(set) var sending = false
@@ -247,6 +321,16 @@ final class ComposerModel {
 
     private let channelId: String
     private let client: any ChatClient
+    /// Tells the server you're typing (throttled).
+    private let typing: TypingSender
+    /// The app is putting a failed message's text back: that isn't typing.
+    private var restoring = false
+
+    private func restore(_ typed: String) {
+        restoring = true
+        text = typed
+        restoring = false
+    }
     /// Where a sent or edited message goes (the timeline, before the live event arrives).
     private let onMessage: (FfiMessage) -> Void
     /// The channel's unsent bubbles, re-read after a message is queued.
@@ -265,8 +349,11 @@ final class ComposerModel {
 
     /// Attach and drops are open: local data possible, not preparing, not editing.
     var canAttach: Bool {
-        client is any OfflineClient && !filesUnavailable && !preparing && editing == nil
+        !readOnly && client is any OfflineClient && !filesUnavailable && !preparing && editing == nil
     }
+
+    /// An archived channel: nothing can be written to it (the view also replaces the composer).
+    var readOnly = false
 
     func attach(_ urls: [URL]) {
         guard canAttach else { return }
@@ -291,15 +378,18 @@ final class ComposerModel {
     init(channelId: String, client: any ChatClient, onMessage: @escaping (FfiMessage) -> Void) {
         self.channelId = channelId
         self.client = client
+        typing = TypingSender(channelId: channelId, client: client)
         self.onMessage = onMessage
     }
 
     func reply(to message: FfiMessage) {
+        guard !readOnly else { return }
         editing = nil
         replyingTo = message
     }
 
     func edit(_ message: FfiMessage) {
+        guard !readOnly else { return }
         replyingTo = nil
         editing = message
         text = message.body
@@ -323,7 +413,7 @@ final class ComposerModel {
     /// come back, with why. A network failure may still have delivered it (a direct send
     /// can't be retried safely), so it says so instead of "not sent".
     func send() async {
-        guard canSend else { return }
+        guard canSend, !readOnly else { return }
         if editing == nil, !staged.isEmpty {
             await sendWithFiles()
             return
@@ -350,7 +440,7 @@ final class ComposerModel {
                 draft = nil // no local data (yet): sent directly below, as before
             } catch {
                 if text.isEmpty { // unless something new was typed meanwhile
-                    text = typed
+                    restore(typed)
                     replyingTo = reply
                 }
                 self.error = Self.explainQueued(error)
@@ -370,7 +460,7 @@ final class ComposerModel {
             onMessage(message)
         } catch {
             if text.isEmpty {  // unless something new was typed meanwhile
-                text = typed
+                restore(typed)
                 replyingTo = reply
                 self.editing = editing
             }
@@ -552,4 +642,28 @@ final class TransferBridge: TransferListener, @unchecked Sendable {
     }
 
     func onResync() {}  // a save's end state comes from its own call, not from events
+}
+
+/// How a live reaction event changes a message's chips. Absolute: the event carries the emoji's
+/// new total, so applying the same event twice changes nothing. (Two different events for one
+/// emoji can still arrive out of order; the server doesn't order them, so a wrong count lasts
+/// until the next event, a re-read, or the cache's sync.)
+enum ReactionRules {
+    static func applying(emoji: String, count: Int64, added: Bool, byMe: Bool,
+                         to list: [FfiReaction]) -> [FfiReaction] {
+        var list = list
+        let i = list.firstIndex { $0.emoji == emoji }
+        let me = byMe ? added : (i.map { list[$0].me } ?? false)
+        if count <= 0 {
+            if let i { list.remove(at: i) }
+        } else if let i {
+            list[i] = FfiReaction(emoji: emoji, count: count, me: me)
+        } else {
+            list.append(FfiReaction(emoji: emoji, count: count, me: me))
+        }
+        return list
+    }
+
+    /// The quick set (as GTK's).
+    static let quick = ["\u{1F44D}", "\u{2764}\u{FE0F}", "\u{1F602}", "\u{1F389}", "\u{1F440}", "\u{1F64F}"]
 }

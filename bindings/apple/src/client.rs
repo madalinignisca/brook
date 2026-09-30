@@ -245,6 +245,78 @@ impl FfiBrookClient {
         run(async move { inner.remove_member(&channel_id, &user_id).await }).await
     }
 
+    /// Open (or find) the direct message with `handle`. An unknown handle is `validation.error`
+    /// (422), not `not_found`.
+    pub async fn open_dm(&self, handle: String) -> Result<FfiChannel, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        Ok(run(async move { inner.open_dm(&handle).await })
+            .await?
+            .into())
+    }
+
+    /// Create a channel (global admins only: `authz.forbidden` otherwise); `is_public` makes it
+    /// browsable and self-joinable.
+    pub async fn create_channel(
+        &self,
+        name: String,
+        topic: Option<String>,
+        is_public: bool,
+    ) -> Result<FfiChannel, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        Ok(run(async move {
+            inner
+                .create_channel_with(&name, topic.as_deref(), is_public)
+                .await
+        })
+        .await?
+        .into())
+    }
+
+    /// Public, non-archived channels you haven't joined.
+    pub async fn list_public_channels(&self) -> Result<Vec<FfiChannel>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let channels = run(async move { inner.list_public_channels().await }).await?;
+        Ok(channels.into_iter().map(Into::into).collect())
+    }
+
+    /// Join a public channel.
+    pub async fn join_channel(&self, channel_id: String) -> Result<FfiChannel, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        Ok(run(async move { inner.join_channel(&channel_id).await })
+            .await?
+            .into())
+    }
+
+    /// Add a member by handle (an owner or an admin). Errors: `not_found`, `authz.forbidden`.
+    pub async fn add_member(&self, channel_id: String, handle: String) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.add_member(&channel_id, &handle).await }).await
+    }
+
+    /// Rename, retopic or (un)archive a channel (an owner or an admin); nil leaves a field.
+    pub async fn update_channel(
+        &self,
+        channel_id: String,
+        name: Option<String>,
+        topic: Option<String>,
+        archived: Option<bool>,
+    ) -> Result<FfiChannel, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        Ok(run(async move {
+            inner
+                .update_channel(&channel_id, name.as_deref(), topic.as_deref(), archived)
+                .await
+        })
+        .await?
+        .into())
+    }
+
+    /// Delete a channel and its history (an owner or an admin).
+    pub async fn delete_channel(&self, channel_id: String) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.delete_channel(&channel_id).await }).await
+    }
+
     /// Offer to make the member `handle` an owner (an owner or an admin). Answers the channel,
     /// its `ownerOffers` including the new one. Errors: `authz.forbidden`,
     /// `channel.not_member`, `channel.already_owner`, `channel.dm`, `not_found`.
@@ -291,6 +363,39 @@ impl FfiBrookClient {
     pub async fn leave_channel(&self, channel_id: String) -> Result<(), LoginError> {
         let inner = Arc::clone(&self.inner);
         run(async move { inner.leave_channel(&channel_id).await }).await
+    }
+
+    /// Say you're typing in a channel (ephemeral; send at most every few seconds).
+    pub async fn send_typing(&self, channel_id: String) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.send_typing(&channel_id).await }).await
+    }
+
+    /// Search message bodies across your channels, newest first (needs the server).
+    pub async fn search_messages(
+        &self,
+        query: String,
+    ) -> Result<Vec<crate::offline::FfiMessage>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let found = run(async move { inner.search_messages(&query).await }).await?;
+        Ok(found.into_iter().map(Into::into).collect())
+    }
+
+    /// Toggle your reaction on a message; answers the message's whole summary from your side.
+    pub async fn toggle_reaction(
+        &self,
+        channel_id: String,
+        message_id: String,
+        emoji: String,
+    ) -> Result<Vec<crate::offline::FfiReaction>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let summary = run(async move {
+            inner
+                .toggle_reaction(&channel_id, &message_id, &emoji)
+                .await
+        })
+        .await?;
+        Ok(summary.into_iter().map(Into::into).collect())
     }
 
     /// Save an attachment to `destination` (the path a save panel chose), checked against
@@ -491,6 +596,30 @@ pub(crate) fn map_event(event: ServerEvent) -> Option<FfiServerEvent> {
             channel_id,
             message_id,
         },
+        ServerEvent::Typing {
+            channel_id,
+            user_id,
+            display_name,
+        } => FfiServerEvent::Typing {
+            channel_id,
+            user_id,
+            display_name,
+        },
+        ServerEvent::ReactionUpdate {
+            channel_id,
+            message_id,
+            emoji,
+            user_id,
+            added,
+            count,
+        } => FfiServerEvent::ReactionUpdate {
+            channel_id,
+            message_id,
+            emoji,
+            user_id,
+            added,
+            count,
+        },
         ServerEvent::ChannelUpdate(c) => FfiServerEvent::ChannelUpdate { channel: c.into() },
         ServerEvent::ChannelDelete { channel_id } => FfiServerEvent::ChannelDelete { channel_id },
         _ => return None,
@@ -562,6 +691,37 @@ mod tests {
         assert_eq!(session.access_token, ACCESS);
         assert_eq!(session.refresh_token, REFRESH);
         assert_eq!(session.user.handle, "alice");
+    }
+
+    /// A channel created through the binding keeps its topic, public or not.
+    #[tokio::test]
+    async fn creating_a_channel_sends_its_topic_public_or_not() {
+        let server = mock_login_ok().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/channels"))
+            .and(wiremock::matchers::body_json(json!({
+                "kind": "channel", "name": "general", "topic": "all hands", "public": true
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "c1", "kind": "channel", "name": "general", "topic": "all hands",
+                "public": true, "created_by": "u1", "created_at": "2026-06-18T00:00:00Z",
+                "members": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = FfiBrookClient::new(server.uri(), false).unwrap();
+        client.login("alice".into(), "pw".into()).await.unwrap();
+
+        let made = client
+            .create_channel("general".into(), Some("all hands".into()), true)
+            .await
+            .unwrap();
+
+        // Through the binding (not core's call alone): the topic of a public channel survives,
+        // and what comes back carries them.
+        assert_eq!(made.topic.as_deref(), Some("all hands"));
+        assert!(made.is_public);
     }
 
     /// Test 3: the server's error code reaches Swift verbatim.
