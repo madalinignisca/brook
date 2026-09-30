@@ -397,6 +397,12 @@ pub enum FfiServerEvent {
         call_id: Option<String>,
         participant_count: u32,
     },
+    /// Someone is typing in a channel. Expire it client-side (GTK and the Mac: 4 seconds).
+    Typing {
+        channel_id: String,
+        user_id: String,
+        display_name: String,
+    },
     /// A channel you're in changed (renamed, members joined or left, archived): replace
     /// its row. Without local data this is the only way the list hears of it.
     ChannelUpdate { channel: crate::types::FfiChannel },

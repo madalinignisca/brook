@@ -61,6 +61,8 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     }
     func deleteMessage(channelId: String, messageId: String) async throws {}
     func markRead(channelId: String, messageId: String?) async throws { read.append(messageId) }
+    let typed = Mutex<[String]>([])
+    func sendTyping(channelId: String) async throws { typed.withLock { $0.append(channelId) } }
     var downloadFailure: Error?
     var downloadBytes = Data("new".utf8)
     func downloadFile(transferId: UInt64, fileId: String, sha256: String, size: UInt64,

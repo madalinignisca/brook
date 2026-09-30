@@ -133,7 +133,7 @@ final class ChannelsModel {
         case let .messageNew(message):
             timeline?.apply(event)  // the open conversation's
             arrived(message)
-        case .messageUpdate, .messageDelete, .resync:
+        case .messageUpdate, .messageDelete, .resync, .typing:
             timeline?.apply(event)
         case let .channelDelete(channelId):
             cacheRemoved([channelId]) // left, removed or deleted: as the cache's removal

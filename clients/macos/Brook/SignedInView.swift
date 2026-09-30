@@ -31,6 +31,8 @@ struct SignedInView: View {
     @State private var shownName: String?
     @State private var leaving: ChannelRow?
     @State private var showingMembers = false
+    /// Message search (online), when this client can.
+    @State private var search: SearchModel?
     /// The open channel's ownership question (#190): when it shows, and its answer's state
     /// (kept here so an error and "Ask Me Later" survive redraws). Keyed by channel and offer.
     @State private var prompt = OfferPrompt()
@@ -52,6 +54,7 @@ struct SignedInView: View {
         self.calls = calls
         self.signOut = signOut
         _channels = State(initialValue: ChannelsModel(client: client, me: user.id, notifier: MacNotifier.shared))
+        _search = State(initialValue: (client as? any SearchClient).map(SearchModel.init))
     }
     @Environment(\.openWindow) private var openWindow
 
@@ -87,6 +90,9 @@ struct SignedInView: View {
                     }
                 }
             }
+            .modifier(SearchPresentation(
+                model: search, title: { id in channels.channels.first { $0.id == id }.map(channels.title) ?? "a channel" },
+                onOpen: { id in selection = id; search?.clear() }))
             .navigationSplitViewColumnWidth(min: 200, ideal: 240)
         } detail: {
             if let channel = channels.channels.first(where: { $0.id == selection }),
@@ -294,7 +300,7 @@ extension SignedInView {
             feed?.pending = nil
             return
         }
-        let model = TimelineModel(channelId: channelId, client: chat)
+        let model = TimelineModel(channelId: channelId, client: chat, me: user.id)
         timeline = model
         channels.timeline = model
         pending = (client as? any OfflineClient).map { PendingModel(channelId: channelId, client: $0) }

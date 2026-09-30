@@ -293,6 +293,22 @@ impl FfiBrookClient {
         run(async move { inner.leave_channel(&channel_id).await }).await
     }
 
+    /// Say you're typing in a channel (ephemeral; send at most every few seconds).
+    pub async fn send_typing(&self, channel_id: String) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.send_typing(&channel_id).await }).await
+    }
+
+    /// Search message bodies across your channels, newest first (needs the server).
+    pub async fn search_messages(
+        &self,
+        query: String,
+    ) -> Result<Vec<crate::offline::FfiMessage>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let found = run(async move { inner.search_messages(&query).await }).await?;
+        Ok(found.into_iter().map(Into::into).collect())
+    }
+
     /// Save an attachment to `destination` (the path a save panel chose), checked against
     /// `sha256`. Progress and cancel go by `transfer_id` (`subscribe_transfers`,
     /// `cancel_transfer`). A failed or cancelled download leaves no file behind;
@@ -490,6 +506,15 @@ pub(crate) fn map_event(event: ServerEvent) -> Option<FfiServerEvent> {
         } => FfiServerEvent::MessageDelete {
             channel_id,
             message_id,
+        },
+        ServerEvent::Typing {
+            channel_id,
+            user_id,
+            display_name,
+        } => FfiServerEvent::Typing {
+            channel_id,
+            user_id,
+            display_name,
         },
         ServerEvent::ChannelUpdate(c) => FfiServerEvent::ChannelUpdate { channel: c.into() },
         ServerEvent::ChannelDelete { channel_id } => FfiServerEvent::ChannelDelete { channel_id },

@@ -572,3 +572,22 @@ fn owner_offers_cross_on_live_and_cached_channels() {
     );
     assert_eq!(FfiCachedChannel::from(channel).owner_offers, vec![offer]);
 }
+
+#[test]
+fn a_typing_event_crosses_with_the_name() {
+    use crate::call::FfiServerEvent;
+    use crate::client::map_event;
+    use brook_core::ServerEvent;
+    assert_eq!(
+        map_event(ServerEvent::Typing {
+            channel_id: "c".into(),
+            user_id: "u2".into(),
+            display_name: "Bob".into(),
+        }),
+        Some(FfiServerEvent::Typing {
+            channel_id: "c".into(),
+            user_id: "u2".into(),
+            display_name: "Bob".into(),
+        })
+    );
+}

@@ -592,6 +592,8 @@ extension FakeRealtime {
     func markRead(channelId: String, messageId: String?) async throws { throw unused }
     func removeMember(channelId: String, userId: String) async throws { throw unused }
     func leaveChannel(channelId: String) async throws { throw unused }
+    func sendTyping(channelId: String) async throws { throw unused }
+    func searchMessages(query: String) async throws -> [FfiMessage] { throw unused }
     func offerOwnership(channelId: String, handle: String) async throws -> FfiChannel { throw unused }
     func withdrawOwnershipOffer(channelId: String, userId: String) async throws { throw unused }
     func acceptOwnership(channelId: String) async throws -> FfiChannel { throw unused }

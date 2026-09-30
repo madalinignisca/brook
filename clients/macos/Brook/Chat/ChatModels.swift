@@ -9,6 +9,7 @@ protocol ChatClient: AnyObject, Sendable {
     func editMessage(channelId: String, messageId: String, body: String) async throws -> FfiMessage
     func deleteMessage(channelId: String, messageId: String) async throws
     func markRead(channelId: String, messageId: String?) async throws
+    func sendTyping(channelId: String) async throws
     func downloadFile(transferId: UInt64, fileId: String, sha256: String, size: UInt64,
                       destination: String) async throws
     func cancelTransfer(transferId: UInt64)
@@ -48,11 +49,17 @@ final class TimelineModel {
     private let isActive: @MainActor () -> Bool
     /// Messages arrived while the app was in the background: read when it's active again.
     private(set) var readOwed = false
+    /// Who's typing here (never this user: `me` is filtered out).
+    private(set) var typing = TypingState()
+    private let me: String
+    private let now: () -> Date
 
-    init(channelId: String, client: any ChatClient,
+    init(channelId: String, client: any ChatClient, me: String = "", now: @escaping () -> Date = Date.init,
          isActive: @escaping @MainActor () -> Bool = { AppActivity.isActive }) {
         self.channelId = channelId
         self.client = client
+        self.me = me
+        self.now = now
         self.isActive = isActive
     }
 
@@ -150,8 +157,12 @@ final class TimelineModel {
     /// A live event, if it's this channel's.
     func apply(_ event: FfiServerEvent) {
         switch event {
+        case let .typing(channel, userId, name):
+            guard channel == channelId, userId != me else { return }
+            typing.note(userId: userId, name: name, at: now())
         case let .messageNew(message), let .messageUpdate(message):
             guard message.channelId == channelId else { return }
+            if case .messageNew = event { typing.clear(userId: message.authorId) }
             merge([message])
             if case .messageNew = event {
                 if isActive() {
@@ -239,7 +250,10 @@ final class TimelineModel {
 @MainActor
 @Observable
 final class ComposerModel {
-    var text = ""
+    var text = "" {
+        // Not while editing: choosing Edit fills the field without the user typing.
+        didSet { if text != oldValue, editing == nil { typing.draftChanged(text) } }
+    }
     private(set) var replyingTo: FfiMessage?
     private(set) var editing: FfiMessage?
     private(set) var sending = false
@@ -247,6 +261,8 @@ final class ComposerModel {
 
     private let channelId: String
     private let client: any ChatClient
+    /// Tells the server you're typing (throttled).
+    private let typing: TypingSender
     /// Where a sent or edited message goes (the timeline, before the live event arrives).
     private let onMessage: (FfiMessage) -> Void
     /// The channel's unsent bubbles, re-read after a message is queued.
@@ -291,6 +307,7 @@ final class ComposerModel {
     init(channelId: String, client: any ChatClient, onMessage: @escaping (FfiMessage) -> Void) {
         self.channelId = channelId
         self.client = client
+        typing = TypingSender(channelId: channelId, client: client)
         self.onMessage = onMessage
     }
 
