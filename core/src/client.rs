@@ -548,14 +548,28 @@ impl BrookClient {
 
     /// Create a named channel (server requires the caller be a global admin).
     pub async fn create_channel(&self, name: &str, topic: Option<&str>) -> Result<Channel> {
-        self.post_channel(json!({ "kind": "channel", "name": name, "topic": topic }))
-            .await
+        self.create_channel_with(name, topic, false).await
     }
 
-    /// Create a public (browsable + self-joinable) channel. Requires admin.
+    /// Create a public (browsable + self-joinable) channel. Requires admin. (No topic: use
+    /// [`BrookClient::create_channel_with`].)
     pub async fn create_public_channel(&self, name: &str) -> Result<Channel> {
-        self.post_channel(json!({ "kind": "channel", "name": name, "public": true }))
-            .await
+        self.create_channel_with(name, None, true).await
+    }
+
+    /// Create a channel with a topic, public or not (the server requires a global admin). A
+    /// public channel keeps its topic too.
+    pub async fn create_channel_with(
+        &self,
+        name: &str,
+        topic: Option<&str>,
+        public: bool,
+    ) -> Result<Channel> {
+        let mut body = json!({ "kind": "channel", "name": name, "topic": topic });
+        if public {
+            body["public"] = json!(true);
+        }
+        self.post_channel(body).await
     }
 
     /// Rename / retopic / archive a channel (admin or owner). `None` fields unchanged.
@@ -1541,6 +1555,36 @@ mod tests {
             matches!(&err, Error::Api { code, .. } if code == "offer.not_found"),
             "got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_channel_is_created_with_its_topic_public_or_not() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/channels"))
+            .and(wiremock::matchers::body_json(json!({
+                "kind": "channel", "name": "general", "topic": "all hands", "public": true
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(channel_json(json!([]))))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/channels"))
+            .and(wiremock::matchers::body_json(json!({
+                "kind": "channel", "name": "quiet", "topic": null
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(channel_json(json!([]))))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client
+            .create_channel_with("general", Some("all hands"), true)
+            .await
+            .unwrap();
+        client.create_channel("quiet", None).await.unwrap(); // private: no `public` key
     }
 
     #[tokio::test]

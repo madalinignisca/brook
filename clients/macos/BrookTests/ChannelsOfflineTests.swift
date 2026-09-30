@@ -63,7 +63,7 @@ final class ChannelsOfflineTests: XCTestCase {
         XCTAssertEqual(model.channels.map(\.id), ["c1"])
         XCTAssertEqual(model.closed, "c2")
         gate.open()
-        await older.value
+        _ = await older.value
         XCTAssertEqual(model.channels.map(\.id), ["c1"], "a read from before the removal brought it back")
     }
 

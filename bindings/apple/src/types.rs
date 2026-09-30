@@ -258,6 +258,10 @@ pub struct FfiChannel {
     pub kind: String,
     pub name: Option<String>,
     pub archived: bool,
+    /// The channel's topic, if any.
+    pub topic: Option<String>,
+    /// Browsable and self-joinable.
+    pub is_public: bool,
     /// Unread messages mentioning you or everyone (`GET /channels` only; 0 on an update).
     pub unread_mentions: i64,
     /// Current members (Members, and who Remove is offered for).
@@ -292,6 +296,8 @@ impl From<brook_core::Channel> for FfiChannel {
             kind: c.kind,
             name: c.name,
             archived: c.archived,
+            topic: c.topic,
+            is_public: c.public,
             unread_mentions: c.unread_mentions,
             members: c.members.into_iter().map(Into::into).collect(),
             owner_offers: c.owner_offers.into_iter().map(Into::into).collect(),
