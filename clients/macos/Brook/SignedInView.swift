@@ -31,6 +31,8 @@ struct SignedInView: View {
     @State private var shownName: String?
     @State private var leaving: ChannelRow?
     @State private var showingMembers = false
+    /// Message search (online), when this client can.
+    @State private var search: SearchModel?
     /// Starting conversations and managing the open channel (spec 2026-09-30-mac-conversations).
     @State private var conversationSheet: ConversationSheet?
     @State private var managing: ChannelManagementModel?
@@ -56,7 +58,12 @@ struct SignedInView: View {
         self.client = client
         self.calls = calls
         self.signOut = signOut
-        _channels = State(initialValue: ChannelsModel(client: client, me: user.id, notifier: MacNotifier.shared))
+        let channelsModel = ChannelsModel(client: client, me: user.id, notifier: MacNotifier.shared)
+        _channels = State(initialValue: channelsModel)
+        // Hits are listed only for channels the list has (a hit elsewhere would open an empty pane).
+        _search = State(initialValue: (client as? any SearchClient).map { search in
+            SearchModel(client: search, known: { id in channelsModel.channels.contains { $0.id == id } })
+        })
     }
     @Environment(\.openWindow) private var openWindow
 
@@ -95,6 +102,9 @@ struct SignedInView: View {
                     }
                 }
             }
+            .modifier(SearchPresentation(
+                model: search, title: { id in channels.channels.first { $0.id == id }.map(channels.title) ?? "a channel" },
+                onOpen: { id in selection = id; search?.clear() }))
             .navigationSplitViewColumnWidth(min: 200, ideal: 240)
         } detail: {
             if let channel = channels.channels.first(where: { $0.id == selection }),

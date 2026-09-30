@@ -9,6 +9,7 @@ protocol ChatClient: AnyObject, Sendable {
     func editMessage(channelId: String, messageId: String, body: String) async throws -> FfiMessage
     func deleteMessage(channelId: String, messageId: String) async throws
     func markRead(channelId: String, messageId: String?) async throws
+    func sendTyping(channelId: String) async throws
     func toggleReaction(channelId: String, messageId: String, emoji: String) async throws -> [FfiReaction]
     func downloadFile(transferId: UInt64, fileId: String, sha256: String, size: UInt64,
                       destination: String) async throws
@@ -49,6 +50,9 @@ final class TimelineModel {
     private let isActive: @MainActor () -> Bool
     /// Messages arrived while the app was in the background: read when it's active again.
     private(set) var readOwed = false
+    /// Who's typing here (never this user: `me` is filtered out).
+    private(set) var typing = TypingState()
+    private let now: () -> Date
     /// This user's id: a reaction event of theirs sets their own flag.
     let me: String
     /// Why the last reaction didn't go through: cleared by the next one, or by itself after
@@ -81,11 +85,13 @@ final class TimelineModel {
         }
     }
 
-    init(channelId: String, client: any ChatClient, me: String = "", errorLifetime: Duration = .seconds(5),
+    init(channelId: String, client: any ChatClient, me: String = "", now: @escaping () -> Date = Date.init,
+         errorLifetime: Duration = .seconds(5),
          isActive: @escaping @MainActor () -> Bool = { AppActivity.isActive }) {
         self.channelId = channelId
         self.client = client
         self.me = me
+        self.now = now
         self.errorLifetime = errorLifetime
         self.isActive = isActive
     }
@@ -204,8 +210,12 @@ final class TimelineModel {
     /// A live event, if it's this channel's.
     func apply(_ event: FfiServerEvent) {
         switch event {
+        case let .typing(channel, userId, name):
+            guard channel == channelId, userId != me else { return }
+            typing.note(userId: userId, name: name, at: now())
         case let .messageNew(message), let .messageUpdate(message):
             guard message.channelId == channelId else { return }
+            if case .messageNew = event { typing.clear(userId: message.authorId, at: now()) }
             merge([message])
             if case .messageNew = event {
                 if isActive() {
@@ -299,7 +309,11 @@ final class TimelineModel {
 @MainActor
 @Observable
 final class ComposerModel {
-    var text = ""
+    var text = "" {
+        // Not while editing (choosing Edit fills the field without the user typing), and not when
+        // the app puts a failed message's text back (`restore`).
+        didSet { if text != oldValue, editing == nil, !restoring { typing.draftChanged(text) } }
+    }
     private(set) var replyingTo: FfiMessage?
     private(set) var editing: FfiMessage?
     private(set) var sending = false
@@ -307,6 +321,16 @@ final class ComposerModel {
 
     private let channelId: String
     private let client: any ChatClient
+    /// Tells the server you're typing (throttled).
+    private let typing: TypingSender
+    /// The app is putting a failed message's text back: that isn't typing.
+    private var restoring = false
+
+    private func restore(_ typed: String) {
+        restoring = true
+        text = typed
+        restoring = false
+    }
     /// Where a sent or edited message goes (the timeline, before the live event arrives).
     private let onMessage: (FfiMessage) -> Void
     /// The channel's unsent bubbles, re-read after a message is queued.
@@ -354,6 +378,7 @@ final class ComposerModel {
     init(channelId: String, client: any ChatClient, onMessage: @escaping (FfiMessage) -> Void) {
         self.channelId = channelId
         self.client = client
+        typing = TypingSender(channelId: channelId, client: client)
         self.onMessage = onMessage
     }
 
@@ -415,7 +440,7 @@ final class ComposerModel {
                 draft = nil // no local data (yet): sent directly below, as before
             } catch {
                 if text.isEmpty { // unless something new was typed meanwhile
-                    text = typed
+                    restore(typed)
                     replyingTo = reply
                 }
                 self.error = Self.explainQueued(error)
@@ -435,7 +460,7 @@ final class ComposerModel {
             onMessage(message)
         } catch {
             if text.isEmpty {  // unless something new was typed meanwhile
-                text = typed
+                restore(typed)
                 replyingTo = reply
                 self.editing = editing
             }

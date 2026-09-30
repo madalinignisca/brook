@@ -643,3 +643,22 @@ fn a_channel_carries_its_topic_and_whether_its_public() {
     let f = crate::types::FfiChannel::from(plain);
     assert_eq!((f.topic, f.is_public), (None, false));
 }
+
+#[test]
+fn a_typing_event_crosses_with_the_name() {
+    use crate::call::FfiServerEvent;
+    use crate::client::map_event;
+    use brook_core::ServerEvent;
+    assert_eq!(
+        map_event(ServerEvent::Typing {
+            channel_id: "c".into(),
+            user_id: "u2".into(),
+            display_name: "Bob".into(),
+        }),
+        Some(FfiServerEvent::Typing {
+            channel_id: "c".into(),
+            user_id: "u2".into(),
+            display_name: "Bob".into(),
+        })
+    );
+}

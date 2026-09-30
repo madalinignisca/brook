@@ -70,6 +70,13 @@ struct ChatView: View {
             if let error = timeline.visibleError {
                 Text(error).foregroundStyle(.red).font(.caption).padding(.horizontal)
             }
+            // Re-evaluated every second, so "typing…" expires by itself.
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                if let line = timeline.typing.line(now: context.date) {
+                    Text(line).font(.callout).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
+                }
+            }
             Divider()
             if let reactionError = timeline.reactionError {
                 Text(reactionError).font(.callout).foregroundStyle(.red)

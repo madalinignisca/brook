@@ -365,6 +365,22 @@ impl FfiBrookClient {
         run(async move { inner.leave_channel(&channel_id).await }).await
     }
 
+    /// Say you're typing in a channel (ephemeral; send at most every few seconds).
+    pub async fn send_typing(&self, channel_id: String) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.send_typing(&channel_id).await }).await
+    }
+
+    /// Search message bodies across your channels, newest first (needs the server).
+    pub async fn search_messages(
+        &self,
+        query: String,
+    ) -> Result<Vec<crate::offline::FfiMessage>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let found = run(async move { inner.search_messages(&query).await }).await?;
+        Ok(found.into_iter().map(Into::into).collect())
+    }
+
     /// Toggle your reaction on a message; answers the message's whole summary from your side.
     pub async fn toggle_reaction(
         &self,
@@ -579,6 +595,15 @@ pub(crate) fn map_event(event: ServerEvent) -> Option<FfiServerEvent> {
         } => FfiServerEvent::MessageDelete {
             channel_id,
             message_id,
+        },
+        ServerEvent::Typing {
+            channel_id,
+            user_id,
+            display_name,
+        } => FfiServerEvent::Typing {
+            channel_id,
+            user_id,
+            display_name,
         },
         ServerEvent::ReactionUpdate {
             channel_id,
