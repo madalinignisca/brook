@@ -365,6 +365,23 @@ impl FfiBrookClient {
         run(async move { inner.leave_channel(&channel_id).await }).await
     }
 
+    /// Toggle your reaction on a message; answers the message's whole summary from your side.
+    pub async fn toggle_reaction(
+        &self,
+        channel_id: String,
+        message_id: String,
+        emoji: String,
+    ) -> Result<Vec<crate::offline::FfiReaction>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let summary = run(async move {
+            inner
+                .toggle_reaction(&channel_id, &message_id, &emoji)
+                .await
+        })
+        .await?;
+        Ok(summary.into_iter().map(Into::into).collect())
+    }
+
     /// Save an attachment to `destination` (the path a save panel chose), checked against
     /// `sha256`. Progress and cancel go by `transfer_id` (`subscribe_transfers`,
     /// `cancel_transfer`). A failed or cancelled download leaves no file behind;
@@ -562,6 +579,21 @@ pub(crate) fn map_event(event: ServerEvent) -> Option<FfiServerEvent> {
         } => FfiServerEvent::MessageDelete {
             channel_id,
             message_id,
+        },
+        ServerEvent::ReactionUpdate {
+            channel_id,
+            message_id,
+            emoji,
+            user_id,
+            added,
+            count,
+        } => FfiServerEvent::ReactionUpdate {
+            channel_id,
+            message_id,
+            emoji,
+            user_id,
+            added,
+            count,
         },
         ServerEvent::ChannelUpdate(c) => FfiServerEvent::ChannelUpdate { channel: c.into() },
         ServerEvent::ChannelDelete { channel_id } => FfiServerEvent::ChannelDelete { channel_id },

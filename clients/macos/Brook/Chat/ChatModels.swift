@@ -9,6 +9,7 @@ protocol ChatClient: AnyObject, Sendable {
     func editMessage(channelId: String, messageId: String, body: String) async throws -> FfiMessage
     func deleteMessage(channelId: String, messageId: String) async throws
     func markRead(channelId: String, messageId: String?) async throws
+    func toggleReaction(channelId: String, messageId: String, emoji: String) async throws -> [FfiReaction]
     func downloadFile(transferId: UInt64, fileId: String, sha256: String, size: UInt64,
                       destination: String) async throws
     func cancelTransfer(transferId: UInt64)
@@ -48,12 +49,65 @@ final class TimelineModel {
     private let isActive: @MainActor () -> Bool
     /// Messages arrived while the app was in the background: read when it's active again.
     private(set) var readOwed = false
+    /// This user's id: a reaction event of theirs sets their own flag.
+    let me: String
+    /// Why the last reaction didn't go through: cleared by the next one, or by itself after
+    /// `errorLifetime`.
+    private(set) var reactionError: String?
+    private var reactionErrorSerial = 0
+    private let errorLifetime: Duration
+    /// Messages whose reaction is being toggled: a second tap on the same message meanwhile sends
+    /// nothing (answers then arrive in the order they were asked, and can't drop each other's).
+    private var reacting: Set<String> = []
+    /// Live reaction events seen per message: a toggle's answer is a snapshot, and is used only
+    /// if none arrived while it was in flight (the events carry the newer counts).
+    private var reactionEvents: [String: Int] = [:]
 
-    init(channelId: String, client: any ChatClient,
+    func clearReactionError() {
+        reactionErrorSerial += 1
+        reactionError = nil
+    }
+
+    /// Show a failure, and take it down after `errorLifetime` unless a newer one replaced it.
+    private func failReaction() {
+        reactionErrorSerial += 1
+        let serial = reactionErrorSerial
+        reactionError = "Couldn't react. Try again."
+        let lifetime = errorLifetime
+        Task { [weak self] in
+            try? await Task.sleep(for: lifetime)
+            guard let self, reactionErrorSerial == serial else { return }
+            reactionError = nil
+        }
+    }
+
+    init(channelId: String, client: any ChatClient, me: String = "", errorLifetime: Duration = .seconds(5),
          isActive: @escaping @MainActor () -> Bool = { AppActivity.isActive }) {
         self.channelId = channelId
         self.client = client
+        self.me = me
+        self.errorLifetime = errorLifetime
         self.isActive = isActive
+    }
+
+    /// Toggle your reaction. The answer is the message's whole summary from your side, and replaces
+    /// its row's unless a reaction event for the message arrived meanwhile: the answer is then
+    /// older than what the events say (your own echo included), so it's left out.
+    func toggleReaction(_ message: FfiMessage, emoji: String) async {
+        guard !message.deleted, reacting.insert(message.id).inserted else { return }
+        defer { reacting.remove(message.id) }
+        clearReactionError()
+        let seen = reactionEvents[message.id, default: 0]
+        do {
+            let summary = try await client.toggleReaction(
+                channelId: channelId, messageId: message.id, emoji: emoji)
+            if reactionEvents[message.id, default: 0] == seen,
+               let i = messages.firstIndex(where: { $0.id == message.id }) {
+                messages[i].reactions = summary
+            }
+        } catch {
+            failReaction()
+        }
     }
 
     /// The app became active: what arrived meanwhile is read now.
@@ -168,6 +222,12 @@ final class TimelineModel {
             }
         case .resync:
             Task { await fetch(before: nil) }
+        case let .reactionUpdate(channel, messageId, emoji, userId, added, count):
+            guard channel == channelId, let i = messages.firstIndex(where: { $0.id == messageId }) else { return }
+            reactionEvents[messageId, default: 0] += 1
+            messages[i].reactions = ReactionRules.applying(
+                emoji: emoji, count: count, added: added, byMe: !me.isEmpty && userId == me,
+                to: messages[i].reactions)
         case .ready, .channelCall, .channelUpdate, .channelDelete:
             break
         }
@@ -557,4 +617,28 @@ final class TransferBridge: TransferListener, @unchecked Sendable {
     }
 
     func onResync() {}  // a save's end state comes from its own call, not from events
+}
+
+/// How a live reaction event changes a message's chips. Absolute: the event carries the emoji's
+/// new total, so applying the same event twice changes nothing. (Two different events for one
+/// emoji can still arrive out of order; the server doesn't order them, so a wrong count lasts
+/// until the next event, a re-read, or the cache's sync.)
+enum ReactionRules {
+    static func applying(emoji: String, count: Int64, added: Bool, byMe: Bool,
+                         to list: [FfiReaction]) -> [FfiReaction] {
+        var list = list
+        let i = list.firstIndex { $0.emoji == emoji }
+        let me = byMe ? added : (i.map { list[$0].me } ?? false)
+        if count <= 0 {
+            if let i { list.remove(at: i) }
+        } else if let i {
+            list[i] = FfiReaction(emoji: emoji, count: count, me: me)
+        } else {
+            list.append(FfiReaction(emoji: emoji, count: count, me: me))
+        }
+        return list
+    }
+
+    /// The quick set (as GTK's).
+    static let quick = ["\u{1F44D}", "\u{2764}\u{FE0F}", "\u{1F602}", "\u{1F389}", "\u{1F440}", "\u{1F64F}"]
 }

@@ -365,7 +365,7 @@ extension SignedInView {
             feed?.pending = nil
             return
         }
-        let model = TimelineModel(channelId: channelId, client: chat)
+        let model = TimelineModel(channelId: channelId, client: chat, me: user.id)
         timeline = model
         channels.timeline = model
         pending = (client as? any OfflineClient).map { PendingModel(channelId: channelId, client: $0) }
