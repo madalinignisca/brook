@@ -9,6 +9,7 @@ protocol ChatClient: AnyObject, Sendable {
     func editMessage(channelId: String, messageId: String, body: String) async throws -> FfiMessage
     func deleteMessage(channelId: String, messageId: String) async throws
     func markRead(channelId: String, messageId: String?) async throws
+    func toggleReaction(channelId: String, messageId: String, emoji: String) async throws -> [FfiReaction]
     func downloadFile(transferId: UInt64, fileId: String, sha256: String, size: UInt64,
                       destination: String) async throws
     func cancelTransfer(transferId: UInt64)
@@ -48,12 +49,34 @@ final class TimelineModel {
     private let isActive: @MainActor () -> Bool
     /// Messages arrived while the app was in the background: read when it's active again.
     private(set) var readOwed = false
+    /// This user's id: a reaction event of theirs sets their own flag.
+    let me: String
+    /// Why the last reaction didn't go through (cleared by the next one).
+    private(set) var reactionError: String?
+    /// Reactions being toggled ("message|emoji"): a second tap meanwhile sends nothing.
+    private var reacting: Set<String> = []
 
-    init(channelId: String, client: any ChatClient,
+    init(channelId: String, client: any ChatClient, me: String = "",
          isActive: @escaping @MainActor () -> Bool = { AppActivity.isActive }) {
         self.channelId = channelId
         self.client = client
+        self.me = me
         self.isActive = isActive
+    }
+
+    /// Toggle your reaction; the answer is the message's whole summary, which replaces its row's.
+    func toggleReaction(_ message: FfiMessage, emoji: String) async {
+        let key = "\(message.id)|\(emoji)"
+        guard !message.deleted, reacting.insert(key).inserted else { return }
+        defer { reacting.remove(key) }
+        reactionError = nil
+        do {
+            let summary = try await client.toggleReaction(
+                channelId: channelId, messageId: message.id, emoji: emoji)
+            if let i = messages.firstIndex(where: { $0.id == message.id }) { messages[i].reactions = summary }
+        } catch {
+            reactionError = "Couldn't react. Try again."
+        }
     }
 
     /// The app became active: what arrived meanwhile is read now.
@@ -168,6 +191,11 @@ final class TimelineModel {
             }
         case .resync:
             Task { await fetch(before: nil) }
+        case let .reactionUpdate(channel, messageId, emoji, userId, added, count):
+            guard channel == channelId, let i = messages.firstIndex(where: { $0.id == messageId }) else { return }
+            messages[i].reactions = ReactionRules.applying(
+                emoji: emoji, count: count, added: added, byMe: !me.isEmpty && userId == me,
+                to: messages[i].reactions)
         case .ready, .channelCall, .channelUpdate, .channelDelete:
             break
         }
@@ -552,4 +580,26 @@ final class TransferBridge: TransferListener, @unchecked Sendable {
     }
 
     func onResync() {}  // a save's end state comes from its own call, not from events
+}
+
+/// How a live reaction event changes a message's chips. Absolute: the event carries the emoji's
+/// new total, so applying it twice, or before or after the toggle's own answer, ends the same.
+enum ReactionRules {
+    static func applying(emoji: String, count: Int64, added: Bool, byMe: Bool,
+                         to list: [FfiReaction]) -> [FfiReaction] {
+        var list = list
+        let i = list.firstIndex { $0.emoji == emoji }
+        let me = byMe ? added : (i.map { list[$0].me } ?? false)
+        if count <= 0 {
+            if let i { list.remove(at: i) }
+        } else if let i {
+            list[i] = FfiReaction(emoji: emoji, count: count, me: me)
+        } else {
+            list.append(FfiReaction(emoji: emoji, count: count, me: me))
+        }
+        return list
+    }
+
+    /// The quick set (as GTK's).
+    static let quick = ["\u{1F44D}", "\u{2764}\u{FE0F}", "\u{1F602}", "\u{1F389}", "\u{1F440}", "\u{1F64F}"]
 }

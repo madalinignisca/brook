@@ -572,3 +572,55 @@ fn owner_offers_cross_on_live_and_cached_channels() {
     );
     assert_eq!(FfiCachedChannel::from(channel).owner_offers, vec![offer]);
 }
+
+#[test]
+fn a_message_carries_its_reactions_and_a_tombstone_none() {
+    let m = FfiMessage::from(wire_message(json!({
+        "reactions": [{"emoji": "👍", "count": 3, "me": true}, {"emoji": "🎉", "count": 1, "me": false}]
+    })));
+    assert_eq!(
+        m.reactions,
+        vec![
+            FfiReaction {
+                emoji: "👍".into(),
+                count: 3,
+                me: true
+            },
+            FfiReaction {
+                emoji: "🎉".into(),
+                count: 1,
+                me: false
+            },
+        ]
+    );
+    let gone = FfiMessage::from(wire_message(json!({
+        "deleted_at": "2026-09-30T10:00:00Z",
+        "reactions": [{"emoji": "👍", "count": 3, "me": true}]
+    })));
+    assert!(gone.reactions.is_empty());
+}
+
+#[test]
+fn a_reaction_event_crosses_with_its_new_count() {
+    use crate::call::FfiServerEvent;
+    use crate::client::map_event;
+    use brook_core::ServerEvent;
+    assert_eq!(
+        map_event(ServerEvent::ReactionUpdate {
+            channel_id: "c".into(),
+            message_id: "m1".into(),
+            emoji: "👍".into(),
+            user_id: "u2".into(),
+            added: true,
+            count: 4,
+        }),
+        Some(FfiServerEvent::ReactionUpdate {
+            channel_id: "c".into(),
+            message_id: "m1".into(),
+            emoji: "👍".into(),
+            user_id: "u2".into(),
+            added: true,
+            count: 4,
+        })
+    );
+}
