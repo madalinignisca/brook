@@ -174,6 +174,17 @@ final class ChannelsModel {
                        body: NotificationPlanner.body(message, me: me))
     }
 
+    /// Re-read the list and say whether `id` is in it, so the caller can select a channel it just
+    /// created, joined or opened (the row may not have arrived through an event yet). One more
+    /// read if the first didn't have it; a channel the list never gets is never selected.
+    func reveal(_ id: String) async -> Bool {
+        for _ in 0..<2 {
+            await reloadList()
+            if channels.contains(where: { $0.id == id }) { return true }
+        }
+        return false
+    }
+
     func canJoin(_ channel: ChannelRow) -> Bool { ready }
 
     /// The pending offer to make this user an owner of `channel` (#190), while `me` is known.

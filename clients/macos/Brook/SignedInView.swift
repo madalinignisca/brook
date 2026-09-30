@@ -31,6 +31,11 @@ struct SignedInView: View {
     @State private var shownName: String?
     @State private var leaving: ChannelRow?
     @State private var showingMembers = false
+    /// Starting conversations and managing the open channel (spec 2026-09-30-mac-conversations).
+    @State private var conversationSheet: ConversationSheet?
+    @State private var managing: ChannelManagementModel?
+    @State private var confirming: ManageConfirm?
+    @State private var manageError: String?
     /// The open channel's ownership question (#190): when it shows, and its answer's state
     /// (kept here so an error and "Ask Me Later" survive redraws). Keyed by channel and offer.
     @State private var prompt = OfferPrompt()
@@ -111,6 +116,26 @@ struct SignedInView: View {
                                 || calls.joining)
                             .help(calls.joinError ?? (channels.ready ? "Join the call" : "Connecting…"))
                         }
+                        if channel.canLeave, powers(channel).canManage, client is any ConversationClient {
+                            ToolbarItem {
+                                Menu {
+                                    Button("Add Member…") { manage(channel, sheet: .addMember) }
+                                    Button("Rename…") { manage(channel, sheet: .rename) }
+                                    Divider()
+                                    Button(channel.archived ? "Unarchive…" : "Archive…") {
+                                        managing = managementModel(channel)
+                                        confirming = .archive(!channel.archived)
+                                    }
+                                    Button("Delete…", role: .destructive) {
+                                        managing = managementModel(channel)
+                                        confirming = .delete
+                                    }
+                                } label: {
+                                    Label("Channel", systemImage: "ellipsis.circle")
+                                }
+                                .help("Manage this channel")
+                            }
+                        }
                         if channel.canLeave, let membership = client as? any MembershipClient {
                             ToolbarItem {
                                 Button { showingMembers = true } label: {
@@ -179,6 +204,20 @@ struct SignedInView: View {
             if let closed, selection == closed { selection = nil } // removed from it (#62)
         }
         .toolbar {
+            if client is any ConversationClient {
+                ToolbarItem {
+                    Menu {
+                        Button("New Message…") { conversationSheet = .newMessage }
+                        if user.globalRole == "admin" {
+                            Button("New Channel…") { conversationSheet = .newChannel }
+                        }
+                        Button("Browse Channels…") { conversationSheet = .browse }
+                    } label: {
+                        Label("New", systemImage: "square.and.pencil")
+                    }
+                    .help("Start a conversation")
+                }
+            }
             ToolbarItem {
                 Menu {
                     Button("Edit Profile…") { editingProfile = true }
@@ -205,6 +244,9 @@ struct SignedInView: View {
                 }
             }
         }
+        .modifier(ConversationPresentation(
+            client: client, user: user, sheet: $conversationSheet, managing: $managing,
+            confirming: $confirming, manageError: $manageError, onOpen: open))
         .sheet(isPresented: $editingProfile) {
             if let account = client as? any AccountClient {
                 ProfileSheet(client: account) { shownName = $0.displayName }
@@ -275,6 +317,22 @@ extension SignedInView {
         answering = OfferAnswerModel(
             channelId: row.id, title: channels.title(row),
             offerer: OfferAnswerModel.offererName(offer, members: row.members), client: membership)
+    }
+
+    /// Select a channel just created, joined or opened, once the list has it.
+    fileprivate func open(_ channel: FfiChannel) {
+        Task { if await channels.reveal(channel.id) { selection = channel.id } }
+    }
+
+    fileprivate func managementModel(_ channel: ChannelRow) -> ChannelManagementModel? {
+        (client as? any ConversationClient).map {
+            ChannelManagementModel(channel: channel, powers: powers(channel), client: $0)
+        }
+    }
+
+    fileprivate func manage(_ channel: ChannelRow, sheet: ConversationSheet) {
+        managing = managementModel(channel)
+        conversationSheet = sheet
     }
 
     fileprivate func powers(_ channel: ChannelRow) -> ChannelPowers {

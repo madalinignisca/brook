@@ -245,6 +245,80 @@ impl FfiBrookClient {
         run(async move { inner.remove_member(&channel_id, &user_id).await }).await
     }
 
+    /// Open (or find) the direct message with `handle`. Errors: `not_found` (no such user),
+    /// `validation`.
+    pub async fn open_dm(&self, handle: String) -> Result<FfiChannel, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        Ok(run(async move { inner.open_dm(&handle).await })
+            .await?
+            .into())
+    }
+
+    /// Create a channel (global admins only: `authz.forbidden` otherwise); `is_public` makes it
+    /// browsable and self-joinable.
+    pub async fn create_channel(
+        &self,
+        name: String,
+        topic: Option<String>,
+        is_public: bool,
+    ) -> Result<FfiChannel, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        Ok(run(async move {
+            if is_public {
+                inner.create_public_channel(&name).await
+            } else {
+                inner.create_channel(&name, topic.as_deref()).await
+            }
+        })
+        .await?
+        .into())
+    }
+
+    /// Public, non-archived channels you haven't joined.
+    pub async fn list_public_channels(&self) -> Result<Vec<FfiChannel>, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let channels = run(async move { inner.list_public_channels().await }).await?;
+        Ok(channels.into_iter().map(Into::into).collect())
+    }
+
+    /// Join a public channel.
+    pub async fn join_channel(&self, channel_id: String) -> Result<FfiChannel, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        Ok(run(async move { inner.join_channel(&channel_id).await })
+            .await?
+            .into())
+    }
+
+    /// Add a member by handle (an owner or an admin). Errors: `not_found`, `authz.forbidden`.
+    pub async fn add_member(&self, channel_id: String, handle: String) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.add_member(&channel_id, &handle).await }).await
+    }
+
+    /// Rename, retopic or (un)archive a channel (an owner or an admin); nil leaves a field.
+    pub async fn update_channel(
+        &self,
+        channel_id: String,
+        name: Option<String>,
+        topic: Option<String>,
+        archived: Option<bool>,
+    ) -> Result<FfiChannel, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        Ok(run(async move {
+            inner
+                .update_channel(&channel_id, name.as_deref(), topic.as_deref(), archived)
+                .await
+        })
+        .await?
+        .into())
+    }
+
+    /// Delete a channel and its history (an owner or an admin).
+    pub async fn delete_channel(&self, channel_id: String) -> Result<(), LoginError> {
+        let inner = Arc::clone(&self.inner);
+        run(async move { inner.delete_channel(&channel_id).await }).await
+    }
+
     /// Offer to make the member `handle` an owner (an owner or an admin). Answers the channel,
     /// its `ownerOffers` including the new one. Errors: `authz.forbidden`,
     /// `channel.not_member`, `channel.already_owner`, `channel.dm`, `not_found`.

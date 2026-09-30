@@ -190,7 +190,7 @@ struct GrantedNothing: AuthorizationSource {
 }
 
 func channel(_ id: String, _ name: String) -> FfiChannel {
-    FfiChannel(id: id, kind: "public", name: name, archived: false, unreadMentions: 0, members: [], ownerOffers: [])
+    FfiChannel(id: id, kind: "public", name: name, archived: false, topic: nil, isPublic: false, unreadMentions: 0, members: [], ownerOffers: [])
 }
 
 /// Let main-queue deliveries (the event/state bridges hop through it) run.
@@ -592,6 +592,13 @@ extension FakeRealtime {
     func markRead(channelId: String, messageId: String?) async throws { throw unused }
     func removeMember(channelId: String, userId: String) async throws { throw unused }
     func leaveChannel(channelId: String) async throws { throw unused }
+    func openDm(handle: String) async throws -> FfiChannel { throw unused }
+    func createChannel(name: String, topic: String?, isPublic: Bool) async throws -> FfiChannel { throw unused }
+    func listPublicChannels() async throws -> [FfiChannel] { throw unused }
+    func joinChannel(channelId: String) async throws -> FfiChannel { throw unused }
+    func addMember(channelId: String, handle: String) async throws { throw unused }
+    func updateChannel(channelId: String, name: String?, topic: String?, archived: Bool?) async throws -> FfiChannel { throw unused }
+    func deleteChannel(channelId: String) async throws { throw unused }
     func offerOwnership(channelId: String, handle: String) async throws -> FfiChannel { throw unused }
     func withdrawOwnershipOffer(channelId: String, userId: String) async throws { throw unused }
     func acceptOwnership(channelId: String) async throws -> FfiChannel { throw unused }
