@@ -1,7 +1,8 @@
 #!/bin/sh
 # Check a release tarball on the distro this runs in (Debian 13, Ubuntu 26.04, Alpine):
-# install the runtime packages INSTALL.md lists, then make sure that
-#   1. every shared library the binary needs resolves,
+# install the runtime packages INSTALL.md lists, run the tarball's own install.sh, then
+# make sure that
+#   1. every shared library the installed binary needs resolves,
 #   2. the GStreamer elements a call needs exist,
 #   3. the app starts and stays up under a virtual display.
 # Run as root in a throwaway container, from the repo root:
@@ -36,11 +37,22 @@ esac
 echo "== $PRETTY_NAME"
 
 work="$(mktemp -d)"
+export HOME="$work/home" XDG_RUNTIME_DIR="$work/run"
+mkdir -p "$HOME" "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
 tar -C "$work" -xzf "$tarball"
-bin="$(echo "$work"/brook-gnome-*/brook-gnome)"
+
+# The documented install path, not a shortcut: INSTALL.md tells users to run ./install.sh,
+# and on Alpine (no bash) that was broken once without any check noticing.
+echo "== 0. ./install.sh"
+sh "$work"/brook-gnome-*/install.sh
+bin="$HOME/.local/bin/brook-gnome"
+[ -x "$bin" ] || { echo "FAIL: install.sh did not install $bin" >&2; exit 1; }
 
 echo "== 1. shared libraries"
-if ldd "$bin" 2>&1 | grep -E 'not found|version .*not found|Error'; then
+# ldd exits non-zero for a missing or non-ELF file, so check its status as well as its text.
+if ! out="$(ldd "$bin" 2>&1)" || echo "$out" | grep -E 'not found|Error'; then
+  echo "$out" >&2
   echo "FAIL: the binary can't load its libraries here" >&2; exit 1
 fi
 echo "ok"
@@ -54,7 +66,7 @@ soft=""
 [ "$ID" = alpine ] && soft="webrtcbin"
 for e in webrtcbin nicesrc nicesink dtlssrtpenc dtlssrtpdec srtpenc srtpdec rtpopuspay \
          opusenc opusdec rtph264pay rtph264depay h264parse rtpvp8pay vp8enc vp8dec \
-         decodebin videoconvert audioconvert autoaudiosrc autoaudiosink; do
+         decodebin videoconvert audioconvert autoaudiosrc autoaudiosink gtk4paintablesink; do
   gst-inspect-1.0 --exists "$e" && continue
   case " $soft " in
     *" $e "*) echo "NOTE     $e is not packaged on $PRETTY_NAME: calls are unavailable" ;;
@@ -62,27 +74,30 @@ for e in webrtcbin nicesrc nicesink dtlssrtpenc dtlssrtpdec srtpenc srtpdec rtpo
   esac
 done
 [ "$missing" = 0 ] && echo "ok"
-# Informational: the video sink is a separate package on some distros.
-gst-inspect-1.0 --exists gtk4paintablesink && echo "gtk4paintablesink: present" \
-  || echo "note: gtk4paintablesink not installed (call video needs it)"
 [ "$missing" = 0 ] || exit 1
 
 echo "== 3. starts and stays up"
-# Software rendering: there is no GPU in a container. timeout exits 124 when the app was
-# still running at the deadline (busybox's, on Alpine, reports 143 = 128+SIGTERM instead);
-# that is what we want, anything else is a crash.
-export GSK_RENDERER=cairo HOME="$work/home" XDG_RUNTIME_DIR="$work/run"
-mkdir -p "$HOME" "$XDG_RUNTIME_DIR"
-chmod 700 "$XDG_RUNTIME_DIR"
+# Software rendering: there is no GPU in a container. timeout reports the deadline with 124
+# (busybox's, on Alpine, with 143 = 128+SIGTERM). Those codes can also come from an early
+# death, so the elapsed time has to show the deadline really passed.
+export GSK_RENDERER=cairo
+start="$(date +%s)"
 set +e
 dbus-run-session -- xvfb-run -a timeout 10 "$bin" >"$work/out.log" 2>&1
 code=$?
 set -e
-if [ "$code" -ne 124 ] && [ "$code" -ne 143 ]; then
-  echo "FAIL: exited with $code before the 10 s deadline:" >&2
+elapsed=$(( $(date +%s) - start ))
+ok=0
+[ "$code" -eq 124 ] && ok=1
+[ "$ID" = alpine ] && [ "$code" -eq 143 ] && ok=1
+if [ "$ok" -ne 1 ] || [ "$elapsed" -lt 9 ]; then
+  echo "FAIL: exited with $code after ${elapsed}s, before the 10 s deadline:" >&2
   tail -30 "$work/out.log" >&2
   exit 1
 fi
-echo "ok (still running after 10 s)"
-grep -i -E 'critical|panic' "$work/out.log" | head -5 || true
+echo "ok (still running after ${elapsed}s)"
+# A panic or GTK critical on a worker thread leaves the process alive, so look for them.
+if grep -E 'panicked at|-CRITICAL' "$work/out.log"; then
+  echo "FAIL: the app logged a panic or critical" >&2; exit 1
+fi
 echo "PASS $PRETTY_NAME"
