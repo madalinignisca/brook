@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # Package a release build of the GNOME client as a tarball.
-# Usage: make-tarball.sh <version> <arch> <outdir>   (run from the repo root,
-# after `cargo build --release --locked -p brook-gnome`).
+# Usage: make-tarball.sh <version> <arch> <outdir> [musl]   (run from the repo root,
+# after `cargo build --release --locked -p brook-gnome`). The optional last argument
+# marks the Alpine (musl) build, which can't share a name with the glibc one:
+#   brook-gnome-<version>-linux-<arch>.tar.gz        glibc (Debian, Ubuntu, Fedora, Arch)
+#   brook-gnome-<version>-linux-musl-<arch>.tar.gz   Alpine
 set -euo pipefail
-version="$1" arch="$2" out="$3"
-name="brook-gnome-${version}-linux-${arch}"
+version="$1" arch="$2" out="$3" libc="${4:-glibc}"
+case "$libc" in
+  glibc) name="brook-gnome-${version}-linux-${arch}" ;;
+  musl) name="brook-gnome-${version}-linux-musl-${arch}" ;;
+  *) echo "libc must be glibc or musl, got '$libc'" >&2; exit 2 ;;
+esac
 stage="$(mktemp -d)/${name}"
 mkdir -p "$stage" "$out"
 
