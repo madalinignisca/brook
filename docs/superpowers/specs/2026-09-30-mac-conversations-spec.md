@@ -34,7 +34,7 @@ GTK has all of it (`clients/gnome/src/chat.rs`), which is the reference for text
      members.". Adding someone already in is not an error on the server, and isn't one here.
    - **Rename…** (owners and admins): name and topic, prefilled.
    - **Archive** / **Unarchive** (owners and admins): a confirmation. An archived channel stays
-     in the list, read-only (the composer is already disabled for one).
+     in the list (marked "archived"), read-only: its composer is replaced by a note.
    - **Delete…** (owners and admins): a confirmation that says the history goes too ("Delete
      #name and its messages for everyone? This can't be undone.").
    - The list changes only through the server's events (`channelUpdate`, `channelDelete`), never

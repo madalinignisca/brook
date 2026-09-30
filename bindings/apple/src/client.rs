@@ -245,8 +245,8 @@ impl FfiBrookClient {
         run(async move { inner.remove_member(&channel_id, &user_id).await }).await
     }
 
-    /// Open (or find) the direct message with `handle`. Errors: `not_found` (no such user),
-    /// `validation`.
+    /// Open (or find) the direct message with `handle`. An unknown handle is `validation.error`
+    /// (422), not `not_found`.
     pub async fn open_dm(&self, handle: String) -> Result<FfiChannel, LoginError> {
         let inner = Arc::clone(&self.inner);
         Ok(run(async move { inner.open_dm(&handle).await })
@@ -264,11 +264,9 @@ impl FfiBrookClient {
     ) -> Result<FfiChannel, LoginError> {
         let inner = Arc::clone(&self.inner);
         Ok(run(async move {
-            if is_public {
-                inner.create_public_channel(&name).await
-            } else {
-                inner.create_channel(&name, topic.as_deref()).await
-            }
+            inner
+                .create_channel_with(&name, topic.as_deref(), is_public)
+                .await
         })
         .await?
         .into())

@@ -65,3 +65,24 @@ Closed.
 Implementation review (vibe; Standard): no findings. Measured: 20 mutants, each caught (one as a
 hang past 180 s; one rewritten because its first form didn't compile). 284 Mac tests pass.
 Not unit-tested: the SwiftUI views and their wiring (menus, sheets, the modifier).
+
+## PR review, round 1 (codex, Claude review (Opus), vibe earlier; Mac-only rule)
+
+Taken:
+- **A public channel's topic was thrown away:** core's `create_public_channel` sent no topic.
+  Core gains `create_channel_with(name, topic, public)` (both old calls delegate to it), and the
+  binding uses it. A core test checks the body for public and private.
+- **Unarchive was unreachable:** the Mac hid archived channels, so after Archive nothing could
+  reach the channel. Archived channels now stay in the list (marked "archived") and open
+  read-only ("This channel is archived. An owner or admin can unarchive it."), as the spec and
+  GTK say. (The spec's "the composer is already disabled" was wrong: it wasn't.)
+- **`reveal` could give up wrongly:** a read superseded by a newer one applies nothing. It now
+  counts only applied reads as misses (two), and reads up to four times. Tested with a list
+  that has the channel only on the second read, and one that never has it.
+- **A finished management call could clear a newer sheet's model** (`managing === model`), and a
+  second call could start while one ran (menu items disabled while busy; `run` refuses when busy).
+- **A channel deleted elsewhere** now clears its open sheet, confirmation and model.
+- **Rename checked only the name:** the 512-character topic limit is checked too.
+- The `open_dm` doc and the `not_found` comment now say what the server really answers.
+
+Measured: 5 more mutants, each caught. 288 Mac tests, core test for the topic with 2 mutants.

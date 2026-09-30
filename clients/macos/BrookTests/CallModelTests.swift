@@ -21,6 +21,8 @@ final class FakeRealtime: FfiBrookClientProtocol, @unchecked Sendable {
     let order = Mutex<[String]>([])
     let listener = Mutex<ServerEventListener?>(nil)
     var channels: [FfiChannel]
+    /// Successive answers for `listChannels` (empty: always `channels`).
+    let readQueue = Mutex<[[FfiChannel]]>([])
     init(channels: [FfiChannel]) { self.channels = channels }
     /// For the offline tests (#62): a failing realtime start or network list, and the cache's
     /// channels (nil: `local.unavailable`).
@@ -41,7 +43,8 @@ final class FakeRealtime: FfiBrookClientProtocol, @unchecked Sendable {
     }
     func listChannels() async throws -> [FfiChannel] {
         order.withLock { $0.append("list") }
-        let snapshot = channels
+        // Tests that need the list to change between reads queue its snapshots (the last repeats).
+        let snapshot = readQueue.withLock { q in q.count > 1 ? q.removeFirst() : (q.first ?? channels) }
         if let listGate { await listGate.wait() }
         if listFails { throw LoginError.Network(message: "offline") }
         return snapshot

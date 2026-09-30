@@ -228,7 +228,16 @@ final class ChannelManagementTests: XCTestCase {
         let m = model(client)
         await m.rename(name: "  ", topic: "")
         await m.rename(name: String(repeating: "a", count: 129), topic: "")
+        await m.rename(name: "ok", topic: String(repeating: "t", count: 513))
         XCTAssertEqual(client.calls.withLock { $0 }, [])
+    }
+
+    func testTheRenameLimitsAreTheServers() {
+        XCTAssertEqual(ChannelManagementModel.renameProblem(name: "", topic: ""), "Enter a name.")
+        XCTAssertNil(ChannelManagementModel.renameProblem(name: String(repeating: "a", count: 128),
+                                                          topic: String(repeating: "t", count: 512)))
+        XCTAssertEqual(ChannelManagementModel.renameProblem(name: "ok", topic: String(repeating: "t", count: 513)),
+                       "A topic can be up to 512 characters.")
     }
 
     func testErrorsAndAlreadyGone() async {
@@ -272,6 +281,30 @@ final class RevealTests: XCTestCase {
         client.channels = [channel("c1", "general"), channel("c2", "new")]
         let revealed = await model.reveal("c2")
         XCTAssertTrue(revealed)
+    }
+
+    /// Not in the first read, in the second: revealed (a `reveal` that read once would miss it).
+    func testAChannelThatAppearsOnTheSecondReadIsRevealed() async {
+        let client = FakeRealtime(channels: [channel("c1", "general")])
+        client.readQueue.withLock {
+            $0 = [[channel("c1", "general")], // start
+                  [channel("c1", "general")], // reveal, first read: not there yet
+                  [channel("c1", "general"), channel("c2", "new")]] // second read
+        }
+        let model = ChannelsModel(client: client)
+        await model.start()
+        let revealed = await model.reveal("c2")
+        XCTAssertTrue(revealed)
+    }
+
+    func testRevealReadsTheListOnlyTwiceBeforeGivingUp() async {
+        let client = FakeRealtime(channels: [channel("c1", "general")])
+        let model = ChannelsModel(client: client)
+        await model.start()
+        let before = client.order.withLock { $0.filter { $0 == "list" }.count }
+        let revealed = await model.reveal("nope")
+        XCTAssertFalse(revealed)
+        XCTAssertEqual(client.order.withLock { $0.filter { $0 == "list" }.count } - before, 2)
     }
 
     func testAChannelTheListNeverGetsIsNotRevealed() async {

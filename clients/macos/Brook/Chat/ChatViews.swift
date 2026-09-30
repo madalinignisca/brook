@@ -13,11 +13,14 @@ struct ChatView: View {
     let pending: PendingModel?
     /// The cache's notices (a file's state changing reaches its row).
     let feed: CacheFeed?
+    /// An archived channel is read-only.
+    let archived: Bool
     private let client: any ChatClient
 
     init(channelId: String, me: String, client: any ChatClient, timeline: TimelineModel,
-         pending: PendingModel? = nil, feed: CacheFeed? = nil) {
+         pending: PendingModel? = nil, feed: CacheFeed? = nil, archived: Bool = false) {
         self.channelId = channelId
+        self.archived = archived
         self.me = me
         self.pending = pending
         self.feed = feed
@@ -67,7 +70,13 @@ struct ChatView: View {
                 Text(error).foregroundStyle(.red).font(.caption).padding(.horizontal)
             }
             Divider()
-            ComposerView(composer: composer)
+            if archived {
+                Text("This channel is archived. An owner or admin can unarchive it.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity).padding(10)
+            } else {
+                ComposerView(composer: composer)
+            }
         }
         // Files dropped anywhere on the conversation join the next message (not while
         // editing, and only with this Mac's storage).

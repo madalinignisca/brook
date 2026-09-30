@@ -154,9 +154,7 @@ struct RenameSheet: View {
     }
 
     private var problem: String? {
-        let n = name.trimmingCharacters(in: .whitespacesAndNewlines).unicodeScalars.count
-        if n == 0 { return "Enter a name." }
-        return n > NewChannelModel.nameLimit ? "A name can be up to \(NewChannelModel.nameLimit) characters." : nil
+        ChannelManagementModel.renameProblem(name: name, topic: topic)
     }
 
     var body: some View {
@@ -202,11 +200,12 @@ struct ConversationPresentation: ViewModifier {
 
     /// An archive or delete the user confirmed: its error, if any, in an alert.
     private func run(_ act: @escaping (ChannelManagementModel) async -> Void) {
-        guard let model = managing else { return }
+        guard let model = managing, !model.busy else { return }
         Task {
             await act(model)
             manageError = model.error
-            managing = nil
+            // Only this model's: a sheet opened meanwhile holds another.
+            if managing === model { managing = nil }
         }
     }
 

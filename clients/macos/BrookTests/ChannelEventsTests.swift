@@ -47,15 +47,24 @@ final class ChannelEventsTests: XCTestCase {
         XCTAssertEqual(model.channels[0].unread, unread)
     }
 
-    func testAnArchivingUpdateDropsTheRow() async {
+    /// Archived channels stay in the list, read-only, so an owner can open one and unarchive it.
+    func testAnArchivingUpdateKeepsTheRowMarkedArchivedAndOpen() async {
         let (client, model) = await started([channel("c1", "general"), channel("c2", "random")])
         model.openChannel = "c2"
         var archived = channel("c2", "random")
         archived.archived = true
         client.deliver(.channelUpdate(channel: archived))
         await drainMain()
-        XCTAssertEqual(model.channels.map(\.id), ["c1"])
-        XCTAssertEqual(model.closed, "c2", "the open channel stayed selected")
+        XCTAssertEqual(model.channels.map(\.id), ["c1", "c2"])
+        XCTAssertEqual(model.channels.map(\.archived), [false, true])
+        XCTAssertNil(model.closed, "archiving doesn't close the channel")
+    }
+
+    func testAnArchivedChannelIsListedByARead() async {
+        var old = channel("c2", "old")
+        old.archived = true
+        let (_, model) = await started([channel("c1", "general"), old])
+        XCTAssertEqual(model.channels.map(\.archived), [false, true])
     }
 
     /// A late update for a channel just left never brings it back by itself: only the

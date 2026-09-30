@@ -65,6 +65,9 @@ struct SignedInView: View {
             List(channels.channels, id: \.id, selection: $selection) { channel in
                 HStack {
                     Text(channels.title(channel))
+                    if channel.archived {
+                        Text("archived").font(.caption).foregroundStyle(.secondary)
+                    }
                     Spacer()
                     if let badge = channels.badge(channel) {
                         Text(badge).font(.caption).foregroundStyle(.green)
@@ -97,7 +100,7 @@ struct SignedInView: View {
             if let channel = channels.channels.first(where: { $0.id == selection }),
                let chat = client as? any ChatClient, let timeline, timeline.channelId == channel.id {
                 ChatView(channelId: channel.id, me: user.id, client: chat, timeline: timeline,
-                         pending: pending, feed: feed)
+                         pending: pending, feed: feed, archived: channel.archived)
                     .id(channel.id)  // a new conversation per channel
                     .navigationTitle(channels.title(channel))
                     .toolbar {
@@ -120,16 +123,20 @@ struct SignedInView: View {
                             ToolbarItem {
                                 Menu {
                                     Button("Add Member…") { manage(channel, sheet: .addMember) }
+                                        .disabled(managing?.busy == true)
                                     Button("Rename…") { manage(channel, sheet: .rename) }
+                                        .disabled(managing?.busy == true)
                                     Divider()
                                     Button(channel.archived ? "Unarchive…" : "Archive…") {
                                         managing = managementModel(channel)
                                         confirming = .archive(!channel.archived)
                                     }
+                                    .disabled(managing?.busy == true)
                                     Button("Delete…", role: .destructive) {
                                         managing = managementModel(channel)
                                         confirming = .delete
                                     }
+                                    .disabled(managing?.busy == true)
                                 } label: {
                                     Label("Channel", systemImage: "ellipsis.circle")
                                 }
@@ -202,6 +209,13 @@ struct SignedInView: View {
         }
         .onChange(of: channels.closed) { _, closed in
             if let closed, selection == closed { selection = nil } // removed from it (#62)
+            // A sheet or confirmation for a channel that's gone would act on nothing (a
+            // `not_found` reads as "done").
+            if let closed, managing?.channel.id == closed {
+                managing = nil
+                conversationSheet = nil
+                confirming = nil
+            }
         }
         .toolbar {
             if client is any ConversationClient {

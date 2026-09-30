@@ -23,7 +23,8 @@ enum Handle {
         return s
     }
 
-    /// The server answers an unknown handle with `validation.error` (422), or `not_found`.
+    /// The server answers an unknown handle with `validation.error` (422). `not_found` is kept for
+    /// a server that might say it, though Add Member treats it as "already gone" first.
     static func unknown(_ error: Error) -> Bool {
         guard case let .Api(code, _)? = error as? LoginError else { return false }
         return code == "validation.error" || code == "not_found"
@@ -194,9 +195,20 @@ final class ChannelManagementModel {
         }
     }
 
+    /// Why a rename can't be sent (the server's limits), or nil.
+    static func renameProblem(name: String, topic: String) -> String? {
+        let n = name.trimmingCharacters(in: .whitespacesAndNewlines).unicodeScalars.count
+        if n == 0 { return "Enter a name." }
+        if n > NewChannelModel.nameLimit { return "A name can be up to \(NewChannelModel.nameLimit) characters." }
+        if topic.trimmingCharacters(in: .whitespacesAndNewlines).unicodeScalars.count > NewChannelModel.topicLimit {
+            return "A topic can be up to \(NewChannelModel.topicLimit) characters."
+        }
+        return nil
+    }
+
     func rename(name: String, topic: String) async {
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard canManage, !n.isEmpty, n.unicodeScalars.count <= NewChannelModel.nameLimit else { return }
+        guard canManage, Self.renameProblem(name: name, topic: topic) == nil else { return }
         let t = topic.trimmingCharacters(in: .whitespacesAndNewlines)
         await run {
             _ = try await self.client.updateChannel(
