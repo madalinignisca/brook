@@ -624,3 +624,22 @@ fn a_reaction_event_crosses_with_its_new_count() {
         })
     );
 }
+
+#[test]
+fn a_channel_carries_its_topic_and_whether_its_public() {
+    let channel: brook_core::Channel = serde_json::from_value(json!({
+        "id": "c1", "kind": "channel", "name": "general", "topic": "all hands", "public": true,
+        "created_by": "u1", "created_at": "2026-06-18T00:00:00Z", "members": []
+    }))
+    .unwrap();
+    let f = crate::types::FfiChannel::from(channel);
+    assert_eq!(f.topic.as_deref(), Some("all hands"));
+    assert!(f.is_public);
+    let plain: brook_core::Channel = serde_json::from_value(json!({
+        "id": "c2", "kind": "channel", "name": "x", "topic": null,
+        "created_by": "u1", "created_at": "2026-06-18T00:00:00Z", "members": []
+    }))
+    .unwrap();
+    let f = crate::types::FfiChannel::from(plain);
+    assert_eq!((f.topic, f.is_public), (None, false));
+}

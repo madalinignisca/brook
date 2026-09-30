@@ -13,11 +13,14 @@ struct ChatView: View {
     let pending: PendingModel?
     /// The cache's notices (a file's state changing reaches its row).
     let feed: CacheFeed?
+    /// An archived channel is read-only.
+    let archived: Bool
     private let client: any ChatClient
 
     init(channelId: String, me: String, client: any ChatClient, timeline: TimelineModel,
-         pending: PendingModel? = nil, feed: CacheFeed? = nil) {
+         pending: PendingModel? = nil, feed: CacheFeed? = nil, archived: Bool = false) {
         self.channelId = channelId
+        self.archived = archived
         self.me = me
         self.pending = pending
         self.feed = feed
@@ -73,7 +76,13 @@ struct ChatView: View {
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
                     // Gone by itself after a few seconds, or by the next reaction (the model's).
             }
-            ComposerView(composer: composer)
+            if archived {
+                Text("This channel is archived. An owner or admin can unarchive it.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity).padding(10)
+            } else {
+                ComposerView(composer: composer)
+            }
         }
         // Files dropped anywhere on the conversation join the next message (not while
         // editing, and only with this Mac's storage).
@@ -82,6 +91,8 @@ struct ChatView: View {
             composer.attach(urls.filter(\.isFileURL))
             return true
         }
+        // Archived: nothing writes (the composer is replaced, and Reply, Edit and dropped files are off).
+        .onChange(of: archived, initial: true) { _, archived in composer.readOnly = archived }
         .task {
             saves.start()
             pending?.startProgress()
@@ -201,14 +212,16 @@ struct MessageRow: View {
                     in: RoundedRectangle(cornerRadius: 6))
         .contextMenu {
             if !message.deleted {
-                Menu("React") {
-                    ForEach(ReactionRules.quick, id: \.self) { emoji in
-                        Button(emoji) { onReact(emoji) }
+                if !composer.readOnly {
+                    Menu("React") {
+                        ForEach(ReactionRules.quick, id: \.self) { emoji in
+                            Button(emoji) { onReact(emoji) }
+                        }
                     }
+                    Button("Reply") { composer.reply(to: message) }
                 }
-                Button("Reply") { composer.reply(to: message) }
                 if mine {
-                    Button("Edit") { composer.edit(message) }
+                    if !composer.readOnly { Button("Edit") { composer.edit(message) } }
                     Button("Delete", role: .destructive) {
                         Task { await composer.delete(message) }
                     }

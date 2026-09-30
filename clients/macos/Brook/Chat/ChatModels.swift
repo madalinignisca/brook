@@ -325,8 +325,11 @@ final class ComposerModel {
 
     /// Attach and drops are open: local data possible, not preparing, not editing.
     var canAttach: Bool {
-        client is any OfflineClient && !filesUnavailable && !preparing && editing == nil
+        !readOnly && client is any OfflineClient && !filesUnavailable && !preparing && editing == nil
     }
+
+    /// An archived channel: nothing can be written to it (the view also replaces the composer).
+    var readOnly = false
 
     func attach(_ urls: [URL]) {
         guard canAttach else { return }
@@ -355,11 +358,13 @@ final class ComposerModel {
     }
 
     func reply(to message: FfiMessage) {
+        guard !readOnly else { return }
         editing = nil
         replyingTo = message
     }
 
     func edit(_ message: FfiMessage) {
+        guard !readOnly else { return }
         replyingTo = nil
         editing = message
         text = message.body
@@ -383,7 +388,7 @@ final class ComposerModel {
     /// come back, with why. A network failure may still have delivered it (a direct send
     /// can't be retried safely), so it says so instead of "not sent".
     func send() async {
-        guard canSend else { return }
+        guard canSend, !readOnly else { return }
         if editing == nil, !staged.isEmpty {
             await sendWithFiles()
             return
