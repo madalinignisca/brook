@@ -184,6 +184,30 @@ final class SearchModelTests: XCTestCase {
         XCTAssertEqual(model.state, .idle, "a stale answer came back after the clear")
     }
 
+    func testAQueryOverTheServersLimitIsRefusedLocallyAndIsNotAConnectionError() async {
+        let client = FakeSearch()
+        let model = SearchModel(client: client)
+        model.query = String(repeating: "a", count: 129)
+        await model.submit()
+        XCTAssertEqual(model.state, .tooLong)
+        XCTAssertEqual(client.queries.withLock { $0 }, [], "nothing sent")
+        model.query = String(repeating: "a", count: 128)
+        await model.submit()
+        XCTAssertEqual(client.queries.withLock { $0 }.count, 1, "128 is allowed")
+    }
+
+    func testTheResultsAreCappedAtFiftyWhenThereMayBeMore() async {
+        let client = FakeSearch()
+        client.answer = (0..<50).map { msg("m\($0)", "hit") }
+        let model = SearchModel(client: client)
+        model.query = "hit"
+        await model.submit()
+        XCTAssertTrue(model.capped)
+        client.answer = [msg("only", "hit")]
+        await model.submit()
+        XCTAssertFalse(model.capped)
+    }
+
     func testClearResetsTheQueryAndHidesTheResults() async {
         let client = FakeSearch()
         client.answer = [msg("m1", "hi")]

@@ -93,7 +93,13 @@ final class SearchModel {
         case results([SearchHit])
         case none
         case failed
+        /// The server refuses a query over its limit (422), which isn't "no connection".
+        case tooLong
     }
+
+    /// The server's query limit, and how many matches it returns (no paging past them).
+    static let queryLimit = 128
+    static let resultCap = 50
 
     static let offlineText = "Search needs a connection."
 
@@ -107,9 +113,20 @@ final class SearchModel {
     /// The results list replaces the channel list while a search is showing.
     var isShowing: Bool { state != .idle }
 
+    /// The server returned as many as it will: there may be older matches it won't show.
+    var capped: Bool {
+        if case let .results(hits) = state { return hits.count >= Self.resultCap }
+        return false
+    }
+
     func submit() async {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return clear() }
+        guard q.unicodeScalars.count <= Self.queryLimit else {
+            generation += 1
+            state = .tooLong
+            return
+        }
         generation += 1
         let mine = generation
         state = .searching

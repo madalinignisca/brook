@@ -18,6 +18,9 @@ struct SearchResultsView: View {
             Text("No messages found.").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
         case .failed:
             Text(SearchModel.offlineText).foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .tooLong:
+            Text("Search terms can be up to \(SearchModel.queryLimit) characters.").foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         case let .results(hits):
             List(hits) { hit in
                 Button { onOpen(hit.channelId) } label: {
@@ -27,6 +30,12 @@ struct SearchResultsView: View {
                     }
                 }
                 .buttonStyle(.plain)
+            }
+            .safeAreaInset(edge: .bottom) {
+                if model.capped {
+                    Text("Showing the newest \(SearchModel.resultCap) matches.").font(.caption)
+                        .foregroundStyle(.secondary).padding(6)
+                }
             }
         }
     }
