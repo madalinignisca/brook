@@ -210,7 +210,7 @@ Messages are tagged envelopes:
 | `call.*`, `channel.call` | call signaling events, see §3.4 |
 
 ### Client → server commands
-> **Sending messages is REST-only** (`POST /channels/{id}/messages`), never a WS command — one send path avoids races between HTTP retries and WS reconnect-replay, and simplifies dedup. Today the WS accepts only `ping` and the `call.*` commands (below), and **receives** fan-out; an unknown command gets `error invalid`. Typing is REST (`POST /channels/{id}/typing`, see §1); it has no stop event, so clients expire the indicator themselves (about 3 to 5 s after the last event).
+> **Sending messages is REST-only** (`POST /channels/{id}/messages`), never a WS command — one send path avoids races between HTTP retries and WS reconnect-replay, and simplifies dedup. Today the WS accepts only `auth` (to refresh the token), `ping` (answered with `pong`) and the `call.*` commands, and **receives** fan-out; an unknown command gets `error invalid`. Typing is REST (`POST /channels/{id}/typing`, see §1); it has no stop event, so clients expire the indicator themselves (about 3 to 5 s after the last event).
 
 | type | data |
 |---|---|
