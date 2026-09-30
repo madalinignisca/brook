@@ -9,10 +9,18 @@ app="${1:?usage: check-notarizable.sh <Brook.app>}"
 [[ -d "$app" ]] || { echo "check-notarizable: no such app: $app" >&2; exit 1; }
 failed=0
 checked=0
+# The walk is written out first, so a `find` that fails is seen (inside a process substitution its
+# exit status would be lost and a partial walk could pass).
+list="$(mktemp)"
+trap 'rm -f "$list"' EXIT
+find "$app" -type f -print0 > "$list" || { echo "check-notarizable: couldn't walk $app" >&2; exit 1; }
 # Every regular file, whatever its mode or name: `file` says what's a Mach-O (a resource or a
 # nested binary needn't be executable or end in .dylib).
 while IFS= read -r -d '' f; do
-  file -b "$f" | grep -q "Mach-O" || continue
+  # Captured, not piped into `grep -q`: a universal binary's several lines can make grep exit early
+  # and SIGPIPE `file`, which under pipefail would skip the binary as "not a Mach-O".
+  kind="$(file -b "$f")"
+  [[ "$kind" == *Mach-O* ]] || continue
   checked=$((checked + 1))
   # Captured first: under pipefail, `grep -q` quitting early would fail codesign by SIGPIPE.
   info="$(codesign -dvv "$f" 2>&1)" || { echo "unsigned: ${f#"$app"/}" >&2; failed=1; continue; }
@@ -34,7 +42,7 @@ while IFS= read -r -d '' f; do
     echo "${f#"$app"/}: $(IFS=,; echo "${problems[*]}")" >&2
     failed=1
   fi
-done < <(find "$app" -type f -print0)
+done < "$list"
 ((checked > 0)) || { echo "check-notarizable: no binaries found in $app" >&2; exit 1; }
 ((failed == 0)) || { echo "check-notarizable: NOT notarizable" >&2; exit 1; }
 echo "check-notarizable: ok ($checked binaries)"
