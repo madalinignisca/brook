@@ -64,22 +64,23 @@ final class ChannelsModel {
 
     /// The network list, with unread counts from the cache; else the cached list; else the
     /// error. Only the newest read applies.
-    func reloadList() async {
+    @discardableResult
+    func reloadList() async -> Bool {
         generation += 1
         let mine = generation
         var rows: [ChannelRow]?
         if let list = try? await client.listChannels() {
             let counts = await cachedCounts()
-            rows = list.filter { !$0.archived }.map {
+            rows = list.map {
                 ChannelRow($0, unread: counts[$0.id]?.unread ?? 0, mentions: counts[$0.id]?.mentions)
             }
         } else if let cached = try? await offline?.cachedChannels() {
-            rows = cached.filter { !$0.archived }.map(ChannelRow.init)
+            rows = cached.map(ChannelRow.init)
         }
-        guard mine == generation else { return } // a newer read started meanwhile
+        guard mine == generation else { return false } // a newer read started meanwhile
         guard let rows else {
             if channels.isEmpty { error = "Couldn't load channels." }
-            return
+            return true
         }
         error = nil
         channels = rows.filter { removedAt[$0.id].map { mine > $0 } ?? true }.map { row in
@@ -87,6 +88,7 @@ final class ChannelsModel {
             if row.id == openChannel { (row.unread, row.unreadMentions) = (0, 0) }
             return row
         }
+        return true
     }
 
     /// The cache's unread and unread-mention counts (empty without local data).
@@ -133,7 +135,7 @@ final class ChannelsModel {
         case let .messageNew(message):
             timeline?.apply(event)  // the open conversation's
             arrived(message)
-        case .messageUpdate, .messageDelete, .resync, .typing:
+        case .messageUpdate, .messageDelete, .resync, .typing, .reactionUpdate:
             timeline?.apply(event)
         case let .channelDelete(channelId):
             cacheRemoved([channelId]) // left, removed or deleted: as the cache's removal
@@ -151,14 +153,6 @@ final class ChannelsModel {
             Task { await reloadList() }
             return
         }
-        if channel.archived {
-            channels.remove(at: i) // as a list read drops archived channels
-            if channel.id == openChannel { // and an open one closes, as a removal does
-                closed = channel.id
-                timeline = nil
-            }
-            return
-        }
         // An update's per-user counts are 0 (never a count): the row keeps its own.
         channels[i] = ChannelRow(channel, unread: channels[i].unread, mentions: channels[i].unreadMentions)
     }
@@ -172,6 +166,27 @@ final class ChannelsModel {
         if NotificationPlanner.mentions(message, me: me) { channels[i].unreadMentions += 1 }
         notifier?.post(channelId: message.channelId, title: title(channels[i]),
                        body: NotificationPlanner.body(message, me: me))
+    }
+
+    /// Re-read the list and say whether `id` is in it, so the caller can select a channel it just
+    /// created, joined or opened (the row may not have arrived through an event yet). One more
+    /// read if the first didn't have it; a channel the list never gets is never selected.
+    func reveal(_ id: String) async -> Bool {
+        await reveal(id) { await self.reloadList() }
+    }
+
+    /// `reveal` with the read it makes (tests give it reads that get superseded).
+    func reveal(_ id: String, read: () async -> Bool) async -> Bool {
+        var misses = 0
+        // A read superseded by a newer one (an event's, say) applies nothing: it isn't a miss,
+        // and the loop reads again (a few times at most).
+        for _ in 0..<4 {
+            let applied = await read()
+            if channels.contains(where: { $0.id == id }) { return true }
+            if applied { misses += 1 }
+            if misses == 2 { break }
+        }
+        return false
     }
 
     func canJoin(_ channel: ChannelRow) -> Bool { ready }

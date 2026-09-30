@@ -63,6 +63,16 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     func markRead(channelId: String, messageId: String?) async throws { read.append(messageId) }
     let typed = Mutex<[String]>([])
     func sendTyping(channelId: String) async throws { typed.withLock { $0.append(channelId) } }
+    var reactionAnswer: [FfiReaction] = []
+    var reactionFails = false
+    var reactionGate: Gate?
+    let toggles = Mutex<[String]>([])
+    func toggleReaction(channelId: String, messageId: String, emoji: String) async throws -> [FfiReaction] {
+        toggles.withLock { $0.append("\(messageId)|\(emoji)") }
+        await reactionGate?.wait()
+        if reactionFails { throw LoginError.Timeout }
+        return reactionAnswer
+    }
     var downloadFailure: Error?
     var downloadBytes = Data("new".utf8)
     func downloadFile(transferId: UInt64, fileId: String, sha256: String, size: UInt64,
@@ -80,7 +90,7 @@ final class FakeChat: ChatClient, @unchecked Sendable {
 func msg(_ id: String, _ body: String, channel: String = "c", deleted: Bool = false) -> FfiMessage {
     FfiMessage(id: id, channelId: channel, authorId: "u", authorHandle: "u", authorDisplayName: "U",
                body: body, createdAt: "2026-09-26T10:00:00Z", clientId: nil, deleted: deleted,
-               editedAt: nil, replyToId: nil, replyTo: nil, attachments: [], mentions: [], mentionEveryone: false)
+               editedAt: nil, replyToId: nil, replyTo: nil, attachments: [], mentions: [], mentionEveryone: false, reactions: [])
 }
 
 @MainActor

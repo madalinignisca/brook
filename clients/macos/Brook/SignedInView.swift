@@ -33,6 +33,11 @@ struct SignedInView: View {
     @State private var showingMembers = false
     /// Message search (online), when this client can.
     @State private var search: SearchModel?
+    /// Starting conversations and managing the open channel (spec 2026-09-30-mac-conversations).
+    @State private var conversationSheet: ConversationSheet?
+    @State private var managing: ChannelManagementModel?
+    @State private var confirming: ManageConfirm?
+    @State private var manageError: String?
     /// The open channel's ownership question (#190): when it shows, and its answer's state
     /// (kept here so an error and "Ask Me Later" survive redraws). Keyed by channel and offer.
     @State private var prompt = OfferPrompt()
@@ -67,6 +72,9 @@ struct SignedInView: View {
             List(channels.channels, id: \.id, selection: $selection) { channel in
                 HStack {
                     Text(channels.title(channel))
+                    if channel.archived {
+                        Text("archived").font(.caption).foregroundStyle(.secondary)
+                    }
                     Spacer()
                     if let badge = channels.badge(channel) {
                         Text(badge).font(.caption).foregroundStyle(.green)
@@ -102,7 +110,7 @@ struct SignedInView: View {
             if let channel = channels.channels.first(where: { $0.id == selection }),
                let chat = client as? any ChatClient, let timeline, timeline.channelId == channel.id {
                 ChatView(channelId: channel.id, me: user.id, client: chat, timeline: timeline,
-                         pending: pending, feed: feed)
+                         pending: pending, feed: feed, archived: channel.archived)
                     .id(channel.id)  // a new conversation per channel
                     .navigationTitle(channels.title(channel))
                     .toolbar {
@@ -117,9 +125,33 @@ struct SignedInView: View {
                                 Label(channels.badge(channel) ?? "Join Call",
                                       systemImage: "phone.fill")
                             }
-                            .disabled(!channels.canJoin(channel) || calls.call != nil
+                            .disabled(channel.archived || !channels.canJoin(channel) || calls.call != nil
                                 || calls.joining)
                             .help(calls.joinError ?? (channels.ready ? "Join the call" : "Connecting…"))
+                        }
+                        if channel.canLeave, powers(channel).canManage, client is any ConversationClient {
+                            ToolbarItem {
+                                Menu {
+                                    Button("Add Member…") { manage(channel, sheet: .addMember) }
+                                        .disabled(managing?.busy == true)
+                                    Button("Rename…") { manage(channel, sheet: .rename) }
+                                        .disabled(managing?.busy == true)
+                                    Divider()
+                                    Button(channel.archived ? "Unarchive…" : "Archive…") {
+                                        managing = managementModel(channel)
+                                        confirming = .archive(!channel.archived)
+                                    }
+                                    .disabled(managing?.busy == true)
+                                    Button("Delete…", role: .destructive) {
+                                        managing = managementModel(channel)
+                                        confirming = .delete
+                                    }
+                                    .disabled(managing?.busy == true)
+                                } label: {
+                                    Label("Channel", systemImage: "ellipsis.circle")
+                                }
+                                .help("Manage this channel")
+                            }
                         }
                         if channel.canLeave, let membership = client as? any MembershipClient {
                             ToolbarItem {
@@ -187,8 +219,28 @@ struct SignedInView: View {
         }
         .onChange(of: channels.closed) { _, closed in
             if let closed, selection == closed { selection = nil } // removed from it (#62)
+            // A sheet or confirmation for a channel that's gone would act on nothing (a
+            // `not_found` reads as "done").
+            if let closed {
+                (managing, conversationSheet, confirming) = ManagementRules.channelClosed(
+                    closed, managing: managing, sheet: conversationSheet, confirming: confirming)
+            }
         }
         .toolbar {
+            if client is any ConversationClient {
+                ToolbarItem {
+                    Menu {
+                        Button("New Message…") { conversationSheet = .newMessage }
+                        if user.globalRole == "admin" {
+                            Button("New Channel…") { conversationSheet = .newChannel }
+                        }
+                        Button("Browse Channels…") { conversationSheet = .browse }
+                    } label: {
+                        Label("New", systemImage: "square.and.pencil")
+                    }
+                    .help("Start a conversation")
+                }
+            }
             ToolbarItem {
                 Menu {
                     Button("Edit Profile…") { editingProfile = true }
@@ -215,6 +267,9 @@ struct SignedInView: View {
                 }
             }
         }
+        .modifier(ConversationPresentation(
+            client: client, user: user, sheet: $conversationSheet, managing: $managing,
+            confirming: $confirming, manageError: $manageError, onOpen: open))
         .sheet(isPresented: $editingProfile) {
             if let account = client as? any AccountClient {
                 ProfileSheet(client: account) { shownName = $0.displayName }
@@ -285,6 +340,22 @@ extension SignedInView {
         answering = OfferAnswerModel(
             channelId: row.id, title: channels.title(row),
             offerer: OfferAnswerModel.offererName(offer, members: row.members), client: membership)
+    }
+
+    /// Select a channel just created, joined or opened, once the list has it.
+    fileprivate func open(_ channel: FfiChannel) {
+        Task { if await channels.reveal(channel.id) { selection = channel.id } }
+    }
+
+    fileprivate func managementModel(_ channel: ChannelRow) -> ChannelManagementModel? {
+        (client as? any ConversationClient).map {
+            ChannelManagementModel(channel: channel, powers: powers(channel), client: $0)
+        }
+    }
+
+    fileprivate func manage(_ channel: ChannelRow, sheet: ConversationSheet) {
+        managing = managementModel(channel)
+        conversationSheet = sheet
     }
 
     fileprivate func powers(_ channel: ChannelRow) -> ChannelPowers {

@@ -43,6 +43,9 @@ struct ChannelPowers {
         return myRole == "owner" && member.role != "owner"
     }
 
+    /// Add member, rename, archive, delete: an owner or a global admin.
+    var canManage: Bool { isAdmin || myRole == "owner" }
+
     /// "Make Owner": an owner or an admin, beside a non-owner who isn't you and hasn't a
     /// pending offer (that one gets Withdraw).
     func canOffer(_ member: FfiMember) -> Bool {

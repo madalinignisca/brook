@@ -21,6 +21,8 @@ final class FakeRealtime: FfiBrookClientProtocol, @unchecked Sendable {
     let order = Mutex<[String]>([])
     let listener = Mutex<ServerEventListener?>(nil)
     var channels: [FfiChannel]
+    /// Successive answers for `listChannels` (empty: always `channels`).
+    let readQueue = Mutex<[[FfiChannel]]>([])
     init(channels: [FfiChannel]) { self.channels = channels }
     /// For the offline tests (#62): a failing realtime start or network list, and the cache's
     /// channels (nil: `local.unavailable`).
@@ -41,7 +43,8 @@ final class FakeRealtime: FfiBrookClientProtocol, @unchecked Sendable {
     }
     func listChannels() async throws -> [FfiChannel] {
         order.withLock { $0.append("list") }
-        let snapshot = channels
+        // Tests that need the list to change between reads queue its snapshots (the last repeats).
+        let snapshot = readQueue.withLock { q in q.count > 1 ? q.removeFirst() : (q.first ?? channels) }
         if let listGate { await listGate.wait() }
         if listFails { throw LoginError.Network(message: "offline") }
         return snapshot
@@ -190,7 +193,7 @@ struct GrantedNothing: AuthorizationSource {
 }
 
 func channel(_ id: String, _ name: String) -> FfiChannel {
-    FfiChannel(id: id, kind: "public", name: name, archived: false, unreadMentions: 0, members: [], ownerOffers: [])
+    FfiChannel(id: id, kind: "public", name: name, archived: false, topic: nil, isPublic: false, unreadMentions: 0, members: [], ownerOffers: [])
 }
 
 /// Let main-queue deliveries (the event/state bridges hop through it) run.
@@ -594,6 +597,14 @@ extension FakeRealtime {
     func leaveChannel(channelId: String) async throws { throw unused }
     func sendTyping(channelId: String) async throws { throw unused }
     func searchMessages(query: String) async throws -> [FfiMessage] { throw unused }
+    func toggleReaction(channelId: String, messageId: String, emoji: String) async throws -> [FfiReaction] { throw unused }
+    func openDm(handle: String) async throws -> FfiChannel { throw unused }
+    func createChannel(name: String, topic: String?, isPublic: Bool) async throws -> FfiChannel { throw unused }
+    func listPublicChannels() async throws -> [FfiChannel] { throw unused }
+    func joinChannel(channelId: String) async throws -> FfiChannel { throw unused }
+    func addMember(channelId: String, handle: String) async throws { throw unused }
+    func updateChannel(channelId: String, name: String?, topic: String?, archived: Bool?) async throws -> FfiChannel { throw unused }
+    func deleteChannel(channelId: String) async throws { throw unused }
     func offerOwnership(channelId: String, handle: String) async throws -> FfiChannel { throw unused }
     func withdrawOwnershipOffer(channelId: String, userId: String) async throws { throw unused }
     func acceptOwnership(channelId: String) async throws -> FfiChannel { throw unused }
