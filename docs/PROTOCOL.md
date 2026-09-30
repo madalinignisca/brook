@@ -203,18 +203,17 @@ Messages are tagged envelopes:
 | `message.new` | message object (channel_id, author, body, attachments) |
 | `message.edit` / `message.delete` | message id + change |
 | `presence.update` | user id, online/away/offline |
-| `typing` | channel id, user id |
+| `typing` | channel id, user id, display name (ephemeral; never sent to the typist) |
 | `channel.update` | membership / metadata change |
 | `bot.message` | message authored by a bot participant |
 | `call.*`, `channel.call` | call signaling events, see §3.4 |
 
 ### Client → server commands
-> **Sending messages is REST-only** (`POST /channels/{id}/messages`), never a WS command — one send path avoids races between HTTP retries and WS reconnect-replay, and simplifies dedup. The WS carries only ephemeral signals (typing, call) and **receives** fan-out.
+> **Sending messages is REST-only** (`POST /channels/{id}/messages`), never a WS command — one send path avoids races between HTTP retries and WS reconnect-replay, and simplifies dedup. The WS carries only ephemeral call signals and **receives** fan-out. Typing is REST too: `POST /channels/{id}/typing` (204, members only, throttled to one per 2 s per user and channel; calls inside the window are dropped silently). Others get the `typing` event; there is no stop event, so clients expire the indicator themselves.
 
 | type | data |
 |---|---|
 | `auth` | `{access_token}`: **required first frame**; may be re-sent to refresh (see above) |
-| `typing` | channel id |
 | `call.*` | call signaling commands, see §3.3 |
 | `slash.command` | channel id, raw text (e.g. `/botname hello`) → triggers outbound webhook |
 
