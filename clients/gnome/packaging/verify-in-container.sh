@@ -45,7 +45,7 @@ tar -C "$work" -xzf "$tarball"
 # The documented install path, not a shortcut: INSTALL.md tells users to run ./install.sh,
 # and on Alpine (no bash) that was broken once without any check noticing.
 echo "== 0. ./install.sh"
-sh "$work"/brook-gnome-*/install.sh
+(cd "$work"/brook-gnome-*/ && ./install.sh)
 bin="$HOME/.local/bin/brook-gnome"
 [ -x "$bin" ] || { echo "FAIL: install.sh did not install $bin" >&2; exit 1; }
 
