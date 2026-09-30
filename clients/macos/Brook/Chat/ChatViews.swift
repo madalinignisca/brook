@@ -73,7 +73,9 @@ struct ChatView: View {
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
                     // Gone by itself after a few seconds (a later reaction clears it sooner).
                     .task(id: reactionError) {
-                        try? await Task.sleep(for: .seconds(5))
+                        // Only after the full 5 s: a cancelled sleep (the error replaced, or the
+                        // view gone) must not clear a newer error early.
+                        guard (try? await Task.sleep(for: .seconds(5))) != nil else { return }
                         timeline.clearReactionError()
                     }
             }

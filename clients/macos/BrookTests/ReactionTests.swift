@@ -120,6 +120,32 @@ final class TimelineReactionTests: XCTestCase {
         XCTAssertEqual(t.messages[0].reactions, [chip("👍", 5)], "the older answer put the count back")
     }
 
+    /// The server's real order: your own echo (an event) arrives first, then the answer.
+    func testMyOwnEchoBeforeTheAnswerLeavesTheRowRight() async {
+        let chat = FakeChat()
+        let gate = Gate()
+        chat.reactionGate = gate
+        chat.reactionAnswer = [chip("👍", 3, me: true)]
+        let t = timeline(chat)
+        let toggling = Task { await t.toggleReaction(t.messages[0], emoji: "👍") }
+        while chat.toggles.withLock({ $0.isEmpty }) { await Task.yield() }
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "me", added: true, count: 3))
+        gate.open()
+        await toggling.value
+        XCTAssertEqual(t.messages[0].reactions, [chip("👍", 3, me: true)])
+    }
+
+    /// A failed toggle releases the lock: the next tap on the same message is sent.
+    func testAfterAFailedToggleTheNextTapIsSent() async {
+        let chat = FakeChat()
+        chat.reactionFails = true
+        let t = timeline(chat)
+        await t.toggleReaction(t.messages[0], emoji: "👍")
+        chat.reactionFails = false
+        await t.toggleReaction(t.messages[0], emoji: "👍")
+        XCTAssertEqual(chat.toggles.withLock { $0 }, ["m1|👍", "m1|👍"])
+    }
+
     func testAnEventForAnotherMessageDoesNotMakeTheAnswerIgnored() async {
         let chat = FakeChat()
         let gate = Gate()

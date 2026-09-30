@@ -53,6 +53,8 @@ clients never show and it can't react.
 - Searching the local cache offline (server search only, as GTK).
 - Scrolling to the found message (it opens the channel).
 - Typing for threads or per-message.
+- Feedback for a tap on a message whose reaction call is still in flight: it's dropped (the call
+  takes well under a second), a choice rather than an oversight.
 
 ## Where it fails
 
@@ -96,3 +98,9 @@ Taken (both reviewers found the same two things):
 - §10 says the search field is in the sidebar (it was written "toolbar").
 
 Measured: 5 more mutants, each caught. 282 Mac tests.
+
+## PR A review, round 2 (Claude review (Opus), codex)
+
+Claude review: LGTM. Taken (lows): the auto-clear timer no longer fires when its sleep is
+cancelled; two tests added (your own echo arriving before the answer, the server's real order;
+and the lock released after a failed toggle); the dropped-tap choice is stated above.
