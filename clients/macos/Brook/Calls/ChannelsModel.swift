@@ -197,7 +197,9 @@ final class ChannelsModel {
         return channel.ownerOffers.first { $0.userId == me }
     }
 
-    func title(_ channel: ChannelRow) -> String { channel.name ?? "Direct message" }
+    /// What the sidebar and toolbar call a channel. A DM has no name: it is the other person's
+    /// display name (their handle when that is blank), as in any chat client.
+    func title(_ channel: ChannelRow) -> String { ChannelTitle.of(channel, me: me) }
 
     /// "● Call · N" in the sidebar, or nil when no call is live.
     func badge(_ channel: ChannelRow) -> String? {
@@ -228,5 +230,20 @@ final class EventBridge: ServerEventListener, @unchecked Sendable {
         DispatchQueue.main.async { [weak self] in
             MainActor.assumeIsolated { self?.model?.handle(event) }
         }
+    }
+}
+
+enum ChannelTitle {
+    /// A named channel keeps its name. Otherwise the other member's display name, then their
+    /// handle; a DM with yourself, or nobody known yet, falls back to the members joined, then
+    /// "Direct message".
+    static func of(_ channel: ChannelRow, me: String?) -> String {
+        if let name = channel.name, !name.isEmpty { return name }
+        func label(_ m: FfiMember) -> String { m.displayName.isEmpty ? m.handle : m.displayName }
+        if let other = channel.members.first(where: { $0.id != me }), !label(other).isEmpty {
+            return label(other)
+        }
+        let all = channel.members.map(label).filter { !$0.isEmpty }
+        return all.isEmpty ? "Direct message" : all.joined(separator: ", ")
     }
 }
