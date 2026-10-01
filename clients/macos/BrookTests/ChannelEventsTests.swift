@@ -10,7 +10,7 @@ final class ChannelEventsTests: XCTestCase {
 
     private func started(_ channels: [FfiChannel]) async -> (FakeRealtime, ChannelsModel) {
         let client = FakeRealtime(channels: channels)
-        let model = ChannelsModel(client: client, me: "me", isActive: { true })
+        let model = ChannelsModel(client: client, me: "me", isActive: { true }, defaults: isolatedDefaults())
         await model.start()
         return (client, model)
     }

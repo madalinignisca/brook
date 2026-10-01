@@ -612,6 +612,7 @@ pub(crate) fn map_event(event: ServerEvent) -> Option<FfiServerEvent> {
             user_id,
             added,
             count,
+            seq,
         } => FfiServerEvent::ReactionUpdate {
             channel_id,
             message_id,
@@ -619,6 +620,7 @@ pub(crate) fn map_event(event: ServerEvent) -> Option<FfiServerEvent> {
             user_id,
             added,
             count,
+            seq,
         },
         ServerEvent::ChannelUpdate(c) => FfiServerEvent::ChannelUpdate { channel: c.into() },
         ServerEvent::ChannelDelete { channel_id } => FfiServerEvent::ChannelDelete { channel_id },

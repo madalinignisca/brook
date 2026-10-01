@@ -54,6 +54,8 @@ pub struct FfiCachedChannel {
     pub unread_mentions: i64,
     pub members: Vec<FfiMember>,
     pub owner_offers: Vec<crate::types::FfiOwnerOffer>,
+    /// The newest cached message's id, tombstones included: the sidebar's activity key.
+    pub last_message_id: Option<String>,
 }
 
 impl From<brook_core::Channel> for FfiCachedChannel {
@@ -67,6 +69,7 @@ impl From<brook_core::Channel> for FfiCachedChannel {
             unread_mentions: c.unread_mentions,
             members: c.members.into_iter().map(Into::into).collect(),
             owner_offers: c.owner_offers.into_iter().map(Into::into).collect(),
+            last_message_id: c.last_message_id,
         }
     }
 }
