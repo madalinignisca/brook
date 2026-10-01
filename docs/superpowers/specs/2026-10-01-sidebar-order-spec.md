@@ -41,8 +41,9 @@ or auth changes remain. The pure rules live in core so GTK can reuse them; the G
   `message.new` (either order of arrival re-sorts once the live message is heard).
 - **When the list re-sorts:** on a list load; on a `message.new` that moves the key (`activity_moves`);
   and on a cache `Channels` notice where a key moved forward for a conversation that is neither the open
-  one nor one opened since the last re-sort (their back-fill raises their own key; the set is cleared on
-  each re-sort).
+  one nor one opened whose back-fill has not been seen yet (its history fetch raises its own key; a channel
+  leaves that set when a notice has moved its key, or when a live message for it arrives; a re-sort does
+  not clear it, because the fetch can finish after any number of re-sorts).
   A click never re-sorts, and neither does the history back-fill that opening starts (it raises the open
   conversation's own key). A re-sort applies the whole rule, so earlier clicks can show then.
 - **Labels in the row:** the model stores each row's label, set by one row factory used wherever a row is
@@ -54,7 +55,7 @@ or auth changes remain. The pure rules live in core so GTK can reuse them; the G
 ## Done means
 
 1. A channel reads `#general` in the sidebar, the window title and notifications. Tests: core
-   `channel_label_is_hash_name`; `ChannelTitleTests`.
+   `channel_label_is_hash_name`; `ChannelLabelTests`.
 2. A DM reads the other person's display name; with Show usernames on, `@bob`. A blank or whitespace
    display name reads `@handle` either way. Core tests `dm_label_follows_the_preference`,
    `blank_name_falls_back_to_at_handle`.
@@ -98,4 +99,6 @@ back-fill, the Settings name clash, label cost: all taken (design section). Roun
 ignores the preference; labels come from one row factory; the opened counter starts above the saved
 ranks; the pending-row mutant is gone; empty `me` joins labels; a back-fill finishing after a switch is
 suppressed by the opened-since-last-sort set; the cache-versus-live arrival order is covered by the
-`sorted` key. Rebutted: none. Closed (no round 3).
+`sorted` key. Rebutted: none. Closed (no round 3). Found in review of the diff and fixed: the opened set was cleared by every
+re-sort, so a late back-fill moved a row (now consumed by its notice); an empty offline list erased the
+saved ranks (pruning only on a network list).
