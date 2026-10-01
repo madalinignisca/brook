@@ -134,6 +134,27 @@ pub struct FfiMessage {
     pub mentions: Vec<String>,
     /// `@channel` / `@here`: everyone in the channel was mentioned.
     pub mention_everyone: bool,
+    /// Emoji reactions, in the server's order (none on a tombstone).
+    pub reactions: Vec<FfiReaction>,
+}
+
+/// An emoji's reactions on a message, from your side.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiReaction {
+    pub emoji: String,
+    pub count: i64,
+    /// You're one of them.
+    pub me: bool,
+}
+
+impl From<brook_core::ReactionSummary> for FfiReaction {
+    fn from(r: brook_core::ReactionSummary) -> Self {
+        Self {
+            emoji: r.emoji,
+            count: r.count,
+            me: r.me,
+        }
+    }
 }
 
 impl From<brook_core::Message> for FfiMessage {
@@ -165,6 +186,11 @@ impl From<brook_core::Message> for FfiMessage {
             },
             mentions: m.mentions,
             mention_everyone: m.mention_everyone,
+            reactions: if deleted {
+                vec![]
+            } else {
+                m.reactions.into_iter().map(Into::into).collect()
+            },
         }
     }
 }
