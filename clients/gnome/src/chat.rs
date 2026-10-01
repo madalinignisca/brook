@@ -40,6 +40,12 @@ struct Chat {
     is_admin: Rc<RefCell<bool>>,
     current: Rc<RefCell<Option<String>>>,
     channel_list: gtk::ListBox,
+    /// Per-conversation activity and open order, for the sidebar's order.
+    sidebar: Rc<RefCell<crate::sidebar::SidebarState>>,
+    /// "Show usernames" (a per-device preference): people are named `@handle`, not by name.
+    show_usernames: Rc<Cell<bool>>,
+    /// Set while the list is rebuilt, so removing and re-adding rows doesn't "select" them.
+    rebuilding: Rc<Cell<bool>>,
     channels: Rc<RefCell<Vec<Channel>>>,
     /// Unread badge label per sidebar row, parallel to `channels`.
     badges: Rc<RefCell<Vec<Badge>>>,
@@ -132,6 +138,10 @@ struct MessageWidgets {
     /// Who wrote it, and the label showing their name (redrawn when their profile changes).
     author_id: String,
     author: gtk::Label,
+    /// The author's handle and the name the message came with, for naming them by the
+    /// "Show usernames" preference (a profile change updates the name in `author_names`).
+    author_handle: String,
+    author_fallback: String,
     /// Hidden once the message is a tombstone: actions, quote, files, reactions.
     extras: Vec<gtk::Widget>,
     /// The quoted message's id, its author and the quote line, if this is a reply.
@@ -240,6 +250,9 @@ pub fn build(
         is_admin: Rc::new(RefCell::new(is_admin)),
         current: Rc::new(RefCell::new(None)),
         channel_list: channel_list.clone(),
+        sidebar: Rc::default(),
+        show_usernames: Rc::new(Cell::new(crate::prefs::show_usernames())),
+        rebuilding: Rc::default(),
         channels: Rc::new(RefCell::new(Vec::new())),
         badges: Rc::new(RefCell::new(Vec::new())),
         message_rows: Rc::new(RefCell::new(HashMap::new())),
@@ -417,9 +430,40 @@ pub fn build(
         .build();
 
     // --- wiring ---
+    // Two sections: channels, then people (the order itself is `rebuild_sidebar`'s).
+    channel_list.set_header_func({
+        let channels = chat.channels.clone();
+        move |row, before| {
+            let channels = channels.borrow();
+            let is_dm = |r: &gtk::ListBoxRow| channels.get(r.index() as usize).map(Channel::is_dm);
+            let (this, previous) = (is_dm(row), before.and_then(is_dm));
+            let heading = match (previous, this) {
+                (None, Some(false)) => Some("Channels"),
+                (None, Some(true)) | (Some(false), Some(true)) => Some("People"),
+                _ => None,
+            };
+            row.set_header(
+                heading
+                    .map(|text| {
+                        gtk::Label::builder()
+                            .label(text)
+                            .xalign(0.0)
+                            .margin_start(12)
+                            .margin_top(8)
+                            .css_classes(["caption-heading", "dim-label"])
+                            .build()
+                            .upcast::<gtk::Widget>()
+                    })
+                    .as_ref(),
+            );
+        }
+    });
     channel_list.connect_row_selected({
         let chat = chat.clone();
         move |_, row| {
+            if chat.rebuilding.get() {
+                return;
+            }
             if let Some(row) = row {
                 let idx = row.index() as usize;
                 let id = chat.channels.borrow().get(idx).map(|c| c.id.clone());
@@ -506,6 +550,15 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         .borrow()
                         .as_deref()
                         .is_some_and(|c| c == message.channel_id);
+                    // New activity moves its conversation up (re-sorted only for this, never
+                    // on a plain redraw). The unread counts below are looked up after it.
+                    if chat
+                        .sidebar
+                        .borrow_mut()
+                        .bump(&message.channel_id, &message.id)
+                    {
+                        rebuild_sidebar(&chat);
+                    }
                     if is_current && window_focused(&chat) {
                         append_message(&chat, &message);
                         mark_read(&chat, message.channel_id.clone(), Some(message.id.clone()));
@@ -653,7 +706,19 @@ fn refresh_channels(chat: &Rc<Chat>, select: Option<String>) {
             let client = chat.client.clone();
             async move {
                 match client.list_channels().await {
-                    Ok(channels) => Ok(channels),
+                    Ok(mut channels) => {
+                        // The server doesn't say when a conversation was last used; the cache
+                        // (when local data is on) does, for the sidebar's order.
+                        if let Ok(cached) = client.cached_channels().await {
+                            for channel in &mut channels {
+                                channel.last_message_id = cached
+                                    .iter()
+                                    .find(|c| c.id == channel.id)
+                                    .and_then(|c| c.last_message_id.clone());
+                            }
+                        }
+                        Ok(channels)
+                    }
                     Err(err) => client.cached_channels().await.map_err(|_| err),
                 }
             }
@@ -661,23 +726,13 @@ fn refresh_channels(chat: &Rc<Chat>, select: Option<String>) {
         let Ok(Ok(channels)) = handle.await else {
             return;
         };
-
-        while let Some(row) = chat.channel_list.row_at_index(0) {
-            chat.channel_list.remove(&row);
-        }
-        chat.badges.borrow_mut().clear();
-        let me = chat.me.borrow().clone().unwrap_or_default();
         for channel in &channels {
-            let (row, badge) = channel_row(
-                &channel.title(&me),
-                channel.is_dm(),
-                (channel.unread_count, channel.unread_mentions),
-                channel.owner_offer_for(&me).is_some(),
-            );
-            chat.channel_list.append(&row);
-            chat.badges.borrow_mut().push(badge);
+            chat.sidebar
+                .borrow_mut()
+                .seed(&channel.id, channel.last_message_id.as_deref());
         }
         *chat.channels.borrow_mut() = channels;
+        rebuild_sidebar(&chat);
 
         // Re-apply chrome for the open channel so a live rename/archive shows now.
         let current = chat.current.borrow().clone();
@@ -698,6 +753,43 @@ fn refresh_channels(chat: &Rc<Chat>, select: Option<String>) {
     });
 }
 
+/// Order `chat.channels` as the sidebar's rules say (channels, then people; each by last use)
+/// and redraw the list. The open conversation stays selected without being "opened" again.
+fn rebuild_sidebar(chat: &Rc<Chat>) {
+    let me = chat.me.borrow().clone().unwrap_or_default();
+    let show_usernames = chat.show_usernames.get();
+    let channels = std::mem::take(&mut *chat.channels.borrow_mut());
+    let order = chat.sidebar.borrow().order(&channels, &me);
+    let channels = crate::sidebar::arranged(channels, &order);
+
+    chat.rebuilding.set(true);
+    while let Some(row) = chat.channel_list.row_at_index(0) {
+        chat.channel_list.remove(&row);
+    }
+    chat.badges.borrow_mut().clear();
+    for channel in &channels {
+        let (row, badge) = channel_row(
+            &crate::sidebar::label(channel, &me, show_usernames),
+            channel.is_dm(),
+            (channel.unread_count, channel.unread_mentions),
+            channel.owner_offer_for(&me).is_some(),
+        );
+        chat.channel_list.append(&row);
+        chat.badges.borrow_mut().push(badge);
+    }
+    // Keep the open conversation selected (it keeps its place until activity moves it).
+    let current = chat.current.borrow().clone();
+    if let Some(idx) = current.and_then(|id| channels.iter().position(|c| c.id == id)) {
+        if let Some(row) = chat.channel_list.row_at_index(idx as i32) {
+            chat.channel_list.select_row(Some(&row));
+        }
+    }
+    *chat.channels.borrow_mut() = channels;
+    chat.rebuilding.set(false);
+    // The section headings read `chat.channels`, which was empty while the rows were added.
+    chat.channel_list.invalidate_headers();
+}
+
 /// Load and render a channel's history, and enable the composer.
 /// Apply the title, subtitle, settings-button visibility, and composer
 /// sensitivity for `channel_id` from the current channel list (re-applied on
@@ -709,7 +801,13 @@ fn apply_channel_chrome(chat: &Rc<Chat>, channel_id: &str) {
         .borrow()
         .iter()
         .find(|c| c.id == channel_id)
-        .map(|c| (c.is_dm(), c.archived, c.title(&me)));
+        .map(|c| {
+            (
+                c.is_dm(),
+                c.archived,
+                crate::sidebar::label(c, &me, chat.show_usernames.get()),
+            )
+        });
     let Some((is_dm, archived, title)) = meta else {
         return;
     };
@@ -784,6 +882,7 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
     if previous.as_deref() != Some(channel_id) {
         forget_deferred_question();
     }
+    chat.sidebar.borrow_mut().opened_now(channel_id);
     apply_channel_chrome(chat, channel_id);
     ask_about_ownership(chat);
 
@@ -1237,10 +1336,14 @@ fn is_safe_link(uri: &str) -> bool {
 fn append_message(chat: &Rc<Chat>, message: &Message) {
     // A name that changed since the message was stored wins.
     let current = chat.author_names.borrow().get(&message.author_id).cloned();
-    let author = current
-        .or_else(|| message.author_display_name.clone())
-        .or_else(|| message.author_handle.clone())
-        .unwrap_or_else(|| "Unknown".to_string());
+    let author = author_text(
+        current
+            .as_deref()
+            .or(message.author_display_name.as_deref())
+            .unwrap_or_default(),
+        message.author_handle.as_deref().unwrap_or_default(),
+        chat.show_usernames.get(),
+    );
 
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -1382,6 +1485,8 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
         reactions: Rc::new(RefCell::new(message.reactions.clone())),
         author_id: message.author_id.clone(),
         author: author_label.clone(),
+        author_handle: message.author_handle.clone().unwrap_or_default(),
+        author_fallback: message.author_display_name.clone().unwrap_or_default(),
         deleted: Rc::new(Cell::new(false)),
         has_files: Rc::new(Cell::new(!message.attachments.is_empty())),
         files_box,
@@ -1737,6 +1842,29 @@ fn main_menu_popover(chat: &Rc<Chat>) -> gtk::Popover {
         }
     });
     menu.append(&edit_profile);
+    // Per device: people are named `@handle` instead of by display name, at once.
+    let show_usernames = gtk::CheckButton::builder()
+        .label("Show usernames")
+        .active(chat.show_usernames.get())
+        .margin_start(8)
+        .margin_end(8)
+        .margin_top(4)
+        .margin_bottom(4)
+        .build();
+    show_usernames.connect_toggled({
+        let chat = chat.clone();
+        move |check| {
+            chat.show_usernames.set(check.is_active());
+            crate::prefs::save_show_usernames(check.is_active());
+            rebuild_sidebar(&chat);
+            relabel_authors(&chat);
+            let current = chat.current.borrow().clone();
+            if let Some(current) = current {
+                apply_channel_chrome(&chat, &current);
+            }
+        }
+    });
+    menu.append(&show_usernames);
     menu.append(&change_password);
     menu.append(&two_factor);
     menu.append(&sign_out);
@@ -2222,13 +2350,21 @@ fn members_dialog(chat: &Rc<Chat>) {
     let may_offer = admin || my_role.as_deref() == Some("owner");
     for member in members {
         let offered = offers.contains(&member.id);
+        // The person as the preference names them; the other form goes beneath.
+        let show_usernames = chat.show_usernames.get();
+        let title = brook_core::person_label(&member.display_name, &member.handle, show_usernames);
+        let other = if show_usernames {
+            member.display_name.clone()
+        } else {
+            format!("@{}", member.handle)
+        };
         let subtitle = match member.role.as_deref() {
-            Some("owner") => format!("@{} · owner", member.handle),
-            _ if offered => format!("@{} · owner offered", member.handle),
-            _ => format!("@{}", member.handle),
+            Some("owner") => format!("{other} · owner"),
+            _ if offered => format!("{other} · owner offered"),
+            _ => other,
         };
         let row = adw::ActionRow::builder()
-            .title(glib::markup_escape_text(&member.display_name).as_str())
+            .title(glib::markup_escape_text(&title).as_str())
             .subtitle(glib::markup_escape_text(&subtitle).as_str())
             .build();
         if may_remove(
@@ -3403,6 +3539,32 @@ fn spawn_cache_loop(chat: &Rc<Chat>) {
 
 /// Put the cache's current names on the authors shown among `ids` (message rows keep the
 /// name they were stored with).
+/// How a message header names its author: the display name, or `@handle` with "Show usernames"
+/// (and when there is no name). "Unknown" when the message carries neither.
+fn author_text(display_name: &str, handle: &str, show_usernames: bool) -> String {
+    if handle.is_empty() {
+        // Nothing to name them by but the name (a message that carries no handle).
+        let name = display_name.trim();
+        return if name.is_empty() { "Unknown" } else { name }.to_string();
+    }
+    brook_core::person_label(display_name, handle, show_usernames)
+}
+
+/// The authors on screen, named by the current preference (after it changes).
+fn relabel_authors(chat: &Rc<Chat>) {
+    let names = chat.author_names.borrow();
+    for widgets in chat.message_rows.borrow().values() {
+        let name = names
+            .get(&widgets.author_id)
+            .map_or(widgets.author_fallback.as_str(), String::as_str);
+        widgets.author.set_label(&author_text(
+            name,
+            &widgets.author_handle,
+            chat.show_usernames.get(),
+        ));
+    }
+}
+
 fn redraw_authors(chat: &Rc<Chat>, ids: Vec<String>) {
     let shown: Vec<String> = {
         let rows = chat.message_rows.borrow();
@@ -3433,7 +3595,11 @@ fn redraw_authors(chat: &Rc<Chat>, ids: Vec<String>) {
             .collect();
         for widgets in chat.message_rows.borrow().values() {
             if let Some(name) = names.get(&widgets.author_id) {
-                widgets.author.set_label(name);
+                widgets.author.set_label(&author_text(
+                    name,
+                    &widgets.author_handle,
+                    chat.show_usernames.get(),
+                ));
             }
         }
         // Rows drawn later (an older page, a redraw after a reset) use them too.
@@ -3502,6 +3668,17 @@ fn badges_from_cache(chat: &Rc<Chat>) {
             (channels[i].unread_count, channels[i].unread_mentions) = (unread, mentions);
             drop(channels);
             update_badge(&chat, i);
+        }
+        // What a catch-up brought is new activity too: re-sort once if it moved anything.
+        let mut moved = false;
+        for fresh in &cached {
+            moved |= chat
+                .sidebar
+                .borrow_mut()
+                .seed(&fresh.id, fresh.last_message_id.as_deref());
+        }
+        if moved {
+            rebuild_sidebar(&chat);
         }
     });
 }
@@ -4150,5 +4327,24 @@ mod mention_tests {
         assert_eq!(badge_texts(3, 1), ("@1".into(), "3".into()));
         // A count that lags the mentions never shows fewer.
         assert_eq!(badge_texts(0, 2), ("@2".into(), "2".into()));
+    }
+}
+
+#[cfg(test)]
+mod author_text_tests {
+    use super::author_text;
+
+    #[test]
+    fn an_author_is_named_by_the_preference_with_fallbacks() {
+        assert_eq!(author_text("Ann", "ann", false), "Ann");
+        assert_eq!(author_text("Ann", "ann", true), "@ann");
+        assert_eq!(author_text("", "ann", false), "@ann", "no name: the handle");
+        assert_eq!(author_text("  ", "ann", false), "@ann");
+        assert_eq!(author_text("", "", false), "Unknown");
+        assert_eq!(
+            author_text("Ann", "", true),
+            "Ann",
+            "no handle: the name stands"
+        );
     }
 }

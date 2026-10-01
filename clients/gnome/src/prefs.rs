@@ -43,3 +43,32 @@ pub fn save_server(server: &str) {
         tracing::warn!(%err, path = %path.display(), "could not save the server");
     }
 }
+
+const SIDEBAR: &str = "sidebar";
+const SHOW_USERNAMES: &str = "show_usernames";
+
+/// "Show usernames": people are named `@handle` rather than by display name. Off by default;
+/// per device.
+pub fn show_usernames() -> bool {
+    let file = glib::KeyFile::new();
+    file.load_from_file(path(), glib::KeyFileFlags::NONE)
+        .is_ok()
+        && file.boolean(SIDEBAR, SHOW_USERNAMES).unwrap_or(false)
+}
+
+/// Remember the "Show usernames" choice. Failures are logged, not fatal.
+pub fn save_show_usernames(on: bool) {
+    let path = path();
+    let file = glib::KeyFile::new();
+    let _ = file.load_from_file(&path, glib::KeyFileFlags::KEEP_COMMENTS);
+    file.set_boolean(SIDEBAR, SHOW_USERNAMES, on);
+    let result = path
+        .parent()
+        .map(std::fs::create_dir_all)
+        .transpose()
+        .map_err(|e| e.to_string())
+        .and_then(|_| file.save_to_file(&path).map_err(|e| e.to_string()));
+    if let Err(err) = result {
+        tracing::warn!(%err, path = %path.display(), "could not save the preference");
+    }
+}
