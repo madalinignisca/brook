@@ -2844,20 +2844,30 @@ impl ErrorHold {
         self.until.is_some_and(|until| until > now)
     }
 
-    /// An error's timer fired: whether the hold is over (draw the line again). A renewed hold
-    /// isn't over yet; that error's own timer ends it.
-    fn timer_fired(&mut self, now: Instant) -> bool {
-        if self.holding(now) {
-            return false;
+    /// An error's timer fired. Over: draw the line again. Wait: the hold lasts longer (a newer
+    /// error renewed it, or GLib's loop clock ran ahead of ours and fired early), so the timer
+    /// is set again for what's left; nothing is ever left holding with no timer.
+    fn timer_fired(&mut self, now: Instant) -> HoldTimer {
+        match self.until {
+            Some(until) if until > now => HoldTimer::Wait(until - now),
+            _ => {
+                self.until = None;
+                HoldTimer::Over
+            }
         }
-        self.until = None;
-        true
     }
 
     /// Another channel was opened: an error about the last one goes now.
     fn clear(&mut self) {
         self.until = None;
     }
+}
+
+/// What an error's timer should do when it fires.
+#[derive(Debug, PartialEq, Eq)]
+enum HoldTimer {
+    Over,
+    Wait(Duration),
 }
 
 /// What the typing line shows.
@@ -2974,10 +2984,14 @@ fn render_typing(chat: &Rc<Chat>) {
         // An error is showing: it keeps the line until its own timer ends it, which draws this.
         LineShown::Error => return,
         LineShown::Typing(line) => {
+            chat.typing_label.remove_css_class("error");
             chat.typing_label.set_label(&line);
             chat.typing_label.set_visible(true);
         }
-        LineShown::Nothing => chat.typing_label.set_visible(false),
+        LineShown::Nothing => {
+            chat.typing_label.remove_css_class("error");
+            chat.typing_label.set_visible(false);
+        }
     }
     if let Some(id) = chat.typing_timeout.borrow_mut().take() {
         id.remove();
@@ -3115,9 +3129,10 @@ fn new_conversation_popover(chat: &Rc<Chat>) -> gtk::Popover {
             if handle.is_empty() {
                 return;
             }
-            dm_entry.set_text("");
             popover.popdown();
-            open_dm(&chat, handle);
+            // The text stays until the server accepts the handle, so a typo is fixed, not retyped.
+            let entry = dm_entry.clone();
+            open_dm(&chat, handle, move || entry.set_text(""));
         }
     });
 
@@ -3147,10 +3162,12 @@ fn new_conversation_popover(chat: &Rc<Chat>) -> gtk::Popover {
                     return;
                 }
                 let public = public_check.is_active();
-                name_entry.set_text("");
-                public_check.set_active(false);
                 popover.popdown();
-                create_channel(&chat, name, public);
+                let (entry, check) = (name_entry.clone(), public_check.clone());
+                create_channel(&chat, name, public, move || {
+                    entry.set_text("");
+                    check.set_active(false);
+                });
             }
         });
     }
@@ -3370,7 +3387,7 @@ fn jump_to_channel(chat: &Rc<Chat>, channel_id: &str) {
     }
 }
 
-fn open_dm(chat: &Rc<Chat>, handle: String) {
+fn open_dm(chat: &Rc<Chat>, handle: String, on_opened: impl FnOnce() + 'static) {
     let chat = chat.clone();
     glib::spawn_future_local(async move {
         let join = chat.runtime.spawn({
@@ -3378,14 +3395,22 @@ fn open_dm(chat: &Rc<Chat>, handle: String) {
             async move { client.open_dm(&handle).await }
         });
         match join.await {
-            Ok(Ok(channel)) => refresh_channels(&chat, Some(channel.id)),
+            Ok(Ok(channel)) => {
+                on_opened();
+                refresh_channels(&chat, Some(channel.id));
+            }
             Ok(Err(err)) => show_conversation_failure(&chat, ConvAction::StartDm, &err),
             Err(_) => {}
         }
     });
 }
 
-fn create_channel(chat: &Rc<Chat>, name: String, public: bool) {
+fn create_channel(
+    chat: &Rc<Chat>,
+    name: String,
+    public: bool,
+    on_created: impl FnOnce() + 'static,
+) {
     let chat = chat.clone();
     glib::spawn_future_local(async move {
         let join = chat.runtime.spawn({
@@ -3399,7 +3424,10 @@ fn create_channel(chat: &Rc<Chat>, name: String, public: bool) {
             }
         });
         match join.await {
-            Ok(Ok(channel)) => refresh_channels(&chat, Some(channel.id)),
+            Ok(Ok(channel)) => {
+                on_created();
+                refresh_channels(&chat, Some(channel.id));
+            }
             Ok(Err(err)) => show_conversation_failure(&chat, ConvAction::CreateChannel, &err),
             Err(_) => {}
         }
@@ -3440,9 +3468,9 @@ fn add_member_popover(chat: &Rc<Chat>) -> gtk::Popover {
             if handle.is_empty() {
                 return;
             }
-            entry.set_text("");
             popover.popdown();
             let chat = chat.clone();
+            let entry = entry.clone();
             glib::spawn_future_local(async move {
                 let join = chat.runtime.spawn({
                     let client = chat.client.clone();
@@ -3451,8 +3479,14 @@ fn add_member_popover(chat: &Rc<Chat>) -> gtk::Popover {
                 // The server fans out channel.update; the new member's client
                 // refreshes itself. Reload ours too so the member count updates.
                 match join.await {
-                    Ok(Ok(())) => refresh_channels(&chat, None),
-                    Ok(Err(err)) if already_gone(&err) => refresh_channels(&chat, None),
+                    Ok(Ok(())) => {
+                        entry.set_text(""); // kept on a failure, so a typo isn't retyped
+                        refresh_channels(&chat, None);
+                    }
+                    Ok(Err(err)) if already_gone(&err) => {
+                        entry.set_text("");
+                        refresh_channels(&chat, None);
+                    }
                     Ok(Err(err)) => show_conversation_failure(&chat, ConvAction::AddMember, &err),
                     Err(_) => {}
                 }
@@ -4158,15 +4192,22 @@ fn show_send_error(chat: &Rc<Chat>, text: &str) {
     let mut hold = chat.error_hold.get();
     hold.hold(Instant::now());
     chat.error_hold.set(hold);
+    arm_error_timer(chat, ERROR_SHOWN);
+}
+
+/// End the hold after `delay`, or set the timer again for what's left if it fired early.
+fn arm_error_timer(chat: &Rc<Chat>, delay: Duration) {
     let chat = chat.clone();
-    glib::timeout_add_local_once(ERROR_SHOWN, move || {
+    glib::timeout_add_local_once(delay, move || {
         let mut hold = chat.error_hold.get();
-        let over = hold.timer_fired(Instant::now());
+        let fired = hold.timer_fired(Instant::now());
         chat.error_hold.set(hold);
-        // A newer error renewed it: that one's timer ends it.
-        if over {
-            chat.typing_label.remove_css_class("error");
-            render_typing(&chat);
+        match fired {
+            HoldTimer::Over => {
+                chat.typing_label.remove_css_class("error");
+                render_typing(&chat);
+            }
+            HoldTimer::Wait(left) => arm_error_timer(&chat, left + Duration::from_millis(20)),
         }
     });
 }
@@ -4682,7 +4723,7 @@ mod error_hold_tests {
         assert_eq!(line_shown(&hold, &typing, t0 + 2 * S), LineShown::Error);
         // The hold ends at 6 s; Ann's notice (1 s) has expired at 5 s, so a fresh one shows.
         typing.note("a", "Ann", t0 + 6 * S);
-        assert!(hold.timer_fired(t0 + 6 * S));
+        assert_eq!(hold.timer_fired(t0 + 6 * S), HoldTimer::Over);
         assert_eq!(
             line_shown(&hold, &typing, t0 + 6 * S),
             LineShown::Typing("Ann is typing\u{2026}".into())
@@ -4696,9 +4737,9 @@ mod error_hold_tests {
         hold.hold(t0);
         hold.hold(t0 + 3 * S);
         // The first error's timer fires at 6 s: the second is still held until 9 s.
-        assert!(!hold.timer_fired(t0 + 6 * S));
+        assert_eq!(hold.timer_fired(t0 + 6 * S), HoldTimer::Wait(3 * S));
         assert!(hold.holding(t0 + 8 * S));
-        assert!(hold.timer_fired(t0 + 9 * S));
+        assert_eq!(hold.timer_fired(t0 + 9 * S), HoldTimer::Over);
         assert!(!hold.holding(t0 + 9 * S));
     }
 
@@ -4726,6 +4767,22 @@ mod error_hold_tests {
             LineShown::Nothing
         );
         // The timer still pending from that error finds nothing held and just redraws.
-        assert!(hold.timer_fired(t0 + 6 * S));
+        assert_eq!(hold.timer_fired(t0 + 6 * S), HoldTimer::Over);
+    }
+
+    #[test]
+    fn a_timer_that_fires_early_is_set_again_for_what_is_left() {
+        // GLib's cached loop time can run slightly ahead of our clock: the timer fires before
+        // the deadline. It must not leave the error holding with nothing to end it.
+        let t0 = Instant::now();
+        let mut hold = ErrorHold::default();
+        hold.hold(t0);
+        let early = t0 + ERROR_SHOWN - Duration::from_millis(5);
+        assert_eq!(
+            hold.timer_fired(early),
+            HoldTimer::Wait(Duration::from_millis(5))
+        );
+        assert!(hold.holding(early), "still held");
+        assert_eq!(hold.timer_fired(t0 + ERROR_SHOWN), HoldTimer::Over);
     }
 }
