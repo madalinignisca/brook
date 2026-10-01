@@ -613,6 +613,7 @@ fn a_reaction_event_crosses_with_its_new_count() {
             user_id: "u2".into(),
             added: true,
             count: 4,
+            seq: 77,
         }),
         Some(FfiServerEvent::ReactionUpdate {
             channel_id: "c".into(),
@@ -621,6 +622,7 @@ fn a_reaction_event_crosses_with_its_new_count() {
             user_id: "u2".into(),
             added: true,
             count: 4,
+            seq: 77,
         })
     );
 }

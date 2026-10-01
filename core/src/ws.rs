@@ -55,6 +55,9 @@ pub enum ServerEvent {
         added: bool,
         /// The new total count for this emoji on the message.
         count: i64,
+        /// The server's commit-ordered change counter. Events for the same message and emoji
+        /// can arrive out of order; the highest `seq` is the newest, so drop anything lower.
+        seq: i64,
     },
     /// A channel's membership/metadata changed (e.g. the user was added to it).
     ChannelUpdate(Channel),
@@ -325,6 +328,7 @@ struct ReactionChanged {
     user_id: String,
     added: bool,
     count: i64,
+    seq: i64,
 }
 
 #[derive(Deserialize)]
@@ -388,6 +392,7 @@ fn dispatch(text: &str, tx: &broadcast::Sender<ServerEvent>) -> bool {
                         user_id: r.user_id,
                         added: r.added,
                         count: r.count,
+                        seq: r.seq,
                     });
                 }
                 Err(err) => {
@@ -905,5 +910,23 @@ pub(crate) async fn run(
         backoff = backoff.min(cap);
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(cap);
+    }
+}
+
+#[cfg(test)]
+mod reaction_event_tests {
+    use super::*;
+
+    #[test]
+    fn a_reaction_update_carries_the_servers_seq_and_count() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let frame = r#"{"type":"reaction.update","data":{"message_id":"m1","channel_id":"c","emoji":"👍","user_id":"u2","added":true,"count":3,"seq":41}}"#;
+        dispatch(frame, &tx);
+        match rx.try_recv() {
+            Ok(ServerEvent::ReactionUpdate { count, seq, .. }) => {
+                assert_eq!((count, seq), (3, 41));
+            }
+            other => panic!("expected a reaction update, got {other:?}"),
+        }
     }
 }

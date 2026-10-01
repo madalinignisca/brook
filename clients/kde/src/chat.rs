@@ -214,6 +214,7 @@ impl qobject::ChatController {
                         user_id,
                         added,
                         count,
+                        ..
                     }) => {
                         let json = serde_json::json!({
                             "channel_id": channel_id,
