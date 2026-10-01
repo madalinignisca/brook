@@ -273,16 +273,200 @@ mod live {
 }
 
 #[cfg(test)]
+mod live_support {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use brook_core::{KeySlot, KeySlotError};
+
+    use super::SecretServiceSlot;
+
+    /// The real desktop keyring, but under names of this run's own, so a live test can never
+    /// touch (or sign out) the developer's real app: the app's slots (`session:<origin>`,
+    /// `index`, `cache:<id>`, `outbox:<id>`) all live under a `brook-selftest-<pid>-<time>/`
+    /// prefix here, and every slot written is deleted by [`ScopedSlot::purge`].
+    pub struct ScopedSlot {
+        inner: SecretServiceSlot,
+        prefix: String,
+        used: Mutex<BTreeSet<String>>,
+    }
+
+    impl ScopedSlot {
+        /// `None` without an unlocked keyring (the test is then skipped).
+        pub fn new() -> Option<Arc<Self>> {
+            let inner = SecretServiceSlot::new();
+            if !inner.available() {
+                return None;
+            }
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            Some(Arc::new(Self {
+                inner,
+                prefix: format!("brook-selftest-{}-{nanos}/", std::process::id()),
+                used: Mutex::default(),
+            }))
+        }
+
+        fn scoped(&self, slot: &str) -> String {
+            format!("{}{slot}", self.prefix)
+        }
+
+        fn record(&self, slot: &str) {
+            self.used.lock().unwrap().insert(slot.to_string());
+        }
+
+        /// Delete every slot this run wrote.
+        pub fn purge(&self) {
+            let used = std::mem::take(&mut *self.used.lock().unwrap());
+            for slot in used {
+                let _ = self.inner.delete(self.scoped(&slot));
+            }
+        }
+
+        /// How many slots this run still holds (the cleanup test).
+        pub fn held(&self) -> usize {
+            self.used.lock().unwrap().len()
+        }
+    }
+
+    impl KeySlot for ScopedSlot {
+        fn load(&self, slot: String) -> Result<Option<Vec<u8>>, KeySlotError> {
+            self.inner.load(self.scoped(&slot))
+        }
+        fn create(&self, slot: String, bytes: Vec<u8>) -> Result<(), KeySlotError> {
+            self.record(&slot);
+            self.inner.create(self.scoped(&slot), bytes)
+        }
+        fn replace(&self, slot: String, bytes: Vec<u8>) -> Result<(), KeySlotError> {
+            self.record(&slot);
+            self.inner.replace(self.scoped(&slot), bytes)
+        }
+        fn delete(&self, slot: String) -> Result<(), KeySlotError> {
+            self.inner.delete(self.scoped(&slot))
+        }
+    }
+
+    /// A live test's scratch: the slots it wrote and its temp dir, removed even when an
+    /// assertion fails.
+    pub struct Cleanup {
+        pub slot: Arc<ScopedSlot>,
+        pub dir: tempfile::TempDir,
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.slot.purge();
+        }
+    }
+
+    /// What a scan of a data dir found.
+    #[derive(Debug, Default)]
+    pub struct Scan {
+        /// Every file read, by path relative to the scanned dir.
+        pub files: Vec<String>,
+        /// Files containing the needle, or starting as a plain SQLite database.
+        pub readable: Vec<String>,
+        /// Files that couldn't be read (a scan that skipped them proves nothing).
+        pub unreadable: Vec<String>,
+    }
+
+    impl Scan {
+        pub fn has_file(&self, suffix: &str) -> bool {
+            self.files.iter().any(|f| f.ends_with(suffix))
+        }
+    }
+
+    /// Scan every file under `dir` (SQLite's `-wal` and `-shm` included) for `needle`.
+    pub fn scan(dir: &Path, needle: &str) -> Scan {
+        fn walk(root: &Path, dir: &Path, needle: &str, out: &mut Scan) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                out.unreadable.push(dir.display().to_string());
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                if path.is_dir() {
+                    walk(root, &path, needle, out);
+                    continue;
+                }
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let has =
+                            |n: &[u8]| !n.is_empty() && bytes.windows(n.len()).any(|w| w == n);
+                        if has(needle.as_bytes()) || bytes.starts_with(b"SQLite format 3\0") {
+                            out.readable.push(name.clone());
+                        }
+                        out.files.push(name);
+                    }
+                    Err(_) => out.unreadable.push(name),
+                }
+            }
+        }
+        let mut out = Scan::default();
+        walk(dir, dir, needle, &mut out);
+        out
+    }
+
+    #[test]
+    fn the_scan_finds_plain_text_and_plain_sqlite_and_reports_unreadable_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/notes.txt"), b"xx NEEDLE yy").unwrap();
+        std::fs::write(dir.path().join("plain.db"), b"SQLite format 3\0rest").unwrap();
+        std::fs::write(dir.path().join("cipher.db"), [7u8; 64]).unwrap();
+        let found = scan(dir.path(), "NEEDLE");
+        assert_eq!(found.files.len(), 3);
+        let mut readable = found.readable.clone();
+        readable.sort();
+        assert_eq!(readable, ["plain.db", "sub/notes.txt"]);
+        assert!(found.unreadable.is_empty());
+        assert!(found.has_file("cipher.db") && !found.has_file("other.db"));
+        // A dangling symlink can't be read: reported, not skipped.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/nonexistent/x", dir.path().join("dangling")).unwrap();
+            assert_eq!(scan(dir.path(), "NEEDLE").unreadable, ["dangling"]);
+        }
+    }
+
+    #[test]
+    #[ignore = "touches the desktop keyring (under its own names)"]
+    fn a_scoped_slot_keeps_its_names_apart_and_forgets_them_on_purge() {
+        let Some(slot) = ScopedSlot::new() else {
+            eprintln!("no unlocked keyring: skipped");
+            return;
+        };
+        slot.create("session:https://h".into(), b"a".to_vec())
+            .unwrap();
+        slot.replace("index".into(), b"b".to_vec()).unwrap();
+        assert_eq!(slot.held(), 2);
+        assert_eq!(slot.load("index".into()), Ok(Some(b"b".to_vec())));
+        // The unscoped (the app's real) name is a different slot.
+        assert_eq!(slot.inner.load("index".into()), Ok(None));
+        slot.purge();
+        assert_eq!(slot.held(), 0);
+        assert_eq!(slot.load("index".into()), Ok(None));
+    }
+}
+
+#[cfg(test)]
 mod live_restore {
     use std::sync::Arc;
 
     use brook_core::{BrookClient, CoreConfig, LoginOutcome, RestoreOutcome};
 
-    use super::SecretServiceSlot;
+    use super::live_support::{Cleanup, ScopedSlot};
 
-    /// Stay signed in end to end: the real keyring + core's restore against a server.
-    /// `BROOK_LIVE_SERVER=... BROOK_LIVE_HANDLE=... BROOK_LIVE_PASSWORD=... cargo test
-    /// -p brook-gnome -- --ignored keyring_restore_live`
+    /// Stay signed in end to end: the real keyring (under this run's own names, never the
+    /// app's) + core's restore against a server. `BROOK_LIVE_SERVER=... BROOK_LIVE_HANDLE=...
+    /// BROOK_LIVE_PASSWORD=... cargo test -p brook-gnome -- --ignored keyring_restore_live`
     #[test]
     #[ignore = "touches the desktop keyring and a live server"]
     fn keyring_restore_live() {
@@ -294,12 +478,15 @@ mod live_restore {
             eprintln!("BROOK_LIVE_* not set: skipped");
             return;
         };
-        let slot = Arc::new(SecretServiceSlot::new());
-        if !slot.available() {
+        let Some(slot) = ScopedSlot::new() else {
             eprintln!("no unlocked keyring: skipped");
             return;
-        }
-        let dir = std::env::temp_dir().join(format!("brook-live-{}", std::process::id()));
+        };
+        let scratch = Cleanup {
+            slot: slot.clone(),
+            dir: tempfile::tempdir().unwrap(),
+        };
+        let dir = scratch.dir.path().to_path_buf();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = || {
             let c = BrookClient::new(CoreConfig::with_options(&server, true).unwrap()).unwrap();
@@ -324,63 +511,28 @@ mod live_restore {
             println!("restore after sign-out -> {after:?}");
             assert_eq!(after, RestoreOutcome::NotSignedIn);
         });
-        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
 #[cfg(test)]
 mod live_local_data {
-    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use brook_core::{BrookClient, CoreConfig, LoginOutcome};
+    use brook_core::{
+        BrookClient, CoreConfig, FileCacheState, LoginOutcome, OutgoingFile, TransferId,
+    };
 
-    use super::SecretServiceSlot;
+    use super::live_support::{scan, Cleanup, Scan, ScopedSlot};
 
-    /// Every file under `dir`, recursively, that contains `needle`, or starts like a plain
-    /// SQLite database.
-    fn plaintext(dir: &Path, needle: &str, found: &mut Vec<String>, files: &mut usize) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                plaintext(&path, needle, found, files);
-            } else if let Ok(bytes) = std::fs::read(&path) {
-                *files += 1;
-                let has = |n: &[u8]| !n.is_empty() && bytes.windows(n.len()).any(|w| w == n);
-                if has(needle.as_bytes()) || bytes.starts_with(b"SQLite format 3\0") {
-                    found.push(path.display().to_string());
-                }
-            }
-        }
+    struct Live {
+        server: String,
+        handle: String,
+        password: String,
+        channel: String,
     }
 
-    #[test]
-    fn the_scan_finds_plain_text_and_plain_sqlite_files() {
-        let dir = std::env::temp_dir().join(format!("brook-scan-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        std::fs::write(dir.join("sub/notes.txt"), b"xx NEEDLE yy").unwrap();
-        std::fs::write(dir.join("plain.db"), b"SQLite format 3\0rest").unwrap();
-        std::fs::write(dir.join("cipher.db"), [7u8; 64]).unwrap();
-        let (mut found, mut files) = (Vec::new(), 0);
-        plaintext(&dir, "NEEDLE", &mut found, &mut files);
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(files, 3);
-        found.sort();
-        assert_eq!(found.len(), 2, "{found:?}");
-        assert!(
-            found[0].ends_with("plain.db") && found[1].ends_with("notes.txt"),
-            "{found:?}"
-        );
-    }
-
-    /// Offline cache at rest, end to end on the real desktop keyring: with local data on, a
-    /// message that went through the cache (and the outbox) leaves nothing readable on disk.
-    /// `BROOK_LIVE_SERVER=... BROOK_LIVE_HANDLE=... BROOK_LIVE_PASSWORD=... BROOK_LIVE_CHANNEL=<id>
-    /// cargo test -p brook-gnome -- --ignored local_data_is_ciphertext_on_disk`
-    #[test]
-    #[ignore = "touches the desktop keyring and a live server"]
-    fn local_data_is_ciphertext_on_disk() {
+    fn live() -> Option<(Live, Cleanup)> {
         let (Ok(server), Ok(handle), Ok(password), Ok(channel)) = (
             std::env::var("BROOK_LIVE_SERVER"),
             std::env::var("BROOK_LIVE_HANDLE"),
@@ -388,40 +540,101 @@ mod live_local_data {
             std::env::var("BROOK_LIVE_CHANNEL"),
         ) else {
             eprintln!("BROOK_LIVE_* not set: skipped");
+            return None;
+        };
+        let Some(slot) = ScopedSlot::new() else {
+            eprintln!("no unlocked keyring: skipped");
+            return None;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        Some((
+            Live {
+                server,
+                handle,
+                password,
+                channel,
+            },
+            Cleanup { slot, dir },
+        ))
+    }
+
+    /// A signed-in client with local data on, in `scratch`'s own dir and keyring names.
+    async fn signed_in(live: &Live, scratch: &Cleanup) -> Arc<BrookClient> {
+        let data_dir = scratch.dir.path().join("data");
+        let client = Arc::new(
+            BrookClient::new(CoreConfig::with_options(&live.server, true).unwrap()).unwrap(),
+        );
+        client.enable_persistence(scratch.slot.clone(), data_dir.clone());
+        assert!(
+            client
+                .enable_local_data(scratch.slot.clone(), data_dir)
+                .await,
+            "local data should turn on with a usable keyring"
+        );
+        assert!(matches!(
+            client.login(&live.handle, &live.password).await.unwrap(),
+            LoginOutcome::LoggedIn(_)
+        ));
+        client.start_realtime().await.unwrap();
+        client
+    }
+
+    /// What a good scan looks like: both stores' databases were read, nothing was unreadable,
+    /// and nothing was readable.
+    fn assert_ciphertext(found: &Scan, when: &str) {
+        println!("{when}: scanned {:?}", found.files);
+        assert!(
+            found.unreadable.is_empty(),
+            "{when}: unreadable {:?}",
+            found.unreadable
+        );
+        assert!(
+            found.has_file("cache.db"),
+            "{when}: no cache.db scanned: {:?}",
+            found.files
+        );
+        assert!(
+            found.has_file("outbox.db"),
+            "{when}: no outbox.db scanned: {:?}",
+            found.files
+        );
+        assert!(
+            found.readable.is_empty(),
+            "{when}: readable on disk: {:?}",
+            found.readable
+        );
+    }
+
+    /// Offline cache at rest, end to end on the real desktop keyring (under this run's own
+    /// names): with local data on, a message that went through the cache (and the outbox)
+    /// leaves nothing readable on disk, scanned while the stores are open (their `-wal` and
+    /// `-shm` exist then) and again after they close.
+    /// `BROOK_LIVE_SERVER=... BROOK_LIVE_HANDLE=... BROOK_LIVE_PASSWORD=... BROOK_LIVE_CHANNEL=<id>
+    /// cargo test -p brook-gnome -- --ignored local_data_is_ciphertext_on_disk`
+    #[test]
+    #[ignore = "touches the desktop keyring and a live server"]
+    fn local_data_is_ciphertext_on_disk() {
+        let Some((live, scratch)) = live() else {
             return;
         };
-        let slot = Arc::new(SecretServiceSlot::new());
-        if !slot.available() {
-            eprintln!("no unlocked keyring: skipped");
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("brook-live-data-{}", std::process::id()));
-        let marker = format!("CIPHERCHECK-{}-{}", std::process::id(), "needle");
+        let marker = format!("CIPHERCHECK-{}-needle", std::process::id());
         let outbox_marker = format!("{marker}-outbox");
+        let data_dir = scratch.dir.path().join("data");
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let client = Arc::new(
-                BrookClient::new(CoreConfig::with_options(&server, true).unwrap()).unwrap(),
-            );
-            client.enable_persistence(slot.clone(), dir.clone());
-            assert!(
-                client.enable_local_data(slot.clone(), dir.clone()).await,
-                "local data should turn on with a usable keyring"
-            );
-            assert!(matches!(
-                client.login(&handle, &password).await.unwrap(),
-                LoginOutcome::LoggedIn(_)
-            ));
-            client.start_realtime().await.unwrap();
-            client.send_message(&channel, &marker, None).await.unwrap();
+        let while_open = rt.block_on(async {
+            let client = signed_in(&live, &scratch).await;
             client
-                .send_queued(&channel, &outbox_marker, None, None)
+                .send_message(&live.channel, &marker, None)
+                .await
+                .unwrap();
+            client
+                .send_queued(&live.channel, &outbox_marker, None, None)
                 .await
                 .unwrap();
             // Wait until both went through the cache, then read them back from it.
             let mut seen = false;
             for _ in 0..40 {
-                if let Ok(page) = client.cached_messages(&channel, None, 50).await {
+                if let Ok(page) = client.cached_messages(&live.channel, None, 50).await {
                     let bodies: Vec<&str> = page.messages.iter().map(|m| m.body.as_str()).collect();
                     if bodies.contains(&marker.as_str()) && bodies.contains(&outbox_marker.as_str())
                     {
@@ -429,53 +642,43 @@ mod live_local_data {
                         break;
                     }
                 }
-                let _ = client.load_head(&channel, 50).await;
+                let _ = client.load_head(&live.channel, 50).await;
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             assert!(seen, "both messages should be readable from the cache");
+            // Still open: SQLite's write-ahead logs exist and can hold the newest pages.
+            let open = scan(&data_dir, &marker);
             client.logout().await;
             client.close_local_data().await;
+            open
         });
-        let (mut found, mut files) = (Vec::new(), 0);
-        plaintext(&dir, &marker, &mut found, &mut files);
-        println!("scanned {files} files under {}", dir.display());
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(files > 0, "the stores should have written files");
-        assert!(found.is_empty(), "readable on disk: {found:?}");
+        assert!(
+            while_open.has_file("-wal"),
+            "the open stores should have write-ahead logs: {:?}",
+            while_open.files
+        );
+        assert_ciphertext(&while_open, "while open");
+        assert_ciphertext(&scan(&data_dir, &marker), "after close");
+        assert!(scratch.slot.held() > 0, "the run did write keyring slots");
     }
 
-    /// Attachments end to end on the real keyring and a real server: a file goes out through
-    /// the outbox, is kept available offline, and is then saved from the cache (which never
-    /// touches the network), byte for byte, while the cache's blobs on disk hold none of it.
-    /// Same `BROOK_LIVE_*` as above.
+    /// Attachments end to end on the real keyring (under this run's own names) and a real
+    /// server: a file goes out through the outbox, is kept available offline, and is then
+    /// saved from the cache (which never touches the network), byte for byte, while the
+    /// data dir holds none of it. Same `BROOK_LIVE_*` as above.
     /// cargo test -p brook-gnome -- --ignored attachment_is_kept_offline_and_ciphertext
     #[test]
     #[ignore = "touches the desktop keyring and a live server"]
     fn attachment_is_kept_offline_and_ciphertext() {
-        use brook_core::{FileCacheState, OutgoingFile, TransferId};
+        let Some((live, scratch)) = live() else {
+            return;
+        };
         // RUST_LOG=brook_core=debug shows why core refused something.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_test_writer()
             .try_init();
-
-        let (Ok(server), Ok(handle), Ok(password), Ok(channel)) = (
-            std::env::var("BROOK_LIVE_SERVER"),
-            std::env::var("BROOK_LIVE_HANDLE"),
-            std::env::var("BROOK_LIVE_PASSWORD"),
-            std::env::var("BROOK_LIVE_CHANNEL"),
-        ) else {
-            eprintln!("BROOK_LIVE_* not set: skipped");
-            return;
-        };
-        let slot = Arc::new(SecretServiceSlot::new());
-        if !slot.available() {
-            eprintln!("no unlocked keyring: skipped");
-            return;
-        }
         let pid = std::process::id();
-        let dir = std::env::temp_dir().join(format!("brook-live-files-{pid}"));
-        std::fs::create_dir_all(&dir).unwrap();
         // 3 MiB: more than one encrypted chunk (1 MiB each), with a marker repeated through it.
         let marker = format!("FILECHECK-{pid}-needle");
         let mut content = Vec::new();
@@ -483,29 +686,18 @@ mod live_local_data {
             content.extend_from_slice(marker.as_bytes());
             content.extend_from_slice(&(content.len() as u64).to_le_bytes());
         }
-        let source = dir.join("source.bin");
+        let source = scratch.dir.path().join("source.bin");
         std::fs::write(&source, &content).unwrap();
         let caption = format!("attachment-check-{pid}");
-        let data_dir = dir.join("data");
+        let data_dir = scratch.dir.path().join("data");
+        let target = scratch.dir.path().join("saved.bin");
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let saved = rt.block_on(async {
-            let client = Arc::new(
-                BrookClient::new(CoreConfig::with_options(&server, true).unwrap()).unwrap(),
-            );
-            client.enable_persistence(slot.clone(), data_dir.clone());
-            assert!(
-                client
-                    .enable_local_data(slot.clone(), data_dir.clone())
-                    .await
-            );
-            assert!(matches!(
-                client.login(&handle, &password).await.unwrap(),
-                LoginOutcome::LoggedIn(_)
-            ));
-            client.start_realtime().await.unwrap();
+        let while_open = rt.block_on(async {
+            let client = signed_in(&live, &scratch).await;
+            let channel = &live.channel;
             client
                 .send_queued_with_files(
-                    &channel,
+                    channel,
                     &caption,
                     None,
                     None,
@@ -521,7 +713,7 @@ mod live_local_data {
             // The server has it: its message carries the file.
             let mut file_id = None;
             for _ in 0..60 {
-                let history = client.channel_history(&channel, None).await.unwrap();
+                let history = client.channel_history(channel, None).await.unwrap();
                 if let Some(file) = history
                     .iter()
                     .find(|m| m.body == caption)
@@ -537,13 +729,13 @@ mod live_local_data {
             // The cache indexes a file through its message: wait until it holds this one.
             let mut cached = false;
             for _ in 0..40 {
-                if let Ok(page) = client.cached_messages(&channel, None, 50).await {
+                if let Ok(page) = client.cached_messages(channel, None, 50).await {
                     if page.messages.iter().any(|m| m.body == caption) {
                         cached = true;
                         break;
                     }
                 }
-                let _ = client.load_head(&channel, 50).await;
+                let _ = client.load_head(channel, 50).await;
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             assert!(cached, "the message should reach the cache");
@@ -561,20 +753,17 @@ mod live_local_data {
             }
             assert!(pinned, "the pinned file should be complete in the cache");
             // Saving from the cache: no network involved, and the bytes are the original's.
-            let target = dir.join("saved.bin");
             assert!(client.save_cached_file(&file_id, &target).await.unwrap());
+            let open = scan(&data_dir, &marker);
             client.logout().await;
             client.close_local_data().await;
-            std::fs::read(&target).unwrap()
+            open
         });
+        let saved = std::fs::read(&target).unwrap();
         assert_eq!(saved.len(), content.len());
         assert!(saved == content, "the saved copy differs from the original");
-        // Nothing the cache wrote (the data dir) holds the file's bytes or a plain database.
-        let (mut found, mut files) = (Vec::new(), 0);
-        plaintext(&data_dir, &marker, &mut found, &mut files);
-        println!("scanned {files} files under {}", data_dir.display());
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(files > 0, "the stores should have written files");
-        assert!(found.is_empty(), "readable on disk: {found:?}");
+        // Nothing the cache wrote holds the file's bytes or a plain database, open or closed.
+        assert_ciphertext(&while_open, "while open");
+        assert_ciphertext(&scan(&data_dir, &marker), "after close");
     }
 }
