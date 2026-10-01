@@ -413,6 +413,9 @@ pub enum FfiServerEvent {
         added: bool,
         /// The emoji's new total on the message: apply it as is (0 removes the chip).
         count: i64,
+        /// The server's commit-ordered counter: for one message and emoji, ignore an event
+        /// whose `seq` is not above the last one applied.
+        seq: i64,
     },
     /// A channel you're in changed (renamed, members joined or left, archived): replace
     /// its row. Without local data this is the only way the list hears of it.
