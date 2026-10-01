@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use brook_core::{
@@ -52,8 +53,10 @@ struct Chat {
     reply_label: gtk::Label,
     /// Channel settings menu (rename/archive/delete); shown for managed channels.
     channel_settings: gtk::MenuButton,
-    /// "X is typing…" indicator above the composer + its auto-clear timeout.
+    /// "X is typing…" indicator above the composer, who is in it, and the timer that
+    /// refreshes it when the first of them expires.
     typing_label: gtk::Label,
+    typing: Rc<RefCell<TypingState>>,
     typing_timeout: Rc<RefCell<Option<glib::SourceId>>>,
     /// Last time we sent a typing signal (to throttle to ~once per few seconds).
     last_typing: Rc<RefCell<Option<std::time::Instant>>>,
@@ -248,6 +251,7 @@ pub fn build(
         reply_label: reply_label.clone(),
         channel_settings: channel_settings.clone(),
         typing_label: typing_label.clone(),
+        typing: Rc::default(),
         typing_timeout: Rc::new(RefCell::new(None)),
         last_typing: Rc::new(RefCell::new(None)),
         message_list: message_list.clone(),
@@ -506,6 +510,10 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         .borrow()
                         .as_deref()
                         .is_some_and(|c| c == message.channel_id);
+                    if is_current {
+                        // They sent it: they're done typing.
+                        clear_typing_of(&chat, &message.author_id);
+                    }
                     if is_current && window_focused(&chat) {
                         append_message(&chat, &message);
                         mark_read(&chat, message.channel_id.clone(), Some(message.id.clone()));
@@ -607,7 +615,7 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     let me = chat.me.borrow().clone().unwrap_or_default();
                     let is_current = chat.current.borrow().as_deref() == Some(channel_id.as_str());
                     if is_current && user_id != me {
-                        show_typing(&chat, &display_name);
+                        show_typing(&chat, &user_id, &display_name);
                     }
                 }
                 Ok(ServerEvent::ChannelUpdate(_)) => {
@@ -1491,6 +1499,7 @@ fn toggle_reaction(chat: &Rc<Chat>, channel_id: String, message_id: String, emoj
             .await;
         if let Ok(Err(err)) = result {
             tracing::warn!(%err, "failed to toggle reaction");
+            show_send_error(&chat, "Couldn't react. Try again.");
         }
     });
 }
@@ -1892,6 +1901,38 @@ fn membership_error_text(err: &brook_core::Error) -> String {
                     .into()
             }
             _ => "That didn't work. Try again.".into(),
+        },
+        brook_core::Error::NotAuthenticated => "You were signed out.".into(),
+        _ => "Couldn't reach the server.".into(),
+    }
+}
+
+/// A handle as typed: trimmed, without a leading `@`.
+fn clean_handle(typed: &str) -> String {
+    typed.trim().trim_start_matches('@').trim().to_string()
+}
+
+/// The thing the action was about is already gone (`not_found`): what it wanted, so nothing
+/// to report. The `channel.update` or `channel.delete` on its way redraws.
+fn already_gone(err: &brook_core::Error) -> bool {
+    matches!(err, brook_core::Error::Api { code, .. } if code == "not_found")
+}
+
+/// Why starting or managing a conversation failed, briefly (the Mac's texts). `forbidden` is
+/// what a refusal by the server's rules says, `invalid` what a rejected input says (an unknown
+/// handle, a name that doesn't fit); `fallback` covers anything else that was answered, and a
+/// call that wasn't answered says so.
+fn conversation_error_text(
+    err: &brook_core::Error,
+    forbidden: &str,
+    invalid: &str,
+    fallback: &str,
+) -> String {
+    match err {
+        brook_core::Error::Api { code, .. } => match code.as_str() {
+            "authz.forbidden" => forbidden.to_string(),
+            "validation.error" => invalid.to_string(),
+            _ => fallback.to_string(),
         },
         brook_core::Error::NotAuthenticated => "You were signed out.".into(),
         _ => "Couldn't reach the server.".into(),
@@ -2456,6 +2497,21 @@ fn update_channel_async(chat: &Rc<Chat>, name: Option<String>, archived: Option<
             .await;
         if let Ok(Err(err)) = result {
             tracing::warn!(%err, "failed to update channel");
+            if already_gone(&err) {
+                // A missed event can leave a stale row: read the list again.
+                refresh_channels(&chat, None);
+            } else {
+                show_alert(
+                    &chat,
+                    "Couldn't Do That",
+                    &conversation_error_text(
+                        &err,
+                        "Only an owner or admin can do that.",
+                        "That name or topic can't be used.",
+                        "That didn't work. Try again.",
+                    ),
+                );
+            }
         }
     });
 }
@@ -2530,6 +2586,20 @@ fn delete_channel_confirm(chat: &Rc<Chat>) {
                     .await;
                 if let Ok(Err(err)) = result {
                     tracing::warn!(%err, "failed to delete channel");
+                    if already_gone(&err) {
+                        refresh_channels(&chat, None);
+                    } else {
+                        show_alert(
+                            &chat,
+                            "Couldn't Delete",
+                            &conversation_error_text(
+                                &err,
+                                "Only an owner or admin can delete it.",
+                                "That didn't work. Try again.",
+                                "That didn't work. Try again.",
+                            ),
+                        );
+                    }
                 }
             });
         }
@@ -2699,29 +2769,113 @@ fn maybe_send_typing(chat: &Rc<Chat>) {
     }
 }
 
-/// Show "<name> is typing…" and (re)start the 4s auto-clear.
-fn show_typing(chat: &Rc<Chat>, name: &str) {
-    chat.typing_label
-        .set_label(&format!("{name} is typing\u{2026}"));
-    chat.typing_label.set_visible(true);
+/// Who is typing in the open channel, as events say. Each shows for `LIFETIME` after their
+/// last event, or until a message from them arrives.
+#[derive(Default)]
+struct TypingState {
+    seen: Vec<(String, String, Instant)>,
+    last_message: HashMap<String, Instant>,
+}
+
+impl TypingState {
+    const LIFETIME: Duration = Duration::from_secs(4);
+    /// A typing notice this soon after their message is the one sent just before it (two
+    /// requests, no ordering between them), not a new one.
+    const AFTER_MESSAGE: Duration = Duration::from_secs(2);
+
+    fn note(&mut self, user_id: &str, name: &str, at: Instant) {
+        if let Some(sent) = self.last_message.get(user_id) {
+            if at.saturating_duration_since(*sent) < Self::AFTER_MESSAGE {
+                return;
+            }
+        }
+        match self.seen.iter_mut().find(|(id, _, _)| id == user_id) {
+            Some(entry) => (entry.1, entry.2) = (name.to_string(), at),
+            None => self.seen.push((user_id.to_string(), name.to_string(), at)),
+        }
+    }
+
+    /// A message from them: they're done.
+    fn clear(&mut self, user_id: &str, at: Instant) {
+        self.seen.retain(|(id, _, _)| id != user_id);
+        self.last_message.insert(user_id.to_string(), at);
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn live(&self, now: Instant) -> impl Iterator<Item = &(String, String, Instant)> {
+        self.seen
+            .iter()
+            .filter(move |(_, _, at)| now.saturating_duration_since(*at) < Self::LIFETIME)
+    }
+
+    /// "Ann is typing…", "Ann and Bob are typing…", "Several people are typing…"; none when
+    /// nobody is.
+    fn line(&self, now: Instant) -> Option<String> {
+        let mut names: Vec<&str> = self.live(now).map(|(_, n, _)| n.as_str()).collect();
+        names.sort_unstable();
+        match names.as_slice() {
+            [] => None,
+            [one] => Some(format!("{one} is typing\u{2026}")),
+            [a, b] => Some(format!("{a} and {b} are typing\u{2026}")),
+            _ => Some("Several people are typing\u{2026}".to_string()),
+        }
+    }
+
+    /// How long until the first of those shown expires.
+    fn next_expiry(&self, now: Instant) -> Option<Duration> {
+        self.live(now)
+            .map(|(_, _, at)| Self::LIFETIME.saturating_sub(now.saturating_duration_since(*at)))
+            .min()
+    }
+}
+
+/// Note that `user_id` is typing, and redraw the line.
+fn show_typing(chat: &Rc<Chat>, user_id: &str, name: &str) {
+    chat.typing.borrow_mut().note(user_id, name, Instant::now());
+    render_typing(chat);
+}
+
+/// A message from `user_id` arrived: they're no longer typing.
+fn clear_typing_of(chat: &Rc<Chat>, user_id: &str) {
+    chat.typing.borrow_mut().clear(user_id, Instant::now());
+    render_typing(chat);
+}
+
+/// Draw who's typing, and wake up when the first of them expires.
+fn render_typing(chat: &Rc<Chat>) {
+    let now = Instant::now();
+    let (line, expiry) = {
+        let state = chat.typing.borrow();
+        (state.line(now), state.next_expiry(now))
+    };
+    match line {
+        Some(line) => {
+            chat.typing_label.set_label(&line);
+            chat.typing_label.set_visible(true);
+        }
+        None => chat.typing_label.set_visible(false),
+    }
     if let Some(id) = chat.typing_timeout.borrow_mut().take() {
         id.remove();
     }
-    let chat2 = chat.clone();
-    let id = glib::timeout_add_seconds_local(4, move || {
-        chat2.typing_label.set_visible(false);
-        *chat2.typing_timeout.borrow_mut() = None;
-        glib::ControlFlow::Break
-    });
-    *chat.typing_timeout.borrow_mut() = Some(id);
+    if let Some(expiry) = expiry {
+        let chat2 = chat.clone();
+        let id = glib::timeout_add_local_once(expiry + Duration::from_millis(50), move || {
+            // Fired: forget the id first, so nothing removes a source that's gone.
+            *chat2.typing_timeout.borrow_mut() = None;
+            render_typing(&chat2);
+        });
+        *chat.typing_timeout.borrow_mut() = Some(id);
+    }
 }
 
 /// Clear any typing indicator (e.g. on channel switch).
 fn clear_typing(chat: &Rc<Chat>) {
-    chat.typing_label.set_visible(false);
-    if let Some(id) = chat.typing_timeout.borrow_mut().take() {
-        id.remove();
-    }
+    chat.typing.borrow_mut().reset();
+    render_typing(chat);
 }
 
 /// Whether a message calls for this user's attention: someone else's, not deleted, naming
@@ -2832,7 +2986,7 @@ fn new_conversation_popover(chat: &Rc<Chat>) -> gtk::Popover {
         let dm_entry = dm_entry.clone();
         let popover = popover.clone();
         move |_| {
-            let handle = dm_entry.text().trim().to_string();
+            let handle = clean_handle(&dm_entry.text());
             if handle.is_empty() {
                 return;
             }
@@ -2887,8 +3041,22 @@ fn browse_public_channels(chat: &Rc<Chat>) {
             let client = chat.client.clone();
             async move { client.list_public_channels().await }
         });
-        let Ok(Ok(channels)) = handle.await else {
-            return;
+        let channels = match handle.await {
+            Ok(Ok(channels)) => channels,
+            Ok(Err(err)) => {
+                show_alert(
+                    &chat,
+                    "Couldn't Load the Channels",
+                    &conversation_error_text(
+                        &err,
+                        "You can't browse channels.",
+                        "That didn't work. Try again.",
+                        "That didn't work. Try again.",
+                    ),
+                );
+                return;
+            }
+            Err(_) => return,
         };
         let list = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -2943,8 +3111,25 @@ fn join_public(chat: &Rc<Chat>, channel_id: String) {
             let client = chat.client.clone();
             async move { client.join_channel(&channel_id).await }
         });
-        if let Ok(Ok(channel)) = handle.await {
-            refresh_channels(&chat, Some(channel.id));
+        match handle.await {
+            Ok(Ok(channel)) => refresh_channels(&chat, Some(channel.id)),
+            // Gone, archived or no longer public: retrying never helps.
+            Ok(Err(err)) if already_gone(&err) => show_alert(
+                &chat,
+                "Couldn't Join",
+                "That channel isn't open to join any more.",
+            ),
+            Ok(Err(err)) => show_alert(
+                &chat,
+                "Couldn't Join",
+                &conversation_error_text(
+                    &err,
+                    "You can't join that channel.",
+                    "That didn't work. Try again.",
+                    "That didn't work. Try again.",
+                ),
+            ),
+            Err(_) => {}
         }
     });
 }
@@ -3085,8 +3270,19 @@ fn open_dm(chat: &Rc<Chat>, handle: String) {
             let client = chat.client.clone();
             async move { client.open_dm(&handle).await }
         });
-        if let Ok(Ok(channel)) = join.await {
-            refresh_channels(&chat, Some(channel.id));
+        match join.await {
+            Ok(Ok(channel)) => refresh_channels(&chat, Some(channel.id)),
+            Ok(Err(err)) => show_alert(
+                &chat,
+                "Couldn't Start the Conversation",
+                &conversation_error_text(
+                    &err,
+                    "You can't message them.",
+                    "No one has that handle.",
+                    "That didn't work. Try again.",
+                ),
+            ),
+            Err(_) => {}
         }
     });
 }
@@ -3104,8 +3300,19 @@ fn create_channel(chat: &Rc<Chat>, name: String, public: bool) {
                 }
             }
         });
-        if let Ok(Ok(channel)) = join.await {
-            refresh_channels(&chat, Some(channel.id));
+        match join.await {
+            Ok(Ok(channel)) => refresh_channels(&chat, Some(channel.id)),
+            Ok(Err(err)) => show_alert(
+                &chat,
+                "Couldn't Create the Channel",
+                &conversation_error_text(
+                    &err,
+                    "Only admins can create channels.",
+                    "That name or topic can't be used.",
+                    "That didn't work. Try again.",
+                ),
+            ),
+            Err(_) => {}
         }
     });
 }
@@ -3137,7 +3344,7 @@ fn add_member_popover(chat: &Rc<Chat>) -> gtk::Popover {
         let entry = entry.clone();
         let popover = popover.clone();
         move |_| {
-            let handle = entry.text().trim().to_string();
+            let handle = clean_handle(&entry.text());
             let Some(channel_id) = chat.current.borrow().clone() else {
                 return;
             };
@@ -3154,8 +3361,20 @@ fn add_member_popover(chat: &Rc<Chat>) -> gtk::Popover {
                 });
                 // The server fans out channel.update; the new member's client
                 // refreshes itself. Reload ours too so the member count updates.
-                if let Ok(Ok(())) = join.await {
-                    refresh_channels(&chat, None);
+                match join.await {
+                    Ok(Ok(())) => refresh_channels(&chat, None),
+                    Ok(Err(err)) if already_gone(&err) => refresh_channels(&chat, None),
+                    Ok(Err(err)) => show_alert(
+                        &chat,
+                        "Couldn't Add Them",
+                        &conversation_error_text(
+                            &err,
+                            "Only an owner or admin can add members.",
+                            "No one has that handle.",
+                            "That didn't work. Try again.",
+                        ),
+                    ),
+                    Err(_) => {}
                 }
             });
         }
@@ -4150,5 +4369,126 @@ mod mention_tests {
         assert_eq!(badge_texts(3, 1), ("@1".into(), "3".into()));
         // A count that lags the mentions never shows fewer.
         assert_eq!(badge_texts(0, 2), ("@2".into(), "2".into()));
+    }
+}
+
+#[cfg(test)]
+mod typing_tests {
+    use super::*;
+
+    const S: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn the_line_names_one_two_or_several_and_expires() {
+        let t0 = Instant::now();
+        let mut state = TypingState::default();
+        assert_eq!(state.line(t0), None);
+        state.note("a", "Ann", t0);
+        assert_eq!(state.line(t0).as_deref(), Some("Ann is typing\u{2026}"));
+        state.note("b", "Bob", t0 + S);
+        assert_eq!(
+            state.line(t0 + S).as_deref(),
+            Some("Ann and Bob are typing\u{2026}")
+        );
+        state.note("c", "Cy", t0 + S);
+        assert_eq!(
+            state.line(t0 + S).as_deref(),
+            Some("Several people are typing\u{2026}")
+        );
+        // Ann's last event was 4 s ago: only Bob and Cy are left.
+        assert_eq!(
+            state.line(t0 + 4 * S).as_deref(),
+            Some("Bob and Cy are typing\u{2026}")
+        );
+        assert_eq!(state.next_expiry(t0 + 4 * S), Some(S));
+        assert_eq!(state.line(t0 + 6 * S), None);
+    }
+
+    #[test]
+    fn a_new_event_renews_the_same_person() {
+        let t0 = Instant::now();
+        let mut state = TypingState::default();
+        state.note("a", "Ann", t0);
+        state.note("a", "Ann", t0 + 3 * S);
+        assert_eq!(
+            state.line(t0 + 6 * S).as_deref(),
+            Some("Ann is typing\u{2026}")
+        );
+        assert_eq!(state.live(t0 + 6 * S).count(), 1);
+    }
+
+    #[test]
+    fn their_message_clears_them_and_ignores_the_notice_just_before_it() {
+        let t0 = Instant::now();
+        let mut state = TypingState::default();
+        state.note("a", "Ann", t0);
+        state.clear("a", t0 + S);
+        assert_eq!(state.line(t0 + S), None);
+        // The typing request that raced their message: dropped.
+        state.note("a", "Ann", t0 + S + Duration::from_millis(500));
+        assert_eq!(state.line(t0 + 2 * S), None);
+        // A real one for their next message, after the window: shown.
+        state.note("a", "Ann", t0 + 4 * S);
+        assert_eq!(
+            state.line(t0 + 4 * S).as_deref(),
+            Some("Ann is typing\u{2026}")
+        );
+    }
+
+    #[test]
+    fn switching_channels_forgets_everyone() {
+        let t0 = Instant::now();
+        let mut state = TypingState::default();
+        state.note("a", "Ann", t0);
+        state.clear("b", t0);
+        state.reset();
+        assert_eq!(state.line(t0), None);
+        state.note("b", "Bob", t0);
+        assert!(state.line(t0).is_some(), "no stale last-message window");
+    }
+}
+
+#[cfg(test)]
+mod conversation_error_tests {
+    use super::*;
+
+    fn api(code: &str) -> brook_core::Error {
+        brook_core::Error::Api {
+            code: code.into(),
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_handle_is_trimmed_and_loses_its_at_sign() {
+        assert_eq!(clean_handle("  @ana "), "ana");
+        assert_eq!(clean_handle("ana"), "ana");
+        assert_eq!(clean_handle("@@ana"), "ana");
+        assert_eq!(clean_handle(" @ "), "");
+    }
+
+    #[test]
+    fn what_already_happened_isnt_reported() {
+        assert!(already_gone(&api("not_found")));
+        assert!(!already_gone(&api("authz.forbidden")));
+        assert!(!already_gone(&brook_core::Error::UnexpectedResponse));
+    }
+
+    #[test]
+    fn a_failed_conversation_action_says_why() {
+        let text = |e: &brook_core::Error| {
+            conversation_error_text(e, "Only admins.", "Bad input.", "Try again.")
+        };
+        assert_eq!(text(&api("authz.forbidden")), "Only admins.");
+        assert_eq!(text(&api("validation.error")), "Bad input.");
+        assert_eq!(text(&api("whatever")), "Try again.");
+        assert_eq!(
+            text(&brook_core::Error::NotAuthenticated),
+            "You were signed out."
+        );
+        assert_eq!(
+            text(&brook_core::Error::Timeout),
+            "Couldn't reach the server."
+        );
     }
 }
