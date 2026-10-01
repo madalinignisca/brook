@@ -443,4 +443,138 @@ mod live_local_data {
         assert!(files > 0, "the stores should have written files");
         assert!(found.is_empty(), "readable on disk: {found:?}");
     }
+
+    /// Attachments end to end on the real keyring and a real server: a file goes out through
+    /// the outbox, is kept available offline, and is then saved from the cache (which never
+    /// touches the network), byte for byte, while the cache's blobs on disk hold none of it.
+    /// Same `BROOK_LIVE_*` as above.
+    /// cargo test -p brook-gnome -- --ignored attachment_is_kept_offline_and_ciphertext
+    #[test]
+    #[ignore = "touches the desktop keyring and a live server"]
+    fn attachment_is_kept_offline_and_ciphertext() {
+        use brook_core::{FileCacheState, OutgoingFile, TransferId};
+        // RUST_LOG=brook_core=debug shows why core refused something.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+
+        let (Ok(server), Ok(handle), Ok(password), Ok(channel)) = (
+            std::env::var("BROOK_LIVE_SERVER"),
+            std::env::var("BROOK_LIVE_HANDLE"),
+            std::env::var("BROOK_LIVE_PASSWORD"),
+            std::env::var("BROOK_LIVE_CHANNEL"),
+        ) else {
+            eprintln!("BROOK_LIVE_* not set: skipped");
+            return;
+        };
+        let slot = Arc::new(SecretServiceSlot::new());
+        if !slot.available() {
+            eprintln!("no unlocked keyring: skipped");
+            return;
+        }
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("brook-live-files-{pid}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 3 MiB: more than one encrypted chunk (1 MiB each), with a marker repeated through it.
+        let marker = format!("FILECHECK-{pid}-needle");
+        let mut content = Vec::new();
+        while content.len() < 3 * 1024 * 1024 {
+            content.extend_from_slice(marker.as_bytes());
+            content.extend_from_slice(&(content.len() as u64).to_le_bytes());
+        }
+        let source = dir.join("source.bin");
+        std::fs::write(&source, &content).unwrap();
+        let caption = format!("attachment-check-{pid}");
+        let data_dir = dir.join("data");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let saved = rt.block_on(async {
+            let client = Arc::new(
+                BrookClient::new(CoreConfig::with_options(&server, true).unwrap()).unwrap(),
+            );
+            client.enable_persistence(slot.clone(), data_dir.clone());
+            assert!(
+                client
+                    .enable_local_data(slot.clone(), data_dir.clone())
+                    .await
+            );
+            assert!(matches!(
+                client.login(&handle, &password).await.unwrap(),
+                LoginOutcome::LoggedIn(_)
+            ));
+            client.start_realtime().await.unwrap();
+            client
+                .send_queued_with_files(
+                    &channel,
+                    &caption,
+                    None,
+                    None,
+                    vec![OutgoingFile {
+                        path: source.clone(),
+                        filename: "source.bin".into(),
+                        content_type: "application/octet-stream".into(),
+                        transfer_id: Some(TransferId::new()),
+                    }],
+                )
+                .await
+                .unwrap();
+            // The server has it: its message carries the file.
+            let mut file_id = None;
+            for _ in 0..60 {
+                let history = client.channel_history(&channel, None).await.unwrap();
+                if let Some(file) = history
+                    .iter()
+                    .find(|m| m.body == caption)
+                    .and_then(|m| m.attachments.first())
+                {
+                    assert_eq!(file.size, content.len() as u64, "the server's size");
+                    file_id = Some(file.id.clone());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let file_id = file_id.expect("the file should reach the server");
+            // The cache indexes a file through its message: wait until it holds this one.
+            let mut cached = false;
+            for _ in 0..40 {
+                if let Ok(page) = client.cached_messages(&channel, None, 50).await {
+                    if page.messages.iter().any(|m| m.body == caption) {
+                        cached = true;
+                        break;
+                    }
+                }
+                let _ = client.load_head(&channel, 50).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert!(cached, "the message should reach the cache");
+            // Keep it offline, and wait until it is complete in the cache.
+            client.pin_file(&file_id).await.unwrap();
+            let mut pinned = false;
+            for _ in 0..80 {
+                if let Ok(FileCacheState::Pinned { cached: true, .. }) =
+                    client.file_state(&file_id).await
+                {
+                    pinned = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert!(pinned, "the pinned file should be complete in the cache");
+            // Saving from the cache: no network involved, and the bytes are the original's.
+            let target = dir.join("saved.bin");
+            assert!(client.save_cached_file(&file_id, &target).await.unwrap());
+            client.logout().await;
+            client.close_local_data().await;
+            std::fs::read(&target).unwrap()
+        });
+        assert_eq!(saved.len(), content.len());
+        assert!(saved == content, "the saved copy differs from the original");
+        // Nothing the cache wrote (the data dir) holds the file's bytes or a plain database.
+        let (mut found, mut files) = (Vec::new(), 0);
+        plaintext(&data_dir, &marker, &mut found, &mut files);
+        println!("scanned {files} files under {}", data_dir.display());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(files > 0, "the stores should have written files");
+        assert!(found.is_empty(), "readable on disk: {found:?}");
+    }
 }
