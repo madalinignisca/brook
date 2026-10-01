@@ -3,8 +3,9 @@
 A native GTK 4 / libadwaita client. It is not a static binary (no GUI toolkit can be:
 graphics drivers are loaded from your system), so it needs these libraries from your
 distribution: GTK 4.14+, libadwaita 1.5+, GStreamer 1.20+ and OpenSSL 3. There are two
-builds: `linux-<arch>` for glibc distributions (glibc 2.39+) and `linux-musl-<arch>` for
-Alpine. Each release is checked on Debian 13, Ubuntu 26.04 and Alpine 3.24 before it is
+builds: `linux-<arch>` for glibc distributions (glibc 2.39+, so Debian 12 and older,
+Ubuntu 22.04 and older, and RHEL 9 and older cannot run it) and `linux-musl-<arch>` for
+Alpine. Each release is checked on Debian 13, Ubuntu 24.04, Ubuntu 26.04 and Alpine 3.24 before it is
 published.
 
 - **Fedora 40+:** `sudo dnf install gtk4 libadwaita gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugin-gtk4 gstreamer1-plugin-openh264 gstreamer1-plugin-libav libnice-gstreamer1 pipewire-gstreamer openssl-libs lcms2 libseccomp fontconfig`

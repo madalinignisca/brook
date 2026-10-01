@@ -100,4 +100,7 @@ echo "ok (still running after ${elapsed}s)"
 if grep -E 'panicked at|-CRITICAL' "$work/out.log"; then
   echo "FAIL: the app logged a panic or critical" >&2; exit 1
 fi
+# The documented removal must take the app away again (INSTALL.md: ./install.sh --uninstall).
+(cd "$work"/brook-gnome-*/ && ./install.sh --uninstall)
+[ ! -e "$bin" ] || { echo "FAIL: --uninstall left $bin behind" >&2; exit 1; }
 echo "PASS $PRETTY_NAME"
