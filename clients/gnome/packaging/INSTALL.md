@@ -6,8 +6,9 @@ distribution: GTK 4.14+, libadwaita 1.5+, GStreamer 1.20+ and OpenSSL 3. There a
 builds: `linux-<arch>` for glibc distributions (glibc 2.39+) and `linux-musl-<arch>` for
 Alpine. Each release is checked on Debian 13, Ubuntu 26.04 and Alpine 3.24 before it is
 published. **Supported: Debian 13 and Ubuntu 26.04** (plus Alpine 3.24 for the musl build).
-Older releases (Debian 12 and earlier, Ubuntu 24.04 and earlier) are not supported: their
-libraries are older than the build needs, and the tarballs are not tested there.
+Older releases are not supported. Debian 12 and earlier have libraries older than the build
+needs (glibc 2.39+, GTK 4.14+, libadwaita 1.5+). Ubuntu 24.04 and earlier are out by decision, not
+because of its libraries: the tarballs are not tested there, so whether they run is not promised.
 
 - **Fedora 40+:** `sudo dnf install gtk4 libadwaita gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugin-gtk4 gstreamer1-plugin-openh264 gstreamer1-plugin-libav libnice-gstreamer1 pipewire-gstreamer openssl-libs lcms2 libseccomp fontconfig`
 - **Ubuntu 26.04 / Debian 13:** `sudo apt install libgtk-4-1 libadwaita-1-0 gstreamer1.0-plugins-{base,good,bad,ugly} gstreamer1.0-libav gstreamer1.0-nice gstreamer1.0-gtk4 gstreamer1.0-pipewire libssl3t64 liblcms2-2 libseccomp2 libfontconfig1`
