@@ -156,7 +156,7 @@ final class ChannelOrderTests: XCTestCase {
         XCTAssertEqual(ids(model), ["c3", "c1", "c2"], "the live message re-sorted a second time")
     }
 
-    func testTheCacheNoticeAfterItsLiveMessageForTheOpenConversationStillReSorts() async {
+    func testTheCacheNoticeBeforeItsLiveMessageForTheOpenConversationStillLetsTheLiveMessageReSort() async {
         let (client, model) = await started(cached: cache(["c1": "m5", "c2": "m5", "c3": "m1"]))
         model.openChannel = "c3"
         client.cached = cache(["c1": "m5", "c2": "m5", "c3": "m8"])
@@ -164,6 +164,91 @@ final class ChannelOrderTests: XCTestCase {
         XCTAssertEqual(ids(model), ["c1", "c2", "c3"])
         live(model, "m8", in: "c3") // not swallowed by the key the notice raised
         XCTAssertEqual(ids(model), ["c3", "c1", "c2"])
+    }
+
+    func testABackFillNoticeAfterSeveralReSortsAndOpensMovesNoRow() async {
+        let (client, model) = await started(cached: cache(["c1": "m5", "c2": "m5", "c3": nil]))
+        model.openChannel = "c1" // A: its back-fill is still running
+        model.openChannel = "c2" // B
+        live(model, "m9", in: "c3") // a re-sort that must not forget A
+        let after = ids(model)
+        XCTAssertEqual(after.first, "c3")
+        client.cached = cache(["c1": "m7", "c2": "m5", "c3": "m9"]) // A's back-fill lands
+        await model.cacheChannelsChanged()
+        XCTAssertEqual(ids(model), after, "A's own back-fill moved it after a re-sort")
+    }
+
+    func testTheOpenConversationsLaterNoticesMoveNoRowEvenOnceConsumedAndAfterAReSort() async {
+        let (client, model) = await started(cached: cache(["c1": "m5", "c2": "m5", "c3": "m1"]))
+        model.openChannel = "c3"
+        live(model, "m6", in: "c1") // a re-sort from another conversation
+        let after = ids(model)
+        client.cached = cache(["c1": "m6", "c2": "m5", "c3": "m7"]) // c3's back-fill, consumed
+        await model.cacheChannelsChanged()
+        XCTAssertEqual(ids(model), after)
+        client.cached = cache(["c1": "m6", "c2": "m5", "c3": "m8"]) // more of it, c3 still open
+        await model.cacheChannelsChanged()
+        XCTAssertEqual(ids(model), after, "the open conversation's back-fill moved it")
+    }
+
+    func testANoticeThatMovedAKeyIsConsumedSoALaterOneForAClosedConversationReSorts() async {
+        let (client, model) = await started(cached: cache(["c1": "m5", "c2": "m5", "c3": "m1"]))
+        model.openChannel = "c3"
+        client.cached = cache(["c1": "m5", "c2": "m5", "c3": "m7"]) // the back-fill, consumed
+        await model.cacheChannelsChanged()
+        XCTAssertEqual(ids(model), ["c1", "c2", "c3"])
+        model.openChannel = "c2" // c3 is no longer open
+        client.cached = cache(["c1": "m5", "c2": "m5", "c3": "m8"])
+        await model.cacheChannelsChanged()
+        XCTAssertEqual(ids(model).first, "c3", "a consumed back-fill still hid c3's later news")
+    }
+
+    func testALiveMessageEndsTheWaitForTheBackFillSoALaterNoticeReSorts() async {
+        let (client, model) = await started(cached: cache(["c1": "m5", "c2": "m5", "c3": "m1"]))
+        model.openChannel = "c3"
+        model.openChannel = "c2"
+        live(model, "m6", in: "c3")
+        live(model, "m7", in: "c1")
+        XCTAssertEqual(ids(model).prefix(2), ["c1", "c3"])
+        client.cached = cache(["c1": "m7", "c2": "m5", "c3": "m8"])
+        await model.cacheChannelsChanged()
+        XCTAssertEqual(ids(model).first, "c3", "c3 was still waiting for a back-fill after its live message")
+    }
+
+    func testANoticeRaisingTheKeyOfAChannelNotInTheListReSortsNothing() async {
+        let (client, model) = await started(cached: cache(["c1": "m5", "c2": "m5", "c3": "m5"]))
+        model.openChannel = "c3" // pending: the next re-sort would put c3 first
+        client.cached = cache(["c1": "m5", "c2": "m5", "c3": "m5", "c9": "m9"])
+        await model.cacheChannelsChanged()
+        XCTAssertEqual(ids(model), ["c1", "c2", "c3"], "a channel with no row re-sorted the list")
+    }
+
+    func testAnEmptyOfflineListKeepsTheSavedRanks() async {
+        let (client, first) = await started()
+        first.openChannel = "c1"
+        first.openChannel = "c2"
+        let key = defaults.dictionaryRepresentation().keys.first { $0.hasPrefix("ChannelOpenedRanks.") }
+        let saved = defaults.dictionary(forKey: key!) as? [String: Int]
+        XCTAssertEqual(saved?.count, 2)
+        client.listFails = true
+        client.cached = []
+        await first.reloadList() // network failed and the cache is empty
+        XCTAssertTrue(first.channels.isEmpty)
+        XCTAssertEqual(defaults.dictionary(forKey: key!) as? [String: Int], saved, "saved ranks erased")
+        client.listFails = false
+        client.cached = nil
+        await first.reloadList()
+        XCTAssertEqual(ids(first), ["c2", "c1", "c3"], "ranks lost in memory")
+        client.listFails = true
+        client.cached = cache(["c1": nil]) // a stale cache without c2 and c3 is no proof they are gone
+        await first.reloadList()
+        client.listFails = false
+        client.cached = nil
+        await first.reloadList()
+        XCTAssertEqual(defaults.dictionary(forKey: key!) as? [String: Int], saved, "an offline list pruned the ranks")
+        client.channels = []
+        await first.reloadList() // an empty list prunes nothing either
+        XCTAssertEqual(defaults.dictionary(forKey: key!) as? [String: Int], saved, "an empty list pruned the ranks")
     }
 
     func testTheLiveMessageBeforeItsCacheNoticeReSortsOnce() async {

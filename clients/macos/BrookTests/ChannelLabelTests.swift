@@ -75,6 +75,7 @@ final class ChannelLabelTests: XCTestCase {
         ])
         XCTAssertEqual(model.channels.map(\.id), ["d1", "d2"])
         XCTAssertEqual(model.channels.map(\.label), ["Amy", "Zed"])
+        model.openChannel = "d2" // a pending rank: a re-sort now would put d2 first
         model.showUsernames = true
         XCTAssertEqual(model.channels.map(\.label), ["@zoe", "@amy"])
         XCTAssertEqual(model.channels.map(\.id), ["d1", "d2"], "the preference moved a row")

@@ -61,9 +61,11 @@ final class ChannelsModel {
     /// channel id → when this device opened it (higher is later), saved per account.
     private var opened: [String: Int] = [:]
     private var nextRank = 1
-    /// Opened since the last re-sort: their history back-fill raises their own key without
-    /// moving them, even once another conversation has been opened.
-    private var openedSinceSort: Set<String> = []
+    /// Opened, and the history back-fill that opening starts has not been seen yet: it raises
+    /// the channel's own key without moving it, even once other conversations were opened or
+    /// the list re-sorted meanwhile. A channel leaves when a notice has moved its key (the
+    /// back-fill, consumed) or when a live message for it arrives; a re-sort does not clear it.
+    private var awaitingBackfill: Set<String> = []
 
     init(client: any FfiBrookClientProtocol, me: String? = nil, notifier: (any Notifying)? = nil,
          isActive: @escaping @MainActor () -> Bool = { AppActivity.isActive },
@@ -105,12 +107,14 @@ final class ChannelsModel {
         let mine = generation
         var rows: [ChannelRow]?
         var keys: [String: String] = [:]
+        var fromNetwork = false
         if let list = try? await client.listChannels() {
             let counts = await cachedCounts()
             rows = list.map {
                 ChannelRow($0, unread: counts[$0.id]?.unread ?? 0, mentions: counts[$0.id]?.mentions)
             }
             keys = counts.compactMapValues(\.last)
+            fromNetwork = true
         } else if let cached = try? await offline?.cachedChannels() {
             rows = cached.map(ChannelRow.init)
             keys = Dictionary(cached.compactMap { c in c.lastMessageId.map { (c.id, $0) } }, uniquingKeysWith: max)
@@ -129,8 +133,10 @@ final class ChannelsModel {
         // After the generation check, so a superseded read leaves the keys alone. `max`: the
         // cache may be behind what a live message already told us.
         raiseKeys(keys)
+        // Only a network list says a channel is gone: an offline read (even an empty cache)
+        // must not erase the saved ranks.
         let present = Set(channels.map(\.id))
-        if opened.keys.contains(where: { !present.contains($0) }) {
+        if fromNetwork, !channels.isEmpty, opened.keys.contains(where: { !present.contains($0) }) {
             opened = opened.filter { present.contains($0.key) }
             saveRanks()
         }
@@ -157,7 +163,6 @@ final class ChannelsModel {
         let rank = Dictionary(sidebarOrder(entries: entries).enumerated().map { ($1, $0) }, uniquingKeysWith: { a, _ in a })
         channels.sort { (rank[$0.id] ?? 0) < (rank[$1.id] ?? 0) }
         sorted = activity
-        openedSinceSort = []
     }
 
     private static func ranksKey(_ me: String?) -> String? {
@@ -168,7 +173,7 @@ final class ChannelsModel {
     private func markOpened(_ id: String) {
         opened[id] = nextRank
         nextRank += 1
-        openedSinceSort.insert(id)
+        awaitingBackfill.insert(id)
         saveRanks()
     }
 
@@ -194,13 +199,13 @@ final class ChannelsModel {
             if let n = counts[channels[i].id] { (channels[i].unread, channels[i].unreadMentions) = (n.unread, n.mentions) }
         }
         let moved = raiseKeys(counts.compactMapValues(\.last))
-        // The open conversation, and ones opened since the last re-sort, raise their own key
-        // while their history back-fills: that is not news, and moving the row under the
-        // pointer would be a jump.
+        // The open conversation, and ones opened whose back-fill has not been seen, raise their
+        // own key while their history back-fills: that is not news, and moving the row under
+        // the pointer would be a jump.
         let listed = Set(channels.map(\.id))
-        if moved.contains(where: { listed.contains($0) && $0 != openChannel && !openedSinceSort.contains($0) }) {
-            resort()
-        }
+        let news = moved.contains { listed.contains($0) && $0 != openChannel && !awaitingBackfill.contains($0) }
+        awaitingBackfill.subtract(moved) // the notice that moved a key is the back-fill, consumed
+        if news { resort() }
     }
 
     /// Removed from these channels: gone from the list, and the open one closes.
@@ -258,6 +263,7 @@ final class ChannelsModel {
         let id = message.channelId
         let moves = activityMoves(current: sorted[id], messageId: message.id)
         raiseKeys([id: message.id])
+        awaitingBackfill.remove(id) // news of its own: any later notice is the cache catching up
         if moves, channels.contains(where: { $0.id == id }) { resort() }
     }
 
