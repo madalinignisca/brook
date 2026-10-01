@@ -605,7 +605,7 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         chat.send_button.set_sensitive(false);
                         chat.attach_button.set_sensitive(false);
                         chat.channel_settings.set_visible(false);
-                        show_management(&chat, false, false);
+                        show_management(&chat, ManageShown::default());
                         chat.call_button.set_sensitive(false);
                     }
                     refresh_channels(&chat, None);
@@ -743,8 +743,10 @@ fn apply_channel_chrome(chat: &Rc<Chat>, channel_id: &str) {
     chat.channel_settings.set_visible(!is_dm);
     // Add member, rename, archive and delete: the owner or a global admin (as the server
     // allows it), never in a DM.
-    let manage = !is_dm && may_manage(*chat.is_admin.borrow(), my_role.as_deref());
-    show_management(chat, manage, archived);
+    show_management(
+        chat,
+        management_shown(is_dm, *chat.is_admin.borrow(), my_role.as_deref(), archived),
+    );
     // While files are being copied the composer waits (a reload mustn't unlock it).
     let open = !archived && !chat.preparing.get();
     chat.composer.set_sensitive(open);
@@ -1956,17 +1958,42 @@ fn may_manage(admin: bool, my_role: Option<&str>) -> bool {
     admin || my_role == Some("owner")
 }
 
-/// Show or hide what only managers are offered; the archive toggle follows the channel's state.
-fn show_management(chat: &Rc<Chat>, manage: bool, archived: bool) {
+/// What of the manager-only widgets to show.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ManageShown {
+    /// Add member, Rename and Delete.
+    whole: bool,
+    archive: bool,
+    unarchive: bool,
+}
+
+/// What a viewer is offered in the open channel: nothing in a DM (the server refuses it, 422)
+/// or without management rights; Archive for an open channel and Unarchive for an archived one.
+fn management_shown(
+    is_dm: bool,
+    admin: bool,
+    my_role: Option<&str>,
+    archived: bool,
+) -> ManageShown {
+    let manage = !is_dm && may_manage(admin, my_role);
+    ManageShown {
+        whole: manage,
+        archive: manage && !archived,
+        unarchive: manage && archived,
+    }
+}
+
+/// Show or hide what only managers are offered.
+fn show_management(chat: &Rc<Chat>, shown: ManageShown) {
     let widgets = chat.manage.borrow();
     for widget in &widgets.whole {
-        widget.set_visible(manage);
+        widget.set_visible(shown.whole);
     }
     if let Some(archive) = &widgets.archive {
-        archive.set_visible(manage && !archived);
+        archive.set_visible(shown.archive);
     }
     if let Some(unarchive) = &widgets.unarchive {
-        unarchive.set_visible(manage && archived);
+        unarchive.set_visible(shown.unarchive);
     }
 }
 
@@ -4213,7 +4240,7 @@ mod mention_tests {
 
 #[cfg(test)]
 mod manage_tests {
-    use super::may_manage;
+    use super::{management_shown, may_manage, ManageShown, QUICK_EMOJI};
 
     #[test]
     fn an_admin_or_the_channels_owner_manages_it() {
@@ -4223,5 +4250,43 @@ mod manage_tests {
         assert!(!may_manage(false, Some("member")));
         // Roles unknown (an older server) and not an admin: nothing is offered.
         assert!(!may_manage(false, None));
+    }
+
+    #[test]
+    fn a_dm_offers_nothing_and_archive_follows_the_state() {
+        // A DM: not even an admin or an owner (the server answers 422).
+        assert_eq!(
+            management_shown(true, true, Some("owner"), false),
+            ManageShown::default()
+        );
+        // A plain member of a channel.
+        assert_eq!(
+            management_shown(false, false, Some("member"), false),
+            ManageShown::default()
+        );
+        // An owner of an open channel: Archive, not Unarchive.
+        assert_eq!(
+            management_shown(false, false, Some("owner"), false),
+            ManageShown {
+                whole: true,
+                archive: true,
+                unarchive: false
+            }
+        );
+        // An admin of an archived channel: Unarchive, not Archive.
+        assert_eq!(
+            management_shown(false, true, None, true),
+            ManageShown {
+                whole: true,
+                archive: false,
+                unarchive: true
+            }
+        );
+    }
+
+    #[test]
+    fn the_quick_heart_is_the_emoji_form_the_mac_and_kde_send() {
+        // The server keys reactions on the exact string: a bare U+2764 would be another one.
+        assert_eq!(QUICK_EMOJI[1], "\u{2764}\u{fe0f}");
     }
 }
