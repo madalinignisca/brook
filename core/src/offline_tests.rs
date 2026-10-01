@@ -479,7 +479,7 @@ mod client {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::test_support::TestServer;
+    use crate::test_support::{FlakyLink, TestServer};
     use crate::{BrookClient, CoreConfig, InMemoryKeySlot, KeySlot, LoginOutcome};
 
     async fn active(c: &BrookClient) -> bool {
@@ -679,5 +679,52 @@ mod client {
             ),
             "the cache is still open"
         );
+    }
+
+    /// Wait (bounded) until the cache state satisfies `f`.
+    async fn state_is(c: &BrookClient, what: &str, f: impl Fn(&crate::cache::CacheState) -> bool) {
+        let mut rx = c.subscribe_cache_state();
+        tokio::time::timeout(Duration::from_secs(8), rx.wait_for(|s| f(s)))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+            .unwrap();
+    }
+
+    /// Signed in, local data on, the socket up and a sync done.
+    async fn synced_over(
+        server: &mut TestServer,
+        link: &FlakyLink,
+        dir: &std::path::Path,
+    ) -> (BrookClient, crate::test_support::WsPeer) {
+        let slot: Arc<dyn KeySlot> = Arc::new(InMemoryKeySlot::default());
+        let c = BrookClient::new(CoreConfig::new(&link.base).unwrap()).unwrap();
+        assert!(c.enable_local_data(slot, dir.to_path_buf()).await);
+        c.login("alice", "pw").await.unwrap();
+        c.start_realtime().await.unwrap();
+        let mut peer = server.accept().await;
+        peer.accept_auth().await;
+        state_is(&c, "the first sync", |s| {
+            s.last_synced.is_some() && !s.offline
+        })
+        .await;
+        (c, peer)
+    }
+
+    /// The connection drops and the server can't be reached: the banner state comes on at
+    /// once, not at the next periodic sync (300 s away). A sync after the reconnect clears it.
+    #[tokio::test]
+    async fn losing_the_connection_sets_offline_and_reconnecting_clears_it() {
+        let mut server = TestServer::start().await;
+        let link = FlakyLink::to(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (c, _peer) = synced_over(&mut server, &link, dir.path()).await;
+
+        link.cut();
+        state_is(&c, "offline after the drop", |s| s.offline).await;
+
+        link.restore();
+        let mut peer = server.accept().await; // the socket reconnects by itself
+        peer.accept_auth().await;
+        state_is(&c, "online after the reconnect", |s| !s.offline).await;
     }
 }

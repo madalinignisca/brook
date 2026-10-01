@@ -173,6 +173,7 @@ impl TestServer {
             .route("/api/v1/auth/logout", post(logout))
             .route("/api/v1/users", get(list_users))
             .route("/api/v1/users/{id}/password", post(reset_password))
+            .route("/api/v1/sync", get(sync_page))
             .route("/ws", get(ws_upgrade))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -777,6 +778,65 @@ async fn refresh(State(state): State<Shared>, Json(body): Json<Value>) -> Respon
             ),
         )
             .into_response(),
+    }
+}
+
+/// `/sync`: an empty page, already caught up.
+async fn sync_page() -> Response {
+    Json(json!({
+        "channels": [], "removed_channels": [], "left_members": [], "users": [],
+        "messages": [], "memberships": [], "next": "1", "more": false,
+    }))
+    .into_response()
+}
+
+/// A TCP hop between a client and a [`TestServer`] that a test can cut, as Wi-Fi going off
+/// does: open connections die and new ones are dropped on arrival, so requests fail with a
+/// network error (not an HTTP status). The client's origin is `base`.
+pub struct FlakyLink {
+    pub base: String,
+    down: Arc<std::sync::atomic::AtomicBool>,
+    /// Aborting these closes both halves of every relayed connection.
+    relays: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl FlakyLink {
+    pub async fn to(server: &TestServer) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let target = server.base.trim_start_matches("http://").to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let down = Arc::new(AtomicBool::new(false));
+        let relays: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::default();
+        let (d, r) = (down.clone(), relays.clone());
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                if d.load(Ordering::SeqCst) {
+                    continue; // dropped: the client sees a reset
+                }
+                let target = target.clone();
+                let relay = tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+                r.lock().unwrap().push(relay);
+            }
+        });
+        Self { base, down, relays }
+    }
+
+    /// The network goes away.
+    pub fn cut(&self) {
+        self.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        for relay in self.relays.lock().unwrap().drain(..) {
+            relay.abort();
+        }
+    }
+
+    /// The network comes back (new connections are relayed again).
+    pub fn restore(&self) {
+        self.down.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

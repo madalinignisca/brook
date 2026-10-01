@@ -187,6 +187,11 @@ pub(crate) struct Transport {
     raw: broadcast::Sender<(String, Value)>,
 }
 
+/// Raw event `type` the socket task itself publishes when a connection ends. Not a server
+/// event: only the offline cache's pump consumes the raw feed, and it must handle this
+/// type before its catch-all (`cache.live_event`).
+pub(crate) const WS_DISCONNECTED: &str = "ws.disconnected";
+
 pub(crate) fn command_channel() -> (Commands, Transport) {
     let (tx, rx) = mpsc::channel(COMMAND_QUEUE);
     let (conn_tx, conn_rx) = watch::channel(Conn::default());
@@ -852,6 +857,13 @@ pub(crate) async fn run(
             &mut generation,
         )
         .await;
+        // The connection is gone (or never came up): tell the cache, which syncs soon and so
+        // learns whether the server is reachable. Without this it only finds out at the next
+        // periodic sync, minutes later. Sent on every run end, failed reconnects included:
+        // the cache debounces its syncs and the backoff below is at least a second.
+        let _ = transport
+            .raw
+            .send((WS_DISCONNECTED.to_string(), Value::Null));
         let rate_limited = matches!(end, Ok(RunEnd::RateLimited { .. }));
         match end {
             Ok(RunEnd::SessionChanged) => continue, // reconnect at once as the new identity
