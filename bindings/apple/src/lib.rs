@@ -3,6 +3,9 @@
 //! `brook-core` stays idiomatic Rust (it is used directly by the GNOME client); every
 //! FFI concern — the owned Tokio runtime, the listener callback, FFI-safe types — lives
 //! here. See `docs/superpowers/specs/2026-09-24-apple-ffi-bridge-design.md`.
+// async_trait expands each method to a boxed future (already #[must_use]) and a newer clippy
+// reports that as double_must_use on every async_trait trait; the macro owns the expansion.
+#![allow(clippy::double_must_use)]
 
 mod call;
 mod client;
