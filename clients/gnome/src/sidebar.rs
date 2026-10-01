@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 
-use brook_core::{activity_moves, conversation_label, sidebar_order, Channel, SidebarEntry};
+use brook_core::{
+    activity_moves, conversation_label, sidebar_order, sort_key, Channel, SidebarEntry,
+};
 
 /// Per-conversation activity and open order, for this device and this run.
 #[derive(Default)]
@@ -46,7 +48,7 @@ impl SidebarState {
         self.opened.insert(id.to_string(), self.counter);
     }
 
-    /// The conversation ids in sidebar order. The name key is the label with usernames off,
+    /// The conversation ids in sidebar order. The name key is core's `sort_key` (usernames off),
     /// so the "Show usernames" preference can never change the order.
     pub fn order(&self, channels: &[Channel], me: &str) -> Vec<String> {
         let entries: Vec<SidebarEntry> = channels
@@ -56,7 +58,7 @@ impl SidebarState {
                 kind: c.kind.clone(),
                 last_message_id: self.last.get(&c.id).cloned(),
                 opened: self.opened.get(&c.id).copied(),
-                sort_key: label(c, me, false).to_lowercase(),
+                sort_key: sort_key(&c.kind, c.name.as_deref(), &c.members, me),
             })
             .collect();
         sidebar_order(&entries)
