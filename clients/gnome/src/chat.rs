@@ -598,7 +598,7 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                                 .borrow()
                                 .iter()
                                 .find(|c| c.id == message.channel_id)
-                                .map(|c| c.title(&me))
+                                .map(|c| crate::sidebar::label(c, &me, chat.show_usernames.get()))
                                 .unwrap_or_else(|| "Brook".to_string());
                             let body = notification_body(&message, &me, &author);
                             notify(&message.channel_id, &title, &body);
@@ -3584,14 +3584,8 @@ fn redraw_authors(chat: &Rc<Chat>, ids: Vec<String>) {
         let Ok(Ok(users)) = handle.await else { return };
         let names: HashMap<String, String> = users
             .into_iter()
-            .map(|u| {
-                let name = if u.display_name.trim().is_empty() {
-                    u.handle
-                } else {
-                    u.display_name
-                };
-                (u.id, name)
-            })
+            // A blank name stays blank: `author_text` then names them `@handle`.
+            .map(|u| (u.id, u.display_name))
             .collect();
         for widgets in chat.message_rows.borrow().values() {
             if let Some(name) = names.get(&widgets.author_id) {
@@ -3670,8 +3664,14 @@ fn badges_from_cache(chat: &Rc<Chat>) {
             update_badge(&chat, i);
         }
         // What a catch-up brought is new activity too: re-sort once if it moved anything.
+        // Not the open channel: opening it loads its history into the cache, which is a
+        // back-fill (the conversation's old messages), not new activity, and must not make
+        // the row you just clicked jump.
         let mut moved = false;
-        for fresh in &cached {
+        for fresh in cached
+            .iter()
+            .filter(|f| current.as_deref() != Some(f.id.as_str()))
+        {
             moved |= chat
                 .sidebar
                 .borrow_mut()
