@@ -14,6 +14,13 @@ SLICES=(aarch64-apple-darwin)
 # Keep in step with Package.swift's `platforms`.
 export MACOSX_DEPLOYMENT_TARGET=26.0
 
+# Homebrew's rustup is a proxy that is not always on the PATH of a fresh terminal; `rustup which`
+# finds the toolchain's own bin directory, so cargo resolves the same way everywhere.
+command -v cargo >/dev/null || {
+  cargo_bin="$(rustup which cargo 2>/dev/null || true)"
+  [[ -n "$cargo_bin" ]] && export PATH="$(dirname "$cargo_bin"):$PATH"
+}
+command -v cargo >/dev/null || { echo "cargo not found (install Rust with rustup)" >&2; exit 1; }
 command -v xcodebuild >/dev/null || { echo "xcodebuild not found" >&2; exit 1; }
 for t in "${SLICES[@]}"; do
   rustup target list --installed | grep -qx "$t" || { echo "missing Rust target: $t (rustup target add $t)" >&2; exit 1; }
