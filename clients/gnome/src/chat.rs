@@ -3926,6 +3926,28 @@ fn badges_from_cache(chat: &Rc<Chat>) {
 
 /// The offline banner, from the cache's state (every few seconds), and the one-time
 /// clean-up of other accounts' saved data once this user's storage is open.
+/// How long the cache must stay offline before the banner says so.
+const OFFLINE_BANNER_DELAY: Duration = Duration::from_secs(3);
+
+/// What the banner does when the cache's offline flag changes (or is re-read).
+#[derive(Debug, PartialEq, Eq)]
+enum BannerStep {
+    /// Online: hide it at once (and cancel a pending reveal).
+    Hide,
+    /// Offline and not shown yet: show it if that lasts.
+    StartTimer,
+    /// Nothing to do (offline and already shown).
+    Keep,
+}
+
+fn banner_step(offline: bool, revealed: bool) -> BannerStep {
+    match (offline, revealed) {
+        (false, _) => BannerStep::Hide,
+        (true, false) => BannerStep::StartTimer,
+        (true, true) => BannerStep::Keep,
+    }
+}
+
 fn watch_offline(chat: &Rc<Chat>) {
     // Core's state feed (#113): it follows sign-ins and switches by itself and resets
     // to the default on sign-out, so the banner never shows a previous user's state.
@@ -3933,6 +3955,10 @@ fn watch_offline(chat: &Rc<Chat>) {
     let chat_weak = Rc::downgrade(chat);
     glib::spawn_future_local(async move {
         let mut checked_others = false;
+        // Whether the cache says offline now, and the timer that shows the banner once that
+        // has lasted (a flaky link flips the flag within seconds: not every flip is shown).
+        let offline_now = Rc::new(Cell::new(false));
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
         loop {
             let current = state.borrow_and_update().clone();
             let Some(chat) = chat_weak.upgrade() else {
@@ -3941,7 +3967,29 @@ fn watch_offline(chat: &Rc<Chat>) {
             if chat.offline_banner.root().is_none() {
                 break; // signed out: the view is gone
             }
-            chat.offline_banner.set_revealed(current.offline);
+            offline_now.set(current.offline);
+            match banner_step(current.offline, chat.offline_banner.is_revealed()) {
+                BannerStep::Hide => {
+                    if let Some(id) = pending.borrow_mut().take() {
+                        id.remove();
+                    }
+                    chat.offline_banner.set_revealed(false);
+                }
+                BannerStep::StartTimer if pending.borrow().is_none() => {
+                    let banner = chat.offline_banner.downgrade();
+                    let (offline_now, slot) = (offline_now.clone(), pending.clone());
+                    let id = glib::timeout_add_local_once(OFFLINE_BANNER_DELAY, move || {
+                        // Fired: forget the id first, so nothing removes a source that's gone.
+                        *slot.borrow_mut() = None;
+                        if let Some(banner) = banner.upgrade() {
+                            // Only if it is still offline by now.
+                            banner.set_revealed(offline_now.get());
+                        }
+                    });
+                    *pending.borrow_mut() = Some(id);
+                }
+                BannerStep::StartTimer | BannerStep::Keep => {}
+            }
             // The first completed sync means this user's storage is open: now is the
             // time to clear another account's saved data (#46 §8).
             if current.last_synced.is_some() && !checked_others {
@@ -4922,5 +4970,22 @@ mod manage_tests {
     fn the_quick_heart_is_the_emoji_form_the_mac_and_kde_send() {
         // The server keys reactions on the exact string: a bare U+2764 would be another one.
         assert_eq!(QUICK_EMOJI[1], "\u{2764}\u{fe0f}");
+    }
+}
+
+#[cfg(test)]
+mod offline_banner_tests {
+    use super::{banner_step, BannerStep};
+
+    #[test]
+    fn going_offline_waits_and_coming_back_hides_at_once() {
+        assert_eq!(banner_step(true, false), BannerStep::StartTimer);
+        assert_eq!(banner_step(true, true), BannerStep::Keep, "already shown");
+        assert_eq!(
+            banner_step(false, false),
+            BannerStep::Hide,
+            "cancels a pending reveal"
+        );
+        assert_eq!(banner_step(false, true), BannerStep::Hide);
     }
 }
