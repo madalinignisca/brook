@@ -240,7 +240,8 @@ enum ChannelTitle {
     static func of(_ channel: ChannelRow, me: String?) -> String {
         if let name = channel.name, !name.isEmpty { return name }
         func label(_ m: FfiMember) -> String { m.displayName.isEmpty ? m.handle : m.displayName }
-        if let other = channel.members.first(where: { $0.id != me }), !label(other).isEmpty {
+        if channel.kind == "dm", let me, !me.isEmpty,
+           let other = channel.members.first(where: { $0.id != me }), !label(other).isEmpty {
             return label(other)
         }
         let all = channel.members.map(label).filter { !$0.isEmpty }
