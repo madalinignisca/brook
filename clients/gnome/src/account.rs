@@ -14,6 +14,10 @@ use tokio::runtime::Handle;
 const MIN_LEN: usize = 8;
 const MAX_LEN: usize = 256;
 
+/// The password dialog's switch that ends other devices' sign-ins. Sign Out's help text names
+/// it, so both read from here.
+pub(crate) const SIGN_OUT_OTHERS_LABEL: &str = "Sign out of other devices";
+
 /// Local checks before anything is sent. Core maps every server 422 to one `validation` code,
 /// so the rules the server would refuse with a reason are checked here, where the reason can
 /// still be shown.
@@ -96,7 +100,7 @@ pub fn change_password_dialog(
         .title("Repeat new password")
         .build();
     let sign_out = adw::SwitchRow::builder()
-        .title("Sign out of other devices")
+        .title(SIGN_OUT_OTHERS_LABEL)
         .subtitle("Right away. This device stays signed in.")
         .active(true)
         .build();

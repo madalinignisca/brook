@@ -4052,10 +4052,23 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
             .label("Remove this device's data")
             .active(true)
             .build();
+        let options = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .build();
+        options.append(&remove);
+        options.append(
+            &gtk::Label::builder()
+                .label(lost_device_help(*chat.is_admin.borrow()))
+                .wrap(true)
+                .xalign(0.0)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
         let known = chat.local_open.get();
         let body = sign_out_body(unsent, known, true);
         let dialog = adw::AlertDialog::new(Some("Sign Out?"), Some(&body));
-        dialog.set_extra_child(Some(&remove));
+        dialog.set_extra_child(Some(&options));
         remove.connect_toggled({
             let dialog = dialog.clone();
             move |check| dialog.set_body(&sign_out_body(unsent, known, check.is_active()))
@@ -4074,6 +4087,25 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
         });
         dialog.present(Some(&chat.message_list));
     });
+}
+
+/// Under the checkbox (owner decision, #46 §8): a lost device's *account* access is cut off by
+/// ending its sign-in. The data already saved on it is not: it is encrypted with that device's
+/// own random key, held in that device's keyring, so it stays readable to whoever can sign in
+/// to that computer. The text says both. An admin can't be reset by another admin (the server
+/// refuses), so they're only told the password route.
+fn lost_device_help(admin: bool) -> String {
+    let switch = crate::account::SIGN_OUT_OTHERS_LABEL;
+    let reset = if admin {
+        ""
+    } else {
+        ", or ask an admin to reset your account"
+    };
+    format!(
+        "If you lose a device, change your password with \"{switch}\" on{reset}. That ends its \
+         sign-in, but messages already saved on it stay readable to anyone who can sign in to \
+         that computer."
+    )
 }
 
 /// What signing out does to this device's data, in words.
@@ -4587,6 +4619,93 @@ mod mention_tests {
 }
 
 #[cfg(test)]
+mod lost_device_help_tests {
+    use super::lost_device_help;
+    use crate::account::SIGN_OUT_OTHERS_LABEL;
+
+    #[test]
+    fn the_sign_out_help_names_the_ways_to_cut_off_a_lost_device() {
+        let member = lost_device_help(false);
+        assert!(member.contains("change your password"));
+        assert!(
+            member.contains(SIGN_OUT_OTHERS_LABEL),
+            "the switch's own label"
+        );
+        assert!(member.contains("ask an admin to reset your account"));
+    }
+
+    #[test]
+    fn the_help_doesnt_promise_protection_for_data_already_on_the_device() {
+        for admin in [false, true] {
+            let help = lost_device_help(admin);
+            assert!(help.contains("ends its sign-in, but"), "{help}");
+            assert!(help.contains("stay readable"), "{help}");
+        }
+    }
+
+    #[test]
+    fn an_admin_is_only_told_the_password_route() {
+        // The server refuses an admin resetting another admin (403).
+        let admin = lost_device_help(true);
+        assert!(admin.contains(SIGN_OUT_OTHERS_LABEL));
+        assert!(!admin.contains("admin"));
+    }
+}
+
+#[cfg(test)]
+mod manage_tests {
+    use super::{management_shown, may_manage, ManageShown, QUICK_EMOJI};
+
+    #[test]
+    fn an_admin_or_the_channels_owner_manages_it() {
+        assert!(may_manage(true, None));
+        assert!(may_manage(true, Some("member")));
+        assert!(may_manage(false, Some("owner")));
+        assert!(!may_manage(false, Some("member")));
+        // Roles unknown (an older server) and not an admin: nothing is offered.
+        assert!(!may_manage(false, None));
+    }
+
+    #[test]
+    fn a_dm_offers_nothing_and_archive_follows_the_state() {
+        // A DM: not even an admin or an owner (the server answers 422).
+        assert_eq!(
+            management_shown(true, true, Some("owner"), false),
+            ManageShown::default()
+        );
+        // A plain member of a channel.
+        assert_eq!(
+            management_shown(false, false, Some("member"), false),
+            ManageShown::default()
+        );
+        // An owner of an open channel: Archive, not Unarchive.
+        assert_eq!(
+            management_shown(false, false, Some("owner"), false),
+            ManageShown {
+                whole: true,
+                archive: true,
+                unarchive: false
+            }
+        );
+        // An admin of an archived channel: Unarchive, not Archive.
+        assert_eq!(
+            management_shown(false, true, None, true),
+            ManageShown {
+                whole: true,
+                archive: false,
+                unarchive: true
+            }
+        );
+    }
+
+    #[test]
+    fn the_quick_heart_is_the_emoji_form_the_mac_and_kde_send() {
+        // The server keys reactions on the exact string: a bare U+2764 would be another one.
+        assert_eq!(QUICK_EMOJI[1], "\u{2764}\u{fe0f}");
+    }
+}
+
+#[cfg(test)]
 mod typing_tests {
     use super::*;
 
@@ -4869,58 +4988,5 @@ mod error_hold_tests {
         );
         assert!(hold.holding(early), "still held");
         assert_eq!(hold.timer_fired(t0 + ERROR_SHOWN), HoldTimer::Over);
-    }
-}
-
-#[cfg(test)]
-mod manage_tests {
-    use super::{management_shown, may_manage, ManageShown, QUICK_EMOJI};
-
-    #[test]
-    fn an_admin_or_the_channels_owner_manages_it() {
-        assert!(may_manage(true, None));
-        assert!(may_manage(true, Some("member")));
-        assert!(may_manage(false, Some("owner")));
-        assert!(!may_manage(false, Some("member")));
-        // Roles unknown (an older server) and not an admin: nothing is offered.
-        assert!(!may_manage(false, None));
-    }
-
-    #[test]
-    fn a_dm_offers_nothing_and_archive_follows_the_state() {
-        // A DM: not even an admin or an owner (the server answers 422).
-        assert_eq!(
-            management_shown(true, true, Some("owner"), false),
-            ManageShown::default()
-        );
-        // A plain member of a channel.
-        assert_eq!(
-            management_shown(false, false, Some("member"), false),
-            ManageShown::default()
-        );
-        // An owner of an open channel: Archive, not Unarchive.
-        assert_eq!(
-            management_shown(false, false, Some("owner"), false),
-            ManageShown {
-                whole: true,
-                archive: true,
-                unarchive: false
-            }
-        );
-        // An admin of an archived channel: Unarchive, not Archive.
-        assert_eq!(
-            management_shown(false, true, None, true),
-            ManageShown {
-                whole: true,
-                archive: false,
-                unarchive: true
-            }
-        );
-    }
-
-    #[test]
-    fn the_quick_heart_is_the_emoji_form_the_mac_and_kde_send() {
-        // The server keys reactions on the exact string: a bare U+2764 would be another one.
-        assert_eq!(QUICK_EMOJI[1], "\u{2764}\u{fe0f}");
     }
 }
