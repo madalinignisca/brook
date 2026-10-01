@@ -21,7 +21,9 @@ use tokio::runtime::Handle;
 /// Quick-react emoji offered by the per-message reaction picker.
 const QUICK_EMOJI: [&str; 6] = [
     "\u{1f44d}",
-    "\u{2764}",
+    // With the emoji-presentation selector, as the Mac and KDE send it: the server keeps the
+    // string as sent, so a bare U+2764 would be a different reaction from theirs.
+    "\u{2764}\u{fe0f}",
     "\u{1f602}",
     "\u{1f389}",
     "\u{1f440}",
@@ -51,8 +53,10 @@ struct Chat {
     /// The reply banner shown above the composer while replying.
     reply_bar: gtk::Revealer,
     reply_label: gtk::Label,
-    /// Channel settings menu (rename/archive/delete); shown for managed channels.
+    /// Channel settings menu (members, leave, and for owners and admins rename/archive/delete).
     channel_settings: gtk::MenuButton,
+    /// What only an owner or an admin of the open channel is offered (see `show_management`).
+    manage: Rc<RefCell<ManageWidgets>>,
     /// "X is typing…" indicator above the composer, who is in it, and the timer that
     /// refreshes it when the first of them expires.
     typing_label: gtk::Label,
@@ -253,6 +257,7 @@ pub fn build(
         reply_bar: reply_bar.clone(),
         reply_label: reply_label.clone(),
         channel_settings: channel_settings.clone(),
+        manage: Rc::default(),
         typing_label: typing_label.clone(),
         typing: Rc::default(),
         error_hold: Rc::default(),
@@ -348,8 +353,13 @@ pub fn build(
         .icon_name("contact-new-symbolic")
         .tooltip_text("Add member to this channel")
         .popover(&add_member_popover(&chat))
+        .visible(false)
         .build();
     content_header.pack_end(&add_member_button);
+    chat.manage
+        .borrow_mut()
+        .whole
+        .push(add_member_button.clone().upcast());
     channel_settings.set_popover(Some(&channel_settings_popover(&chat)));
     content_header.pack_end(&channel_settings);
     content_header.pack_start(&call_button);
@@ -607,6 +617,7 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         chat.send_button.set_sensitive(false);
                         chat.attach_button.set_sensitive(false);
                         chat.channel_settings.set_visible(false);
+                        show_management(&chat, ManageShown::default());
                         chat.call_button.set_sensitive(false);
                     }
                     refresh_channels(&chat, None);
@@ -721,8 +732,15 @@ fn apply_channel_chrome(chat: &Rc<Chat>, channel_id: &str) {
         .borrow()
         .iter()
         .find(|c| c.id == channel_id)
-        .map(|c| (c.is_dm(), c.archived, c.title(&me)));
-    let Some((is_dm, archived, title)) = meta else {
+        .map(|c| {
+            let my_role = c
+                .members
+                .iter()
+                .find(|m| m.id == me)
+                .and_then(|m| m.role.clone());
+            (c.is_dm(), c.archived, c.title(&me), my_role)
+        });
+    let Some((is_dm, archived, title, my_role)) = meta else {
         return;
     };
     chat.title.set_title(&title);
@@ -735,6 +753,12 @@ fn apply_channel_chrome(chat: &Rc<Chat>, channel_id: &str) {
     });
     // Every member of a channel may leave it; DMs can't be left.
     chat.channel_settings.set_visible(!is_dm);
+    // Add member, rename, archive and delete: the owner or a global admin (as the server
+    // allows it), never in a DM.
+    show_management(
+        chat,
+        management_shown(is_dm, *chat.is_admin.borrow(), my_role.as_deref(), archived),
+    );
     // While files are being copied the composer waits (a reload mustn't unlock it).
     let open = !archived && !chat.preparing.get();
     chat.composer.set_sensitive(open);
@@ -1826,12 +1850,18 @@ fn channel_settings_popover(chat: &Rc<Chat>) -> gtk::Popover {
         .css_classes(["error"])
         .build();
     menu.append(&members);
-    // Renaming, archiving and deleting are for admins; everyone can see who's in and leave.
-    if *chat.is_admin.borrow() {
-        menu.append(&rename);
-        menu.append(&archive);
-        menu.append(&unarchive);
-        menu.append(&delete);
+    // Renaming, archiving and deleting are for owners and admins (shown per channel by
+    // `show_management`); everyone can see who's in and leave.
+    menu.append(&rename);
+    menu.append(&archive);
+    menu.append(&unarchive);
+    menu.append(&delete);
+    {
+        let mut manage = chat.manage.borrow_mut();
+        manage.whole.push(rename.clone().upcast());
+        manage.whole.push(delete.clone().upcast());
+        manage.archive = Some(archive.clone().upcast());
+        manage.unarchive = Some(unarchive.clone().upcast());
     }
     menu.append(&leave);
     popover.set_child(Some(&menu));
@@ -2024,6 +2054,61 @@ fn show_alert(chat: &Rc<Chat>, heading: &str, body: &str) {
 fn profile_fits(name: &str, status: &str) -> bool {
     let n = name.trim().chars().count();
     (1..=64).contains(&n) && status.trim().chars().count() <= 100
+}
+
+/// The widgets only an owner or an admin of the open channel is offered.
+#[derive(Default)]
+struct ManageWidgets {
+    /// Add member, Rename and Delete.
+    whole: Vec<gtk::Widget>,
+    /// Archive (an open channel) and Unarchive (an archived one).
+    archive: Option<gtk::Widget>,
+    unarchive: Option<gtk::Widget>,
+}
+
+/// Whether a viewer manages a channel (add members, rename, archive, delete): a global admin
+/// or its owner, as the server allows it (`_require_channel_admin`).
+fn may_manage(admin: bool, my_role: Option<&str>) -> bool {
+    admin || my_role == Some("owner")
+}
+
+/// What of the manager-only widgets to show.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ManageShown {
+    /// Add member, Rename and Delete.
+    whole: bool,
+    archive: bool,
+    unarchive: bool,
+}
+
+/// What a viewer is offered in the open channel: nothing in a DM (the server refuses it, 422)
+/// or without management rights; Archive for an open channel and Unarchive for an archived one.
+fn management_shown(
+    is_dm: bool,
+    admin: bool,
+    my_role: Option<&str>,
+    archived: bool,
+) -> ManageShown {
+    let manage = !is_dm && may_manage(admin, my_role);
+    ManageShown {
+        whole: manage,
+        archive: manage && !archived,
+        unarchive: manage && archived,
+    }
+}
+
+/// Show or hide what only managers are offered.
+fn show_management(chat: &Rc<Chat>, shown: ManageShown) {
+    let widgets = chat.manage.borrow();
+    for widget in &widgets.whole {
+        widget.set_visible(shown.whole);
+    }
+    if let Some(archive) = &widgets.archive {
+        archive.set_visible(shown.archive);
+    }
+    if let Some(unarchive) = &widgets.unarchive {
+        unarchive.set_visible(shown.unarchive);
+    }
 }
 
 /// Whether a viewer is offered Remove on a member, as the server allows it (#183): never
@@ -4784,5 +4869,58 @@ mod error_hold_tests {
         );
         assert!(hold.holding(early), "still held");
         assert_eq!(hold.timer_fired(t0 + ERROR_SHOWN), HoldTimer::Over);
+    }
+}
+
+#[cfg(test)]
+mod manage_tests {
+    use super::{management_shown, may_manage, ManageShown, QUICK_EMOJI};
+
+    #[test]
+    fn an_admin_or_the_channels_owner_manages_it() {
+        assert!(may_manage(true, None));
+        assert!(may_manage(true, Some("member")));
+        assert!(may_manage(false, Some("owner")));
+        assert!(!may_manage(false, Some("member")));
+        // Roles unknown (an older server) and not an admin: nothing is offered.
+        assert!(!may_manage(false, None));
+    }
+
+    #[test]
+    fn a_dm_offers_nothing_and_archive_follows_the_state() {
+        // A DM: not even an admin or an owner (the server answers 422).
+        assert_eq!(
+            management_shown(true, true, Some("owner"), false),
+            ManageShown::default()
+        );
+        // A plain member of a channel.
+        assert_eq!(
+            management_shown(false, false, Some("member"), false),
+            ManageShown::default()
+        );
+        // An owner of an open channel: Archive, not Unarchive.
+        assert_eq!(
+            management_shown(false, false, Some("owner"), false),
+            ManageShown {
+                whole: true,
+                archive: true,
+                unarchive: false
+            }
+        );
+        // An admin of an archived channel: Unarchive, not Archive.
+        assert_eq!(
+            management_shown(false, true, None, true),
+            ManageShown {
+                whole: true,
+                archive: false,
+                unarchive: true
+            }
+        );
+    }
+
+    #[test]
+    fn the_quick_heart_is_the_emoji_form_the_mac_and_kde_send() {
+        // The server keys reactions on the exact string: a bare U+2764 would be another one.
+        assert_eq!(QUICK_EMOJI[1], "\u{2764}\u{fe0f}");
     }
 }

@@ -50,7 +50,7 @@ final class NotificationsTests: XCTestCase {
     func testALiveMessageRaisesItsChannelsBadgeAndNotifiesOnce() async {
         let client = FakeRealtime(channels: [channel("c1", "general"), channel("c2", "random")])
         let notifier = FakeNotifier()
-        let model = ChannelsModel(client: client, me: "me", notifier: notifier, isActive: { true })
+        let model = ChannelsModel(client: client, me: "me", notifier: notifier, isActive: { true }, defaults: isolatedDefaults())
         await model.start()
         model.openChannel = "c1"
         model.handle(.messageNew(message: from("u9", "hi", channel: "c2")))
@@ -59,7 +59,7 @@ final class NotificationsTests: XCTestCase {
         model.handle(.messageNew(message: from("me", "mine", channel: "c2")))
         XCTAssertEqual(model.channels.map(\.unread), [0, 2])
         XCTAssertEqual(notifier.posted.map(\.channel), ["c2", "c2"])
-        XCTAssertEqual(notifier.posted.first?.title, "random")
+        XCTAssertEqual(notifier.posted.first?.title, "#random")
         XCTAssertEqual(notifier.posted.last?.body, "Bo: again")
     }
 

@@ -1,8 +1,8 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Install Brook for the current user (no root): the binary to ~/.local/bin and
 # the launcher to ~/.local/share/applications, the icon to the hicolor theme.
 # Re-run to upgrade; `./install.sh --uninstall` removes all three.
-set -euo pipefail
+set -eu
 here="$(cd "$(dirname "$0")" && pwd)"
 bin="${XDG_BIN_HOME:-$HOME/.local/bin}"
 data="${XDG_DATA_HOME:-$HOME/.local/share}"
