@@ -38,6 +38,10 @@ final class ReactionRulesTests: XCTestCase {
     }
 }
 
+/// Strictly rising, like the server's counter, so tests that don't care about order still apply.
+@MainActor private var seqCounter: Int64 = 0
+@MainActor private func nextSeq() -> Int64 { seqCounter += 1; return seqCounter }
+
 @MainActor
 final class TimelineReactionTests: XCTestCase {
     private func timeline(_ chat: FakeChat, me: String = "me") -> TimelineModel {
@@ -48,24 +52,37 @@ final class TimelineReactionTests: XCTestCase {
 
     func testAnEventForAMessageHereAdjustsItsChips() {
         let t = timeline(FakeChat())
-        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "bob", added: true, count: 2))
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "bob", added: true, count: 2, seq: nextSeq()))
         XCTAssertEqual(t.messages[0].reactions, [chip("👍", 2)])
         XCTAssertTrue(t.messages[1].reactions.isEmpty)
     }
 
+    func testAnOlderEventForTheSameEmojiIsDroppedAndANewerOneApplies() {
+        let t = timeline(FakeChat())
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "bob", added: true, count: 3, seq: 10))
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "ann", added: true, count: 2, seq: 9))
+        XCTAssertEqual(t.messages[0].reactions, [chip("👍", 3)], "an older seq must not put an older count back")
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "ann", added: false, count: 1, seq: 11))
+        XCTAssertEqual(t.messages[0].reactions, [chip("👍", 1)])
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "🎉", userId: "bob", added: true, count: 1, seq: 5))
+        XCTAssertEqual(t.messages[0].reactions, [chip("👍", 1), chip("🎉", 1)], "seq is tracked per emoji")
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m2", emoji: "👍", userId: "bob", added: true, count: 1, seq: 1))
+        XCTAssertEqual(t.messages[1].reactions, [chip("👍", 1)], "and per message")
+    }
+
     func testMyEventSetsMyFlagAndAnotherChannelOrUnknownMessageIsIgnored() {
         let t = timeline(FakeChat())
-        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "me", added: true, count: 1))
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "me", added: true, count: 1, seq: nextSeq()))
         XCTAssertEqual(t.messages[0].reactions, [chip("👍", 1, me: true)])
-        t.apply(.reactionUpdate(channelId: "other", messageId: "m2", emoji: "👍", userId: "bob", added: true, count: 1))
-        t.apply(.reactionUpdate(channelId: "c", messageId: "nope", emoji: "👍", userId: "bob", added: true, count: 1))
+        t.apply(.reactionUpdate(channelId: "other", messageId: "m2", emoji: "👍", userId: "bob", added: true, count: 1, seq: nextSeq()))
+        t.apply(.reactionUpdate(channelId: "c", messageId: "nope", emoji: "👍", userId: "bob", added: true, count: 1, seq: nextSeq()))
         XCTAssertTrue(t.messages[1].reactions.isEmpty)
         XCTAssertEqual(t.messages.count, 2)
     }
 
     func testAnEventWithoutMyIdNeverSetsMyFlag() {
         let t = timeline(FakeChat(), me: "")
-        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "", added: true, count: 1))
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "", added: true, count: 1, seq: nextSeq()))
         XCTAssertEqual(t.messages[0].reactions, [chip("👍", 1, me: false)])
     }
 
@@ -83,7 +100,7 @@ final class TimelineReactionTests: XCTestCase {
         let chat = FakeChat()
         chat.reactionFails = true
         let t = timeline(chat)
-        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "bob", added: true, count: 1))
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "bob", added: true, count: 1, seq: nextSeq()))
         await t.toggleReaction(t.messages[0], emoji: "👍")
         XCTAssertEqual(t.messages[0].reactions, [chip("👍", 1)])
         XCTAssertEqual(t.reactionError, "Couldn't react. Try again.")
@@ -114,7 +131,7 @@ final class TimelineReactionTests: XCTestCase {
         let t = timeline(chat)
         let toggling = Task { await t.toggleReaction(t.messages[0], emoji: "👍") }
         while chat.toggles.withLock({ $0.isEmpty }) { await Task.yield() }
-        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "bob", added: true, count: 5))
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "bob", added: true, count: 5, seq: nextSeq()))
         gate.open()
         await toggling.value
         XCTAssertEqual(t.messages[0].reactions, [chip("👍", 5)], "the older answer put the count back")
@@ -129,7 +146,7 @@ final class TimelineReactionTests: XCTestCase {
         let t = timeline(chat)
         let toggling = Task { await t.toggleReaction(t.messages[0], emoji: "👍") }
         while chat.toggles.withLock({ $0.isEmpty }) { await Task.yield() }
-        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "me", added: true, count: 3))
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "me", added: true, count: 3, seq: nextSeq()))
         gate.open()
         await toggling.value
         XCTAssertEqual(t.messages[0].reactions, [chip("👍", 3, me: true)])
@@ -154,7 +171,7 @@ final class TimelineReactionTests: XCTestCase {
         let t = timeline(chat)
         let toggling = Task { await t.toggleReaction(t.messages[0], emoji: "👍") }
         while chat.toggles.withLock({ $0.isEmpty }) { await Task.yield() }
-        t.apply(.reactionUpdate(channelId: "c", messageId: "m2", emoji: "🎉", userId: "bob", added: true, count: 1))
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m2", emoji: "🎉", userId: "bob", added: true, count: 1, seq: nextSeq()))
         gate.open()
         await toggling.value
         XCTAssertEqual(t.messages[0].reactions, [chip("👍", 1, me: true)])

@@ -66,6 +66,8 @@ final class TimelineModel {
     /// Live reaction events seen per message: a toggle's answer is a snapshot, and is used only
     /// if none arrived while it was in flight (the events carry the newer counts).
     private var reactionEvents: [String: Int] = [:]
+    /// The last server `seq` applied per message and emoji, so a late, older event is dropped.
+    private var reactionSeqs: [String: Int64] = [:]
 
     func clearReactionError() {
         reactionErrorSerial += 1
@@ -232,8 +234,13 @@ final class TimelineModel {
             }
         case .resync:
             Task { await fetch(before: nil) }
-        case let .reactionUpdate(channel, messageId, emoji, userId, added, count):
+        case let .reactionUpdate(channel, messageId, emoji, userId, added, count, seq):
             guard channel == channelId, let i = messages.firstIndex(where: { $0.id == messageId }) else { return }
+            // The server numbers changes in commit order; one that is not above the last applied
+            // for this emoji on this message is stale, and would put an older count back.
+            let key = "\(messageId)\u{0}\(emoji)"
+            guard seq > (reactionSeqs[key] ?? Int64.min) else { return }
+            reactionSeqs[key] = seq
             reactionEvents[messageId, default: 0] += 1
             messages[i].reactions = ReactionRules.applying(
                 emoji: emoji, count: count, added: added, byMe: !me.isEmpty && userId == me,
