@@ -7,6 +7,9 @@
 //! Phase 1 surface: configure a server, log in over TLS, list/create channels and
 //! DMs, send and page message history, and observe realtime [`ServerEvent`]s over
 //! a WebSocket — plus the observable [`AuthState`] the UI watches.
+// async_trait expands each method to a boxed future (already #[must_use]) and a newer clippy
+// reports that as double_must_use on every async_trait trait; the macro owns the expansion.
+#![allow(clippy::double_must_use)]
 
 mod account;
 #[cfg(test)]
