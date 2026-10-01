@@ -9,7 +9,8 @@ Alpine. Each release is checked on Debian 13, Ubuntu 24.04, Ubuntu 26.04 and Alp
 published.
 
 - **Fedora 40+:** `sudo dnf install gtk4 libadwaita gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugin-gtk4 gstreamer1-plugin-openh264 gstreamer1-plugin-libav libnice-gstreamer1 pipewire-gstreamer openssl-libs lcms2 libseccomp fontconfig`
-- **Ubuntu 24.04+ / Debian 13+:** `sudo apt install libgtk-4-1 libadwaita-1-0 gstreamer1.0-plugins-{base,good,bad,ugly} gstreamer1.0-libav gstreamer1.0-nice gstreamer1.0-gtk4 gstreamer1.0-pipewire libssl3t64 liblcms2-2 libseccomp2 libfontconfig1`
+- **Ubuntu 26.04+ / Debian 13+:** `sudo apt install libgtk-4-1 libadwaita-1-0 gstreamer1.0-plugins-{base,good,bad,ugly} gstreamer1.0-libav gstreamer1.0-nice gstreamer1.0-gtk4 gstreamer1.0-pipewire libssl3t64 liblcms2-2 libseccomp2 libfontconfig1`
+- **Ubuntu 24.04:** the same without `gstreamer1.0-gtk4`, which that archive does not have. Chat and attachments work, but **calls do not**: the app refuses to start a call without the GStreamer GTK 4 plugin (`gst-plugin-gtk4`), so install it from elsewhere or use Ubuntu 26.04.
 - **Alpine 3.24+** (the `linux-musl` build, as root): `apk add gtk4.0 libadwaita gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav libnice-gstreamer gst-plugins-rs-gtk4 gst-plugin-pipewire openssl lcms2 libseccomp fontconfig`
 - **Arch:** `sudo pacman -S gtk4 libadwaita gst-plugins-{base,good,bad,ugly} gst-libav gst-plugin-gtk4 gst-plugin-pipewire libnice openssl lcms2 libseccomp fontconfig`
 
