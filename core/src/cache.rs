@@ -75,6 +75,9 @@ pub struct CachedChannel {
     pub unread: u32,
     /// Of those, the ones naming this user (`mentions`) or everyone (`mention_everyone`).
     pub unread_mentions: u32,
+    /// The newest cached message's id, tombstones included (a deletion never lowers it).
+    /// UUIDv7, so it sorts by time: the sidebar's last-activity key.
+    pub last_message_id: Option<String>,
 }
 
 /// A page of cached messages, newest first.
@@ -438,21 +441,28 @@ impl Cache {
                           AND json_type(m.json, '$.deleted_at') IS NOT 'text'
                           AND (json_extract(m.json, '$.mention_everyone') = 1
                                OR EXISTS (SELECT 1 FROM json_each(m.json, '$.mentions')
-                                          WHERE value = ?1)))
+                                          WHERE value = ?1))),
+                       (SELECT max(m.id) FROM messages m WHERE m.channel_id = ch.id)
                      FROM channels ch
                      JOIN memberships my ON my.channel_id = ch.id AND my.user_id = ?1 AND my.left = 0
                      ORDER BY ch.id",
                 )?;
                 let rows = stmt.query_map([&me], |r| {
                     let json: String = r.get(0)?;
-                    Ok((json, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?))
+                    Ok((
+                        json,
+                        r.get::<_, u32>(1)?,
+                        r.get::<_, u32>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
                 })?;
                 rows.map(|row| {
-                    let (json, unread, unread_mentions) = row?;
+                    let (json, unread, unread_mentions, last_message_id) = row?;
                     Ok(CachedChannel {
                         json: serde_json::from_str(&json).unwrap_or(Value::Null),
                         unread,
                         unread_mentions,
+                        last_message_id,
                     })
                 })
                 .collect()

@@ -168,6 +168,82 @@ async fn unread_counts_others_messages_after_my_read_marker() {
     );
 }
 
+#[tokio::test]
+async fn cached_channels_carry_the_newest_message_id_including_tombstones() {
+    let s = setup(
+        vec![page(
+            9,
+            None,
+            vec![
+                msg("m1", "c", 4, "bob", "a"),
+                msg("m3", "c", 5, "bob", "c"),
+                msg("m2", "c", 6, "bob", "b"),
+            ],
+            vec![],
+        )],
+        no_history(),
+        None,
+    );
+    s.cache.sync_now().await.unwrap();
+    let last = |s: &Setup| {
+        let cache = s.cache.clone();
+        async move {
+            cache.cached_channels().await.unwrap()[0]
+                .last_message_id
+                .clone()
+        }
+    };
+    assert_eq!(
+        last(&s).await.as_deref(),
+        Some("m3"),
+        "not the newest by arrival"
+    );
+    s.cache
+        .live_event(
+            "message.delete",
+            &json!({ "id": "m3", "channel_id": "c", "seq": 10 }),
+        )
+        .await;
+    assert_eq!(
+        last(&s).await.as_deref(),
+        Some("m3"),
+        "a tombstone still counts: a deletion never lowers the key"
+    );
+}
+
+#[tokio::test]
+async fn a_channel_without_messages_has_no_last_message_id() {
+    let s = setup(vec![page(9, None, vec![], vec![])], no_history(), None);
+    s.cache.sync_now().await.unwrap();
+    assert_eq!(
+        s.cache.cached_channels().await.unwrap()[0].last_message_id,
+        None
+    );
+}
+
+/// An acknowledged send lands in the cache (`apply_ack`) with no socket echo, so it counts at
+/// once. (A queued, unacknowledged message lives in the separate outbox database: it never
+/// appears here. No mutant of the query can fail this: it guards the cache/outbox split.)
+#[tokio::test]
+async fn an_acknowledged_send_counts_without_a_socket_echo() {
+    let s = setup(
+        vec![page(9, None, vec![msg("m1", "c", 4, "bob", "a")], vec![])],
+        no_history(),
+        None,
+    );
+    s.cache.sync_now().await.unwrap();
+    s.cache
+        .apply_ack(&msg("m2", "c", 11, ME, "mine"))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.cache.cached_channels().await.unwrap()[0]
+            .last_message_id
+            .as_deref(),
+        Some("m2")
+    );
+}
+
 fn mentioning(mut m: Value, mentions: &[&str], everyone: bool) -> Value {
     m["mentions"] = json!(mentions);
     m["mention_everyone"] = json!(everyone);

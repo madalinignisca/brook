@@ -51,6 +51,10 @@ pub struct Channel {
     /// reaches an offline member through `/sync` and the cache, as a role does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owner_offers: Vec<OwnerOffer>,
+    /// The newest cached message's id, filled only by the cache read (`cached_channels`):
+    /// never on the wire, so `None` from the network.
+    #[serde(skip)]
+    pub last_message_id: Option<String>,
 }
 
 /// A pending offer to make `user_id` a channel owner, from `offered_by`.

@@ -57,6 +57,9 @@ mod preview;
 mod restore_tests;
 mod session;
 mod session_store;
+mod sidebar;
+#[cfg(test)]
+mod sidebar_tests;
 #[cfg(test)]
 mod signout_tests;
 mod snapshot;
@@ -102,6 +105,7 @@ pub use preview::{
     ImageKind, ImagePreview, PREVIEW_MAX_BYTES, PREVIEW_MAX_PIXELS, PREVIEW_MAX_SIDE,
 };
 pub use session::{Session, User};
+pub use sidebar::{activity_moves, conversation_label, person_label, sidebar_order, SidebarEntry};
 pub use state::AuthState;
 pub use transfer::{
     is_transient, DownloadSink, FileInfo, FileSink, FileSource, SinkError, TransferEvent,
