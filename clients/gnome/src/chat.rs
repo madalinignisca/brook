@@ -57,6 +57,9 @@ struct Chat {
     /// refreshes it when the first of them expires.
     typing_label: gtk::Label,
     typing: Rc<RefCell<TypingState>>,
+    /// While set and in the future, the line shows an error (a failed send or reaction) that
+    /// typing must not overwrite or hide.
+    error_until: Rc<Cell<Option<Instant>>>,
     typing_timeout: Rc<RefCell<Option<glib::SourceId>>>,
     /// Last time we sent a typing signal (to throttle to ~once per few seconds).
     last_typing: Rc<RefCell<Option<std::time::Instant>>>,
@@ -252,6 +255,7 @@ pub fn build(
         channel_settings: channel_settings.clone(),
         typing_label: typing_label.clone(),
         typing: Rc::default(),
+        error_until: Rc::default(),
         typing_timeout: Rc::new(RefCell::new(None)),
         last_typing: Rc::new(RefCell::new(None)),
         message_list: message_list.clone(),
@@ -1918,25 +1922,94 @@ fn already_gone(err: &brook_core::Error) -> bool {
     matches!(err, brook_core::Error::Api { code, .. } if code == "not_found")
 }
 
-/// Why starting or managing a conversation failed, briefly (the Mac's texts). `forbidden` is
-/// what a refusal by the server's rules says, `invalid` what a rejected input says (an unknown
-/// handle, a name that doesn't fit); `fallback` covers anything else that was answered, and a
-/// call that wasn't answered says so.
-fn conversation_error_text(
-    err: &brook_core::Error,
-    forbidden: &str,
-    invalid: &str,
-    fallback: &str,
-) -> String {
-    match err {
-        brook_core::Error::Api { code, .. } => match code.as_str() {
-            "authz.forbidden" => forbidden.to_string(),
-            "validation.error" => invalid.to_string(),
-            _ => fallback.to_string(),
-        },
-        brook_core::Error::NotAuthenticated => "You were signed out.".into(),
-        _ => "Couldn't reach the server.".into(),
+/// The conversation actions that can fail with a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConvAction {
+    StartDm,
+    CreateChannel,
+    Join,
+    Browse,
+    AddMember,
+    Update,
+    Delete,
+}
+
+const TRY_AGAIN: &str = "That didn't work. Try again.";
+const NO_ONE: &str = "No one has that handle.";
+const BAD_NAME: &str = "That name or topic can't be used.";
+
+impl ConvAction {
+    /// The alert's heading, then what a refusal by the server's rules says (`forbidden`), what a
+    /// rejected input says (`invalid`: an unknown handle, a name that doesn't fit) and what
+    /// anything else that was answered says.
+    fn texts(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            ConvAction::StartDm => (
+                "Couldn't Start the Conversation",
+                "You can't message them.",
+                NO_ONE,
+                TRY_AGAIN,
+            ),
+            ConvAction::CreateChannel => (
+                "Couldn't Create the Channel",
+                "Only admins can create channels.",
+                BAD_NAME,
+                TRY_AGAIN,
+            ),
+            ConvAction::Join => (
+                "Couldn't Join",
+                "You can't join that channel.",
+                TRY_AGAIN,
+                TRY_AGAIN,
+            ),
+            ConvAction::Browse => (
+                "Couldn't Load the Channels",
+                "You can't browse channels.",
+                TRY_AGAIN,
+                TRY_AGAIN,
+            ),
+            ConvAction::AddMember => (
+                "Couldn't Add Them",
+                "Only an owner or admin can add members.",
+                NO_ONE,
+                TRY_AGAIN,
+            ),
+            ConvAction::Update => (
+                "Couldn't Do That",
+                "Only an owner or admin can do that.",
+                BAD_NAME,
+                TRY_AGAIN,
+            ),
+            ConvAction::Delete => (
+                "Couldn't Delete",
+                "Only an owner or admin can delete it.",
+                TRY_AGAIN,
+                TRY_AGAIN,
+            ),
+        }
     }
+
+    /// The alert's heading and text for `err`. A call that wasn't answered says so; one answered
+    /// in a shape the client didn't expect gets the generic text, since retrying may help.
+    fn failure(self, err: &brook_core::Error) -> (&'static str, String) {
+        let (heading, forbidden, invalid, fallback) = self.texts();
+        let body = match err {
+            brook_core::Error::Api { code, .. } => match code.as_str() {
+                "authz.forbidden" => forbidden,
+                "validation.error" => invalid,
+                _ => fallback,
+            },
+            brook_core::Error::NotAuthenticated => "You were signed out.",
+            brook_core::Error::UnexpectedResponse => fallback,
+            _ => "Couldn't reach the server.",
+        };
+        (heading, body.to_string())
+    }
+}
+
+fn show_conversation_failure(chat: &Rc<Chat>, action: ConvAction, err: &brook_core::Error) {
+    let (heading, body) = action.failure(err);
+    show_alert(chat, heading, &body);
 }
 
 fn show_alert(chat: &Rc<Chat>, heading: &str, body: &str) {
@@ -2501,16 +2574,7 @@ fn update_channel_async(chat: &Rc<Chat>, name: Option<String>, archived: Option<
                 // A missed event can leave a stale row: read the list again.
                 refresh_channels(&chat, None);
             } else {
-                show_alert(
-                    &chat,
-                    "Couldn't Do That",
-                    &conversation_error_text(
-                        &err,
-                        "Only an owner or admin can do that.",
-                        "That name or topic can't be used.",
-                        "That didn't work. Try again.",
-                    ),
-                );
+                show_conversation_failure(&chat, ConvAction::Update, &err);
             }
         }
     });
@@ -2589,16 +2653,7 @@ fn delete_channel_confirm(chat: &Rc<Chat>) {
                     if already_gone(&err) {
                         refresh_channels(&chat, None);
                     } else {
-                        show_alert(
-                            &chat,
-                            "Couldn't Delete",
-                            &conversation_error_text(
-                                &err,
-                                "Only an owner or admin can delete it.",
-                                "That didn't work. Try again.",
-                                "That didn't work. Try again.",
-                            ),
-                        );
+                        show_conversation_failure(&chat, ConvAction::Delete, &err);
                     }
                 }
             });
@@ -2847,6 +2902,10 @@ fn clear_typing_of(chat: &Rc<Chat>, user_id: &str) {
 /// Draw who's typing, and wake up when the first of them expires.
 fn render_typing(chat: &Rc<Chat>) {
     let now = Instant::now();
+    // An error is showing: it keeps the line until its own timer ends it, which draws this.
+    if chat.error_until.get().is_some_and(|until| until > now) {
+        return;
+    }
     let (line, expiry) = {
         let state = chat.typing.borrow();
         (state.line(now), state.next_expiry(now))
@@ -3044,16 +3103,7 @@ fn browse_public_channels(chat: &Rc<Chat>) {
         let channels = match handle.await {
             Ok(Ok(channels)) => channels,
             Ok(Err(err)) => {
-                show_alert(
-                    &chat,
-                    "Couldn't Load the Channels",
-                    &conversation_error_text(
-                        &err,
-                        "You can't browse channels.",
-                        "That didn't work. Try again.",
-                        "That didn't work. Try again.",
-                    ),
-                );
+                show_conversation_failure(&chat, ConvAction::Browse, &err);
                 return;
             }
             Err(_) => return,
@@ -3119,16 +3169,7 @@ fn join_public(chat: &Rc<Chat>, channel_id: String) {
                 "Couldn't Join",
                 "That channel isn't open to join any more.",
             ),
-            Ok(Err(err)) => show_alert(
-                &chat,
-                "Couldn't Join",
-                &conversation_error_text(
-                    &err,
-                    "You can't join that channel.",
-                    "That didn't work. Try again.",
-                    "That didn't work. Try again.",
-                ),
-            ),
+            Ok(Err(err)) => show_conversation_failure(&chat, ConvAction::Join, &err),
             Err(_) => {}
         }
     });
@@ -3272,16 +3313,7 @@ fn open_dm(chat: &Rc<Chat>, handle: String) {
         });
         match join.await {
             Ok(Ok(channel)) => refresh_channels(&chat, Some(channel.id)),
-            Ok(Err(err)) => show_alert(
-                &chat,
-                "Couldn't Start the Conversation",
-                &conversation_error_text(
-                    &err,
-                    "You can't message them.",
-                    "No one has that handle.",
-                    "That didn't work. Try again.",
-                ),
-            ),
+            Ok(Err(err)) => show_conversation_failure(&chat, ConvAction::StartDm, &err),
             Err(_) => {}
         }
     });
@@ -3302,16 +3334,7 @@ fn create_channel(chat: &Rc<Chat>, name: String, public: bool) {
         });
         match join.await {
             Ok(Ok(channel)) => refresh_channels(&chat, Some(channel.id)),
-            Ok(Err(err)) => show_alert(
-                &chat,
-                "Couldn't Create the Channel",
-                &conversation_error_text(
-                    &err,
-                    "Only admins can create channels.",
-                    "That name or topic can't be used.",
-                    "That didn't work. Try again.",
-                ),
-            ),
+            Ok(Err(err)) => show_conversation_failure(&chat, ConvAction::CreateChannel, &err),
             Err(_) => {}
         }
     });
@@ -3364,16 +3387,7 @@ fn add_member_popover(chat: &Rc<Chat>) -> gtk::Popover {
                 match join.await {
                     Ok(Ok(())) => refresh_channels(&chat, None),
                     Ok(Err(err)) if already_gone(&err) => refresh_channels(&chat, None),
-                    Ok(Err(err)) => show_alert(
-                        &chat,
-                        "Couldn't Add Them",
-                        &conversation_error_text(
-                            &err,
-                            "Only an owner or admin can add members.",
-                            "No one has that handle.",
-                            "That didn't work. Try again.",
-                        ),
-                    ),
+                    Ok(Err(err)) => show_conversation_failure(&chat, ConvAction::AddMember, &err),
                     Err(_) => {}
                 }
             });
@@ -4069,17 +4083,27 @@ fn send_error_text(err: &brook_core::Error) -> String {
     }
 }
 
-/// Show a send error in the typing line for a few seconds.
+/// Show an error in the typing line for a few seconds. Typing and messages arriving meanwhile
+/// leave it alone; when it ends, whoever is typing is drawn again.
 fn show_send_error(chat: &Rc<Chat>, text: &str) {
+    const SHOWN: Duration = Duration::from_secs(6);
     chat.typing_label.set_text(text);
     chat.typing_label.add_css_class("error");
     chat.typing_label.set_visible(true);
-    let label = chat.typing_label.downgrade();
-    glib::timeout_add_seconds_local_once(6, move || {
-        if let Some(label) = label.upgrade() {
-            label.remove_css_class("error");
-            label.set_visible(false);
+    chat.error_until.set(Some(Instant::now() + SHOWN));
+    let chat = chat.clone();
+    glib::timeout_add_local_once(SHOWN, move || {
+        // A newer error renewed it: that one's timer ends it.
+        if chat
+            .error_until
+            .get()
+            .is_some_and(|until| until > Instant::now())
+        {
+            return;
         }
+        chat.error_until.set(None);
+        chat.typing_label.remove_css_class("error");
+        render_typing(&chat);
     });
 }
 
@@ -4405,6 +4429,16 @@ mod typing_tests {
     }
 
     #[test]
+    fn the_next_expiry_is_the_earliest_not_the_latest() {
+        let t0 = Instant::now();
+        let mut state = TypingState::default();
+        state.note("a", "Ann", t0);
+        state.note("b", "Bob", t0 + 3 * S);
+        // Ann expires in 2 s, Bob in 4: the refresh must come for Ann first.
+        assert_eq!(state.next_expiry(t0 + 2 * S), Some(2 * S));
+    }
+
+    #[test]
     fn a_new_event_renews_the_same_person() {
         let t0 = Instant::now();
         let mut state = TypingState::default();
@@ -4474,21 +4508,84 @@ mod conversation_error_tests {
         assert!(!already_gone(&brook_core::Error::UnexpectedResponse));
     }
 
+    const ALL: [ConvAction; 7] = [
+        ConvAction::StartDm,
+        ConvAction::CreateChannel,
+        ConvAction::Join,
+        ConvAction::Browse,
+        ConvAction::AddMember,
+        ConvAction::Update,
+        ConvAction::Delete,
+    ];
+
+    fn body(action: ConvAction, code: &str) -> String {
+        action.failure(&api(code)).1
+    }
+
     #[test]
-    fn a_failed_conversation_action_says_why() {
-        let text = |e: &brook_core::Error| {
-            conversation_error_text(e, "Only admins.", "Bad input.", "Try again.")
-        };
-        assert_eq!(text(&api("authz.forbidden")), "Only admins.");
-        assert_eq!(text(&api("validation.error")), "Bad input.");
-        assert_eq!(text(&api("whatever")), "Try again.");
+    fn each_action_says_why_in_its_own_words() {
+        for action in ALL {
+            let (heading, forbidden, invalid, fallback) = action.texts();
+            assert!(heading.starts_with("Couldn't"), "{action:?}");
+            assert_eq!(
+                action.failure(&api("authz.forbidden")),
+                (heading, forbidden.to_string())
+            );
+            assert_eq!(
+                action.failure(&api("validation.error")),
+                (heading, invalid.to_string())
+            );
+            assert_eq!(
+                action.failure(&api("whatever")),
+                (heading, fallback.to_string())
+            );
+        }
+        // The specific ones, so swapped columns can't pass.
         assert_eq!(
-            text(&brook_core::Error::NotAuthenticated),
-            "You were signed out."
+            body(ConvAction::StartDm, "validation.error"),
+            "No one has that handle."
         );
         assert_eq!(
-            text(&brook_core::Error::Timeout),
-            "Couldn't reach the server."
+            body(ConvAction::AddMember, "validation.error"),
+            "No one has that handle."
         );
+        assert_eq!(
+            body(ConvAction::CreateChannel, "validation.error"),
+            "That name or topic can't be used."
+        );
+        assert_eq!(
+            body(ConvAction::Update, "validation.error"),
+            "That name or topic can't be used."
+        );
+        assert_eq!(
+            body(ConvAction::CreateChannel, "authz.forbidden"),
+            "Only admins can create channels."
+        );
+        assert_eq!(
+            body(ConvAction::Delete, "authz.forbidden"),
+            "Only an owner or admin can delete it."
+        );
+        assert_eq!(
+            body(ConvAction::AddMember, "authz.forbidden"),
+            "Only an owner or admin can add members."
+        );
+    }
+
+    #[test]
+    fn an_unanswered_call_says_so_but_an_odd_answer_is_a_retry() {
+        for action in ALL {
+            assert_eq!(
+                action.failure(&brook_core::Error::Timeout).1,
+                "Couldn't reach the server."
+            );
+            assert_eq!(
+                action.failure(&brook_core::Error::NotAuthenticated).1,
+                "You were signed out."
+            );
+            assert_eq!(
+                action.failure(&brook_core::Error::UnexpectedResponse).1,
+                "That didn't work. Try again."
+            );
+        }
     }
 }
