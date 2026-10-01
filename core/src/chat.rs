@@ -82,7 +82,8 @@ impl Channel {
     }
 
     /// A human label for the channel: the channel name, or — for a DM — the
-    /// other member's display name (falling back to `self_handle`'s peer).
+    /// other member's display name (falling back to `self_handle`'s peer). The clients'
+    /// sidebar does not use this: it uses `conversation_label` and `sort_key`.
     pub fn title(&self, self_user_id: &str) -> String {
         if let Some(name) = self.name.as_ref().filter(|n| !n.is_empty()) {
             return name.clone();

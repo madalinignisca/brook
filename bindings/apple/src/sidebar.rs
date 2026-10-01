@@ -27,6 +27,18 @@ impl From<FfiSidebarEntry> for brook_core::SidebarEntry {
     }
 }
 
+fn to_members(members: Vec<FfiMember>) -> Vec<brook_core::ChannelMember> {
+    members
+        .into_iter()
+        .map(|m| brook_core::ChannelMember {
+            id: m.id,
+            handle: m.handle,
+            display_name: m.display_name,
+            role: m.role,
+        })
+        .collect()
+}
+
 #[uniffi::export]
 pub fn person_label(display_name: String, handle: String, show_usernames: bool) -> String {
     brook_core::person_label(&display_name, &handle, show_usernames)
@@ -40,16 +52,19 @@ pub fn conversation_label(
     me: String,
     show_usernames: bool,
 ) -> String {
-    let members: Vec<brook_core::ChannelMember> = members
-        .into_iter()
-        .map(|m| brook_core::ChannelMember {
-            id: m.id,
-            handle: m.handle,
-            display_name: m.display_name,
-            role: m.role,
-        })
-        .collect();
-    brook_core::conversation_label(&kind, name.as_deref(), &members, &me, show_usernames)
+    brook_core::conversation_label(
+        &kind,
+        name.as_deref(),
+        &to_members(members),
+        &me,
+        show_usernames,
+    )
+}
+
+/// The name key the sidebar order uses: the lowercase label with usernames off.
+#[uniffi::export]
+pub fn sort_key(kind: String, name: Option<String>, members: Vec<FfiMember>, me: String) -> String {
+    brook_core::sort_key(&kind, name.as_deref(), &to_members(members), &me)
 }
 
 /// The conversation ids in sidebar order.

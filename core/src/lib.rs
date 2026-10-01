@@ -105,7 +105,9 @@ pub use preview::{
     ImageKind, ImagePreview, PREVIEW_MAX_BYTES, PREVIEW_MAX_PIXELS, PREVIEW_MAX_SIDE,
 };
 pub use session::{Session, User};
-pub use sidebar::{activity_moves, conversation_label, person_label, sidebar_order, SidebarEntry};
+pub use sidebar::{
+    activity_moves, conversation_label, person_label, sidebar_order, sort_key, SidebarEntry,
+};
 pub use state::AuthState;
 pub use transfer::{
     is_transient, DownloadSink, FileInfo, FileSink, FileSource, SinkError, TransferEvent,

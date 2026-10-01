@@ -63,6 +63,12 @@ pub fn conversation_label(
     }
 }
 
+/// The name key a `SidebarEntry` is ordered by: the lowercase `conversation_label` with
+/// usernames off, whatever the preference, so toggling it never reorders the list.
+pub fn sort_key(kind: &str, name: Option<&str>, members: &[ChannelMember], me: &str) -> String {
+    conversation_label(kind, name, members, me, false).to_lowercase()
+}
+
 /// One conversation as the sidebar order sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarEntry {

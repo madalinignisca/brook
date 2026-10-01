@@ -30,7 +30,7 @@ pub use offline::{
     FfiTransferEvent, FfiTransferState, TransferListener,
 };
 pub use sidebar::{
-    activity_moves, conversation_label, person_label, sidebar_order, FfiSidebarEntry,
+    activity_moves, conversation_label, person_label, sidebar_order, sort_key, FfiSidebarEntry,
 };
 pub use types::{FfiAuthState, FfiChannel, FfiSession, FfiUser, LoginError, LoginResult};
 

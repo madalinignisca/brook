@@ -145,3 +145,12 @@ fn activity_moves_only_when_strictly_newer() {
     assert!(!activity_moves(Some("b"), "b"));
     assert!(!activity_moves(Some("c"), "b"));
 }
+
+#[test]
+fn the_sort_key_is_the_lowercase_label_and_ignores_the_preference() {
+    let m = dm_members();
+    // "Bob R" shown, "@bob" with usernames on: the key must be the former, lowercased, and
+    // never the latter, so toggling the preference cannot reorder the list.
+    assert_eq!(sort_key("dm", None, &m, "me"), "bob r");
+    assert_eq!(sort_key("channel", Some("General"), &m, "me"), "#general");
+}

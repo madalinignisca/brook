@@ -311,11 +311,9 @@ final class ChannelsModel {
     /// a toggle of the preference all agree (and `body` never calls into core per row).
     private func makeRow(_ row: ChannelRow) -> ChannelRow {
         var row = row
-        func label(_ show: Bool) -> String {
-            conversationLabel(kind: row.kind, name: row.name, members: row.members, me: me ?? "", showUsernames: show)
-        }
-        row.label = label(showUsernames)
-        row.nameKey = label(false).lowercased()
+        row.label = conversationLabel(
+            kind: row.kind, name: row.name, members: row.members, me: me ?? "", showUsernames: showUsernames)
+        row.nameKey = sortKey(kind: row.kind, name: row.name, members: row.members, me: me ?? "")
         return row
     }
 

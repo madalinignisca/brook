@@ -148,6 +148,15 @@ fn the_sidebar_functions_reach_core_unchanged() {
         ("Bob R", "@bob")
     );
     assert_eq!(
+        crate::sidebar::sort_key(
+            "dm".into(),
+            None,
+            vec![me.clone(), bob.clone()],
+            "me".into()
+        ),
+        "bob r"
+    );
+    assert_eq!(
         crate::sidebar::person_label("".into(), "bob".into(), false),
         "@bob"
     );
