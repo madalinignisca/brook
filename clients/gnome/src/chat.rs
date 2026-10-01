@@ -59,7 +59,7 @@ struct Chat {
     typing: Rc<RefCell<TypingState>>,
     /// While set and in the future, the line shows an error (a failed send or reaction) that
     /// typing must not overwrite or hide.
-    error_until: Rc<Cell<Option<Instant>>>,
+    error_hold: Rc<Cell<ErrorHold>>,
     typing_timeout: Rc<RefCell<Option<glib::SourceId>>>,
     /// Last time we sent a typing signal (to throttle to ~once per few seconds).
     last_typing: Rc<RefCell<Option<std::time::Instant>>>,
@@ -255,7 +255,7 @@ pub fn build(
         channel_settings: channel_settings.clone(),
         typing_label: typing_label.clone(),
         typing: Rc::default(),
-        error_until: Rc::default(),
+        error_hold: Rc::default(),
         typing_timeout: Rc::new(RefCell::new(None)),
         last_typing: Rc::new(RefCell::new(None)),
         message_list: message_list.clone(),
@@ -2824,6 +2824,60 @@ fn maybe_send_typing(chat: &Rc<Chat>) {
     }
 }
 
+/// How long an error keeps the typing line.
+const ERROR_SHOWN: Duration = Duration::from_secs(6);
+
+/// The typing line is shared with errors (a failed send or reaction). While an error is held,
+/// typing and messages leave the line alone; when the hold ends, typing is drawn again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ErrorHold {
+    until: Option<Instant>,
+}
+
+impl ErrorHold {
+    /// An error is shown now: it holds the line for `ERROR_SHOWN` (a newer one renews it).
+    fn hold(&mut self, now: Instant) {
+        self.until = Some(now + ERROR_SHOWN);
+    }
+
+    fn holding(&self, now: Instant) -> bool {
+        self.until.is_some_and(|until| until > now)
+    }
+
+    /// An error's timer fired: whether the hold is over (draw the line again). A renewed hold
+    /// isn't over yet; that error's own timer ends it.
+    fn timer_fired(&mut self, now: Instant) -> bool {
+        if self.holding(now) {
+            return false;
+        }
+        self.until = None;
+        true
+    }
+
+    /// Another channel was opened: an error about the last one goes now.
+    fn clear(&mut self) {
+        self.until = None;
+    }
+}
+
+/// What the typing line shows.
+#[derive(Debug, PartialEq, Eq)]
+enum LineShown {
+    /// An error holds it: leave it alone.
+    Error,
+    Typing(String),
+    Nothing,
+}
+
+fn line_shown(hold: &ErrorHold, typing: &TypingState, now: Instant) -> LineShown {
+    if hold.holding(now) {
+        return LineShown::Error;
+    }
+    typing
+        .line(now)
+        .map_or(LineShown::Nothing, LineShown::Typing)
+}
+
 /// Who is typing in the open channel, as events say. Each shows for `LIFETIME` after their
 /// last event, or until a message from them arrives.
 #[derive(Default)]
@@ -2902,20 +2956,21 @@ fn clear_typing_of(chat: &Rc<Chat>, user_id: &str) {
 /// Draw who's typing, and wake up when the first of them expires.
 fn render_typing(chat: &Rc<Chat>) {
     let now = Instant::now();
-    // An error is showing: it keeps the line until its own timer ends it, which draws this.
-    if chat.error_until.get().is_some_and(|until| until > now) {
-        return;
-    }
-    let (line, expiry) = {
+    let (shown, expiry) = {
         let state = chat.typing.borrow();
-        (state.line(now), state.next_expiry(now))
+        (
+            line_shown(&chat.error_hold.get(), &state, now),
+            state.next_expiry(now),
+        )
     };
-    match line {
-        Some(line) => {
+    match shown {
+        // An error is showing: it keeps the line until its own timer ends it, which draws this.
+        LineShown::Error => return,
+        LineShown::Typing(line) => {
             chat.typing_label.set_label(&line);
             chat.typing_label.set_visible(true);
         }
-        None => chat.typing_label.set_visible(false),
+        LineShown::Nothing => chat.typing_label.set_visible(false),
     }
     if let Some(id) = chat.typing_timeout.borrow_mut().take() {
         id.remove();
@@ -2934,6 +2989,11 @@ fn render_typing(chat: &Rc<Chat>) {
 /// Clear any typing indicator (e.g. on channel switch).
 fn clear_typing(chat: &Rc<Chat>) {
     chat.typing.borrow_mut().reset();
+    // An error about the channel just left doesn't follow you into the next.
+    let mut hold = chat.error_hold.get();
+    hold.clear();
+    chat.error_hold.set(hold);
+    chat.typing_label.remove_css_class("error");
     render_typing(chat);
 }
 
@@ -4086,24 +4146,22 @@ fn send_error_text(err: &brook_core::Error) -> String {
 /// Show an error in the typing line for a few seconds. Typing and messages arriving meanwhile
 /// leave it alone; when it ends, whoever is typing is drawn again.
 fn show_send_error(chat: &Rc<Chat>, text: &str) {
-    const SHOWN: Duration = Duration::from_secs(6);
     chat.typing_label.set_text(text);
     chat.typing_label.add_css_class("error");
     chat.typing_label.set_visible(true);
-    chat.error_until.set(Some(Instant::now() + SHOWN));
+    let mut hold = chat.error_hold.get();
+    hold.hold(Instant::now());
+    chat.error_hold.set(hold);
     let chat = chat.clone();
-    glib::timeout_add_local_once(SHOWN, move || {
+    glib::timeout_add_local_once(ERROR_SHOWN, move || {
+        let mut hold = chat.error_hold.get();
+        let over = hold.timer_fired(Instant::now());
+        chat.error_hold.set(hold);
         // A newer error renewed it: that one's timer ends it.
-        if chat
-            .error_until
-            .get()
-            .is_some_and(|until| until > Instant::now())
-        {
-            return;
+        if over {
+            chat.typing_label.remove_css_class("error");
+            render_typing(&chat);
         }
-        chat.error_until.set(None);
-        chat.typing_label.remove_css_class("error");
-        render_typing(&chat);
     });
 }
 
@@ -4562,6 +4620,18 @@ mod conversation_error_tests {
             "Only admins can create channels."
         );
         assert_eq!(
+            body(ConvAction::Join, "authz.forbidden"),
+            "You can't join that channel."
+        );
+        assert_eq!(
+            body(ConvAction::Browse, "authz.forbidden"),
+            "You can't browse channels."
+        );
+        assert_eq!(
+            body(ConvAction::Join, "validation.error"),
+            "That didn't work. Try again."
+        );
+        assert_eq!(
             body(ConvAction::Delete, "authz.forbidden"),
             "Only an owner or admin can delete it."
         );
@@ -4587,5 +4657,57 @@ mod conversation_error_tests {
                 "That didn't work. Try again."
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod error_hold_tests {
+    use super::*;
+
+    const S: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn typing_noted_during_an_error_doesnt_show_until_the_hold_ends() {
+        let t0 = Instant::now();
+        let mut hold = ErrorHold::default();
+        let mut typing = TypingState::default();
+        hold.hold(t0);
+        typing.note("a", "Ann", t0 + S);
+        assert_eq!(line_shown(&hold, &typing, t0 + 2 * S), LineShown::Error);
+        // The hold ends at 6 s; Ann's notice (1 s) has expired at 5 s, so a fresh one shows.
+        typing.note("a", "Ann", t0 + 6 * S);
+        assert!(hold.timer_fired(t0 + 6 * S));
+        assert_eq!(
+            line_shown(&hold, &typing, t0 + 6 * S),
+            LineShown::Typing("Ann is typing\u{2026}".into())
+        );
+    }
+
+    #[test]
+    fn a_new_error_renews_the_hold_so_the_first_timer_does_nothing() {
+        let t0 = Instant::now();
+        let mut hold = ErrorHold::default();
+        hold.hold(t0);
+        hold.hold(t0 + 3 * S);
+        // The first error's timer fires at 6 s: the second is still held until 9 s.
+        assert!(!hold.timer_fired(t0 + 6 * S));
+        assert!(hold.holding(t0 + 8 * S));
+        assert!(hold.timer_fired(t0 + 9 * S));
+        assert!(!hold.holding(t0 + 9 * S));
+    }
+
+    #[test]
+    fn opening_another_channel_drops_the_error() {
+        let t0 = Instant::now();
+        let mut hold = ErrorHold::default();
+        hold.hold(t0);
+        hold.clear();
+        assert!(!hold.holding(t0 + S));
+        assert_eq!(
+            line_shown(&hold, &TypingState::default(), t0 + S),
+            LineShown::Nothing
+        );
+        // The timer still pending from that error finds nothing held and just redraws.
+        assert!(hold.timer_fired(t0 + 6 * S));
     }
 }
