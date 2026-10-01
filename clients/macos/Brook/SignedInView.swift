@@ -66,6 +66,8 @@ struct SignedInView: View {
         })
     }
     @Environment(\.openWindow) private var openWindow
+    /// The Settings window's preference: pushed into the model, which relabels the rows.
+    @AppStorage(Settings.showUsernamesKey) private var showUsernames = false
 
     var body: some View {
         NavigationSplitView {
@@ -201,6 +203,7 @@ struct SignedInView: View {
             prompt.opened()
             syncAnswering()
         }
+        .onChange(of: showUsernames, initial: true) { _, on in channels.showUsernames = on }
         .onChange(of: channels.channels) { _, _ in syncAnswering() } // an offer came or went
         .sheet(isPresented: Binding(
             get: {
