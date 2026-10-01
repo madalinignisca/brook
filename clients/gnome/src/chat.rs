@@ -3671,9 +3671,11 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
     });
 }
 
-/// Under the checkbox (owner decision, #46 §8): data kept on a device is cut off, if the
-/// device is lost, by ending its sign-in, not by this checkbox. An admin can't be reset by
-/// another admin (the server refuses), so they're only told the password route.
+/// Under the checkbox (owner decision, #46 §8): a lost device's *account* access is cut off by
+/// ending its sign-in. The data already saved on it is not: it is encrypted with that device's
+/// own random key, held in that device's keyring, so it stays readable to whoever can sign in
+/// to that computer. The text says both. An admin can't be reset by another admin (the server
+/// refuses), so they're only told the password route.
 fn lost_device_help(admin: bool) -> String {
     let switch = crate::account::SIGN_OUT_OTHERS_LABEL;
     let reset = if admin {
@@ -3682,7 +3684,9 @@ fn lost_device_help(admin: bool) -> String {
         ", or ask an admin to reset your account"
     };
     format!(
-        "If you lose a device, change your password with \"{switch}\" on{reset}. That ends its sign-in."
+        "If you lose a device, change your password with \"{switch}\" on{reset}. That ends its \
+         sign-in, but messages already saved on it stay readable to anyone who can sign in to \
+         that computer."
     )
 }
 
@@ -4195,6 +4199,15 @@ mod lost_device_help_tests {
             "the switch's own label"
         );
         assert!(member.contains("ask an admin to reset your account"));
+    }
+
+    #[test]
+    fn the_help_doesnt_promise_protection_for_data_already_on_the_device() {
+        for admin in [false, true] {
+            let help = lost_device_help(admin);
+            assert!(help.contains("ends its sign-in, but"), "{help}");
+            assert!(help.contains("stay readable"), "{help}");
+        }
     }
 
     #[test]
