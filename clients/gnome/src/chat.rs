@@ -2869,6 +2869,13 @@ enum LineShown {
     Nothing,
 }
 
+/// The state half of opening another channel: nobody is typing there yet, and an error about the
+/// last one goes.
+fn switch_channel(typing: &mut TypingState, hold: &mut ErrorHold) {
+    typing.reset();
+    hold.clear();
+}
+
 fn line_shown(hold: &ErrorHold, typing: &TypingState, now: Instant) -> LineShown {
     if hold.holding(now) {
         return LineShown::Error;
@@ -2988,10 +2995,9 @@ fn render_typing(chat: &Rc<Chat>) {
 
 /// Clear any typing indicator (e.g. on channel switch).
 fn clear_typing(chat: &Rc<Chat>) {
-    chat.typing.borrow_mut().reset();
     // An error about the channel just left doesn't follow you into the next.
     let mut hold = chat.error_hold.get();
-    hold.clear();
+    switch_channel(&mut chat.typing.borrow_mut(), &mut hold);
     chat.error_hold.set(hold);
     chat.typing_label.remove_css_class("error");
     render_typing(chat);
@@ -4694,6 +4700,18 @@ mod error_hold_tests {
         assert!(hold.holding(t0 + 8 * S));
         assert!(hold.timer_fired(t0 + 9 * S));
         assert!(!hold.holding(t0 + 9 * S));
+    }
+
+    #[test]
+    fn switching_channel_forgets_typing_and_drops_the_error() {
+        let t0 = Instant::now();
+        let mut hold = ErrorHold::default();
+        let mut typing = TypingState::default();
+        typing.note("a", "Ann", t0);
+        hold.hold(t0);
+        switch_channel(&mut typing, &mut hold);
+        assert_eq!(line_shown(&hold, &typing, t0 + S), LineShown::Nothing);
+        assert!(!hold.holding(t0 + S));
     }
 
     #[test]
