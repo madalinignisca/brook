@@ -22,7 +22,8 @@ or auth changes remain. The pure rules live in core so GTK can reuse them; the G
   - `sidebar_order(entries) -> Vec<String>` (ids). Channels (`kind != "dm"`) before DMs. Within a section:
     newest message id descending, none last; then opened rank descending, none last; then the **name
     key** (lowercase `conversation_label` with `show_usernames = false`, so the preference can never
-    change the order); then id. `SidebarEntry` carries that key as `sort_key`.
+    change the order); then id. `SidebarEntry` carries that key as `sort_key`; core offers `sort_key(kind, name, members, me)` so no
+  client computes it with the preference on.
   - `activity_moves(current: Option<&str>, message_id: &str) -> bool`: strictly newer.
 - **Last activity:** `cached_channels` gains `last_message_id`, `max(m.id)` over the channel's cached
   messages (tombstones included, so a deletion never lowers it). Message ids are UUIDv7 text, so they sort
@@ -87,6 +88,9 @@ or auth changes remain. The pure rules live in core so GTK can reuse them; the G
 - **Fresh sign-in, a rebuilt cache or a 410 reset:** keys are empty, so the order is by opened rank, then
   A to Z, until messages arrive. Local data off: same at every launch (ranks persist, keys do not).
 - **A re-sort can move a row a click raised earlier** (the whole rule applies); a click itself never does.
+- **A conversation opened this session whose news arrives only by the cache's catch-up sync** (no live
+  message) has that first notice treated as its back-fill, so it moves at the next re-sort from any cause,
+  not at once.
 - **Two messages in the same millisecond:** the random part of the UUIDv7 decides.
 - **Message ids are compared as text:** the server issues canonical lowercase UUIDv7 strings.
 - **No server calls are added**, so there are no refusal codes.
