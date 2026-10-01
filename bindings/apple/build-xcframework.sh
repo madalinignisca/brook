@@ -17,7 +17,7 @@ export MACOSX_DEPLOYMENT_TARGET=26.0
 # Homebrew's rustup is a proxy that is not always on the PATH of a fresh terminal; `rustup which`
 # finds the toolchain's own bin directory, so cargo resolves the same way everywhere.
 command -v cargo >/dev/null || {
-  cargo_bin="$(rustup which cargo 2>/dev/null || true)"
+  cargo_bin="$(rustup which cargo || true)"
   [[ -n "$cargo_bin" ]] && export PATH="$(dirname "$cargo_bin"):$PATH"
 }
 command -v cargo >/dev/null || { echo "cargo not found (install Rust with rustup)" >&2; exit 1; }
