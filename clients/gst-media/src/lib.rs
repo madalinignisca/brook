@@ -17,6 +17,9 @@
 //!
 //! [`GstEngine`] implements core's [`brook_core::MediaEngine`], so a client
 //! hands it to `BrookClient::join_call` and core drives it.
+// async_trait expands each method to a boxed future (already #[must_use]) and a newer clippy
+// reports that as double_must_use on every async_trait trait; the macro owns the expansion.
+#![allow(clippy::double_must_use)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
