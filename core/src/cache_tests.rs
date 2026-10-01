@@ -1225,3 +1225,130 @@ fn the_send_body_names_the_reply_target_only_for_a_reply() {
         serde_json::json!(["f2", "f1"])
     );
 }
+
+/// `/sync` that fails with a network error a set number of times, then answers an empty page
+/// caught up. Optionally held (each call waits for a permit) and timestamping every call.
+struct Failing {
+    fails: AtomicUsize,
+    calls: Mutex<Vec<std::time::Instant>>,
+    gate: Option<Arc<Notify>>,
+}
+
+impl Failing {
+    fn new(fails: usize, gate: Option<Arc<Notify>>) -> Arc<Self> {
+        Arc::new(Self {
+            fails: AtomicUsize::new(fails),
+            calls: Mutex::default(),
+            gate,
+        })
+    }
+    fn count(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+}
+
+#[async_trait::async_trait]
+impl Fetch for Failing {
+    async fn page(&self, _since: &str) -> Result<Page, crate::Error> {
+        self.calls.lock().unwrap().push(std::time::Instant::now());
+        if let Some(g) = &self.gate {
+            g.notified().await;
+        }
+        let left = self.fails.load(Ordering::SeqCst);
+        if left > 0 {
+            self.fails.store(left - 1, Ordering::SeqCst);
+            return Err(crate::Error::Timeout);
+        }
+        Ok(Page::Rows(page(9, None, vec![], vec![])))
+    }
+}
+
+fn cache_over(fetch: Arc<Failing>) -> (Arc<Cache>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let slot: Arc<dyn KeySlot> = Arc::new(InMemoryKeySlot::default());
+    let db = match store::open(dir.path(), Kind::Cache, "s", &KeyStore::new(slot)).unwrap() {
+        Opened::Ready { db, .. } => db,
+        other => panic!("{other:?}"),
+    };
+    (
+        Cache::new(db, ME.into(), fetch, Arc::new(no_history())),
+        dir,
+    )
+}
+
+/// A sync asked for while a run is in flight is not lost when that run fails: the failing run
+/// serves it, so `offline` ends false once the server answers (the retry timer is an hour
+/// away here, so only the drain can do it).
+#[tokio::test]
+async fn a_request_that_arrived_during_a_failing_run_is_served_after_it() {
+    let gate = Arc::new(Notify::new());
+    let fetch = Failing::new(1, Some(gate.clone()));
+    let (cache, _dir) = cache_over(fetch.clone());
+    cache.set_retry_for_tests(Duration::from_secs(3600), Duration::from_secs(3600));
+    let first = tokio::spawn({
+        let c = cache.clone();
+        async move { c.sync_now().await }
+    });
+    let f = fetch.clone();
+    eventually("the first run", move || f.count() == 1).await;
+    cache.sync_now().await.unwrap(); // joins the run in flight
+    gate.notify_one(); // the first run fails
+    let f = fetch.clone();
+    eventually("the run for the request", move || f.count() == 2).await;
+    gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap(); // the last outcome is what is returned
+    assert!(!cache.state().borrow().offline);
+}
+
+/// A network failure schedules its own retry, so `offline` clears without any other trigger.
+/// Waits double up to the cap, and start over after a success.
+#[tokio::test]
+async fn a_network_failure_is_retried_with_a_growing_capped_wait() {
+    let fetch = Failing::new(4, None);
+    let (cache, _dir) = cache_over(fetch.clone());
+    cache.set_retry_for_tests(Duration::from_millis(100), Duration::from_millis(150));
+    assert!(cache.sync_now().await.is_err());
+    assert!(cache.state().borrow().offline);
+    let f = fetch.clone();
+    eventually("the retries", move || f.count() == 5).await;
+    let mut state = cache.state();
+    tokio::time::timeout(Duration::from_secs(5), state.wait_for(|s| !s.offline))
+        .await
+        .unwrap()
+        .unwrap();
+    let t = fetch.calls.lock().unwrap().clone();
+    let gap = |i: usize| t[i + 1].duration_since(t[i]);
+    assert!(gap(0) >= Duration::from_millis(100), "{:?}", gap(0));
+    assert!(
+        gap(1) >= Duration::from_millis(150),
+        "doubled: {:?}",
+        gap(1)
+    ); // 200, capped to 150
+    assert!(gap(2) >= Duration::from_millis(150), "{:?}", gap(2));
+    assert!(gap(2) < Duration::from_millis(300), "capped: {:?}", gap(2)); // 400 uncapped
+
+    // Back to the start wait after the success: 100 ms again, not 150.
+    fetch.fails.store(2, Ordering::SeqCst);
+    assert!(cache.sync_now().await.is_err());
+    let f = fetch.clone();
+    eventually("the retries", move || f.count() == 8).await;
+    let t = fetch.calls.lock().unwrap().clone();
+    let reset = t[6].duration_since(t[5]);
+    assert!(reset < Duration::from_millis(140), "reset: {reset:?}");
+}
+
+/// A closed cache does not retry.
+#[tokio::test]
+async fn a_closed_cache_does_not_retry() {
+    let fetch = Failing::new(100, None);
+    let (cache, _dir) = cache_over(fetch.clone());
+    cache.set_retry_for_tests(Duration::from_millis(100), Duration::from_millis(100));
+    assert!(cache.sync_now().await.is_err());
+    cache.clone().close().await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(fetch.count(), 1);
+}

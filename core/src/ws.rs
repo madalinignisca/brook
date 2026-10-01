@@ -93,6 +93,12 @@ pub enum ServerEvent {
 const RATE_LIMIT_BACKOFF_SECS: u64 = 5;
 /// How long the server has to answer a command, counted from when it was written.
 pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// A connection that has delivered no frame at all for this long is dead. A network that
+/// vanishes (Wi-Fi off, a dropped route) gives an idle TCP socket no EOF or reset, so without
+/// this the loop would wait forever. The server's websocket layer pings every ~20 s
+/// (uvicorn's default `--ws-ping-interval`), which tungstenite hands to us as a `Ping`
+/// frame, so a healthy idle link still produces a frame well inside the window.
+pub(crate) const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 /// Client frames above this are refused locally (the server closes with 1009).
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Commands waiting for the socket writer; beyond this, callers get `Busy`.
@@ -173,6 +179,8 @@ pub(crate) struct Transport {
     conn: watch::Sender<Conn>,
     routes: Routes,
     pub(crate) reply_timeout: Duration,
+    /// How long a connection may deliver nothing before it is treated as dead.
+    pub(crate) idle_timeout: Duration,
     /// Test hook: when set, every command waits for a permit before it is written. The wait
     /// happens off the socket loop (like a slow producer), so the loop keeps servicing frames.
     #[cfg(test)]
@@ -210,6 +218,7 @@ pub(crate) fn command_channel() -> (Commands, Transport) {
             conn: conn_tx,
             routes,
             reply_timeout: REPLY_TIMEOUT,
+            idle_timeout: WS_IDLE_TIMEOUT,
             #[cfg(test)]
             hold_writes: None,
             released_tx,
@@ -487,6 +496,10 @@ async fn run_once(
     let mut ready = false;
     let mut pending: HashMap<String, Pending> = HashMap::new();
     let mut next_id: u64 = 0;
+    // When any frame (text, ping, pong, binary) last arrived. A dead network leaves the
+    // socket open and silent; the server pings an idle link, so silence past the timeout
+    // means the connection is gone.
+    let mut last_frame = Instant::now();
     let result = loop {
         let next_deadline = pending
             .values()
@@ -547,12 +560,18 @@ async fn run_once(
                     }
                 }
             }
+            () = tokio::time::sleep_until(last_frame + transport.idle_timeout) => {
+                tracing::warn!(idle = ?transport.idle_timeout, "websocket silent; reconnecting");
+                // No close handshake: the peer is unreachable, so it would only wait.
+                break Ok(RunEnd::Closed { ready });
+            }
             frame = socket.next() => {
                 let Some(frame) = frame else { break Ok(RunEnd::Closed { ready }) };
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(err) => break Err(err.into()),
                 };
+                last_frame = Instant::now(); // every kind of frame shows the link is up
                 match frame {
                     WsMessage::Text(text) => {
                         // Our re-auth's answer: confirmed (`ready` with `re`) or refused.
@@ -857,14 +876,18 @@ pub(crate) async fn run(
             &mut generation,
         )
         .await;
-        // The connection is gone (or never came up): tell the cache, which syncs soon and so
-        // learns whether the server is reachable. Without this it only finds out at the next
-        // periodic sync, minutes later. Sent on every run end, failed reconnects included:
-        // the cache debounces its syncs and the backoff below is at least a second.
-        let _ = transport
-            .raw
-            .send((WS_DISCONNECTED.to_string(), Value::Null));
         let rate_limited = matches!(end, Ok(RunEnd::RateLimited { .. }));
+        // A session change (sign-out, account switch) is no lost connection: the cache of the
+        // old identity is on its way out, and the new one syncs on its own `ready`.
+        if !matches!(end, Ok(RunEnd::SessionChanged)) {
+            // The connection is gone (or never came up): tell the cache, which syncs soon and so
+            // learns whether the server is reachable. Without this it only finds out at the next
+            // periodic sync, minutes later. Sent on every run end, failed reconnects included:
+            // the cache debounces its syncs and the backoff below is at least a second.
+            let _ = transport
+                .raw
+                .send((WS_DISCONNECTED.to_string(), Value::Null));
+        }
         match end {
             Ok(RunEnd::SessionChanged) => continue, // reconnect at once as the new identity
             Ok(RunEnd::AuthRejected { ready }) => {

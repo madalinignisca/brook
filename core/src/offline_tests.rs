@@ -695,9 +695,15 @@ mod client {
         server: &mut TestServer,
         link: &FlakyLink,
         dir: &std::path::Path,
+        idle: Duration,
     ) -> (BrookClient, crate::test_support::WsPeer) {
         let slot: Arc<dyn KeySlot> = Arc::new(InMemoryKeySlot::default());
-        let c = BrookClient::new(CoreConfig::new(&link.base).unwrap()).unwrap();
+        // Short request timeout: through a black hole a request only ends by timing out.
+        let config = CoreConfig::new(&link.base)
+            .unwrap()
+            .with_request_timeout(Duration::from_secs(1));
+        let c = BrookClient::new(config).unwrap();
+        c.with_transport(|t| t.idle_timeout = idle);
         assert!(c.enable_local_data(slot, dir.to_path_buf()).await);
         c.login("alice", "pw").await.unwrap();
         c.start_realtime().await.unwrap();
@@ -717,13 +723,33 @@ mod client {
         let mut server = TestServer::start().await;
         let link = FlakyLink::to(&server).await;
         let dir = tempfile::tempdir().unwrap();
-        let (c, _peer) = synced_over(&mut server, &link, dir.path()).await;
+        let (c, _peer) =
+            synced_over(&mut server, &link, dir.path(), crate::ws::WS_IDLE_TIMEOUT).await;
 
         link.cut();
         state_is(&c, "offline after the drop", |s| s.offline).await;
 
         link.restore();
         let mut peer = server.accept().await; // the socket reconnects by itself
+        peer.accept_auth().await;
+        state_is(&c, "online after the reconnect", |s| !s.offline).await;
+    }
+
+    /// The real case: the network vanishes under an idle socket, which then sees neither EOF
+    /// nor reset. The idle timeout ends the connection, the cache learns of it and goes
+    /// offline; when the network is back the reconnect syncs and clears it.
+    #[tokio::test]
+    async fn a_black_holed_connection_goes_offline_and_recovers() {
+        let mut server = TestServer::start().await;
+        let link = FlakyLink::to(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (c, _peer) = synced_over(&mut server, &link, dir.path(), Duration::from_secs(1)).await;
+
+        link.blackhole(); // no FIN, no RST: the sockets just stop delivering
+        state_is(&c, "offline after the black hole", |s| s.offline).await;
+
+        link.restore();
+        let mut peer = server.accept().await;
         peer.accept_auth().await;
         state_is(&c, "online after the reconnect", |s| !s.offline).await;
     }
