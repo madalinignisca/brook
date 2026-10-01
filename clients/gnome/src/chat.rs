@@ -3641,7 +3641,7 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
         options.append(&remove);
         options.append(
             &gtk::Label::builder()
-                .label(LOST_DEVICE_HELP)
+                .label(lost_device_help(*chat.is_admin.borrow()))
                 .wrap(true)
                 .xalign(0.0)
                 .css_classes(["caption", "dim-label"])
@@ -3672,10 +3672,19 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
 }
 
 /// Under the checkbox (owner decision, #46 §8): data kept on a device is cut off, if the
-/// device is lost, by ending its sign-in, not by this checkbox.
-const LOST_DEVICE_HELP: &str = "If you lose a device, change your password with \
-\"Sign out of other devices\" on, or ask an admin to reset your account. That ends its \
-sign-in.";
+/// device is lost, by ending its sign-in, not by this checkbox. An admin can't be reset by
+/// another admin (the server refuses), so they're only told the password route.
+fn lost_device_help(admin: bool) -> String {
+    let switch = crate::account::SIGN_OUT_OTHERS_LABEL;
+    let reset = if admin {
+        ""
+    } else {
+        ", or ask an admin to reset your account"
+    };
+    format!(
+        "If you lose a device, change your password with \"{switch}\" on{reset}. That ends its sign-in."
+    )
+}
 
 /// What signing out does to this device's data, in words.
 /// `known`: this user's stores answered a cached call, so `unsent` is a real count (it's 0
@@ -4174,10 +4183,25 @@ mod mention_tests {
 
 #[cfg(test)]
 mod lost_device_help_tests {
+    use super::lost_device_help;
+    use crate::account::SIGN_OUT_OTHERS_LABEL;
+
     #[test]
     fn the_sign_out_help_names_the_ways_to_cut_off_a_lost_device() {
-        assert!(super::LOST_DEVICE_HELP.contains("change your password"));
-        assert!(super::LOST_DEVICE_HELP.contains("Sign out of other devices"));
-        assert!(super::LOST_DEVICE_HELP.contains("admin"));
+        let member = lost_device_help(false);
+        assert!(member.contains("change your password"));
+        assert!(
+            member.contains(SIGN_OUT_OTHERS_LABEL),
+            "the switch's own label"
+        );
+        assert!(member.contains("ask an admin to reset your account"));
+    }
+
+    #[test]
+    fn an_admin_is_only_told_the_password_route() {
+        // The server refuses an admin resetting another admin (403).
+        let admin = lost_device_help(true);
+        assert!(admin.contains(SIGN_OUT_OTHERS_LABEL));
+        assert!(!admin.contains("admin"));
     }
 }
