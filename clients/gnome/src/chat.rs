@@ -3634,10 +3634,23 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
             .label("Remove this device's data")
             .active(true)
             .build();
+        let options = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .build();
+        options.append(&remove);
+        options.append(
+            &gtk::Label::builder()
+                .label(LOST_DEVICE_HELP)
+                .wrap(true)
+                .xalign(0.0)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
         let known = chat.local_open.get();
         let body = sign_out_body(unsent, known, true);
         let dialog = adw::AlertDialog::new(Some("Sign Out?"), Some(&body));
-        dialog.set_extra_child(Some(&remove));
+        dialog.set_extra_child(Some(&options));
         remove.connect_toggled({
             let dialog = dialog.clone();
             move |check| dialog.set_body(&sign_out_body(unsent, known, check.is_active()))
@@ -3657,6 +3670,12 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
         dialog.present(Some(&chat.message_list));
     });
 }
+
+/// Under the checkbox (owner decision, #46 §8): data kept on a device is cut off, if the
+/// device is lost, by ending its sign-in, not by this checkbox.
+const LOST_DEVICE_HELP: &str = "If you lose a device, change your password with \
+\"Sign out of other devices\" on, or ask an admin to reset your account. That ends its \
+sign-in.";
 
 /// What signing out does to this device's data, in words.
 /// `known`: this user's stores answered a cached call, so `unsent` is a real count (it's 0
@@ -4150,5 +4169,15 @@ mod mention_tests {
         assert_eq!(badge_texts(3, 1), ("@1".into(), "3".into()));
         // A count that lags the mentions never shows fewer.
         assert_eq!(badge_texts(0, 2), ("@2".into(), "2".into()));
+    }
+}
+
+#[cfg(test)]
+mod lost_device_help_tests {
+    #[test]
+    fn the_sign_out_help_names_the_ways_to_cut_off_a_lost_device() {
+        assert!(super::LOST_DEVICE_HELP.contains("change your password"));
+        assert!(super::LOST_DEVICE_HELP.contains("Sign out of other devices"));
+        assert!(super::LOST_DEVICE_HELP.contains("admin"));
     }
 }
