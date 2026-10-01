@@ -28,13 +28,13 @@ mutant named beside it.
 5. **Mac order**: `ChannelsModel` gets `activity`, `opened` (persisted per account in `UserDefaults`, written on
    the main actor; the counter starts at `max(saved) + 1`; nothing is persisted while `me` is unknown), and `resort()` calling `sidebarOrder`. Rules: `reloadList` applies
    `max(current, cache)` after its generation check and re-sorts; `message.new` records the key (also for
-   unknown channels) and re-sorts when `activityMoves`; `cacheChannelsChanged` only moves keys forward and
+   unknown channels) and re-sorts when `activityMoves` against the `sorted` key, which is set at each re-sort; `cacheChannelsChanged` only moves keys forward and
    re-sorts only if a conversation other than the open one, or one opened since the last re-sort, moved; `openChannel.didSet` raises the rank and
    never re-sorts. New `ChannelOrderTests`, with fixtures: out-of-order `cachedChannels`; a click before a
    notice; names whose display order differs from handle order; local data off, live message, then reload;
-   the back-fill notice for the open channel, and for A when B was opened right after A; saved ranks, a new model, one click: that channel ranks first; a message for an unknown channel. Mutants: no sort in
+   the cache notice before and after its live message (both orders re-sort once), the back-fill notice for the open channel, and for A when B was opened right after A; saved ranks, a new model, one click: that channel ranks first; a message for an unknown channel. Mutants: no sort in
    `reloadList`; no re-sort on `message.new`; a re-sort in `didSet`; a re-sort on every notice; cache key
-   overwriting the live one (no `max`); no handling of the open channel in a notice.
+   overwriting the live one (no `max`); no handling of the open channel in a notice; comparing against `activity` instead of `sorted`.
 6. **Run and show**: `cargo test -p brook-core -p brook-ffi`, `cargo clippy`, `clients/macos/build.sh test`,
    each mutant output pasted. Against a test server: a second account posts and the conversation moves up;
    restart; toggle the preference. The PR states what could not be seen (GTK unchanged; the live run needs

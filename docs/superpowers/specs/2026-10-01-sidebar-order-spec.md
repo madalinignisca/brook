@@ -35,6 +35,10 @@ or auth changes remain. The pure rules live in core so GTK can reuse them; the G
   replaces a row, or a late cache read can only move a key forward (`max`). A message for a channel that is
   not in the list yet is recorded in `activity` and applies when the row arrives (the reload the unknown
   `channel.update` starts).
+- **Two keys per conversation:** `activity` (the newest id seen, from the cache or live) and `sorted` (the
+  value at the last re-sort). `activity_moves` compares a live message against `sorted`, not `activity`, so a
+  cache notice that already advanced `activity` for the open conversation cannot swallow its later
+  `message.new` (either order of arrival re-sorts once the live message is heard).
 - **When the list re-sorts:** on a list load; on a `message.new` that moves the key (`activity_moves`);
   and on a cache `Channels` notice where a key moved forward for a conversation that is neither the open
   one nor one opened since the last re-sort (their back-fill raises their own key; the set is cleared on
@@ -85,3 +89,13 @@ or auth changes remain. The pure rules live in core so GTK can reuse them; the G
 - **Two messages in the same millisecond:** the random part of the UUIDv7 decides.
 - **Message ids are compared as text:** the server issues canonical lowercase UUIDv7 strings.
 - **No server calls are added**, so there are no refusal codes.
+
+## Review record
+
+Round 1 (codex, Claude): the cache format bump (lost pinned files), in-memory keys lost on reload and
+replace, the unknown-channel path, contradictory restart criteria, the click jump through the history
+back-fill, the Settings name clash, label cost: all taken (design section). Round 2: the tie-break now
+ignores the preference; labels come from one row factory; the opened counter starts above the saved
+ranks; the pending-row mutant is gone; empty `me` joins labels; a back-fill finishing after a switch is
+suppressed by the opened-since-last-sort set; the cache-versus-live arrival order is covered by the
+`sorted` key. Rebutted: none. Closed (no round 3).
