@@ -70,6 +70,26 @@ final class TimelineReactionTests: XCTestCase {
         XCTAssertEqual(t.messages[1].reactions, [chip("👍", 1)], "and per message")
     }
 
+    func testMyOlderEventStillSetsMyFlagWhenSomeoneElsesNewerEventCarriedTheCount() {
+        let t = timeline(FakeChat())
+        // Bob's add commits after mine, but his event arrives first.
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "bob", added: true, count: 2, seq: 10))
+        XCTAssertEqual(t.messages[0].reactions, [chip("👍", 2)])
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "me", added: true, count: 1, seq: 9))
+        XCTAssertEqual(t.messages[0].reactions, [chip("👍", 2, me: true)], "the count stays, my flag is set")
+        // And an older event of mine does not undo a newer one of mine.
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "me", added: false, count: 1, seq: 8))
+        XCTAssertEqual(t.messages[0].reactions, [chip("👍", 2, me: true)])
+    }
+
+    func testAResyncForgetsTheOrderingSoALowerSeqIsHeardAgain() {
+        let t = timeline(FakeChat())
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "bob", added: true, count: 3, seq: 100))
+        t.apply(.resync)
+        t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "bob", added: true, count: 4, seq: 2))
+        XCTAssertEqual(t.messages[0].reactions, [chip("👍", 4)])
+    }
+
     func testMyEventSetsMyFlagAndAnotherChannelOrUnknownMessageIsIgnored() {
         let t = timeline(FakeChat())
         t.apply(.reactionUpdate(channelId: "c", messageId: "m1", emoji: "👍", userId: "me", added: true, count: 1, seq: nextSeq()))
