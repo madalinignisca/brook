@@ -327,3 +327,120 @@ mod live_restore {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+#[cfg(test)]
+mod live_local_data {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use brook_core::{BrookClient, CoreConfig, LoginOutcome};
+
+    use super::SecretServiceSlot;
+
+    /// Every file under `dir`, recursively, that contains `needle`, or starts like a plain
+    /// SQLite database.
+    fn plaintext(dir: &Path, needle: &str, found: &mut Vec<String>, files: &mut usize) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                plaintext(&path, needle, found, files);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                *files += 1;
+                let has = |n: &[u8]| !n.is_empty() && bytes.windows(n.len()).any(|w| w == n);
+                if has(needle.as_bytes()) || bytes.starts_with(b"SQLite format 3\0") {
+                    found.push(path.display().to_string());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_scan_finds_plain_text_and_plain_sqlite_files() {
+        let dir = std::env::temp_dir().join(format!("brook-scan-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/notes.txt"), b"xx NEEDLE yy").unwrap();
+        std::fs::write(dir.join("plain.db"), b"SQLite format 3\0rest").unwrap();
+        std::fs::write(dir.join("cipher.db"), [7u8; 64]).unwrap();
+        let (mut found, mut files) = (Vec::new(), 0);
+        plaintext(&dir, "NEEDLE", &mut found, &mut files);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(files, 3);
+        found.sort();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found[0].ends_with("plain.db") && found[1].ends_with("notes.txt"),
+            "{found:?}"
+        );
+    }
+
+    /// Offline cache at rest, end to end on the real desktop keyring: with local data on, a
+    /// message that went through the cache (and the outbox) leaves nothing readable on disk.
+    /// `BROOK_LIVE_SERVER=... BROOK_LIVE_HANDLE=... BROOK_LIVE_PASSWORD=... BROOK_LIVE_CHANNEL=<id>
+    /// cargo test -p brook-gnome -- --ignored local_data_is_ciphertext_on_disk`
+    #[test]
+    #[ignore = "touches the desktop keyring and a live server"]
+    fn local_data_is_ciphertext_on_disk() {
+        let (Ok(server), Ok(handle), Ok(password), Ok(channel)) = (
+            std::env::var("BROOK_LIVE_SERVER"),
+            std::env::var("BROOK_LIVE_HANDLE"),
+            std::env::var("BROOK_LIVE_PASSWORD"),
+            std::env::var("BROOK_LIVE_CHANNEL"),
+        ) else {
+            eprintln!("BROOK_LIVE_* not set: skipped");
+            return;
+        };
+        let slot = Arc::new(SecretServiceSlot::new());
+        if !slot.available() {
+            eprintln!("no unlocked keyring: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("brook-live-data-{}", std::process::id()));
+        let marker = format!("CIPHERCHECK-{}-{}", std::process::id(), "needle");
+        let outbox_marker = format!("{marker}-outbox");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let client = Arc::new(
+                BrookClient::new(CoreConfig::with_options(&server, true).unwrap()).unwrap(),
+            );
+            client.enable_persistence(slot.clone(), dir.clone());
+            assert!(
+                client.enable_local_data(slot.clone(), dir.clone()).await,
+                "local data should turn on with a usable keyring"
+            );
+            assert!(matches!(
+                client.login(&handle, &password).await.unwrap(),
+                LoginOutcome::LoggedIn(_)
+            ));
+            client.start_realtime().await.unwrap();
+            client.send_message(&channel, &marker, None).await.unwrap();
+            client
+                .send_queued(&channel, &outbox_marker, None, None)
+                .await
+                .unwrap();
+            // Wait until both went through the cache, then read them back from it.
+            let mut seen = false;
+            for _ in 0..40 {
+                if let Ok(page) = client.cached_messages(&channel, None, 50).await {
+                    let bodies: Vec<&str> = page.messages.iter().map(|m| m.body.as_str()).collect();
+                    if bodies.contains(&marker.as_str()) && bodies.contains(&outbox_marker.as_str())
+                    {
+                        seen = true;
+                        break;
+                    }
+                }
+                let _ = client.load_head(&channel, 50).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert!(seen, "both messages should be readable from the cache");
+            client.logout().await;
+            client.close_local_data().await;
+        });
+        let (mut found, mut files) = (Vec::new(), 0);
+        plaintext(&dir, &marker, &mut found, &mut files);
+        println!("scanned {files} files under {}", dir.display());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(files > 0, "the stores should have written files");
+        assert!(found.is_empty(), "readable on disk: {found:?}");
+    }
+}
