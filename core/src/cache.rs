@@ -31,6 +31,15 @@ pub(crate) const HINT_DEBOUNCE: Duration = Duration::from_millis(500);
 const RETRY_START: Duration = Duration::from_secs(2);
 const RETRY_CAP: Duration = Duration::from_secs(30);
 
+/// The wait before the next retry, in ms: `start` after a success (`last` is 0), then double
+/// the previous wait, never beyond `cap`.
+pub(crate) fn retry_delay(last: u64, start: u64, cap: u64) -> u64 {
+    match last {
+        0 => start,
+        last => (last * 2).min(cap),
+    }
+}
+
 /// The server couldn't be reached (as opposed to refusing or failing the request).
 fn is_network_failure(e: &SyncError) -> bool {
     matches!(
@@ -270,10 +279,7 @@ impl Cache {
         }
         let start = self.retry_bounds_ms[0].load(Ordering::SeqCst);
         let cap = self.retry_bounds_ms[1].load(Ordering::SeqCst);
-        let wait = match self.retry_ms.load(Ordering::SeqCst) {
-            0 => start,
-            last => (last * 2).min(cap),
-        };
+        let wait = retry_delay(self.retry_ms.load(Ordering::SeqCst), start, cap);
         self.retry_ms.store(wait, Ordering::SeqCst);
         let me = Arc::clone(self);
         let task = tokio::spawn(async move {
@@ -290,6 +296,11 @@ impl Cache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         tasks.retain(|t| !t.is_finished());
         tasks.push(task);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retry_wait_for_tests(&self) -> u64 {
+        self.retry_ms.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     #[cfg(test)]

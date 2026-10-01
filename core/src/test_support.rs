@@ -904,10 +904,17 @@ impl FlakyLink {
 
 impl Drop for FlakyLink {
     fn drop(&mut self) {
-        self.accept.abort(); // drops the listener
-        for relay in self.relays.lock().unwrap().drain(..) {
+        // Like `cut`: `down` is set under the relay lock before the drain, so an accept
+        // task running on another worker that is registering a relay right now either
+        // registered before (and is drained here) or sees `down` and aborts its own relay.
+        // Aborting `accept` first would leave that window open. Not testable
+        // deterministically: it needs a task preempted between spawn and registration.
+        let mut relays = self.relays.lock().unwrap();
+        self.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        for relay in relays.drain(..) {
             relay.abort();
         }
+        self.accept.abort(); // drops the listener
     }
 }
 
@@ -1519,6 +1526,32 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(tokio::net::TcpStream::connect(&addr).await.is_err());
+    }
+
+    /// A server that accepts the TCP connection and never answers the websocket upgrade does
+    /// not hang the attempt: it ends within the idle timeout, like any failed connect, so the
+    /// disconnect is announced and the backoff applies.
+    #[tokio::test]
+    async fn an_upgrade_that_is_never_answered_ends_within_the_idle_timeout() {
+        use crate::ws::WS_DISCONNECTED;
+        let server = TestServer::start().await;
+        let link = FlakyLink::to(&server).await;
+        let client = BrookClient::new(CoreConfig::new(&link.base).unwrap()).unwrap();
+        client.login("alice", "pw").await.unwrap();
+        // From here connections are accepted and swallowed: the upgrade gets no answer.
+        link.blackhole();
+        client.with_transport(|t| t.idle_timeout = Duration::from_secs(1));
+        let mut raw = client.commands.raw_events_sender().subscribe();
+        client.start_realtime().await.unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(4), async {
+            while let Ok((ty, _)) = raw.recv().await {
+                if ty == WS_DISCONNECTED {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(end.is_ok(), "the connect attempt hung");
     }
 
     /// A lost connection is announced to the cache; a sign-out is not a lost connection.

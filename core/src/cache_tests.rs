@@ -1304,13 +1304,26 @@ async fn a_request_that_arrived_during_a_failing_run_is_served_after_it() {
     assert!(!cache.state().borrow().offline);
 }
 
-/// A network failure schedules its own retry, so `offline` clears without any other trigger.
-/// Waits double up to the cap, and start over after a success.
+/// The retry wait starts at `start`, doubles, stops at `cap`, and restarts from `start` when
+/// `last` is 0 (what a success leaves). Checked on the values, not on elapsed time.
+#[test]
+fn the_retry_wait_doubles_up_to_the_cap() {
+    use crate::cache::retry_delay;
+    assert_eq!(retry_delay(0, 100, 350), 100);
+    assert_eq!(retry_delay(100, 100, 350), 200);
+    assert_eq!(retry_delay(200, 100, 350), 350); // 400 uncapped
+    assert_eq!(retry_delay(350, 100, 350), 350);
+    assert_eq!(retry_delay(0, 2000, 30_000), 2000); // after a success
+}
+
+/// A network failure schedules its own retry, so `offline` clears without any other trigger;
+/// a success resets the wait so the next outage starts over from the first wait. The waits
+/// are read from the cache's own record, so no timing bound is involved.
 #[tokio::test]
-async fn a_network_failure_is_retried_with_a_growing_capped_wait() {
+async fn a_network_failure_is_retried_and_a_success_resets_the_wait() {
     let fetch = Failing::new(4, None);
     let (cache, _dir) = cache_over(fetch.clone());
-    cache.set_retry_for_tests(Duration::from_millis(100), Duration::from_millis(150));
+    cache.set_retry_for_tests(Duration::from_millis(20), Duration::from_millis(50));
     assert!(cache.sync_now().await.is_err());
     assert!(cache.state().borrow().offline);
     let f = fetch.clone();
@@ -1320,25 +1333,16 @@ async fn a_network_failure_is_retried_with_a_growing_capped_wait() {
         .await
         .unwrap()
         .unwrap();
-    let t = fetch.calls.lock().unwrap().clone();
-    let gap = |i: usize| t[i + 1].duration_since(t[i]);
-    assert!(gap(0) >= Duration::from_millis(100), "{:?}", gap(0));
-    assert!(
-        gap(1) >= Duration::from_millis(150),
-        "doubled: {:?}",
-        gap(1)
-    ); // 200, capped to 150
-    assert!(gap(2) >= Duration::from_millis(150), "{:?}", gap(2));
-    assert!(gap(2) < Duration::from_millis(300), "capped: {:?}", gap(2)); // 400 uncapped
+    // 20, 40, 50 (capped from 80), 50: the record is the last wait until a success clears it.
+    let c = cache.clone();
+    eventually("the wait reset", move || c.retry_wait_for_tests() == 0).await;
 
-    // Back to the start wait after the success: 100 ms again, not 150.
-    fetch.fails.store(2, Ordering::SeqCst);
+    // A new outage starts at the first wait again, not at the doubled last one (an hour away
+    // here, so the record cannot move before it is read).
+    cache.set_retry_for_tests(Duration::from_secs(3600), Duration::from_secs(7200));
+    fetch.fails.store(1, Ordering::SeqCst);
     assert!(cache.sync_now().await.is_err());
-    let f = fetch.clone();
-    eventually("the retries", move || f.count() == 8).await;
-    let t = fetch.calls.lock().unwrap().clone();
-    let reset = t[6].duration_since(t[5]);
-    assert!(reset < Duration::from_millis(140), "reset: {reset:?}");
+    assert_eq!(cache.retry_wait_for_tests(), 3_600_000);
 }
 
 /// A closed cache does not retry.

@@ -487,7 +487,12 @@ async fn run_once(
     // The credential revision this socket is authenticated with.
     let mut auth_rev = rev.credential_rev;
     let mut reauth: Option<Reauth> = None;
-    let (mut socket, _resp) = connect_async(url.as_str()).await?;
+    // A server that accepts the TCP connection and never answers the upgrade would hold this
+    // attempt forever, with no backoff and no disconnect event: bound it like an idle link.
+    let (mut socket, _resp) =
+        tokio::time::timeout(transport.idle_timeout, connect_async(url.as_str()))
+            .await
+            .map_err(|_| Error::Timeout)??;
     tracing::info!(%url, "websocket connected; sending auth");
 
     let auth = json!({ "type": "auth", "data": { "access_token": token } });
@@ -533,13 +538,37 @@ async fn run_once(
                     });
                     continue;
                 }
-                if let Err(err) = write_command(&mut socket, transport, out, &mut pending, &mut next_id).await {
-                    break Err(err);
+                // A write that cannot finish within the idle timeout means a dead link (the
+                // send buffer is full and nothing drains it): end the connection.
+                match tokio::time::timeout(
+                    transport.idle_timeout,
+                    write_command(&mut socket, transport, out, &mut pending, &mut next_id),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => break Err(err),
+                    Err(_) => {
+                        tracing::warn!("websocket write stalled; reconnecting");
+                        break Ok(RunEnd::Closed { ready });
+                    }
                 }
             }
             Some(out) = transport.released_rx.recv() => {
-                if let Err(err) = write_command(&mut socket, transport, out, &mut pending, &mut next_id).await {
-                    break Err(err);
+                // A write that cannot finish within the idle timeout means a dead link (the
+                // send buffer is full and nothing drains it): end the connection.
+                match tokio::time::timeout(
+                    transport.idle_timeout,
+                    write_command(&mut socket, transport, out, &mut pending, &mut next_id),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => break Err(err),
+                    Err(_) => {
+                        tracing::warn!("websocket write stalled; reconnecting");
+                        break Ok(RunEnd::Closed { ready });
+                    }
                 }
             }
             () = sleep_until_opt(next_deadline) => {
