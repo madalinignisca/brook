@@ -45,6 +45,8 @@ struct Chat {
     badges: Rc<RefCell<Vec<Badge>>>,
     /// message id -> its widgets, for live edit/delete of the open channel.
     message_rows: Rc<RefCell<HashMap<String, MessageWidgets>>>,
+    /// The newest reaction event applied per message and emoji (a late, older one is dropped).
+    reaction_seqs: Rc<RefCell<ReactionSeqs>>,
     /// The message id currently being replied to (quote-reply), if any.
     replying_to: Rc<RefCell<Option<String>>>,
     /// The reply banner shown above the composer while replying.
@@ -243,6 +245,7 @@ pub fn build(
         channels: Rc::new(RefCell::new(Vec::new())),
         badges: Rc::new(RefCell::new(Vec::new())),
         message_rows: Rc::new(RefCell::new(HashMap::new())),
+        reaction_seqs: Rc::default(),
         replying_to: Rc::new(RefCell::new(None)),
         reply_bar: reply_bar.clone(),
         reply_label: reply_label.clone(),
@@ -577,15 +580,26 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     user_id,
                     added,
                     count,
+                    seq,
                     ..
                 }) => {
-                    apply_reaction(&chat, &message_id, &emoji, &user_id, added, count);
+                    // The server numbers changes in commit order: an event not above the last
+                    // applied for this emoji on this message is stale, and would put an older
+                    // count back.
+                    if chat
+                        .reaction_seqs
+                        .borrow_mut()
+                        .accept(&message_id, &emoji, seq)
+                    {
+                        apply_reaction(&chat, &message_id, &emoji, &user_id, added, count);
+                    }
                 }
                 Ok(ServerEvent::ChannelDelete { channel_id }) => {
                     // If the open channel was deleted, clear the conversation view.
                     if chat.current.borrow().as_deref() == Some(channel_id.as_str()) {
                         *chat.current.borrow_mut() = None;
                         chat.message_rows.borrow_mut().clear();
+                        chat.reaction_seqs.borrow_mut().clear();
                         while let Some(row) = chat.message_list.row_at_index(0) {
                             chat.message_list.remove(&row);
                         }
@@ -809,6 +823,7 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
     // Clear now, before the await, so live messages that arrive while history is
     // loading are appended to a fresh list rather than wiped by a late clear.
     chat.message_rows.borrow_mut().clear();
+    chat.reaction_seqs.borrow_mut().clear();
     chat.pending_rows.borrow_mut().clear();
     chat.shown_client_ids.borrow_mut().clear();
     while let Some(row) = chat.message_list.row_at_index(0) {
@@ -1493,6 +1508,32 @@ fn toggle_reaction(chat: &Rc<Chat>, channel_id: String, message_id: String, emoj
             tracing::warn!(%err, "failed to toggle reaction");
         }
     });
+}
+
+/// The newest `reaction.update` seq applied per message and emoji.
+#[derive(Default)]
+struct ReactionSeqs(HashMap<(String, String), i64>);
+
+impl ReactionSeqs {
+    /// Whether an event is newer than the last applied for this emoji on this message (and
+    /// remembers it if so). The server's counter is commit-ordered, so a lower or equal one is
+    /// stale.
+    fn accept(&mut self, message_id: &str, emoji: &str, seq: i64) -> bool {
+        let last = self
+            .0
+            .entry((message_id.to_string(), emoji.to_string()))
+            .or_insert(i64::MIN);
+        if seq > *last {
+            *last = seq;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 /// Apply an incremental `reaction.update` to a message's tallies, then re-render.
@@ -4150,5 +4191,29 @@ mod mention_tests {
         assert_eq!(badge_texts(3, 1), ("@1".into(), "3".into()));
         // A count that lags the mentions never shows fewer.
         assert_eq!(badge_texts(0, 2), ("@2".into(), "2".into()));
+    }
+}
+
+#[cfg(test)]
+mod reaction_seq_tests {
+    use super::ReactionSeqs;
+
+    #[test]
+    fn an_older_or_repeated_event_for_the_same_emoji_is_dropped() {
+        let mut seqs = ReactionSeqs::default();
+        assert!(seqs.accept("m1", "\u{1f44d}", 10));
+        assert!(!seqs.accept("m1", "\u{1f44d}", 9), "older");
+        assert!(!seqs.accept("m1", "\u{1f44d}", 10), "the same event twice");
+        assert!(seqs.accept("m1", "\u{1f44d}", 11), "newer");
+    }
+
+    #[test]
+    fn the_order_is_tracked_per_message_and_per_emoji() {
+        let mut seqs = ReactionSeqs::default();
+        assert!(seqs.accept("m1", "\u{1f44d}", 10));
+        assert!(seqs.accept("m1", "\u{1f389}", 5), "another emoji");
+        assert!(seqs.accept("m2", "\u{1f44d}", 1), "another message");
+        seqs.clear();
+        assert!(seqs.accept("m1", "\u{1f44d}", 1), "after a channel switch");
     }
 }
