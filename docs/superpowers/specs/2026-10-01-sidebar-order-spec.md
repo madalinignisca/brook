@@ -1,6 +1,6 @@
 # Mac: sidebar labels and last-used order (#219): spec
 
-Status: spec, closed after review round 1 (codex, Claude); round 2 pending. Review dial: **Standard**
+Status: spec, closed after review round 2 (codex, Claude). Review dial: **Standard**
 for the spec, plan and diff (two external reviewers plus the Claude review, as for any Mac change).
 Round 1 first set it to Heavy for a cache format bump; that bump was dropped (see Design), so no storage
 or auth changes remain. The pure rules live in core so GTK can reuse them; the GTK UI is a follow-up.
@@ -16,16 +16,18 @@ or auth changes remain. The pure rules live in core so GTK can reuse them; the G
   - `person_label(display_name, handle, show_usernames) -> String`: `@handle` when the preference is on;
     else the trimmed display name; if that is empty, `@handle`.
   - `conversation_label(kind, name, members, me, show_usernames) -> String`: a non-empty name is `#name`;
-    a DM is the other member's `person_label`; otherwise the members' labels joined by commas; and
+    a DM is the other member's `person_label` (an empty or unknown `me` picks no "other": the members'
+    labels are joined instead); otherwise the members' labels joined by commas; and
     `"Direct message"` when nothing is known. Never empty, so the sort key is always defined.
   - `sidebar_order(entries) -> Vec<String>` (ids). Channels (`kind != "dm"`) before DMs. Within a section:
-    newest message id descending, none last; then opened rank descending, none last; then label
-    (lowercase); then id.
+    newest message id descending, none last; then opened rank descending, none last; then the **name
+    key** (lowercase `conversation_label` with `show_usernames = false`, so the preference can never
+    change the order); then id. `SidebarEntry` carries that key as `sort_key`.
   - `activity_moves(current: Option<&str>, message_id: &str) -> bool`: strictly newer.
 - **Last activity:** `cached_channels` gains `last_message_id`, `max(m.id)` over the channel's cached
   messages (tombstones included, so a deletion never lowers it). Message ids are UUIDv7 text, so they sort
   by time. A read-only query: no schema or format change.
-- **Opened rank:** an in-memory counter in the Mac's model, persisted as a `[channelId: Int]` dictionary in
+- **Opened rank:** an in-memory counter in the Mac's model (it starts at `max(saved ranks) + 1` after a launch), persisted as a `[channelId: Int]` dictionary in
   `UserDefaults` under a key per account. Written synchronously on the main actor (no detached writes, so
   no ordering race). Entries for channels no longer in the list are dropped when the list loads.
 - **Model state is separate from rows.** `ChannelsModel` keeps `activity: [id: messageId]` and
@@ -34,11 +36,14 @@ or auth changes remain. The pure rules live in core so GTK can reuse them; the G
   not in the list yet is recorded in `activity` and applies when the row arrives (the reload the unknown
   `channel.update` starts).
 - **When the list re-sorts:** on a list load; on a `message.new` that moves the key (`activity_moves`);
-  and on a cache `Channels` notice where a key moved forward for a conversation that is *not* the open one.
+  and on a cache `Channels` notice where a key moved forward for a conversation that is neither the open
+  one nor one opened since the last re-sort (their back-fill raises their own key; the set is cleared on
+  each re-sort).
   A click never re-sorts, and neither does the history back-fill that opening starts (it raises the open
   conversation's own key). A re-sort applies the whole rule, so earlier clicks can show then.
-- **Labels in the row:** the model stores each row's label at load and when the preference toggles, so
-  `body` never calls into core per row. Notification titles use the same labels.
+- **Labels in the row:** the model stores each row's label, set by one row factory used wherever a row is
+  built (list load, `channel.update`, reveal) and recomputed when the preference toggles, so `body` never
+  calls into core per row and a rename shows at once. Notification titles use the same labels.
 - **Preference:** `UserDefaults` key `ShowUsernames`, off by default, a Toggle in a Settings window
   (`SwiftUI.Settings`, named in full: the app has its own `Settings` struct).
 
@@ -60,8 +65,8 @@ or auth changes remain. The pure rules live in core so GTK can reuse them; the G
 7. With local data on, a restart recomputes the same rule from the cache and the saved ranks, so the order
    is the one that rule gives (not a replay of what was shown).
 8. A message for an unknown channel is kept and applies when its row arrives.
-9. Core: `cached_channels_carry_the_newest_message_id_including_tombstones`; acknowledged outbox messages
-   count and pending ones do not (`last_message_id` ignores pending rows); the pure rules are usable from
+9. Core: `cached_channels_carry_the_newest_message_id_including_tombstones`; an acknowledged outbox message
+   counts (the pending ones live in the separate outbox database, so a queued message never appears here); the pure rules are usable from
    an external crate (doctest).
 
 ## Not doing
