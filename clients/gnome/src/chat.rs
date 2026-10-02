@@ -3978,9 +3978,11 @@ impl OfflineBanner {
     }
 }
 
-/// The offline banner, from the cache's state (shown once offline has lasted
-/// `OFFLINE_BANNER_DELAY`), and the one-time clean-up of other accounts' saved data once this
-/// user's storage is open.
+/// Watch the cache's offline flag: show the offline banner `OFFLINE_BANNER_DELAY` after the
+/// flag turns true if it hasn't gone false since (a flip back within the delay shows nothing;
+/// the flag is a watch value, so an offline-online-offline flap shorter than one poll can show
+/// the banner slightly early), and hide it at once when it goes false. Also the one-time
+/// clean-up of other accounts' saved data once this user's storage is open.
 fn watch_offline(chat: &Rc<Chat>) {
     // Core's state feed (#113): it follows sign-ins and switches by itself and resets
     // to the default on sign-out, so the banner never shows a previous user's state.
