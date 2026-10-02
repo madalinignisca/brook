@@ -241,6 +241,9 @@ final class CacheFeed {
     func cleanUpOthers() async {
         defer { cleaning = false }
         guard let others = try? await client.otherLocalUsers() else { return } // retried later
+        // The lookup can outlive the session: a stale answer may list the account now current
+        // as an "other", so a stopped feed neither erases ranks nor wipes.
+        guard !stopped else { return }
         guard !others.isEmpty else {
             cleanedUp = true
             return

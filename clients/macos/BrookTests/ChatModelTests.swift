@@ -39,6 +39,9 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     var lost: UInt64?
     let acknowledged = Mutex<[UInt64]>([])
     var others: [FfiLocalUser] = []
+    /// Holds `otherLocalUsers` after it has counted the call.
+    var othersGate: Gate?
+    let othersAsked = Mutex(0)
     let wiped = Mutex(0)
     let wipeFails = Mutex(false)
     let wipeTried = Mutex(0)

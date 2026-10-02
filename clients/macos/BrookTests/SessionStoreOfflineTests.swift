@@ -154,7 +154,7 @@ final class SessionStoreOfflineTests: XCTestCase {
         fake.forgetFails.withLock { $0 = removalFails }
         seedRanks(alice.id, "other")
         store.signOut(removeData: removeData)
-        // The erase runs before the stores close, in the same task: "closed" ends both forms.
+        // "closed" ends both forms.
         await until("sign-out ended") { fake.localCalls.withLock { $0 }.contains("closed") }
     }
 
@@ -172,6 +172,26 @@ final class SessionStoreOfflineTests: XCTestCase {
     func testTheRanksGoEvenWhenTheRemovalFails() async {
         await signOutAfterSignIn(removeData: true, removalFails: true)
         XCTAssertFalse(hasRanks(alice.id), "a failed removal left the ranks")
+    }
+
+    func testASameUserSignInWhileTheRemovalRunsKeepsItsOwnRanks() async {
+        let fake = signedIn()
+        let store = store(fake)
+        await store.signIn(server: "https://h", handle: "alice", password: "pw")
+        await until("on") { store.localData == .on }
+        defaults.set(["old": 5], forKey: "ChannelOpenedRanks.\(alice.id)")
+        fake.forgetGated.withLock { $0 = true }
+        store.signOut(removeData: true)
+        await until("removing") { fake.localCalls.withLock { $0 }.contains("forget") }
+        // The same user signs in again before the removal ends, and their model is built.
+        await store.signIn(server: "https://h", handle: "alice", password: "pw")
+        let model = ChannelsModel(client: FakeRealtime(channels: []), me: alice.id, isActive: { true },
+                                  defaults: defaults)
+        fake.forgetGate.open()
+        await until("removal ended") { fake.localCalls.withLock { $0 }.contains("closed") }
+        model.openChannel = "c2"
+        XCTAssertEqual(defaults.dictionary(forKey: "ChannelOpenedRanks.\(alice.id)") as? [String: Int], ["c2": 1],
+                       "the late removal blocked the new session's ranks, or the old ranks came back")
     }
 
     func testCleaningUpOtherAccountsDropsTheirRanksNotTheCurrentOnes() async {
@@ -201,6 +221,31 @@ final class SessionStoreOfflineTests: XCTestCase {
         XCTAssertTrue(tried, "the wipe was not attempted")
         XCTAssertFalse(hasRanks("u9"), "a failed wipe left the listed account's ranks")
         XCTAssertTrue(hasRanks("me"), "the current user's ranks went")
+    }
+
+    func testAStoppedFeedLateLookupErasesNothingAndWipesNothing() async {
+        let chat = FakeChat()
+        chat.local = true
+        let gate = Gate()
+        chat.othersGate = gate
+        chat.others = [FfiLocalUser(origin: "o", userId: "u9", unsent: 0)]
+        seedRanks("u9")
+        // The model of the account that is current by the time the stale lookup returns.
+        let model = ChannelsModel(client: FakeRealtime(channels: []), me: "u9", isActive: { true }, defaults: defaults)
+        let feed = CacheFeed(client: chat, defaults: defaults)
+        let run = Task { await feed.cleanUpOthers() }
+        for _ in 0 ..< 300 where chat.othersAsked.withLock({ $0 }) == 0 {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(chat.othersAsked.withLock { $0 }, 1, "the lookup never started")
+        feed.stop()
+        gate.open()
+        await run.value
+        XCTAssertTrue(hasRanks("u9"), "a stale lookup erased the ranks")
+        XCTAssertEqual(chat.wipeTried.withLock { $0 }, 0, "a stopped feed wiped")
+        model.openChannel = "c2"
+        XCTAssertNotNil((defaults.dictionary(forKey: "ChannelOpenedRanks.u9") as? [String: Int])?["c2"],
+                        "the stale lookup blocked the current account's saving")
     }
 
     func testEveryUnfinishedSignOutIsWaitedForNotOnlyTheLatest() async {

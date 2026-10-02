@@ -386,6 +386,11 @@ final class SessionStore {
         end()
         phase = .signedOut(error: nil)
         let before = signIns
+        // The user asked for removal: their opened-order ranks go even if the core's removal
+        // fails (a failure is said below and retried by the user). Here, before anything
+        // awaits: a same-user sign-in does not wait for the task below, and an erase landing
+        // after its new model loaded would wipe that session's ranks and block its saves.
+        if removeData { ChannelsModel.eraseRanks(for: user.id, defaults: defaults) }
         _ = tracked { [weak self] in
             var removalFailed = false
             if removeData {
@@ -394,9 +399,6 @@ final class SessionStore {
                 // waits for this task (and that one) anyway.
                 await enabling?.value
                 do { try await client.signOutAndForget() } catch { removalFailed = true }
-                // The user asked for removal: their opened-order ranks go even if the core's
-                // removal failed (a failure is said below and retried by the user).
-                ChannelsModel.eraseRanks(for: user.id, defaults: defaults)
             } else {
                 await client.logout() // core forgets the stored copy, then revokes (best effort)
             }

@@ -79,7 +79,10 @@ extension FakeChat: OfflineClient {
 
     func otherLocalUsers() async throws -> [FfiLocalUser] {
         try need()
-        return others
+        othersAsked.withLock { $0 += 1 }
+        let answer = others
+        if let othersGate { await othersGate.wait() }
+        return answer
     }
 
     func wipeOtherLocalUsers() async throws {
