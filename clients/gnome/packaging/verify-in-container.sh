@@ -113,4 +113,7 @@ fi
 # The documented removal must take the app away again (INSTALL.md: ./install.sh --uninstall).
 (cd "$work"/brook-gnome-*/ && ./install.sh --uninstall)
 [ ! -e "$bin" ] || { echo "FAIL: --uninstall left $bin behind" >&2; exit 1; }
+# A launcher left pointing at a deleted binary is the failure users would see.
+desktop="${XDG_DATA_HOME:-$HOME/.local/share}/applications/dev.brook.Brook.desktop"
+[ ! -e "$desktop" ] || { echo "FAIL: --uninstall left $desktop behind" >&2; exit 1; }
 echo "PASS $PRETTY_NAME"
