@@ -4,7 +4,7 @@
 # after `cargo build --release --locked -p brook-gnome`; BROOK_BINARY overrides
 # the binary path, e.g. the musl build in target/musl/release). The optional last argument
 # marks the Alpine (musl) build, which can't share a name with the glibc one:
-#   brook-gnome-<version>-linux-<arch>.tar.gz        glibc (Debian, Ubuntu, Fedora, Arch)
+#   brook-gnome-<version>-linux-<arch>.tar.gz        glibc (Debian 13, Ubuntu 26.04)
 #   brook-gnome-<version>-linux-musl-<arch>.tar.gz   Alpine
 set -euo pipefail
 version="$1" arch="$2" out="$3" libc="${4:-glibc}"

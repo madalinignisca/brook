@@ -48,6 +48,9 @@ struct Chat {
     badges: Rc<RefCell<Vec<Badge>>>,
     /// message id -> its widgets, for live edit/delete of the open channel.
     message_rows: Rc<RefCell<HashMap<String, MessageWidgets>>>,
+    /// The newest reaction event applied per message and emoji, for the count and for my own
+    /// flag (a late, older event is dropped, or applied to my flag alone).
+    reaction_order: Rc<RefCell<ReactionOrder>>,
     /// The message id currently being replied to (quote-reply), if any.
     replying_to: Rc<RefCell<Option<String>>>,
     /// The reply banner shown above the composer while replying.
@@ -253,6 +256,7 @@ pub fn build(
         channels: Rc::new(RefCell::new(Vec::new())),
         badges: Rc::new(RefCell::new(Vec::new())),
         message_rows: Rc::new(RefCell::new(HashMap::new())),
+        reaction_order: Rc::default(),
         replying_to: Rc::new(RefCell::new(None)),
         reply_bar: reply_bar.clone(),
         reply_label: reply_label.clone(),
@@ -599,15 +603,17 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     user_id,
                     added,
                     count,
+                    seq,
                     ..
                 }) => {
-                    apply_reaction(&chat, &message_id, &emoji, &user_id, added, count);
+                    apply_reaction(&chat, &message_id, &emoji, &user_id, added, count, seq);
                 }
                 Ok(ServerEvent::ChannelDelete { channel_id }) => {
                     // If the open channel was deleted, clear the conversation view.
                     if chat.current.borrow().as_deref() == Some(channel_id.as_str()) {
                         *chat.current.borrow_mut() = None;
                         chat.message_rows.borrow_mut().clear();
+                        chat.reaction_order.borrow_mut().clear();
                         while let Some(row) = chat.message_list.row_at_index(0) {
                             chat.message_list.remove(&row);
                         }
@@ -657,9 +663,17 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     }
                     refresh_call_button(&chat);
                 }
-                Ok(ServerEvent::Ready) => {}
+                Ok(ServerEvent::Ready) => {
+                    // A (re)connect: the server's numbering may have restarted (a restore from
+                    // a backup), so what was applied before says nothing about what follows.
+                    chat.reaction_order.borrow_mut().clear();
+                }
                 Ok(_) => {} // future event kinds — ignored
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Events were missed: the order seen so far can't vouch for what follows.
+                    chat.reaction_order.borrow_mut().clear();
+                    continue;
+                }
                 Err(_) => break, // sender gone
             }
         }
@@ -845,6 +859,7 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
     // Clear now, before the await, so live messages that arrive while history is
     // loading are appended to a fresh list rather than wiped by a late clear.
     chat.message_rows.borrow_mut().clear();
+    chat.reaction_order.borrow_mut().clear();
     chat.pending_rows.borrow_mut().clear();
     chat.shown_client_ids.borrow_mut().clear();
     while let Some(row) = chat.message_list.row_at_index(0) {
@@ -1532,6 +1547,86 @@ fn toggle_reaction(chat: &Rc<Chat>, channel_id: String, message_id: String, emoj
     });
 }
 
+/// The newest `reaction.update` seq applied per message and emoji, kept apart for the count and
+/// for my own flag. The server numbers changes in commit order, but events can arrive out of
+/// order: a count is taken from an event only if it is the newest for its emoji, while my flag
+/// is taken from my own events only if they are the newest of mine. So an older event of mine
+/// still sets my chip when someone else's newer event carried the count (otherwise the chip
+/// would show unselected and a click would toggle my reaction off).
+#[derive(Default)]
+struct ReactionOrder {
+    counts: HashMap<(String, String), i64>,
+    own: HashMap<(String, String), i64>,
+}
+
+/// What an event may change on a message's chips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fresh {
+    /// The count is the newest seen.
+    count: bool,
+    /// My flag is the newest of my own events (false for other users' events).
+    flag: bool,
+}
+
+impl ReactionOrder {
+    /// Judge an event and remember it.
+    fn judge(&mut self, message_id: &str, emoji: &str, seq: i64, mine: bool) -> Fresh {
+        let key = (message_id.to_string(), emoji.to_string());
+        let newest = |map: &mut HashMap<(String, String), i64>| {
+            let last = map.entry(key.clone()).or_insert(i64::MIN);
+            let fresh = seq > *last;
+            if fresh {
+                *last = seq;
+            }
+            fresh
+        };
+        Fresh {
+            count: newest(&mut self.counts),
+            flag: mine && newest(&mut self.own),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.counts.clear();
+        self.own.clear();
+    }
+}
+
+/// A message's chips after an event. A fresh count replaces the emoji's total (a chip at 0 goes);
+/// my flag follows my own fresh events. A stale count with a fresh flag changes only my flag, on
+/// the chip that exists.
+fn reactions_after(
+    list: &mut Vec<ReactionSummary>,
+    emoji: &str,
+    count: i64,
+    added: bool,
+    mine: bool,
+    fresh: Fresh,
+) {
+    let existing = list.iter().position(|r| r.emoji == emoji);
+    if fresh.count {
+        match existing {
+            Some(i) => {
+                list[i].count = count;
+                if mine && fresh.flag {
+                    list[i].me = added;
+                }
+            }
+            None if count > 0 => list.push(ReactionSummary {
+                emoji: emoji.to_string(),
+                count,
+                me: mine && fresh.flag && added,
+            }),
+            None => {}
+        }
+    } else if fresh.flag {
+        if let Some(i) = existing {
+            list[i].me = added;
+        }
+    }
+    list.retain(|r| r.count > 0);
+}
+
 /// Apply an incremental `reaction.update` to a message's tallies, then re-render.
 fn apply_reaction(
     chat: &Rc<Chat>,
@@ -1540,28 +1635,26 @@ fn apply_reaction(
     user_id: &str,
     added: bool,
     count: i64,
+    seq: i64,
 ) {
     let me = chat.me.borrow().clone().unwrap_or_default();
-    let is_me = !me.is_empty() && user_id == me;
+    let mine = !me.is_empty() && user_id == me;
+    // A message that isn't on screen: nothing to change, and nothing worth remembering.
     let Some(mw) = chat.message_rows.borrow().get(message_id).cloned() else {
         return;
     };
-    {
-        let mut reactions = mw.reactions.borrow_mut();
-        if let Some(existing) = reactions.iter_mut().find(|r| r.emoji == emoji) {
-            existing.count = count;
-            if is_me {
-                existing.me = added;
-            }
-        } else if count > 0 {
-            reactions.push(ReactionSummary {
-                emoji: emoji.to_string(),
-                count,
-                me: is_me && added,
-            });
-        }
-        reactions.retain(|r| r.count > 0);
-    }
+    let fresh = chat
+        .reaction_order
+        .borrow_mut()
+        .judge(message_id, emoji, seq, mine);
+    reactions_after(
+        &mut mw.reactions.borrow_mut(),
+        emoji,
+        count,
+        added,
+        mine,
+        fresh,
+    );
     render_reactions(chat, message_id);
 }
 
@@ -3924,7 +4017,64 @@ fn badges_from_cache(chat: &Rc<Chat>) {
     });
 }
 
-/// The offline banner, from the cache's state (every few seconds), and the one-time
+/// How long the cache must stay offline before the banner says so.
+const OFFLINE_BANNER_DELAY: Duration = Duration::from_secs(3);
+
+/// What the banner does when the cache's offline flag is read.
+#[derive(Debug, PartialEq, Eq)]
+enum BannerAction {
+    /// Online: hide it at once, and any reveal still waiting is cancelled.
+    Hide,
+    /// Offline and not shown: start a timer, which must call `on_fire` with this number.
+    Start(u64),
+    /// Nothing to do (already shown, or a timer is already waiting).
+    Keep,
+}
+
+/// The offline banner's bookkeeping, apart from GTK so it can be tested. Each started timer
+/// has a number, and only the newest waiting one may reveal the banner, so a timer that is
+/// stale (the flag went false and true again, or the loop ended) can't show it early even if
+/// it still fires.
+#[derive(Default)]
+struct OfflineBanner {
+    waiting: Option<u64>,
+    last_timer: u64,
+}
+
+impl OfflineBanner {
+    fn on_state(&mut self, offline: bool, revealed: bool) -> BannerAction {
+        if !offline {
+            self.waiting = None;
+            return BannerAction::Hide;
+        }
+        if revealed || self.waiting.is_some() {
+            return BannerAction::Keep;
+        }
+        self.last_timer += 1;
+        self.waiting = Some(self.last_timer);
+        BannerAction::Start(self.last_timer)
+    }
+
+    /// A timer fired: whether to reveal the banner now. Only the waiting timer may, and going
+    /// online (or the watch ending) clears it, so "still offline" is implied.
+    fn on_fire(&mut self, timer: u64) -> bool {
+        if self.waiting != Some(timer) {
+            return false;
+        }
+        self.waiting = None;
+        true
+    }
+
+    /// The watch ended: nothing waiting may reveal anything.
+    fn stop(&mut self) {
+        self.waiting = None;
+    }
+}
+
+/// Watch the cache's offline flag: show the offline banner `OFFLINE_BANNER_DELAY` after the
+/// flag turns true if it hasn't gone false since (a flip back within the delay shows nothing;
+/// the flag is a watch value, so an offline-online-offline flap shorter than one poll can show
+/// the banner slightly early), and hide it at once when it goes false. Also the one-time
 /// clean-up of other accounts' saved data once this user's storage is open.
 fn watch_offline(chat: &Rc<Chat>) {
     // Core's state feed (#113): it follows sign-ins and switches by itself and resets
@@ -3933,6 +4083,10 @@ fn watch_offline(chat: &Rc<Chat>) {
     let chat_weak = Rc::downgrade(chat);
     glib::spawn_future_local(async move {
         let mut checked_others = false;
+        // The banner's bookkeeping (a flaky link flips the flag within seconds: not every flip
+        // is shown), and the timer that reveals it once offline has lasted.
+        let banner_state = Rc::new(RefCell::new(OfflineBanner::default()));
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
         loop {
             let current = state.borrow_and_update().clone();
             let Some(chat) = chat_weak.upgrade() else {
@@ -3941,7 +4095,33 @@ fn watch_offline(chat: &Rc<Chat>) {
             if chat.offline_banner.root().is_none() {
                 break; // signed out: the view is gone
             }
-            chat.offline_banner.set_revealed(current.offline);
+            let action = banner_state
+                .borrow_mut()
+                .on_state(current.offline, chat.offline_banner.is_revealed());
+            match action {
+                BannerAction::Hide => {
+                    if let Some(id) = pending.borrow_mut().take() {
+                        id.remove();
+                    }
+                    chat.offline_banner.set_revealed(false);
+                }
+                BannerAction::Start(generation) => {
+                    let banner = chat.offline_banner.downgrade();
+                    let (banner_state, slot) = (banner_state.clone(), pending.clone());
+                    let id = glib::timeout_add_local_once(OFFLINE_BANNER_DELAY, move || {
+                        // Fired: forget the id first, so nothing removes a source that's gone.
+                        *slot.borrow_mut() = None;
+                        let show = banner_state.borrow_mut().on_fire(generation);
+                        if let Some(banner) = banner.upgrade() {
+                            if show {
+                                banner.set_revealed(true);
+                            }
+                        }
+                    });
+                    *pending.borrow_mut() = Some(id);
+                }
+                BannerAction::Keep => {}
+            }
             // The first completed sync means this user's storage is open: now is the
             // time to clear another account's saved data (#46 §8).
             if current.last_synced.is_some() && !checked_others {
@@ -3952,6 +4132,12 @@ fn watch_offline(chat: &Rc<Chat>) {
             if state.changed().await.is_err() {
                 break;
             }
+        }
+        // The loop is over (signed out): no timer may fire on a banner that's gone.
+        banner_state.borrow_mut().stop();
+        let leftover = pending.borrow_mut().take();
+        if let Some(id) = leftover {
+            id.remove();
         }
     });
     report_outbox_lost(chat);
@@ -4988,5 +5174,172 @@ mod error_hold_tests {
         );
         assert!(hold.holding(early), "still held");
         assert_eq!(hold.timer_fired(t0 + ERROR_SHOWN), HoldTimer::Over);
+    }
+}
+
+#[cfg(test)]
+mod reaction_order_tests {
+    use super::{reactions_after, Fresh, ReactionOrder, ReactionSummary};
+
+    const UP: &str = "\u{1f44d}";
+    const PARTY: &str = "\u{1f389}";
+
+    fn chip(emoji: &str, count: i64, me: bool) -> ReactionSummary {
+        ReactionSummary {
+            emoji: emoji.into(),
+            count,
+            me,
+        }
+    }
+
+    /// Run an event through the order and the chips, as `apply_reaction` does.
+    fn apply(
+        order: &mut ReactionOrder,
+        list: &mut Vec<ReactionSummary>,
+        (emoji, count, added, mine, seq): (&str, i64, bool, bool, i64),
+    ) {
+        let fresh = order.judge("m1", emoji, seq, mine);
+        reactions_after(list, emoji, count, added, mine, fresh);
+    }
+
+    #[test]
+    fn an_older_count_is_dropped_and_a_newer_one_applies() {
+        let (mut order, mut list) = (ReactionOrder::default(), vec![]);
+        apply(&mut order, &mut list, (UP, 3, true, false, 10));
+        apply(&mut order, &mut list, (UP, 2, true, false, 9));
+        assert_eq!(
+            list,
+            [chip(UP, 3, false)],
+            "an older count must not come back"
+        );
+        apply(&mut order, &mut list, (UP, 1, false, false, 11));
+        assert_eq!(list, [chip(UP, 1, false)]);
+        apply(&mut order, &mut list, (UP, 1, false, false, 11));
+        assert_eq!(list, [chip(UP, 1, false)], "the same event twice");
+    }
+
+    #[test]
+    fn my_older_event_still_sets_my_flag_after_a_newer_event_of_someone_else() {
+        // I react at seq 10, someone else at 11, and 11 arrives first.
+        let (mut order, mut list) = (ReactionOrder::default(), vec![]);
+        apply(&mut order, &mut list, (UP, 2, true, false, 11));
+        assert_eq!(list, [chip(UP, 2, false)]);
+        apply(&mut order, &mut list, (UP, 1, true, true, 10));
+        assert_eq!(list, [chip(UP, 2, true)], "the count stays, my flag is set");
+    }
+
+    #[test]
+    fn my_older_event_never_undoes_a_newer_one_of_mine() {
+        let (mut order, mut list) = (ReactionOrder::default(), vec![]);
+        apply(&mut order, &mut list, (UP, 1, true, true, 12)); // I add
+        apply(&mut order, &mut list, (UP, 0, false, true, 11)); // an older remove of mine, late
+        assert_eq!(list, [chip(UP, 1, true)]);
+    }
+
+    #[test]
+    fn my_newer_remove_clears_my_flag_even_when_the_count_is_already_newer() {
+        // Mirror of the add case: someone else's seq 12 set the count, then my remove at 11
+        // arrives late. The count stays, and my flag goes (it is the newest of mine).
+        let (mut order, mut list) = (ReactionOrder::default(), vec![]);
+        apply(&mut order, &mut list, (UP, 2, true, true, 9)); // I added
+        apply(&mut order, &mut list, (UP, 3, true, false, 12)); // someone else, newer
+        assert_eq!(list, [chip(UP, 3, true)]);
+        apply(&mut order, &mut list, (UP, 2, false, true, 11)); // my remove, late
+        assert_eq!(list, [chip(UP, 3, false)], "count kept, my flag cleared");
+    }
+
+    #[test]
+    fn my_older_add_never_undoes_a_newer_remove_of_mine() {
+        let (mut order, mut list) = (ReactionOrder::default(), vec![]);
+        apply(&mut order, &mut list, (UP, 2, true, false, 5));
+        apply(&mut order, &mut list, (UP, 1, false, true, 12)); // I removed
+        apply(&mut order, &mut list, (UP, 2, true, true, 11)); // my older add, late
+        assert_eq!(list, [chip(UP, 1, false)]);
+    }
+
+    #[test]
+    fn a_stale_flag_event_for_a_chip_that_is_gone_creates_nothing() {
+        let (mut order, mut list) = (ReactionOrder::default(), vec![]);
+        apply(&mut order, &mut list, (UP, 0, false, false, 20)); // the count went to 0
+        apply(&mut order, &mut list, (UP, 1, true, true, 10)); // my older add arrives late
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn the_order_is_per_message_and_per_emoji_and_forgotten_on_clear() {
+        let mut order = ReactionOrder::default();
+        assert_eq!(
+            order.judge("m1", UP, 10, false),
+            Fresh {
+                count: true,
+                flag: false
+            }
+        );
+        assert!(order.judge("m1", PARTY, 5, false).count, "another emoji");
+        assert!(order.judge("m2", UP, 1, false).count, "another message");
+        assert!(!order.judge("m1", UP, 9, false).count);
+        order.clear();
+        assert_eq!(
+            order.judge("m1", UP, 1, true),
+            Fresh {
+                count: true,
+                flag: true
+            },
+            "after a reconnect or a channel switch the numbering starts over"
+        );
+    }
+}
+
+#[cfg(test)]
+mod offline_banner_tests {
+    use super::{BannerAction, OfflineBanner};
+
+    #[test]
+    fn going_offline_starts_one_timer_and_a_repeat_while_waiting_starts_none() {
+        let mut b = OfflineBanner::default();
+        assert_eq!(b.on_state(true, false), BannerAction::Start(1));
+        assert_eq!(
+            b.on_state(true, false),
+            BannerAction::Keep,
+            "no second timer"
+        );
+        assert!(b.on_fire(1));
+    }
+
+    #[test]
+    fn a_flaky_flip_restarts_the_wait_and_the_first_timer_shows_nothing() {
+        let mut b = OfflineBanner::default();
+        assert_eq!(b.on_state(true, false), BannerAction::Start(1));
+        assert_eq!(b.on_state(false, false), BannerAction::Hide);
+        assert_eq!(
+            b.on_state(true, false),
+            BannerAction::Start(2),
+            "a fresh wait"
+        );
+        // The first timer still fires (3 s after the first true): it must not reveal.
+        assert!(!b.on_fire(1), "stale timer");
+        assert!(b.on_fire(2));
+    }
+
+    #[test]
+    fn a_timer_firing_after_the_flag_went_false_shows_nothing() {
+        let mut b = OfflineBanner::default();
+        assert_eq!(b.on_state(true, false), BannerAction::Start(1));
+        assert_eq!(b.on_state(false, false), BannerAction::Hide);
+        assert!(!b.on_fire(1));
+    }
+
+    #[test]
+    fn an_already_shown_banner_starts_no_timer_and_a_stopped_watch_reveals_nothing() {
+        let mut b = OfflineBanner::default();
+        assert_eq!(b.on_state(true, true), BannerAction::Keep);
+        assert_eq!(
+            b.on_state(false, true),
+            BannerAction::Hide,
+            "back online hides it"
+        );
+        assert_eq!(b.on_state(true, false), BannerAction::Start(1));
+        b.stop();
+        assert!(!b.on_fire(1));
     }
 }

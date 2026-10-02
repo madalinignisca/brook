@@ -273,6 +273,88 @@ final class CacheFeedTests: XCTestCase {
         XCTAssertFalse(feed.offline, "a state delivered out of order won")
     }
 
+    // ---- The offline banner waits before it shows ----
+
+    func testBannerGateStartsOneTimerAndARepeatWhileWaitingStartsNone() {
+        var g = OfflineBannerGate()
+        XCTAssertEqual(g.onState(offline: true, shown: false), .start(1))
+        XCTAssertEqual(g.onState(offline: true, shown: false), .keep, "no second timer")
+        XCTAssertTrue(g.onFire(1))
+    }
+
+    func testBannerGateFlakyFlipRestartsTheWaitAndTheStaleTimerShowsNothing() {
+        var g = OfflineBannerGate()
+        XCTAssertEqual(g.onState(offline: true, shown: false), .start(1))
+        XCTAssertEqual(g.onState(offline: false, shown: false), .hide)
+        XCTAssertEqual(g.onState(offline: true, shown: false), .start(2), "a fresh wait")
+        XCTAssertFalse(g.onFire(1), "stale timer")
+        XCTAssertTrue(g.onFire(2))
+    }
+
+    func testBannerGateTimerFiringAfterTheFlagWentFalseShowsNothing() {
+        var g = OfflineBannerGate()
+        XCTAssertEqual(g.onState(offline: true, shown: false), .start(1))
+        XCTAssertEqual(g.onState(offline: false, shown: false), .hide)
+        XCTAssertFalse(g.onFire(1))
+    }
+
+    func testBannerGateHidesAtOnceWhenShownAndStartsNoTimerWhileShown() {
+        var g = OfflineBannerGate()
+        XCTAssertEqual(g.onState(offline: true, shown: true), .keep)
+        XCTAssertEqual(g.onState(offline: false, shown: true), .hide)
+    }
+
+    func testBannerGateStoppedRevealsNothing() {
+        var g = OfflineBannerGate()
+        XCTAssertEqual(g.onState(offline: true, shown: false), .start(1))
+        g.stop()
+        XCTAssertFalse(g.onFire(1))
+    }
+
+    func testBannerWaitsForOfflineToLastAndAFlipWithinTheDelayNeverShowsIt() async {
+        let feed = CacheFeed(client: FakeChat(), bannerDelay: .milliseconds(150))
+        feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: nil, offline: true))
+        XCTAssertTrue(feed.offline, "the raw flag is not delayed")
+        XCTAssertFalse(feed.showsOfflineBanner)
+        feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: nil, offline: false))
+        try? await Task.sleep(for: .milliseconds(400))
+        XCTAssertFalse(feed.showsOfflineBanner, "the first wait was cancelled")
+
+        feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: nil, offline: true))
+        let shown = await Self.eventually { feed.showsOfflineBanner }
+        XCTAssertTrue(shown, "offline held past the delay")
+        feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: nil, offline: false))
+        XCTAssertFalse(feed.showsOfflineBanner, "hidden at once")
+    }
+
+    func testStopCancelsAPendingBanner() async {
+        let feed = CacheFeed(client: FakeChat(), bannerDelay: .milliseconds(100))
+        feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: nil, offline: true))
+        feed.stop()
+        feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: nil, offline: true)) // a late one
+        try? await Task.sleep(for: .milliseconds(300))
+        XCTAssertFalse(feed.showsOfflineBanner)
+    }
+
+    func testStopHidesABannerThatIsOnScreen() async {
+        let feed = CacheFeed(client: FakeChat(), bannerDelay: .milliseconds(50))
+        feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: nil, offline: true))
+        let shown = await Self.eventually { feed.showsOfflineBanner }
+        XCTAssertTrue(shown)
+        feed.stop()
+        XCTAssertFalse(feed.showsOfflineBanner, "stop takes a shown banner down")
+    }
+
+    /// Polls until `condition` holds or `within` passes: a fixed sleep can lose to a busy machine.
+    @MainActor static func eventually(within: Duration = .seconds(3), _ condition: @MainActor () -> Bool) async -> Bool {
+        let deadline = ContinuousClock.now + within
+        while ContinuousClock.now < deadline {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return condition()
+    }
+
     func testTheBannerFollowsTheFeedAndResetsOnStop() {
         let feed = CacheFeed(client: FakeChat())
         let t = TimelineModel(channelId: "c", client: FakeChat())
