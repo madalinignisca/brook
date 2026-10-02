@@ -3924,30 +3924,63 @@ fn badges_from_cache(chat: &Rc<Chat>) {
     });
 }
 
-/// The offline banner, from the cache's state (every few seconds), and the one-time
-/// clean-up of other accounts' saved data once this user's storage is open.
 /// How long the cache must stay offline before the banner says so.
 const OFFLINE_BANNER_DELAY: Duration = Duration::from_secs(3);
 
-/// What the banner does when the cache's offline flag changes (or is re-read).
+/// What the banner does when the cache's offline flag is read.
 #[derive(Debug, PartialEq, Eq)]
-enum BannerStep {
-    /// Online: hide it at once (and cancel a pending reveal).
+enum BannerAction {
+    /// Online: hide it at once, and any reveal still waiting is cancelled.
     Hide,
-    /// Offline and not shown yet: show it if that lasts.
-    StartTimer,
-    /// Nothing to do (offline and already shown).
+    /// Offline and not shown: start a timer, which must call `on_fire` with this number.
+    Start(u64),
+    /// Nothing to do (already shown, or a timer is already waiting).
     Keep,
 }
 
-fn banner_step(offline: bool, revealed: bool) -> BannerStep {
-    match (offline, revealed) {
-        (false, _) => BannerStep::Hide,
-        (true, false) => BannerStep::StartTimer,
-        (true, true) => BannerStep::Keep,
+/// The offline banner's bookkeeping, apart from GTK so it can be tested. Each started timer
+/// has a number, and only the newest waiting one may reveal the banner, so a timer that is
+/// stale (the flag went false and true again, or the loop ended) can't show it early even if
+/// it still fires.
+#[derive(Default)]
+struct OfflineBanner {
+    waiting: Option<u64>,
+    last_timer: u64,
+}
+
+impl OfflineBanner {
+    fn on_state(&mut self, offline: bool, revealed: bool) -> BannerAction {
+        if !offline {
+            self.waiting = None;
+            return BannerAction::Hide;
+        }
+        if revealed || self.waiting.is_some() {
+            return BannerAction::Keep;
+        }
+        self.last_timer += 1;
+        self.waiting = Some(self.last_timer);
+        BannerAction::Start(self.last_timer)
+    }
+
+    /// A timer fired: whether to reveal the banner now. Only the waiting timer may, and going
+    /// online (or the watch ending) clears it, so "still offline" is implied.
+    fn on_fire(&mut self, timer: u64) -> bool {
+        if self.waiting != Some(timer) {
+            return false;
+        }
+        self.waiting = None;
+        true
+    }
+
+    /// The watch ended: nothing waiting may reveal anything.
+    fn stop(&mut self) {
+        self.waiting = None;
     }
 }
 
+/// The offline banner, from the cache's state (shown once offline has lasted
+/// `OFFLINE_BANNER_DELAY`), and the one-time clean-up of other accounts' saved data once this
+/// user's storage is open.
 fn watch_offline(chat: &Rc<Chat>) {
     // Core's state feed (#113): it follows sign-ins and switches by itself and resets
     // to the default on sign-out, so the banner never shows a previous user's state.
@@ -3955,9 +3988,9 @@ fn watch_offline(chat: &Rc<Chat>) {
     let chat_weak = Rc::downgrade(chat);
     glib::spawn_future_local(async move {
         let mut checked_others = false;
-        // Whether the cache says offline now, and the timer that shows the banner once that
-        // has lasted (a flaky link flips the flag within seconds: not every flip is shown).
-        let offline_now = Rc::new(Cell::new(false));
+        // The banner's bookkeeping (a flaky link flips the flag within seconds: not every flip
+        // is shown), and the timer that reveals it once offline has lasted.
+        let banner_state = Rc::new(RefCell::new(OfflineBanner::default()));
         let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
         loop {
             let current = state.borrow_and_update().clone();
@@ -3967,28 +4000,32 @@ fn watch_offline(chat: &Rc<Chat>) {
             if chat.offline_banner.root().is_none() {
                 break; // signed out: the view is gone
             }
-            offline_now.set(current.offline);
-            match banner_step(current.offline, chat.offline_banner.is_revealed()) {
-                BannerStep::Hide => {
+            let action = banner_state
+                .borrow_mut()
+                .on_state(current.offline, chat.offline_banner.is_revealed());
+            match action {
+                BannerAction::Hide => {
                     if let Some(id) = pending.borrow_mut().take() {
                         id.remove();
                     }
                     chat.offline_banner.set_revealed(false);
                 }
-                BannerStep::StartTimer if pending.borrow().is_none() => {
+                BannerAction::Start(generation) => {
                     let banner = chat.offline_banner.downgrade();
-                    let (offline_now, slot) = (offline_now.clone(), pending.clone());
+                    let (banner_state, slot) = (banner_state.clone(), pending.clone());
                     let id = glib::timeout_add_local_once(OFFLINE_BANNER_DELAY, move || {
                         // Fired: forget the id first, so nothing removes a source that's gone.
                         *slot.borrow_mut() = None;
+                        let show = banner_state.borrow_mut().on_fire(generation);
                         if let Some(banner) = banner.upgrade() {
-                            // Only if it is still offline by now.
-                            banner.set_revealed(offline_now.get());
+                            if show {
+                                banner.set_revealed(true);
+                            }
                         }
                     });
                     *pending.borrow_mut() = Some(id);
                 }
-                BannerStep::StartTimer | BannerStep::Keep => {}
+                BannerAction::Keep => {}
             }
             // The first completed sync means this user's storage is open: now is the
             // time to clear another account's saved data (#46 §8).
@@ -4000,6 +4037,12 @@ fn watch_offline(chat: &Rc<Chat>) {
             if state.changed().await.is_err() {
                 break;
             }
+        }
+        // The loop is over (signed out): no timer may fire on a banner that's gone.
+        banner_state.borrow_mut().stop();
+        let leftover = pending.borrow_mut().take();
+        if let Some(id) = leftover {
+            id.remove();
         }
     });
     report_outbox_lost(chat);
@@ -4100,10 +4143,23 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
             .label("Remove this device's data")
             .active(true)
             .build();
+        let options = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .build();
+        options.append(&remove);
+        options.append(
+            &gtk::Label::builder()
+                .label(lost_device_help(*chat.is_admin.borrow()))
+                .wrap(true)
+                .xalign(0.0)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
         let known = chat.local_open.get();
         let body = sign_out_body(unsent, known, true);
         let dialog = adw::AlertDialog::new(Some("Sign Out?"), Some(&body));
-        dialog.set_extra_child(Some(&remove));
+        dialog.set_extra_child(Some(&options));
         remove.connect_toggled({
             let dialog = dialog.clone();
             move |check| dialog.set_body(&sign_out_body(unsent, known, check.is_active()))
@@ -4122,6 +4178,25 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
         });
         dialog.present(Some(&chat.message_list));
     });
+}
+
+/// Under the checkbox (owner decision, #46 §8): a lost device's *account* access is cut off by
+/// ending its sign-in. The data already saved on it is not: it is encrypted with that device's
+/// own random key, held in that device's keyring, so it stays readable to whoever can sign in
+/// to that computer. The text says both. An admin can't be reset by another admin (the server
+/// refuses), so they're only told the password route.
+fn lost_device_help(admin: bool) -> String {
+    let switch = crate::account::SIGN_OUT_OTHERS_LABEL;
+    let reset = if admin {
+        ""
+    } else {
+        ", or ask an admin to reset your account"
+    };
+    format!(
+        "If you lose a device, change your password with \"{switch}\" on{reset}. That ends its \
+         sign-in, but messages already saved on it stay readable to anyone who can sign in to \
+         that computer."
+    )
 }
 
 /// What signing out does to this device's data, in words.
@@ -4635,6 +4710,93 @@ mod mention_tests {
 }
 
 #[cfg(test)]
+mod lost_device_help_tests {
+    use super::lost_device_help;
+    use crate::account::SIGN_OUT_OTHERS_LABEL;
+
+    #[test]
+    fn the_sign_out_help_names_the_ways_to_cut_off_a_lost_device() {
+        let member = lost_device_help(false);
+        assert!(member.contains("change your password"));
+        assert!(
+            member.contains(SIGN_OUT_OTHERS_LABEL),
+            "the switch's own label"
+        );
+        assert!(member.contains("ask an admin to reset your account"));
+    }
+
+    #[test]
+    fn the_help_doesnt_promise_protection_for_data_already_on_the_device() {
+        for admin in [false, true] {
+            let help = lost_device_help(admin);
+            assert!(help.contains("ends its sign-in, but"), "{help}");
+            assert!(help.contains("stay readable"), "{help}");
+        }
+    }
+
+    #[test]
+    fn an_admin_is_only_told_the_password_route() {
+        // The server refuses an admin resetting another admin (403).
+        let admin = lost_device_help(true);
+        assert!(admin.contains(SIGN_OUT_OTHERS_LABEL));
+        assert!(!admin.contains("admin"));
+    }
+}
+
+#[cfg(test)]
+mod manage_tests {
+    use super::{management_shown, may_manage, ManageShown, QUICK_EMOJI};
+
+    #[test]
+    fn an_admin_or_the_channels_owner_manages_it() {
+        assert!(may_manage(true, None));
+        assert!(may_manage(true, Some("member")));
+        assert!(may_manage(false, Some("owner")));
+        assert!(!may_manage(false, Some("member")));
+        // Roles unknown (an older server) and not an admin: nothing is offered.
+        assert!(!may_manage(false, None));
+    }
+
+    #[test]
+    fn a_dm_offers_nothing_and_archive_follows_the_state() {
+        // A DM: not even an admin or an owner (the server answers 422).
+        assert_eq!(
+            management_shown(true, true, Some("owner"), false),
+            ManageShown::default()
+        );
+        // A plain member of a channel.
+        assert_eq!(
+            management_shown(false, false, Some("member"), false),
+            ManageShown::default()
+        );
+        // An owner of an open channel: Archive, not Unarchive.
+        assert_eq!(
+            management_shown(false, false, Some("owner"), false),
+            ManageShown {
+                whole: true,
+                archive: true,
+                unarchive: false
+            }
+        );
+        // An admin of an archived channel: Unarchive, not Archive.
+        assert_eq!(
+            management_shown(false, true, None, true),
+            ManageShown {
+                whole: true,
+                archive: false,
+                unarchive: true
+            }
+        );
+    }
+
+    #[test]
+    fn the_quick_heart_is_the_emoji_form_the_mac_and_kde_send() {
+        // The server keys reactions on the exact string: a bare U+2764 would be another one.
+        assert_eq!(QUICK_EMOJI[1], "\u{2764}\u{fe0f}");
+    }
+}
+
+#[cfg(test)]
 mod typing_tests {
     use super::*;
 
@@ -4921,71 +5083,55 @@ mod error_hold_tests {
 }
 
 #[cfg(test)]
-mod manage_tests {
-    use super::{management_shown, may_manage, ManageShown, QUICK_EMOJI};
-
-    #[test]
-    fn an_admin_or_the_channels_owner_manages_it() {
-        assert!(may_manage(true, None));
-        assert!(may_manage(true, Some("member")));
-        assert!(may_manage(false, Some("owner")));
-        assert!(!may_manage(false, Some("member")));
-        // Roles unknown (an older server) and not an admin: nothing is offered.
-        assert!(!may_manage(false, None));
-    }
-
-    #[test]
-    fn a_dm_offers_nothing_and_archive_follows_the_state() {
-        // A DM: not even an admin or an owner (the server answers 422).
-        assert_eq!(
-            management_shown(true, true, Some("owner"), false),
-            ManageShown::default()
-        );
-        // A plain member of a channel.
-        assert_eq!(
-            management_shown(false, false, Some("member"), false),
-            ManageShown::default()
-        );
-        // An owner of an open channel: Archive, not Unarchive.
-        assert_eq!(
-            management_shown(false, false, Some("owner"), false),
-            ManageShown {
-                whole: true,
-                archive: true,
-                unarchive: false
-            }
-        );
-        // An admin of an archived channel: Unarchive, not Archive.
-        assert_eq!(
-            management_shown(false, true, None, true),
-            ManageShown {
-                whole: true,
-                archive: false,
-                unarchive: true
-            }
-        );
-    }
-
-    #[test]
-    fn the_quick_heart_is_the_emoji_form_the_mac_and_kde_send() {
-        // The server keys reactions on the exact string: a bare U+2764 would be another one.
-        assert_eq!(QUICK_EMOJI[1], "\u{2764}\u{fe0f}");
-    }
-}
-
-#[cfg(test)]
 mod offline_banner_tests {
-    use super::{banner_step, BannerStep};
+    use super::{BannerAction, OfflineBanner};
 
     #[test]
-    fn going_offline_waits_and_coming_back_hides_at_once() {
-        assert_eq!(banner_step(true, false), BannerStep::StartTimer);
-        assert_eq!(banner_step(true, true), BannerStep::Keep, "already shown");
+    fn going_offline_starts_one_timer_and_a_repeat_while_waiting_starts_none() {
+        let mut b = OfflineBanner::default();
+        assert_eq!(b.on_state(true, false), BannerAction::Start(1));
         assert_eq!(
-            banner_step(false, false),
-            BannerStep::Hide,
-            "cancels a pending reveal"
+            b.on_state(true, false),
+            BannerAction::Keep,
+            "no second timer"
         );
-        assert_eq!(banner_step(false, true), BannerStep::Hide);
+        assert!(b.on_fire(1));
+    }
+
+    #[test]
+    fn a_flaky_flip_restarts_the_wait_and_the_first_timer_shows_nothing() {
+        let mut b = OfflineBanner::default();
+        assert_eq!(b.on_state(true, false), BannerAction::Start(1));
+        assert_eq!(b.on_state(false, false), BannerAction::Hide);
+        assert_eq!(
+            b.on_state(true, false),
+            BannerAction::Start(2),
+            "a fresh wait"
+        );
+        // The first timer still fires (3 s after the first true): it must not reveal.
+        assert!(!b.on_fire(1), "stale timer");
+        assert!(b.on_fire(2));
+    }
+
+    #[test]
+    fn a_timer_firing_after_the_flag_went_false_shows_nothing() {
+        let mut b = OfflineBanner::default();
+        assert_eq!(b.on_state(true, false), BannerAction::Start(1));
+        assert_eq!(b.on_state(false, false), BannerAction::Hide);
+        assert!(!b.on_fire(1));
+    }
+
+    #[test]
+    fn an_already_shown_banner_starts_no_timer_and_a_stopped_watch_reveals_nothing() {
+        let mut b = OfflineBanner::default();
+        assert_eq!(b.on_state(true, true), BannerAction::Keep);
+        assert_eq!(
+            b.on_state(false, true),
+            BannerAction::Hide,
+            "back online hides it"
+        );
+        assert_eq!(b.on_state(true, false), BannerAction::Start(1));
+        b.stop();
+        assert!(!b.on_fire(1));
     }
 }
