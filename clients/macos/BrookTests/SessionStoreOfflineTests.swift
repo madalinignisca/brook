@@ -321,19 +321,38 @@ final class CacheFeedTests: XCTestCase {
         XCTAssertFalse(feed.showsOfflineBanner, "the first wait was cancelled")
 
         feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: nil, offline: true))
-        try? await Task.sleep(for: .milliseconds(400))
-        XCTAssertTrue(feed.showsOfflineBanner, "offline held past the delay")
+        let shown = await Self.eventually { feed.showsOfflineBanner }
+        XCTAssertTrue(shown, "offline held past the delay")
         feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: nil, offline: false))
         XCTAssertFalse(feed.showsOfflineBanner, "hidden at once")
     }
 
-    func testStopCancelsAPendingBannerAndHidesAShownOne() async {
+    func testStopCancelsAPendingBanner() async {
         let feed = CacheFeed(client: FakeChat(), bannerDelay: .milliseconds(100))
         feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: nil, offline: true))
         feed.stop()
         feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: nil, offline: true)) // a late one
         try? await Task.sleep(for: .milliseconds(300))
         XCTAssertFalse(feed.showsOfflineBanner)
+    }
+
+    func testStopHidesABannerThatIsOnScreen() async {
+        let feed = CacheFeed(client: FakeChat(), bannerDelay: .milliseconds(50))
+        feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: nil, offline: true))
+        let shown = await Self.eventually { feed.showsOfflineBanner }
+        XCTAssertTrue(shown)
+        feed.stop()
+        XCTAssertFalse(feed.showsOfflineBanner, "stop takes a shown banner down")
+    }
+
+    /// Polls until `condition` holds or `within` passes: a fixed sleep can lose to a busy machine.
+    @MainActor static func eventually(within: Duration = .seconds(3), _ condition: @MainActor () -> Bool) async -> Bool {
+        let deadline = ContinuousClock.now + within
+        while ContinuousClock.now < deadline {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return condition()
     }
 
     func testTheBannerFollowsTheFeedAndResetsOnStop() {
