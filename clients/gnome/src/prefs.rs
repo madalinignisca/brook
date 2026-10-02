@@ -72,3 +72,92 @@ pub fn save_show_usernames(on: bool) {
         tracing::warn!(%err, path = %path.display(), "could not save the preference");
     }
 }
+
+/// The sidebar's "opened" ranks for one account: which conversation this device opened when
+/// (higher is later), kept in a group named for the user so accounts don't mix.
+fn opened_group(user_id: &str) -> String {
+    format!("opened-{user_id}")
+}
+
+pub fn load_opened(user_id: &str) -> std::collections::HashMap<String, i64> {
+    load_opened_from(&path(), user_id)
+}
+
+fn load_opened_from(
+    path: &std::path::Path,
+    user_id: &str,
+) -> std::collections::HashMap<String, i64> {
+    let file = glib::KeyFile::new();
+    if user_id.is_empty() || file.load_from_file(path, glib::KeyFileFlags::NONE).is_err() {
+        return Default::default();
+    }
+    let group = opened_group(user_id);
+    let Ok(keys) = file.keys(&group) else {
+        return Default::default();
+    };
+    keys.iter()
+        .filter_map(|key| {
+            let rank = i64::from(file.integer(&group, key).ok()?);
+            Some((key.to_string(), rank))
+        })
+        .collect()
+}
+
+/// Save the ranks for `user_id` (replacing what was there). Failures are logged, not fatal.
+pub fn save_opened(user_id: &str, ranks: &std::collections::HashMap<String, i64>) {
+    save_opened_to(&path(), user_id, ranks);
+}
+
+fn save_opened_to(
+    path: &std::path::Path,
+    user_id: &str,
+    ranks: &std::collections::HashMap<String, i64>,
+) {
+    if user_id.is_empty() {
+        return;
+    }
+    let file = glib::KeyFile::new();
+    let _ = file.load_from_file(path, glib::KeyFileFlags::KEEP_COMMENTS);
+    let group = opened_group(user_id);
+    let _ = file.remove_group(&group);
+    for (id, rank) in ranks {
+        // A key file integer is 32-bit: ranks only count conversations opened, never near it.
+        file.set_integer(&group, id, i32::try_from(*rank).unwrap_or(i32::MAX));
+    }
+    let result = path
+        .parent()
+        .map(std::fs::create_dir_all)
+        .transpose()
+        .map_err(|e| e.to_string())
+        .and_then(|_| file.save_to_file(path).map_err(|e| e.to_string()));
+    if let Err(err) = result {
+        tracing::warn!(%err, path = %path.display(), "could not save the sidebar order");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::{load_opened_from, save_opened_to};
+
+    #[test]
+    fn opened_ranks_are_saved_per_account_and_read_back() {
+        let dir = std::env::temp_dir().join(format!("brook-prefs-test-{}", std::process::id()));
+        let file = dir.join("brook").join("gnome.ini");
+        let ann = HashMap::from([("c1".to_string(), 3), ("c2".to_string(), 9)]);
+        let bob = HashMap::from([("c1".to_string(), 1)]);
+        assert!(load_opened_from(&file, "ann").is_empty(), "no file yet");
+        save_opened_to(&file, "ann", &ann);
+        save_opened_to(&file, "bob", &bob);
+        assert_eq!(load_opened_from(&file, "ann"), ann);
+        assert_eq!(load_opened_from(&file, "bob"), bob);
+        // Saving replaces an account's ranks (a pruned conversation is gone); others stay.
+        save_opened_to(&file, "ann", &HashMap::from([("c2".to_string(), 9)]));
+        assert_eq!(load_opened_from(&file, "ann").len(), 1);
+        assert_eq!(load_opened_from(&file, "bob"), bob);
+        // No user: nothing read or written.
+        assert!(load_opened_from(&file, "").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -45,6 +45,8 @@ struct Chat {
     channel_list: gtk::ListBox,
     /// Per-conversation activity and open order, for the sidebar's order.
     sidebar: Rc<RefCell<crate::sidebar::SidebarState>>,
+    /// This account's saved opened ranks are loaded into `sidebar` (once the user is known).
+    sidebar_loaded: Rc<Cell<bool>>,
     /// "Show usernames" (a per-device preference): people are named `@handle`, not by name.
     show_usernames: Rc<Cell<bool>>,
     /// Set while the list is rebuilt, so removing and re-adding rows doesn't "select" them.
@@ -261,6 +263,7 @@ pub fn build(
         current: Rc::new(RefCell::new(None)),
         channel_list: channel_list.clone(),
         sidebar: Rc::default(),
+        sidebar_loaded: Rc::default(),
         show_usernames: Rc::new(Cell::new(crate::prefs::show_usernames())),
         rebuilding: Rc::default(),
         channels: Rc::new(RefCell::new(Vec::new())),
@@ -577,7 +580,7 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     if chat
                         .sidebar
                         .borrow_mut()
-                        .bump(&message.channel_id, &message.id)
+                        .live(&message.channel_id, &message.id)
                     {
                         rebuild_sidebar(&chat);
                     }
@@ -740,19 +743,33 @@ fn refresh_channels(chat: &Rc<Chat>, select: Option<String>) {
                                     .and_then(|c| c.last_message_id.clone());
                             }
                         }
-                        Ok(channels)
+                        Ok((channels, true))
                     }
-                    Err(err) => client.cached_channels().await.map_err(|_| err),
+                    Err(err) => client
+                        .cached_channels()
+                        .await
+                        .map(|channels| (channels, false))
+                        .map_err(|_| err),
                 }
             }
         });
-        let Ok(Ok(channels)) = handle.await else {
+        let Ok(Ok((channels, from_network))) = handle.await else {
             return;
         };
-        for channel in &channels {
-            chat.sidebar
-                .borrow_mut()
-                .seed(&channel.id, channel.last_message_id.as_deref());
+        load_sidebar_ranks(&chat);
+        {
+            let mut sidebar = chat.sidebar.borrow_mut();
+            for channel in &channels {
+                sidebar.learn(&channel.id, channel.last_message_id.as_deref());
+            }
+            // Ranks of conversations that are gone go, but only on the network's list and only
+            // when it isn't empty (an empty offline list must not erase them).
+            if from_network {
+                let listed: Vec<&str> = channels.iter().map(|c| c.id.as_str()).collect();
+                if sidebar.prune(&listed) {
+                    save_sidebar_ranks(&chat, &sidebar);
+                }
+            }
         }
         *chat.channels.borrow_mut() = channels;
         rebuild_sidebar(&chat);
@@ -780,19 +797,27 @@ fn refresh_channels(chat: &Rc<Chat>, select: Option<String>) {
 /// and redraw the list. The open conversation stays selected without being "opened" again.
 fn rebuild_sidebar(chat: &Rc<Chat>) {
     let me = chat.me.borrow().clone().unwrap_or_default();
-    let show_usernames = chat.show_usernames.get();
     let channels = std::mem::take(&mut *chat.channels.borrow_mut());
-    let order = chat.sidebar.borrow().order(&channels, &me);
-    let channels = crate::sidebar::arranged(channels, &order);
+    let order = chat.sidebar.borrow_mut().order(&channels, &me);
+    *chat.channels.borrow_mut() = crate::sidebar::arranged(channels, &order);
+    redraw_sidebar(chat);
+}
+
+/// Draw the list as `chat.channels` stands, in that order: no sorting. What a change of labels
+/// ("Show usernames") needs, since a click or two since the last sort must not take effect then.
+fn redraw_sidebar(chat: &Rc<Chat>) {
+    let me = chat.me.borrow().clone().unwrap_or_default();
+    let channels = chat.channels.borrow().clone();
+    let labels = crate::sidebar::labels_in_order(&channels, &me, chat.show_usernames.get());
 
     chat.rebuilding.set(true);
     while let Some(row) = chat.channel_list.row_at_index(0) {
         chat.channel_list.remove(&row);
     }
     chat.badges.borrow_mut().clear();
-    for channel in &channels {
+    for (channel, label) in channels.iter().zip(&labels) {
         let (row, badge) = channel_row(
-            &crate::sidebar::label(channel, &me, show_usernames),
+            label,
             channel.is_dm(),
             (channel.unread_count, channel.unread_mentions),
             channel.owner_offer_for(&me).is_some(),
@@ -807,10 +832,25 @@ fn rebuild_sidebar(chat: &Rc<Chat>) {
             chat.channel_list.select_row(Some(&row));
         }
     }
-    *chat.channels.borrow_mut() = channels;
     chat.rebuilding.set(false);
-    // The section headings read `chat.channels`, which was empty while the rows were added.
     chat.channel_list.invalidate_headers();
+}
+
+/// Load this account's saved opened ranks into the sidebar state, once the user is known (and
+/// before anything is learned, so the counter continues above them).
+fn load_sidebar_ranks(chat: &Rc<Chat>) {
+    let me = chat.me.borrow().clone().unwrap_or_default();
+    if chat.sidebar_loaded.get() || me.is_empty() {
+        return;
+    }
+    chat.sidebar_loaded.set(true);
+    *chat.sidebar.borrow_mut() = crate::sidebar::SidebarState::new(crate::prefs::load_opened(&me));
+}
+
+/// Save the opened ranks for this account (synchronously, so there is no ordering race).
+fn save_sidebar_ranks(chat: &Rc<Chat>, sidebar: &crate::sidebar::SidebarState) {
+    let me = chat.me.borrow().clone().unwrap_or_default();
+    crate::prefs::save_opened(&me, sidebar.opened_ranks());
 }
 
 /// Load and render a channel's history, and enable the composer.
@@ -917,7 +957,12 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
     if previous.as_deref() != Some(channel_id) {
         forget_deferred_question();
     }
-    chat.sidebar.borrow_mut().opened_now(channel_id);
+    load_sidebar_ranks(chat);
+    {
+        let mut sidebar = chat.sidebar.borrow_mut();
+        sidebar.opened_now(channel_id);
+        save_sidebar_ranks(chat, &sidebar);
+    }
     apply_channel_chrome(chat, channel_id);
     ask_about_ownership(chat);
 
@@ -1892,7 +1937,8 @@ fn main_menu_popover(chat: &Rc<Chat>) -> gtk::Popover {
         move |check| {
             chat.show_usernames.set(check.is_active());
             crate::prefs::save_show_usernames(check.is_active());
-            rebuild_sidebar(&chat);
+            // Relabel the rows where they are: this never sorts.
+            redraw_sidebar(&chat);
             relabel_authors(&chat);
             let current = chat.current.borrow().clone();
             if let Some(current) = current {
@@ -2551,16 +2597,23 @@ fn members_dialog(chat: &Rc<Chat>) {
         // The person as the preference names them; the other form goes beneath.
         let show_usernames = chat.show_usernames.get();
         let title = brook_core::person_label(&member.display_name, &member.handle, show_usernames);
+        // With usernames on, the display name goes beneath, when there is one (a blank name
+        // would leave an empty subtitle, or a bare " · owner").
         let other = if show_usernames {
-            member.display_name.clone()
+            member.display_name.trim().to_string()
         } else {
             format!("@{}", member.handle)
         };
-        let subtitle = match member.role.as_deref() {
-            Some("owner") => format!("{other} · owner"),
-            _ if offered => format!("{other} · owner offered"),
-            _ => other,
+        let status = match member.role.as_deref() {
+            Some("owner") => Some("owner"),
+            _ if offered => Some("owner offered"),
+            _ => None,
         };
+        let subtitle = [Some(other.as_str()).filter(|o| !o.is_empty()), status]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
         let row = adw::ActionRow::builder()
             .title(glib::markup_escape_text(&title).as_str())
             .subtitle(glib::markup_escape_text(&subtitle).as_str())
@@ -4080,20 +4133,17 @@ fn badges_from_cache(chat: &Rc<Chat>) {
             drop(channels);
             update_badge(&chat, i);
         }
-        // What a catch-up brought is new activity too: re-sort once if it moved anything.
-        // Not the open channel: opening it loads its history into the cache, which is a
-        // back-fill (the conversation's old messages), not new activity, and must not make
-        // the row you just clicked jump.
-        let mut moved = false;
-        for fresh in cached
-            .iter()
-            .filter(|f| current.as_deref() != Some(f.id.as_str()))
-        {
-            moved |= chat
-                .sidebar
-                .borrow_mut()
-                .seed(&fresh.id, fresh.last_message_id.as_deref());
-        }
+        // What a catch-up brought is new activity too: re-sort once if it moved a conversation
+        // that isn't the open one or one whose history back-fill is still awaited (opening a
+        // conversation loads its old messages, which is not news and must not move its row,
+        // not even after you've switched away).
+        let moved = {
+            let items: Vec<(String, Option<String>)> = cached
+                .iter()
+                .map(|f| (f.id.clone(), f.last_message_id.clone()))
+                .collect();
+            chat.sidebar.borrow_mut().notice(&items, current.as_deref())
+        };
         if moved {
             rebuild_sidebar(&chat);
         }
