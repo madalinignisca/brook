@@ -183,7 +183,7 @@ struct SignedInView: View {
         // The feed arrives once local data is switched on, after this view appears.
         .onChange(of: feed.map(ObjectIdentifier.init), initial: true) { _, _ in registerWithFeed() }
         .safeAreaInset(edge: .top) {
-            if feed?.offline == true {
+            if feed?.showsOfflineBanner == true {
                 Label("Offline: showing messages saved on this Mac", systemImage: "wifi.slash")
                     .font(.callout).frame(maxWidth: .infinity).padding(6)
                     .background(.yellow.opacity(0.2))
