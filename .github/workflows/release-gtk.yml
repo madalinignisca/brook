@@ -6,8 +6,9 @@ name: release-gtk
 #   channel=beta,   version=0.2.0-beta.1 -> tag gtk-v0.2.0-beta.1, a pre-release
 #   channel=stable, version=0.2.0        -> tag gtk-v0.2.0, a full release
 #
-# Two builds per architecture: glibc (built on ubuntu-24.04, the oldest glibc we ship,
-# so it runs on anything newer) and musl (built inside Alpine). Each tarball is then
+# Two builds per architecture: glibc (built on a GitHub ubuntu-24.04 runner, whose glibc is
+# older than on the supported Debian 13 and Ubuntu 26.04, so it runs on both; Ubuntu 24.04
+# itself is not a supported target) and musl (built inside Alpine). Each tarball is then
 # installed and started in a clean container of the distro it claims to support, and
 # the release waits for that. There is no fully static build: GPU drivers and the
 # GTK/GStreamer plugins are loaded from the user's system at run time.

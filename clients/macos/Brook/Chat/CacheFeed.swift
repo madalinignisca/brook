@@ -2,6 +2,46 @@ import BrookCore
 import Foundation
 import Observation
 
+/// The offline banner's bookkeeping, apart from the UI so it can be tested. Each started
+/// timer has a number and only the newest waiting one may reveal the banner, so a timer
+/// that is stale (the flag went false and true again, or the feed stopped) can't show it
+/// early even if it still fires.
+struct OfflineBannerGate {
+    enum Action: Equatable {
+        /// Online: hide at once; any reveal still waiting is cancelled.
+        case hide
+        /// Offline and not shown: start a timer that calls `onFire` with this number.
+        case start(UInt64)
+        /// Nothing to do (already shown, or a timer is already waiting).
+        case keep
+    }
+
+    private var waiting: UInt64?
+    private var lastTimer: UInt64 = 0
+
+    mutating func onState(offline: Bool, shown: Bool) -> Action {
+        guard offline else {
+            waiting = nil
+            return .hide
+        }
+        if shown || waiting != nil { return .keep }
+        lastTimer += 1
+        waiting = lastTimer
+        return .start(lastTimer)
+    }
+
+    /// A timer fired: whether to show the banner now. Only the waiting timer may, and going
+    /// online (or stopping) clears it, so "still offline" is implied.
+    mutating func onFire(_ timer: UInt64) -> Bool {
+        guard waiting == timer else { return false }
+        waiting = nil
+        return true
+    }
+
+    /// The feed stopped: nothing waiting may reveal anything.
+    mutating func stop() { waiting = nil }
+}
+
 /// One signed-in client's local-data notices (#62 spec items 3 to 5 and 7): the cache's
 /// events and state, delivered in order on the main thread, fanned out to the models that
 /// registered, plus the offline banner, lost unsent messages and other accounts' data.
@@ -13,6 +53,14 @@ final class CacheFeed {
         didSet { timeline?.offline = offline }
     }
     private(set) var lastSynced: Int64?
+
+    /// The banner on screen: `offline` once it has lasted `bannerDelay` (a flaky link flips
+    /// the flag within seconds, and not every flip is worth showing). Other readers of
+    /// `offline` keep the raw flag.
+    private(set) var showsOfflineBanner = false
+    @ObservationIgnored private var gate = OfflineBannerGate()
+    @ObservationIgnored private var bannerTimer: Task<Void, Never>?
+    @ObservationIgnored private let bannerDelay: Duration
 
     /// What an alert says, one at a time: a loss of unsent messages (acknowledged exactly
     /// when dismissed), or the notice after other accounts' data went.
@@ -73,8 +121,9 @@ final class CacheFeed {
     /// Stopped (signed out): nothing late may queue an alert.
     private var stopped = false
 
-    init(client: any OfflineClient) {
+    init(client: any OfflineClient, bannerDelay: Duration = .seconds(3)) {
         self.client = client
+        self.bannerDelay = bannerDelay
     }
 
     /// Subscribes before local data is switched on: opening the stores can report a loss.
@@ -89,6 +138,10 @@ final class CacheFeed {
     /// Signed out: nothing more arrives, and the banner and alerts reset.
     func stop() {
         stopped = true
+        gate.stop()
+        bannerTimer?.cancel()
+        bannerTimer = nil
+        showsOfflineBanner = false
         subscriptions.forEach { $0.cancel() }
         subscriptions = []
         offline = false
@@ -131,11 +184,31 @@ final class CacheFeed {
 
     func state(_ state: FfiCacheState) {
         offline = state.offline
+        updateBanner()
         lastSynced = state.lastSyncedUnixMs
         // Other accounts' data goes at this user's first completed sync (#46 §8).
         if lastSynced != nil, !cleanedUp, !cleaning {
             cleaning = true
             Task { await cleanUpOthers() }
+        }
+    }
+
+    private func updateBanner() {
+        guard !stopped else { return } // a late state must not start a wait after sign-out
+        switch gate.onState(offline: offline, shown: showsOfflineBanner) {
+        case .hide:
+            bannerTimer?.cancel()
+            bannerTimer = nil
+            showsOfflineBanner = false
+        case let .start(timer):
+            bannerTimer = Task { [weak self, bannerDelay] in
+                try? await Task.sleep(for: bannerDelay)
+                guard !Task.isCancelled, let self else { return }
+                bannerTimer = nil
+                if gate.onFire(timer) { showsOfflineBanner = true }
+            }
+        case .keep:
+            break
         }
     }
 
