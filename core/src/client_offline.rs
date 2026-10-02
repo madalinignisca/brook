@@ -544,6 +544,7 @@ fn channel_from_row(row: crate::cache::CachedChannel) -> Option<Channel> {
     let mut ch: Channel = serde_json::from_value(row.json).ok()?;
     ch.unread_count = i64::from(row.unread);
     ch.unread_mentions = i64::from(row.unread_mentions);
+    ch.last_message_id = row.last_message_id;
     Some(ch)
 }
 
@@ -560,8 +561,10 @@ mod channel_row_tests {
             }),
             unread: 5,
             unread_mentions: 2,
+            last_message_id: Some("m9".into()),
         };
         let ch = channel_from_row(row).unwrap();
         assert_eq!((ch.unread_count, ch.unread_mentions), (5, 2));
+        assert_eq!(ch.last_message_id.as_deref(), Some("m9"));
     }
 }

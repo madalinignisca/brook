@@ -107,6 +107,82 @@ fn a_cached_channel_keeps_its_unread_count_and_members() {
 }
 
 #[test]
+fn a_cached_channel_keeps_its_last_message_id() {
+    let mut ch: brook_core::Channel = serde_json::from_value(json!({
+        "id": "c", "kind": "channel", "name": "general", "members": [],
+    }))
+    .unwrap();
+    assert_eq!(FfiCachedChannel::from(ch.clone()).last_message_id, None);
+    ch.last_message_id = Some("m9".into());
+    assert_eq!(
+        FfiCachedChannel::from(ch).last_message_id.as_deref(),
+        Some("m9")
+    );
+}
+
+#[test]
+fn the_sidebar_functions_reach_core_unchanged() {
+    let bob = FfiMember {
+        id: "b".into(),
+        handle: "bob".into(),
+        display_name: "Bob R".into(),
+        role: None,
+    };
+    let me = FfiMember {
+        id: "me".into(),
+        handle: "me".into(),
+        display_name: "Me".into(),
+        role: None,
+    };
+    let label = |show| {
+        crate::sidebar::conversation_label(
+            "dm".into(),
+            None,
+            vec![me.clone(), bob.clone()],
+            "me".into(),
+            show,
+        )
+    };
+    assert_eq!(
+        (label(false).as_str(), label(true).as_str()),
+        ("Bob R", "@bob")
+    );
+    assert_eq!(
+        crate::sidebar::sort_key(
+            "dm".into(),
+            None,
+            vec![me.clone(), bob.clone()],
+            "me".into()
+        ),
+        "bob r"
+    );
+    assert_eq!(
+        crate::sidebar::person_label("".into(), "bob".into(), false),
+        "@bob"
+    );
+    let entry = |id: &str, kind: &str, last: Option<&str>| crate::sidebar::FfiSidebarEntry {
+        id: id.into(),
+        kind: kind.into(),
+        last_message_id: last.map(str::to_string),
+        opened: None,
+        sort_key: id.into(),
+    };
+    assert_eq!(
+        crate::sidebar::sidebar_order(vec![
+            entry("d", "dm", Some("9")),
+            entry("a", "channel", Some("1")),
+            entry("b", "channel", Some("2")),
+        ]),
+        ["b", "a", "d"]
+    );
+    assert!(crate::sidebar::activity_moves(Some("1".into()), "2".into()));
+    assert!(!crate::sidebar::activity_moves(
+        Some("2".into()),
+        "2".into()
+    ));
+}
+
+#[test]
 fn a_message_keeps_its_client_id_and_a_tombstone_its_place() {
     let m: brook_core::Message = serde_json::from_value(json!({
         "id": "m1", "channel_id": "c", "author_id": "u1", "author_handle": "al",
@@ -613,6 +689,7 @@ fn a_reaction_event_crosses_with_its_new_count() {
             user_id: "u2".into(),
             added: true,
             count: 4,
+            seq: 77,
         }),
         Some(FfiServerEvent::ReactionUpdate {
             channel_id: "c".into(),
@@ -621,6 +698,7 @@ fn a_reaction_event_crosses_with_its_new_count() {
             user_id: "u2".into(),
             added: true,
             count: 4,
+            seq: 77,
         })
     );
 }

@@ -168,6 +168,82 @@ async fn unread_counts_others_messages_after_my_read_marker() {
     );
 }
 
+#[tokio::test]
+async fn cached_channels_carry_the_newest_message_id_including_tombstones() {
+    let s = setup(
+        vec![page(
+            9,
+            None,
+            vec![
+                msg("m1", "c", 4, "bob", "a"),
+                msg("m3", "c", 5, "bob", "c"),
+                msg("m2", "c", 6, "bob", "b"),
+            ],
+            vec![],
+        )],
+        no_history(),
+        None,
+    );
+    s.cache.sync_now().await.unwrap();
+    let last = |s: &Setup| {
+        let cache = s.cache.clone();
+        async move {
+            cache.cached_channels().await.unwrap()[0]
+                .last_message_id
+                .clone()
+        }
+    };
+    assert_eq!(
+        last(&s).await.as_deref(),
+        Some("m3"),
+        "not the newest by arrival"
+    );
+    s.cache
+        .live_event(
+            "message.delete",
+            &json!({ "id": "m3", "channel_id": "c", "seq": 10 }),
+        )
+        .await;
+    assert_eq!(
+        last(&s).await.as_deref(),
+        Some("m3"),
+        "a tombstone still counts: a deletion never lowers the key"
+    );
+}
+
+#[tokio::test]
+async fn a_channel_without_messages_has_no_last_message_id() {
+    let s = setup(vec![page(9, None, vec![], vec![])], no_history(), None);
+    s.cache.sync_now().await.unwrap();
+    assert_eq!(
+        s.cache.cached_channels().await.unwrap()[0].last_message_id,
+        None
+    );
+}
+
+/// An acknowledged send lands in the cache (`apply_ack`) with no socket echo, so it counts at
+/// once. (A queued, unacknowledged message lives in the separate outbox database: it never
+/// appears here. No mutant of the query can fail this: it guards the cache/outbox split.)
+#[tokio::test]
+async fn an_acknowledged_send_counts_without_a_socket_echo() {
+    let s = setup(
+        vec![page(9, None, vec![msg("m1", "c", 4, "bob", "a")], vec![])],
+        no_history(),
+        None,
+    );
+    s.cache.sync_now().await.unwrap();
+    s.cache
+        .apply_ack(&msg("m2", "c", 11, ME, "mine"))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.cache.cached_channels().await.unwrap()[0]
+            .last_message_id
+            .as_deref(),
+        Some("m2")
+    );
+}
+
 fn mentioning(mut m: Value, mentions: &[&str], everyone: bool) -> Value {
     m["mentions"] = json!(mentions);
     m["mention_everyone"] = json!(everyone);
@@ -1148,4 +1224,135 @@ fn the_send_body_names_the_reply_target_only_for_a_reply() {
         send_body(&m, "cid")["attachments"],
         serde_json::json!(["f2", "f1"])
     );
+}
+
+/// `/sync` that fails with a network error a set number of times, then answers an empty page
+/// caught up. Optionally held (each call waits for a permit) and timestamping every call.
+struct Failing {
+    fails: AtomicUsize,
+    calls: Mutex<Vec<std::time::Instant>>,
+    gate: Option<Arc<Notify>>,
+}
+
+impl Failing {
+    fn new(fails: usize, gate: Option<Arc<Notify>>) -> Arc<Self> {
+        Arc::new(Self {
+            fails: AtomicUsize::new(fails),
+            calls: Mutex::default(),
+            gate,
+        })
+    }
+    fn count(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+}
+
+#[async_trait::async_trait]
+impl Fetch for Failing {
+    async fn page(&self, _since: &str) -> Result<Page, crate::Error> {
+        self.calls.lock().unwrap().push(std::time::Instant::now());
+        if let Some(g) = &self.gate {
+            g.notified().await;
+        }
+        let left = self.fails.load(Ordering::SeqCst);
+        if left > 0 {
+            self.fails.store(left - 1, Ordering::SeqCst);
+            return Err(crate::Error::Timeout);
+        }
+        Ok(Page::Rows(page(9, None, vec![], vec![])))
+    }
+}
+
+fn cache_over(fetch: Arc<Failing>) -> (Arc<Cache>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let slot: Arc<dyn KeySlot> = Arc::new(InMemoryKeySlot::default());
+    let db = match store::open(dir.path(), Kind::Cache, "s", &KeyStore::new(slot)).unwrap() {
+        Opened::Ready { db, .. } => db,
+        other => panic!("{other:?}"),
+    };
+    (
+        Cache::new(db, ME.into(), fetch, Arc::new(no_history())),
+        dir,
+    )
+}
+
+/// A sync asked for while a run is in flight is not lost when that run fails: the failing run
+/// serves it, so `offline` ends false once the server answers (the retry timer is an hour
+/// away here, so only the drain can do it).
+#[tokio::test]
+async fn a_request_that_arrived_during_a_failing_run_is_served_after_it() {
+    let gate = Arc::new(Notify::new());
+    let fetch = Failing::new(1, Some(gate.clone()));
+    let (cache, _dir) = cache_over(fetch.clone());
+    cache.set_retry_for_tests(Duration::from_secs(3600), Duration::from_secs(3600));
+    let first = tokio::spawn({
+        let c = cache.clone();
+        async move { c.sync_now().await }
+    });
+    let f = fetch.clone();
+    eventually("the first run", move || f.count() == 1).await;
+    cache.sync_now().await.unwrap(); // joins the run in flight
+    gate.notify_one(); // the first run fails
+    let f = fetch.clone();
+    eventually("the run for the request", move || f.count() == 2).await;
+    gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap(); // the last outcome is what is returned
+    assert!(!cache.state().borrow().offline);
+}
+
+/// The retry wait starts at `start`, doubles, stops at `cap`, and restarts from `start` when
+/// `last` is 0 (what a success leaves). Checked on the values, not on elapsed time.
+#[test]
+fn the_retry_wait_doubles_up_to_the_cap() {
+    use crate::cache::retry_delay;
+    assert_eq!(retry_delay(0, 100, 350), 100);
+    assert_eq!(retry_delay(100, 100, 350), 200);
+    assert_eq!(retry_delay(200, 100, 350), 350); // 400 uncapped
+    assert_eq!(retry_delay(350, 100, 350), 350);
+    assert_eq!(retry_delay(0, 2000, 30_000), 2000); // after a success
+}
+
+/// A network failure schedules its own retry, so `offline` clears without any other trigger;
+/// a success resets the wait so the next outage starts over from the first wait. The waits
+/// are read from the cache's own record, so no timing bound is involved.
+#[tokio::test]
+async fn a_network_failure_is_retried_and_a_success_resets_the_wait() {
+    let fetch = Failing::new(4, None);
+    let (cache, _dir) = cache_over(fetch.clone());
+    cache.set_retry_for_tests(Duration::from_millis(20), Duration::from_millis(50));
+    assert!(cache.sync_now().await.is_err());
+    assert!(cache.state().borrow().offline);
+    let f = fetch.clone();
+    eventually("the retries", move || f.count() == 5).await;
+    let mut state = cache.state();
+    tokio::time::timeout(Duration::from_secs(5), state.wait_for(|s| !s.offline))
+        .await
+        .unwrap()
+        .unwrap();
+    // 20, 40, 50 (capped from 80), 50: the record is the last wait until a success clears it.
+    let c = cache.clone();
+    eventually("the wait reset", move || c.retry_wait_for_tests() == 0).await;
+
+    // A new outage starts at the first wait again, not at the doubled last one (an hour away
+    // here, so the record cannot move before it is read).
+    cache.set_retry_for_tests(Duration::from_secs(3600), Duration::from_secs(7200));
+    fetch.fails.store(1, Ordering::SeqCst);
+    assert!(cache.sync_now().await.is_err());
+    assert_eq!(cache.retry_wait_for_tests(), 3_600_000);
+}
+
+/// A closed cache does not retry.
+#[tokio::test]
+async fn a_closed_cache_does_not_retry() {
+    let fetch = Failing::new(100, None);
+    let (cache, _dir) = cache_over(fetch.clone());
+    cache.set_retry_for_tests(Duration::from_millis(100), Duration::from_millis(100));
+    assert!(cache.sync_now().await.is_err());
+    cache.clone().close().await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(fetch.count(), 1);
 }

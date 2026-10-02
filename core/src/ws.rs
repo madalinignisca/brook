@@ -55,6 +55,9 @@ pub enum ServerEvent {
         added: bool,
         /// The new total count for this emoji on the message.
         count: i64,
+        /// The server's commit-ordered change counter. Events for the same message and emoji
+        /// can arrive out of order; the highest `seq` is the newest, so drop anything lower.
+        seq: i64,
     },
     /// A channel's membership/metadata changed (e.g. the user was added to it).
     ChannelUpdate(Channel),
@@ -90,6 +93,12 @@ pub enum ServerEvent {
 const RATE_LIMIT_BACKOFF_SECS: u64 = 5;
 /// How long the server has to answer a command, counted from when it was written.
 pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// A connection that has delivered no frame at all for this long is dead. A network that
+/// vanishes (Wi-Fi off, a dropped route) gives an idle TCP socket no EOF or reset, so without
+/// this the loop would wait forever. The server's websocket layer pings every ~20 s
+/// (uvicorn's default `--ws-ping-interval`), which tungstenite hands to us as a `Ping`
+/// frame, so a healthy idle link still produces a frame well inside the window.
+pub(crate) const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 /// Client frames above this are refused locally (the server closes with 1009).
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Commands waiting for the socket writer; beyond this, callers get `Busy`.
@@ -170,6 +179,8 @@ pub(crate) struct Transport {
     conn: watch::Sender<Conn>,
     routes: Routes,
     pub(crate) reply_timeout: Duration,
+    /// How long a connection may deliver nothing before it is treated as dead.
+    pub(crate) idle_timeout: Duration,
     /// Test hook: when set, every command waits for a permit before it is written. The wait
     /// happens off the socket loop (like a slow producer), so the loop keeps servicing frames.
     #[cfg(test)]
@@ -183,6 +194,11 @@ pub(crate) struct Transport {
     /// the `seq` the typed events drop, and `sync.hint` has no typed event.
     raw: broadcast::Sender<(String, Value)>,
 }
+
+/// Raw event `type` the socket task itself publishes when a connection ends. Not a server
+/// event: only the offline cache's pump consumes the raw feed, and it must handle this
+/// type before its catch-all (`cache.live_event`).
+pub(crate) const WS_DISCONNECTED: &str = "ws.disconnected";
 
 pub(crate) fn command_channel() -> (Commands, Transport) {
     let (tx, rx) = mpsc::channel(COMMAND_QUEUE);
@@ -202,6 +218,7 @@ pub(crate) fn command_channel() -> (Commands, Transport) {
             conn: conn_tx,
             routes,
             reply_timeout: REPLY_TIMEOUT,
+            idle_timeout: WS_IDLE_TIMEOUT,
             #[cfg(test)]
             hold_writes: None,
             released_tx,
@@ -325,6 +342,7 @@ struct ReactionChanged {
     user_id: String,
     added: bool,
     count: i64,
+    seq: i64,
 }
 
 #[derive(Deserialize)]
@@ -388,6 +406,7 @@ fn dispatch(text: &str, tx: &broadcast::Sender<ServerEvent>) -> bool {
                         user_id: r.user_id,
                         added: r.added,
                         count: r.count,
+                        seq: r.seq,
                     });
                 }
                 Err(err) => {
@@ -468,7 +487,12 @@ async fn run_once(
     // The credential revision this socket is authenticated with.
     let mut auth_rev = rev.credential_rev;
     let mut reauth: Option<Reauth> = None;
-    let (mut socket, _resp) = connect_async(url.as_str()).await?;
+    // A server that accepts the TCP connection and never answers the upgrade would hold this
+    // attempt forever, with no backoff and no disconnect event: bound it like an idle link.
+    let (mut socket, _resp) =
+        tokio::time::timeout(transport.idle_timeout, connect_async(url.as_str()))
+            .await
+            .map_err(|_| Error::Timeout)??;
     tracing::info!(%url, "websocket connected; sending auth");
 
     let auth = json!({ "type": "auth", "data": { "access_token": token } });
@@ -477,6 +501,10 @@ async fn run_once(
     let mut ready = false;
     let mut pending: HashMap<String, Pending> = HashMap::new();
     let mut next_id: u64 = 0;
+    // When any frame (text, ping, pong, binary) last arrived. A dead network leaves the
+    // socket open and silent; the server pings an idle link, so silence past the timeout
+    // means the connection is gone.
+    let mut last_frame = Instant::now();
     let result = loop {
         let next_deadline = pending
             .values()
@@ -510,13 +538,37 @@ async fn run_once(
                     });
                     continue;
                 }
-                if let Err(err) = write_command(&mut socket, transport, out, &mut pending, &mut next_id).await {
-                    break Err(err);
+                // A write that cannot finish within the idle timeout means a dead link (the
+                // send buffer is full and nothing drains it): end the connection.
+                match tokio::time::timeout(
+                    transport.idle_timeout,
+                    write_command(&mut socket, transport, out, &mut pending, &mut next_id),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => break Err(err),
+                    Err(_) => {
+                        tracing::warn!("websocket write stalled; reconnecting");
+                        break Ok(RunEnd::Closed { ready });
+                    }
                 }
             }
             Some(out) = transport.released_rx.recv() => {
-                if let Err(err) = write_command(&mut socket, transport, out, &mut pending, &mut next_id).await {
-                    break Err(err);
+                // A write that cannot finish within the idle timeout means a dead link (the
+                // send buffer is full and nothing drains it): end the connection.
+                match tokio::time::timeout(
+                    transport.idle_timeout,
+                    write_command(&mut socket, transport, out, &mut pending, &mut next_id),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => break Err(err),
+                    Err(_) => {
+                        tracing::warn!("websocket write stalled; reconnecting");
+                        break Ok(RunEnd::Closed { ready });
+                    }
                 }
             }
             () = sleep_until_opt(next_deadline) => {
@@ -537,12 +589,18 @@ async fn run_once(
                     }
                 }
             }
+            () = tokio::time::sleep_until(last_frame + transport.idle_timeout) => {
+                tracing::warn!(idle = ?transport.idle_timeout, "websocket silent; reconnecting");
+                // No close handshake: the peer is unreachable, so it would only wait.
+                break Ok(RunEnd::Closed { ready });
+            }
             frame = socket.next() => {
                 let Some(frame) = frame else { break Ok(RunEnd::Closed { ready }) };
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(err) => break Err(err.into()),
                 };
+                last_frame = Instant::now(); // every kind of frame shows the link is up
                 match frame {
                     WsMessage::Text(text) => {
                         // Our re-auth's answer: confirmed (`ready` with `re`) or refused.
@@ -848,6 +906,17 @@ pub(crate) async fn run(
         )
         .await;
         let rate_limited = matches!(end, Ok(RunEnd::RateLimited { .. }));
+        // A session change (sign-out, account switch) is no lost connection: the cache of the
+        // old identity is on its way out, and the new one syncs on its own `ready`.
+        if !matches!(end, Ok(RunEnd::SessionChanged)) {
+            // The connection is gone (or never came up): tell the cache, which syncs soon and so
+            // learns whether the server is reachable. Without this it only finds out at the next
+            // periodic sync, minutes later. Sent on every run end, failed reconnects included:
+            // the cache debounces its syncs and the backoff below is at least a second.
+            let _ = transport
+                .raw
+                .send((WS_DISCONNECTED.to_string(), Value::Null));
+        }
         match end {
             Ok(RunEnd::SessionChanged) => continue, // reconnect at once as the new identity
             Ok(RunEnd::AuthRejected { ready }) => {
@@ -905,5 +974,23 @@ pub(crate) async fn run(
         backoff = backoff.min(cap);
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(cap);
+    }
+}
+
+#[cfg(test)]
+mod reaction_event_tests {
+    use super::*;
+
+    #[test]
+    fn a_reaction_update_carries_the_servers_seq_and_count() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let frame = r#"{"type":"reaction.update","data":{"message_id":"m1","channel_id":"c","emoji":"👍","user_id":"u2","added":true,"count":3,"seq":41}}"#;
+        dispatch(frame, &tx);
+        match rx.try_recv() {
+            Ok(ServerEvent::ReactionUpdate { count, seq, .. }) => {
+                assert_eq!((count, seq), (3, 41));
+            }
+            other => panic!("expected a reaction update, got {other:?}"),
+        }
     }
 }

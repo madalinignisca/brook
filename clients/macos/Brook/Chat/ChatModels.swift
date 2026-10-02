@@ -66,6 +66,10 @@ final class TimelineModel {
     /// Live reaction events seen per message: a toggle's answer is a snapshot, and is used only
     /// if none arrived while it was in flight (the events carry the newer counts).
     private var reactionEvents: [String: Int] = [:]
+    /// The last server `seq` applied per message and emoji, so a late, older event is dropped.
+    private var reactionSeqs: [String: Int64] = [:]
+    /// The same, for events that are mine: they decide the "I reacted" flag on their own.
+    private var reactionMineSeqs: [String: Int64] = [:]
 
     func clearReactionError() {
         reactionErrorSerial += 1
@@ -231,13 +235,31 @@ final class TimelineModel {
                 messages[i] = Self.tombstone(messages[i])
             }
         case .resync:
+            // A reconnect (or a restored server) may number events from lower values again.
+            reactionSeqs = [:]
+            reactionMineSeqs = [:]
             Task { await fetch(before: nil) }
-        case let .reactionUpdate(channel, messageId, emoji, userId, added, count):
+        case let .reactionUpdate(channel, messageId, emoji, userId, added, count, seq):
             guard channel == channelId, let i = messages.firstIndex(where: { $0.id == messageId }) else { return }
+            // The server numbers changes in commit order. The count and my own flag are ordered
+            // apart: an older event must not put an older count back, but my own older event can
+            // still be the newest word on whether *I* reacted (someone else's event carried the
+            // newer count and not my flag).
+            let key = "\(messageId)\u{0}\(emoji)"
+            let byMe = !me.isEmpty && userId == me
+            let countFresh = seq > (reactionSeqs[key] ?? Int64.min)
+            let meFresh = byMe && seq > (reactionMineSeqs[key] ?? Int64.min)
+            guard countFresh || meFresh else { return }
+            if countFresh { reactionSeqs[key] = seq }
+            if meFresh { reactionMineSeqs[key] = seq }
             reactionEvents[messageId, default: 0] += 1
-            messages[i].reactions = ReactionRules.applying(
-                emoji: emoji, count: count, added: added, byMe: !me.isEmpty && userId == me,
-                to: messages[i].reactions)
+            if countFresh {
+                messages[i].reactions = ReactionRules.applying(
+                    emoji: emoji, count: count, added: added, byMe: meFresh, to: messages[i].reactions)
+            } else if let j = messages[i].reactions.firstIndex(where: { $0.emoji == emoji }) {
+                let r = messages[i].reactions[j]
+                messages[i].reactions[j] = FfiReaction(emoji: r.emoji, count: r.count, me: added)
+            }
         case .ready, .channelCall, .channelUpdate, .channelDelete:
             break
         }
