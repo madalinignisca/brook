@@ -5144,6 +5144,27 @@ mod reaction_order_tests {
     }
 
     #[test]
+    fn my_newer_remove_clears_my_flag_even_when_the_count_is_already_newer() {
+        // Mirror of the add case: someone else's seq 12 set the count, then my remove at 11
+        // arrives late. The count stays, and my flag goes (it is the newest of mine).
+        let (mut order, mut list) = (ReactionOrder::default(), vec![]);
+        apply(&mut order, &mut list, (UP, 2, true, true, 9)); // I added
+        apply(&mut order, &mut list, (UP, 3, true, false, 12)); // someone else, newer
+        assert_eq!(list, [chip(UP, 3, true)]);
+        apply(&mut order, &mut list, (UP, 2, false, true, 11)); // my remove, late
+        assert_eq!(list, [chip(UP, 3, false)], "count kept, my flag cleared");
+    }
+
+    #[test]
+    fn my_older_add_never_undoes_a_newer_remove_of_mine() {
+        let (mut order, mut list) = (ReactionOrder::default(), vec![]);
+        apply(&mut order, &mut list, (UP, 2, true, false, 5));
+        apply(&mut order, &mut list, (UP, 1, false, true, 12)); // I removed
+        apply(&mut order, &mut list, (UP, 2, true, true, 11)); // my older add, late
+        assert_eq!(list, [chip(UP, 1, false)]);
+    }
+
+    #[test]
     fn a_stale_flag_event_for_a_chip_that_is_gone_creates_nothing() {
         let (mut order, mut list) = (ReactionOrder::default(), vec![]);
         apply(&mut order, &mut list, (UP, 0, false, false, 20)); // the count went to 0
