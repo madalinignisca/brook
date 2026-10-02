@@ -7,13 +7,15 @@ builds: `linux-<arch>` for glibc distributions (glibc 2.39+) and `linux-musl-<ar
 Alpine. Each release is checked on Debian 13, Ubuntu 26.04 and Alpine 3.24 before it is
 published. **Supported: Debian 13 and Ubuntu 26.04** (plus Alpine 3.24 for the musl build).
 Older releases are not supported. Debian 12 and earlier have libraries older than the build
-needs (glibc 2.39+, GTK 4.14+, libadwaita 1.5+). Ubuntu 24.04 and earlier are out by decision, not
-because of its libraries: the tarballs are not tested there, so whether they run is not promised.
+needs (glibc 2.39+, GTK 4.14+, libadwaita 1.5+); Ubuntu 22.04 and earlier likewise (glibc 2.35).
+Ubuntu 24.04 is out by decision, and measured to fail anyway: its archive has no
+`gstreamer1.0-gtk4` (so the apt line below fails and calls cannot start) and its glycin loaders
+are 1.0, below the 2.0 image previews need.
 
-- **Fedora 40+:** `sudo dnf install gtk4 libadwaita gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugin-gtk4 gstreamer1-plugin-openh264 gstreamer1-plugin-libav libnice-gstreamer1 pipewire-gstreamer openssl-libs lcms2 libseccomp fontconfig`
+- **Fedora (untested, community only):** `sudo dnf install gtk4 libadwaita gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugin-gtk4 gstreamer1-plugin-openh264 gstreamer1-plugin-libav libnice-gstreamer1 pipewire-gstreamer openssl-libs lcms2 libseccomp fontconfig`
 - **Ubuntu 26.04 / Debian 13:** `sudo apt install libgtk-4-1 libadwaita-1-0 gstreamer1.0-plugins-{base,good,bad,ugly} gstreamer1.0-libav gstreamer1.0-nice gstreamer1.0-gtk4 gstreamer1.0-pipewire libssl3t64 liblcms2-2 libseccomp2 libfontconfig1`
-- **Alpine 3.24+** (the `linux-musl` build, as root): `apk add gtk4.0 libadwaita gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav libnice-gstreamer gst-plugins-rs-gtk4 gst-plugin-pipewire openssl lcms2 libseccomp fontconfig`
-- **Arch:** `sudo pacman -S gtk4 libadwaita gst-plugins-{base,good,bad,ugly} gst-libav gst-plugin-gtk4 gst-plugin-pipewire libnice openssl lcms2 libseccomp fontconfig`
+- **Alpine 3.24** (the `linux-musl` build, as root): `apk add gtk4.0 libadwaita gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav libnice-gstreamer gst-plugins-rs-gtk4 gst-plugin-pipewire openssl lcms2 libseccomp fontconfig`
+- **Arch (untested, community only):** `sudo pacman -S gtk4 libadwaita gst-plugins-{base,good,bad,ugly} gst-libav gst-plugin-gtk4 gst-plugin-pipewire libnice openssl lcms2 libseccomp fontconfig`
 
 Then:
 
