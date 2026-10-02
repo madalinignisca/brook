@@ -184,8 +184,6 @@ jobs:
         include:
           - {image: "debian:13",    runner: ubuntu-24.04,     arch: x86_64,  artifact: brook-gnome-x86_64}
           - {image: "debian:13",    runner: ubuntu-24.04-arm, arch: aarch64, artifact: brook-gnome-aarch64}
-          - {image: "ubuntu:24.04", runner: ubuntu-24.04,     arch: x86_64,  artifact: brook-gnome-x86_64}
-          - {image: "ubuntu:24.04", runner: ubuntu-24.04-arm, arch: aarch64, artifact: brook-gnome-aarch64}
           - {image: "ubuntu:26.04", runner: ubuntu-24.04,     arch: x86_64,  artifact: brook-gnome-x86_64}
           - {image: "ubuntu:26.04", runner: ubuntu-24.04-arm, arch: aarch64, artifact: brook-gnome-aarch64}
           - {image: "alpine:3.24",  runner: ubuntu-24.04,     arch: x86_64,  artifact: brook-gnome-musl-x86_64}

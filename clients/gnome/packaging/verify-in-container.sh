@@ -24,15 +24,7 @@ case "$ID" in
       gstreamer1.0-pipewire gstreamer1.0-tools libssl3t64 liblcms2-2 libseccomp2 \
       libfontconfig1 glycin-loaders bubblewrap \
       adwaita-icon-theme fonts-dejavu-core xvfb xauth dbus >/dev/null
-    # Ubuntu 24.04's archive has no GStreamer GTK 4 plugin (measured: "Unable to locate
-    # package gstreamer1.0-gtk4"), so calls (the app refuses to start one without it) need it
-    # from elsewhere there. Everywhere
-    # else it is a package and the element check below requires it.
-    if [ "$ID" = ubuntu ] && [ "$VERSION_ID" = 24.04 ]; then
-      echo "NOTE     no gstreamer1.0-gtk4 on $PRETTY_NAME: calls need the plugin from elsewhere"
-    else
-      apt-get install -y -qq --no-install-recommends gstreamer1.0-gtk4 >/dev/null
-    fi
+    apt-get install -y -qq --no-install-recommends gstreamer1.0-gtk4 >/dev/null
     ;;
   alpine)
     apk add -q --no-cache \
@@ -73,7 +65,6 @@ missing=0
 # loudly instead of failing the release of a build that is otherwise fine.
 soft=""
 [ "$ID" = alpine ] && soft="webrtcbin"
-[ "$ID" = ubuntu ] && [ "$VERSION_ID" = 24.04 ] && soft="gtk4paintablesink"
 for e in webrtcbin nicesrc nicesink dtlssrtpenc dtlssrtpdec srtpenc srtpdec rtpopuspay \
          opusenc opusdec rtph264pay rtph264depay h264parse rtpvp8pay vp8enc vp8dec \
          decodebin videoconvert audioconvert autoaudiosrc autoaudiosink gtk4paintablesink; do
