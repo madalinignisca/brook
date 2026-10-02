@@ -114,6 +114,7 @@ final class CacheFeed {
     var registeredRows: Int { purgeRows(); return fileRows.values.reduce(0) { $0 + $1.count } }
 
     private let client: any OfflineClient
+    private let defaults: UserDefaults
     private var subscriptions: [Subscription] = []
     /// Other accounts' data: once per feed, retried at the next sync after a failure.
     private var cleanedUp = false
@@ -121,8 +122,9 @@ final class CacheFeed {
     /// Stopped (signed out): nothing late may queue an alert.
     private var stopped = false
 
-    init(client: any OfflineClient, bannerDelay: Duration = .seconds(3)) {
+    init(client: any OfflineClient, bannerDelay: Duration = .seconds(3), defaults: UserDefaults = .standard) {
         self.client = client
+        self.defaults = defaults
         self.bannerDelay = bannerDelay
     }
 
@@ -244,6 +246,7 @@ final class CacheFeed {
             return
         }
         guard (try? await client.wipeOtherLocalUsers()) != nil else { return } // retried later
+        for other in others { ChannelsModel.eraseRanks(for: other.userId, defaults: defaults) }
         cleanedUp = true
         if !stopped { alerts.append(.notice(Self.noticeText(others))) }
     }

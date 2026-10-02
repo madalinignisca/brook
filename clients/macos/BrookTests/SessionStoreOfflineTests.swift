@@ -138,6 +138,58 @@ final class SessionStoreOfflineTests: XCTestCase {
         XCTAssertNil(fine)
     }
 
+    // ---- Opened-order ranks go with the user's local data ----
+
+    private func seedRanks(_ users: String...) {
+        for u in users { defaults.set(["c1": 1], forKey: "ChannelOpenedRanks.\(u)") }
+    }
+
+    private func hasRanks(_ user: String) -> Bool { defaults.object(forKey: "ChannelOpenedRanks.\(user)") != nil }
+
+    private func signOutAfterSignIn(removeData: Bool, removalFails: Bool = false) async {
+        let fake = signedIn()
+        let store = store(fake)
+        await store.signIn(server: "https://h", handle: "alice", password: "pw")
+        await until("on") { store.localData == .on }
+        fake.forgetFails.withLock { $0 = removalFails }
+        seedRanks(alice.id, "other")
+        store.signOut(removeData: removeData)
+        await until("removal ran") { !removeData || fake.localCalls.withLock { $0 }.contains("forgot") }
+        try? await Task.sleep(for: .milliseconds(100))
+    }
+
+    func testRemovingDataDropsThatUsersRanksAndKeepsAnothers() async {
+        await signOutAfterSignIn(removeData: true)
+        XCTAssertFalse(hasRanks(alice.id), "the signed-out user's ranks were left behind")
+        XCTAssertTrue(hasRanks("other"), "another user's ranks went too")
+    }
+
+    func testKeepingDataKeepsTheRanks() async {
+        await signOutAfterSignIn(removeData: false)
+        XCTAssertTrue(hasRanks(alice.id), "a keep-data sign-out dropped the ranks")
+    }
+
+    func testTheRanksGoEvenWhenTheRemovalFails() async {
+        await signOutAfterSignIn(removeData: true, removalFails: true)
+        XCTAssertFalse(hasRanks(alice.id), "a failed removal left the ranks")
+    }
+
+    func testCleaningUpOtherAccountsDropsTheirRanksNotTheCurrentOnes() async {
+        let chat = FakeChat()
+        chat.local = true
+        chat.others = [FfiLocalUser(origin: "o", userId: "u9", unsent: 0),
+                       FfiLocalUser(origin: "o", userId: "u8", unsent: 0)]
+        seedRanks("u9", "u8", "me")
+        let feed = CacheFeed(client: chat, defaults: defaults)
+        feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: 1, offline: false))
+        for _ in 0 ..< 300 where chat.wiped.withLock({ $0 }) == 0 { try? await Task.sleep(for: .milliseconds(10)) }
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(chat.wiped.withLock { $0 }, 1)
+        XCTAssertFalse(hasRanks("u9"))
+        XCTAssertFalse(hasRanks("u8"))
+        XCTAssertTrue(hasRanks("me"), "the current user's ranks went")
+    }
+
     func testEveryUnfinishedSignOutIsWaitedForNotOnlyTheLatest() async {
         let fake = signedIn()
         let store = store(fake, wait: .milliseconds(300))

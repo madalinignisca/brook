@@ -170,6 +170,12 @@ final class ChannelsModel {
         return "ChannelOpenedRanks.\(me)"
     }
 
+    /// The ranks name the conversations a user opened, so they go whenever that user's local
+    /// data goes (removal on sign-out, another account's cleanup).
+    static func eraseRanks(for userId: String, defaults: UserDefaults = .standard) {
+        if let key = ranksKey(userId) { defaults.removeObject(forKey: key) }
+    }
+
     private func markOpened(_ id: String) {
         opened[id] = nextRank
         nextRank += 1
