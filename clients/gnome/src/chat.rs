@@ -3924,7 +3924,64 @@ fn badges_from_cache(chat: &Rc<Chat>) {
     });
 }
 
-/// The offline banner, from the cache's state (every few seconds), and the one-time
+/// How long the cache must stay offline before the banner says so.
+const OFFLINE_BANNER_DELAY: Duration = Duration::from_secs(3);
+
+/// What the banner does when the cache's offline flag is read.
+#[derive(Debug, PartialEq, Eq)]
+enum BannerAction {
+    /// Online: hide it at once, and any reveal still waiting is cancelled.
+    Hide,
+    /// Offline and not shown: start a timer, which must call `on_fire` with this number.
+    Start(u64),
+    /// Nothing to do (already shown, or a timer is already waiting).
+    Keep,
+}
+
+/// The offline banner's bookkeeping, apart from GTK so it can be tested. Each started timer
+/// has a number, and only the newest waiting one may reveal the banner, so a timer that is
+/// stale (the flag went false and true again, or the loop ended) can't show it early even if
+/// it still fires.
+#[derive(Default)]
+struct OfflineBanner {
+    waiting: Option<u64>,
+    last_timer: u64,
+}
+
+impl OfflineBanner {
+    fn on_state(&mut self, offline: bool, revealed: bool) -> BannerAction {
+        if !offline {
+            self.waiting = None;
+            return BannerAction::Hide;
+        }
+        if revealed || self.waiting.is_some() {
+            return BannerAction::Keep;
+        }
+        self.last_timer += 1;
+        self.waiting = Some(self.last_timer);
+        BannerAction::Start(self.last_timer)
+    }
+
+    /// A timer fired: whether to reveal the banner now. Only the waiting timer may, and going
+    /// online (or the watch ending) clears it, so "still offline" is implied.
+    fn on_fire(&mut self, timer: u64) -> bool {
+        if self.waiting != Some(timer) {
+            return false;
+        }
+        self.waiting = None;
+        true
+    }
+
+    /// The watch ended: nothing waiting may reveal anything.
+    fn stop(&mut self) {
+        self.waiting = None;
+    }
+}
+
+/// Watch the cache's offline flag: show the offline banner `OFFLINE_BANNER_DELAY` after the
+/// flag turns true if it hasn't gone false since (a flip back within the delay shows nothing;
+/// the flag is a watch value, so an offline-online-offline flap shorter than one poll can show
+/// the banner slightly early), and hide it at once when it goes false. Also the one-time
 /// clean-up of other accounts' saved data once this user's storage is open.
 fn watch_offline(chat: &Rc<Chat>) {
     // Core's state feed (#113): it follows sign-ins and switches by itself and resets
@@ -3933,6 +3990,10 @@ fn watch_offline(chat: &Rc<Chat>) {
     let chat_weak = Rc::downgrade(chat);
     glib::spawn_future_local(async move {
         let mut checked_others = false;
+        // The banner's bookkeeping (a flaky link flips the flag within seconds: not every flip
+        // is shown), and the timer that reveals it once offline has lasted.
+        let banner_state = Rc::new(RefCell::new(OfflineBanner::default()));
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
         loop {
             let current = state.borrow_and_update().clone();
             let Some(chat) = chat_weak.upgrade() else {
@@ -3941,7 +4002,33 @@ fn watch_offline(chat: &Rc<Chat>) {
             if chat.offline_banner.root().is_none() {
                 break; // signed out: the view is gone
             }
-            chat.offline_banner.set_revealed(current.offline);
+            let action = banner_state
+                .borrow_mut()
+                .on_state(current.offline, chat.offline_banner.is_revealed());
+            match action {
+                BannerAction::Hide => {
+                    if let Some(id) = pending.borrow_mut().take() {
+                        id.remove();
+                    }
+                    chat.offline_banner.set_revealed(false);
+                }
+                BannerAction::Start(generation) => {
+                    let banner = chat.offline_banner.downgrade();
+                    let (banner_state, slot) = (banner_state.clone(), pending.clone());
+                    let id = glib::timeout_add_local_once(OFFLINE_BANNER_DELAY, move || {
+                        // Fired: forget the id first, so nothing removes a source that's gone.
+                        *slot.borrow_mut() = None;
+                        let show = banner_state.borrow_mut().on_fire(generation);
+                        if let Some(banner) = banner.upgrade() {
+                            if show {
+                                banner.set_revealed(true);
+                            }
+                        }
+                    });
+                    *pending.borrow_mut() = Some(id);
+                }
+                BannerAction::Keep => {}
+            }
             // The first completed sync means this user's storage is open: now is the
             // time to clear another account's saved data (#46 §8).
             if current.last_synced.is_some() && !checked_others {
@@ -3952,6 +4039,12 @@ fn watch_offline(chat: &Rc<Chat>) {
             if state.changed().await.is_err() {
                 break;
             }
+        }
+        // The loop is over (signed out): no timer may fire on a banner that's gone.
+        banner_state.borrow_mut().stop();
+        let leftover = pending.borrow_mut().take();
+        if let Some(id) = leftover {
+            id.remove();
         }
     });
     report_outbox_lost(chat);
@@ -4988,5 +5081,59 @@ mod error_hold_tests {
         );
         assert!(hold.holding(early), "still held");
         assert_eq!(hold.timer_fired(t0 + ERROR_SHOWN), HoldTimer::Over);
+    }
+}
+
+#[cfg(test)]
+mod offline_banner_tests {
+    use super::{BannerAction, OfflineBanner};
+
+    #[test]
+    fn going_offline_starts_one_timer_and_a_repeat_while_waiting_starts_none() {
+        let mut b = OfflineBanner::default();
+        assert_eq!(b.on_state(true, false), BannerAction::Start(1));
+        assert_eq!(
+            b.on_state(true, false),
+            BannerAction::Keep,
+            "no second timer"
+        );
+        assert!(b.on_fire(1));
+    }
+
+    #[test]
+    fn a_flaky_flip_restarts_the_wait_and_the_first_timer_shows_nothing() {
+        let mut b = OfflineBanner::default();
+        assert_eq!(b.on_state(true, false), BannerAction::Start(1));
+        assert_eq!(b.on_state(false, false), BannerAction::Hide);
+        assert_eq!(
+            b.on_state(true, false),
+            BannerAction::Start(2),
+            "a fresh wait"
+        );
+        // The first timer still fires (3 s after the first true): it must not reveal.
+        assert!(!b.on_fire(1), "stale timer");
+        assert!(b.on_fire(2));
+    }
+
+    #[test]
+    fn a_timer_firing_after_the_flag_went_false_shows_nothing() {
+        let mut b = OfflineBanner::default();
+        assert_eq!(b.on_state(true, false), BannerAction::Start(1));
+        assert_eq!(b.on_state(false, false), BannerAction::Hide);
+        assert!(!b.on_fire(1));
+    }
+
+    #[test]
+    fn an_already_shown_banner_starts_no_timer_and_a_stopped_watch_reveals_nothing() {
+        let mut b = OfflineBanner::default();
+        assert_eq!(b.on_state(true, true), BannerAction::Keep);
+        assert_eq!(
+            b.on_state(false, true),
+            BannerAction::Hide,
+            "back online hides it"
+        );
+        assert_eq!(b.on_state(true, false), BannerAction::Start(1));
+        b.stop();
+        assert!(!b.on_fire(1));
     }
 }
