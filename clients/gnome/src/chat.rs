@@ -536,6 +536,9 @@ fn bootstrap(chat: &Rc<Chat>) {
         if let Some(id) = id {
             *chat.me.borrow_mut() = Some(id);
         }
+        // Before the event loop: replacing the state later would lose what a message heard in
+        // between taught it.
+        load_sidebar_ranks(&chat);
         let _ = chat
             .runtime
             .spawn({
@@ -582,7 +585,7 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         .borrow_mut()
                         .live(&message.channel_id, &message.id)
                     {
-                        rebuild_sidebar(&chat);
+                        resort_sidebar(&chat);
                     }
                     if is_current && window_focused(&chat) {
                         append_message(&chat, &message);
@@ -613,11 +616,17 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         // don't guess if our identity isn't resolved yet).
                         let me = chat.me.borrow().clone().unwrap_or_default();
                         if !me.is_empty() && message.author_id != me && !message.is_deleted() {
-                            let author = message
-                                .author_display_name
-                                .clone()
-                                .or_else(|| message.author_handle.clone())
-                                .unwrap_or_else(|| "Someone".to_string());
+                            let author = if message.author_display_name.is_none()
+                                && message.author_handle.is_none()
+                            {
+                                "Someone".to_string()
+                            } else {
+                                author_text(
+                                    message.author_display_name.as_deref().unwrap_or_default(),
+                                    message.author_handle.as_deref().unwrap_or_default(),
+                                    chat.show_usernames.get(),
+                                )
+                            };
                             let title = chat
                                 .channels
                                 .borrow()
@@ -796,11 +805,27 @@ fn refresh_channels(chat: &Rc<Chat>, select: Option<String>) {
 /// Order `chat.channels` as the sidebar's rules say (channels, then people; each by last use)
 /// and redraw the list. The open conversation stays selected without being "opened" again.
 fn rebuild_sidebar(chat: &Rc<Chat>) {
+    sort_sidebar(chat);
+    redraw_sidebar(chat);
+}
+
+/// Sort for new activity: redraw only if a row actually moves, so a message in the top
+/// conversation doesn't destroy and rebuild every row (and with them focus, a press in
+/// progress and the selection).
+fn resort_sidebar(chat: &Rc<Chat>) {
+    if sort_sidebar(chat) {
+        redraw_sidebar(chat);
+    }
+}
+
+/// Order `chat.channels` by the sidebar's rules. Whether the order changed.
+fn sort_sidebar(chat: &Rc<Chat>) -> bool {
     let me = chat.me.borrow().clone().unwrap_or_default();
     let channels = std::mem::take(&mut *chat.channels.borrow_mut());
+    let before: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
     let order = chat.sidebar.borrow_mut().order(&channels, &me);
     *chat.channels.borrow_mut() = crate::sidebar::arranged(channels, &order);
-    redraw_sidebar(chat);
+    before != order
 }
 
 /// Draw the list as `chat.channels` stands, in that order: no sorting. What a change of labels
@@ -4007,8 +4032,6 @@ fn spawn_cache_loop(chat: &Rc<Chat>) {
     });
 }
 
-/// Put the cache's current names on the authors shown among `ids` (message rows keep the
-/// name they were stored with).
 /// How a message header names its author: the display name, or `@handle` with "Show usernames"
 /// (and when there is no name). "Unknown" when the message carries neither.
 fn author_text(display_name: &str, handle: &str, show_usernames: bool) -> String {
@@ -4035,6 +4058,8 @@ fn relabel_authors(chat: &Rc<Chat>) {
     }
 }
 
+/// Put the cache's current names on the authors shown among `ids` (message rows keep the
+/// name they were stored with).
 fn redraw_authors(chat: &Rc<Chat>, ids: Vec<String>) {
     let shown: Vec<String> = {
         let rows = chat.message_rows.borrow();
@@ -4145,7 +4170,7 @@ fn badges_from_cache(chat: &Rc<Chat>) {
             chat.sidebar.borrow_mut().notice(&items, current.as_deref())
         };
         if moved {
-            rebuild_sidebar(&chat);
+            resort_sidebar(&chat);
         }
     });
 }

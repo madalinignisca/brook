@@ -257,9 +257,10 @@ mod tests {
         ids(&mut state);
         state.opened_now("zeta");
         assert!(
-            !state.notice(&cached(&[("zeta", "0005")]), Some("zeta")),
+            !state.notice(&cached(&[("zeta", "0006")]), Some("zeta")),
             "the open one"
         );
+        // The same message, heard live after the notice already moved the key, is still news.
         assert!(
             state.live("zeta", "0006"),
             "compared with what was last sorted"
