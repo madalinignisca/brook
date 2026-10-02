@@ -825,7 +825,7 @@ fn sort_sidebar(chat: &Rc<Chat>) -> bool {
     let before: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
     let order = chat.sidebar.borrow_mut().order(&channels, &me);
     *chat.channels.borrow_mut() = crate::sidebar::arranged(channels, &order);
-    before != order
+    crate::sidebar::order_changed(&before, &order)
 }
 
 /// Draw the list as `chat.channels` stands, in that order: no sorting. What a change of labels
@@ -834,6 +834,14 @@ fn redraw_sidebar(chat: &Rc<Chat>) {
     let me = chat.me.borrow().clone().unwrap_or_default();
     let channels = chat.channels.borrow().clone();
     let labels = crate::sidebar::labels_in_order(&channels, &me, chat.show_usernames.get());
+    // The conversation whose row has keyboard focus (removing the rows would drop it). Rows
+    // carry their conversation's id as their widget name: `chat.channels` is already in the
+    // new order here while the rows are still in the old one, so a position can't say.
+    let focused_id = chat
+        .channel_list
+        .focus_child()
+        .and_downcast::<gtk::ListBoxRow>()
+        .map(|row| row.widget_name().to_string());
 
     chat.rebuilding.set(true);
     while let Some(row) = chat.channel_list.row_at_index(0) {
@@ -847,6 +855,7 @@ fn redraw_sidebar(chat: &Rc<Chat>) {
             (channel.unread_count, channel.unread_mentions),
             channel.owner_offer_for(&me).is_some(),
         );
+        row.set_widget_name(&channel.id);
         chat.channel_list.append(&row);
         chat.badges.borrow_mut().push(badge);
     }
@@ -855,6 +864,11 @@ fn redraw_sidebar(chat: &Rc<Chat>) {
     if let Some(idx) = current.and_then(|id| channels.iter().position(|c| c.id == id)) {
         if let Some(row) = chat.channel_list.row_at_index(idx as i32) {
             chat.channel_list.select_row(Some(&row));
+        }
+    }
+    if let Some(idx) = crate::sidebar::focus_target(focused_id.as_deref(), &channels) {
+        if let Some(row) = chat.channel_list.row_at_index(idx as i32) {
+            row.grab_focus();
         }
     }
     chat.rebuilding.set(false);

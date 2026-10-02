@@ -157,6 +157,21 @@ pub fn labels_in_order(channels: &[Channel], me: &str, show_usernames: bool) -> 
         .collect()
 }
 
+/// Whether the list must be redrawn after a sort: the rows are drawn from `chat.channels` by
+/// position, so a changed order with no redraw would make a click open the wrong conversation,
+/// and an unchanged one needs none (a redraw destroys every row, with its focus and any press
+/// in progress).
+pub fn order_changed(before: &[String], after: &[String]) -> bool {
+    before != after
+}
+
+/// Where keyboard focus belongs after a redraw: the row of the conversation that had it (by id,
+/// since its position may have moved), if it is still listed.
+pub fn focus_target(focused_id: Option<&str>, channels: &[Channel]) -> Option<usize> {
+    let id = focused_id?;
+    channels.iter().position(|c| c.id == id)
+}
+
 /// `channels` reordered as `order` says (an id it doesn't name keeps its relative place at
 /// the end).
 pub fn arranged(mut channels: Vec<Channel>, order: &[String]) -> Vec<Channel> {
@@ -419,6 +434,35 @@ mod tests {
         assert_eq!(label(&list[0], "me", true), "@ann");
         let blank = channel("d", "dm", None, &[("me", "me", "Me"), ("b", "bob", "  ")]);
         assert_eq!(label(&blank, "me", false), "@bob");
+    }
+
+    #[test]
+    fn a_changed_order_needs_a_redraw_and_an_unchanged_one_doesnt() {
+        let a = ["x".to_string(), "y".to_string()];
+        let b = ["y".to_string(), "x".to_string()];
+        assert!(
+            order_changed(&a, &b),
+            "rows are drawn by position: they must follow"
+        );
+        assert!(
+            !order_changed(&a, &a),
+            "nothing moved: leave the rows (and their focus) alone"
+        );
+        assert!(order_changed(&a, &a[..1]));
+    }
+
+    #[test]
+    fn focus_follows_the_conversation_to_its_new_row() {
+        let rows = list();
+        assert_eq!(focus_target(Some("alpha"), &rows), Some(2));
+        let moved = arranged(list(), &["alpha".into(), "zeta".into()]);
+        assert_eq!(
+            focus_target(Some("alpha"), &moved),
+            Some(0),
+            "by id, not position"
+        );
+        assert_eq!(focus_target(Some("gone"), &rows), None);
+        assert_eq!(focus_target(None, &rows), None, "focus wasn't in the list");
     }
 
     #[test]
