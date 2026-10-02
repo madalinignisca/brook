@@ -84,6 +84,8 @@ extension FakeChat: OfflineClient {
 
     func wipeOtherLocalUsers() async throws {
         try need()
+        wipeTried.withLock { $0 += 1 }
+        if wipeFails.withLock({ $0 }) { throw LoginError.Api(code: "local.store", message: "") }
         wiped.withLock { $0 += 1 }
         others = []
     }

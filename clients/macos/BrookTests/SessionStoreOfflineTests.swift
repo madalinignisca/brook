@@ -154,8 +154,8 @@ final class SessionStoreOfflineTests: XCTestCase {
         fake.forgetFails.withLock { $0 = removalFails }
         seedRanks(alice.id, "other")
         store.signOut(removeData: removeData)
-        await until("removal ran") { !removeData || fake.localCalls.withLock { $0 }.contains("forgot") }
-        try? await Task.sleep(for: .milliseconds(100))
+        // The erase runs before the stores close, in the same task: "closed" ends both forms.
+        await until("sign-out ended") { fake.localCalls.withLock { $0 }.contains("closed") }
     }
 
     func testRemovingDataDropsThatUsersRanksAndKeepsAnothers() async {
@@ -182,11 +182,24 @@ final class SessionStoreOfflineTests: XCTestCase {
         seedRanks("u9", "u8", "me")
         let feed = CacheFeed(client: chat, defaults: defaults)
         feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: 1, offline: false))
-        for _ in 0 ..< 300 where chat.wiped.withLock({ $0 }) == 0 { try? await Task.sleep(for: .milliseconds(10)) }
-        try? await Task.sleep(for: .milliseconds(50))
-        XCTAssertEqual(chat.wiped.withLock { $0 }, 1)
+        let done = await CacheFeedTests.eventually { chat.wiped.withLock { $0 } == 1 && feed.alert != nil }
+        XCTAssertTrue(done, "the cleanup did not finish")
         XCTAssertFalse(hasRanks("u9"))
         XCTAssertFalse(hasRanks("u8"))
+        XCTAssertTrue(hasRanks("me"), "the current user's ranks went")
+    }
+
+    func testRanksOfTheListedOthersGoEvenWhenTheWipeFails() async {
+        let chat = FakeChat()
+        chat.local = true
+        chat.wipeFails.withLock { $0 = true }
+        chat.others = [FfiLocalUser(origin: "o", userId: "u9", unsent: 0)]
+        seedRanks("u9", "me")
+        let feed = CacheFeed(client: chat, defaults: defaults)
+        feed.state(FfiCacheState(syncing: false, lastSyncedUnixMs: 1, offline: false))
+        let tried = await CacheFeedTests.eventually { chat.wipeTried.withLock { $0 } >= 1 }
+        XCTAssertTrue(tried, "the wipe was not attempted")
+        XCTAssertFalse(hasRanks("u9"), "a failed wipe left the listed account's ranks")
         XCTAssertTrue(hasRanks("me"), "the current user's ranks went")
     }
 

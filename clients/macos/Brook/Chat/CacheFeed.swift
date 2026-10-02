@@ -245,8 +245,11 @@ final class CacheFeed {
             cleanedUp = true
             return
         }
-        guard (try? await client.wipeOtherLocalUsers()) != nil else { return } // retried later
+        // Before the wipe, whatever its outcome: the core wipes one account at a time and stops
+        // at the first error, so a retry no longer lists the ones already wiped. The ranks are
+        // derived, so losing those of an account that is then kept costs nothing.
         for other in others { ChannelsModel.eraseRanks(for: other.userId, defaults: defaults) }
+        guard (try? await client.wipeOtherLocalUsers()) != nil else { return } // retried later
         cleanedUp = true
         if !stopped { alerts.append(.notice(Self.noticeText(others))) }
     }

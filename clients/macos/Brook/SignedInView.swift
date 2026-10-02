@@ -180,6 +180,7 @@ struct SignedInView: View {
             MacNotifier.shared.onOpen = { selection = $0 } // a clicked notification opens its channel
             await channels.start()
         }
+        .onDisappear { channels.stop() } // the session ended: no late read may save its ranks
         // The feed arrives once local data is switched on, after this view appears.
         .onChange(of: feed.map(ObjectIdentifier.init), initial: true) { _, _ in registerWithFeed() }
         .safeAreaInset(edge: .top) {

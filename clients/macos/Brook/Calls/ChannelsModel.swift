@@ -77,6 +77,7 @@ final class ChannelsModel {
         self.notifier = notifier
         self.isActive = isActive
         if let key = Self.ranksKey(me) {
+            Self.erased.remove(me ?? "") // a new session for this user: saving is allowed again
             opened = (defaults.dictionary(forKey: key) as? [String: Int]) ?? [:]
             nextRank = (opened.values.max() ?? 0) + 1
         }
@@ -89,6 +90,7 @@ final class ChannelsModel {
     /// doesn't skip the list.
     func start() async {
         guard events == nil else { return }
+        stopped = false // the view appeared again: it is this session's model once more
         events = client.subscribeEvents(listener: EventBridge(self))
         do { try await client.startRealtime() } catch {}
         await reloadList()
@@ -97,7 +99,11 @@ final class ChannelsModel {
     func stop() {
         events?.cancel()
         events = nil
+        stopped = true
     }
+
+    /// Stopped (the session ended): a read or click that resumes later must not write the ranks.
+    private var stopped = false
 
     /// The network list, with unread counts from the cache; else the cached list; else the
     /// error. Only the newest read applies.
@@ -173,8 +179,16 @@ final class ChannelsModel {
     /// The ranks name the conversations a user opened, so they go whenever that user's local
     /// data goes (removal on sign-out, another account's cleanup).
     static func eraseRanks(for userId: String, defaults: UserDefaults = .standard) {
-        if let key = ranksKey(userId) { defaults.removeObject(forKey: key) }
+        guard let key = ranksKey(userId) else { return }
+        erased.insert(userId)
+        defaults.removeObject(forKey: key)
     }
+
+    /// Users whose ranks were erased in this process. The erase can run while a model of that
+    /// session still has a read in flight (the view may not have stopped it yet), and that read
+    /// would save the ranks again; a model checks this before every save. A new model for the
+    /// user (a new sign-in) clears the entry.
+    private static var erased: Set<String> = []
 
     private func markOpened(_ id: String) {
         opened[id] = nextRank
@@ -185,7 +199,8 @@ final class ChannelsModel {
 
     /// On the main actor, synchronously: no write can land after a later one.
     private func saveRanks() {
-        if let key = Self.ranksKey(me) { defaults.set(opened, forKey: key) }
+        guard !stopped, let me, !Self.erased.contains(me), let key = Self.ranksKey(me) else { return }
+        defaults.set(opened, forKey: key)
     }
 
     /// The cache's unread and unread-mention counts (empty without local data).

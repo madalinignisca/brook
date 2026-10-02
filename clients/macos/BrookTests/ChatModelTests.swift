@@ -40,6 +40,8 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     let acknowledged = Mutex<[UInt64]>([])
     var others: [FfiLocalUser] = []
     let wiped = Mutex(0)
+    let wipeFails = Mutex(false)
+    let wipeTried = Mutex(0)
     let sent = Mutex<[String]>([])
     var sendFailure: Error?
     var read: [String?] = []
