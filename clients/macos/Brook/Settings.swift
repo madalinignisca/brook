@@ -9,6 +9,9 @@ struct Settings {
     static let lastServerKey = "LastServer"
     /// Hidden, no UI: `defaults write dev.brook.Brook AllowInsecureHTTP -bool YES`.
     static let allowInsecureKey = "AllowInsecureHTTP"
+    /// The Settings window's "Show usernames": people read as `@handle` instead of their display
+    /// name. Off by default.
+    static let showUsernamesKey = "ShowUsernames"
     static let fallbackServer = "https://localhost"
 
     let defaults: UserDefaults
@@ -27,6 +30,8 @@ struct Settings {
     var allowInsecureHTTP: Bool {
         environment["BROOK_ALLOW_INSECURE_HTTP"] == "1" || defaults.bool(forKey: Self.allowInsecureKey)
     }
+
+    var showUsernames: Bool { defaults.bool(forKey: Self.showUsernamesKey) }
 
     /// The server of the last successful sign-in, if any (the launch restore's server).
     var lastGoodServer: String? { defaults.string(forKey: Self.lastServerKey) }

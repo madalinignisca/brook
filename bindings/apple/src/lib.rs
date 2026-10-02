@@ -13,6 +13,7 @@ mod keyslot;
 mod listener;
 mod offline;
 mod runtime;
+mod sidebar;
 mod types;
 
 pub use call::{
@@ -27,6 +28,9 @@ pub use offline::{
     FfiCachedMessages, FfiDeleted, FfiLocalUser, FfiMember, FfiMessage, FfiOutgoingFile,
     FfiPendingFile, FfiPendingMessage, FfiPendingState, FfiQueuedFile, FfiSendReceipt,
     FfiTransferEvent, FfiTransferState, TransferListener,
+};
+pub use sidebar::{
+    activity_moves, conversation_label, person_label, sidebar_order, sort_key, FfiSidebarEntry,
 };
 pub use types::{FfiAuthState, FfiChannel, FfiSession, FfiUser, LoginError, LoginResult};
 
