@@ -114,6 +114,7 @@ final class CacheFeed {
     var registeredRows: Int { purgeRows(); return fileRows.values.reduce(0) { $0 + $1.count } }
 
     private let client: any OfflineClient
+    private let defaults: UserDefaults
     private var subscriptions: [Subscription] = []
     /// Other accounts' data: once per feed, retried at the next sync after a failure.
     private var cleanedUp = false
@@ -121,8 +122,9 @@ final class CacheFeed {
     /// Stopped (signed out): nothing late may queue an alert.
     private var stopped = false
 
-    init(client: any OfflineClient, bannerDelay: Duration = .seconds(3)) {
+    init(client: any OfflineClient, bannerDelay: Duration = .seconds(3), defaults: UserDefaults = .standard) {
         self.client = client
+        self.defaults = defaults
         self.bannerDelay = bannerDelay
     }
 
@@ -239,10 +241,17 @@ final class CacheFeed {
     func cleanUpOthers() async {
         defer { cleaning = false }
         guard let others = try? await client.otherLocalUsers() else { return } // retried later
+        // The lookup can outlive the session: a stale answer may list the account now current
+        // as an "other", so a stopped feed neither erases ranks nor wipes.
+        guard !stopped else { return }
         guard !others.isEmpty else {
             cleanedUp = true
             return
         }
+        // Before the wipe, whatever its outcome: the core wipes one account at a time and stops
+        // at the first error, so a retry no longer lists the ones already wiped. The ranks are
+        // derived, so losing those of an account that is then kept costs nothing.
+        for other in others { ChannelsModel.eraseRanks(for: other.userId, defaults: defaults) }
         guard (try? await client.wipeOtherLocalUsers()) != nil else { return } // retried later
         cleanedUp = true
         if !stopped { alerts.append(.notice(Self.noticeText(others))) }
