@@ -255,7 +255,8 @@ mod live {
     use super::*;
 
     /// Against the real desktop keyring: `cargo test -p brook-gnome -- --ignored keyring_live`.
-    /// Uses a throwaway slot and deletes it; reports and skips when no unlocked keyring answers.
+    /// Uses a throwaway slot (under the test application name) and deletes it. Fails when no
+    /// unlocked keyring answers: running an ignored test is the opt-in.
     #[test]
     #[ignore = "touches the desktop keyring"]
     fn keyring_live_round_trip() {
@@ -291,7 +292,7 @@ mod live_support {
 
     /// The real desktop keyring, but under names of this run's own, so a live test can never
     /// touch (or sign out) the developer's real app: the app's slots (`session:<origin>`,
-    /// `index`, `cache:<id>`, `outbox:<id>`) all live under a `brook-selftest-<pid>-<time>/`
+    /// `index`, `cache:<id>`, `outbox:<id>`) all live under a `brook-selftest-<time>/`
     /// prefix here, and every slot written is deleted by [`ScopedSlot::purge`].
     pub struct ScopedSlot {
         inner: SecretServiceSlot,
@@ -492,11 +493,38 @@ mod live_support {
         assert_eq!(readable, ["plain.db", "sub/notes.txt"]);
         assert!(found.unreadable.is_empty());
         assert!(found.has_file("cipher.db") && !found.has_file("other.db"));
+        // Sizes are recorded: a blob of at least that many bytes, under that part of the path.
+        assert!(
+            found.has_file_of("sub/", 12),
+            "notes.txt is 12 bytes under sub/"
+        );
+        assert!(!found.has_file_of("sub/", 13), "but not 13");
+        assert!(
+            !found.has_file_of("/files/", 1),
+            "no such directory was scanned"
+        );
         // A dangling symlink can't be read: reported, not skipped.
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("/nonexistent/x", dir.path().join("dangling")).unwrap();
             assert_eq!(scan(dir.path(), "NEEDLE").unreadable, ["dangling"]);
+        }
+    }
+
+    #[test]
+    fn a_scoped_slot_puts_every_name_under_its_own_prefix() {
+        // Needs no keyring: the slot connects lazily, and only the naming is checked.
+        let slot = ScopedSlot {
+            inner: SecretServiceSlot::with_application("dev.brook.Brook.selftest"),
+            run_id: "123".into(),
+            prefix: "brook-selftest-123/".into(),
+            used: Mutex::default(),
+        };
+        for name in ["index", "session:https://h", "cache:abc", "outbox:abc"] {
+            let scoped = slot.scoped(name);
+            assert!(scoped.starts_with("brook-selftest-123/"), "{scoped}");
+            assert_ne!(scoped, name, "never the app's own name");
+            assert!(scoped.ends_with(name));
         }
     }
 
