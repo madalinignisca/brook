@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use brook_core::{
@@ -56,8 +57,13 @@ struct Chat {
     channel_settings: gtk::MenuButton,
     /// What only an owner or an admin of the open channel is offered (see `show_management`).
     manage: Rc<RefCell<ManageWidgets>>,
-    /// "X is typing…" indicator above the composer + its auto-clear timeout.
+    /// "X is typing…" indicator above the composer, who is in it, and the timer that
+    /// refreshes it when the first of them expires.
     typing_label: gtk::Label,
+    typing: Rc<RefCell<TypingState>>,
+    /// While set and in the future, the line shows an error (a failed send or reaction) that
+    /// typing must not overwrite or hide.
+    error_hold: Rc<Cell<ErrorHold>>,
     typing_timeout: Rc<RefCell<Option<glib::SourceId>>>,
     /// Last time we sent a typing signal (to throttle to ~once per few seconds).
     last_typing: Rc<RefCell<Option<std::time::Instant>>>,
@@ -253,6 +259,8 @@ pub fn build(
         channel_settings: channel_settings.clone(),
         manage: Rc::default(),
         typing_label: typing_label.clone(),
+        typing: Rc::default(),
+        error_hold: Rc::default(),
         typing_timeout: Rc::new(RefCell::new(None)),
         last_typing: Rc::new(RefCell::new(None)),
         message_list: message_list.clone(),
@@ -516,6 +524,10 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         .borrow()
                         .as_deref()
                         .is_some_and(|c| c == message.channel_id);
+                    if is_current {
+                        // They sent it: they're done typing.
+                        clear_typing_of(&chat, &message.author_id);
+                    }
                     if is_current && window_focused(&chat) {
                         append_message(&chat, &message);
                         mark_read(&chat, message.channel_id.clone(), Some(message.id.clone()));
@@ -618,7 +630,7 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     let me = chat.me.borrow().clone().unwrap_or_default();
                     let is_current = chat.current.borrow().as_deref() == Some(channel_id.as_str());
                     if is_current && user_id != me {
-                        show_typing(&chat, &display_name);
+                        show_typing(&chat, &user_id, &display_name);
                     }
                 }
                 Ok(ServerEvent::ChannelUpdate(_)) => {
@@ -1515,6 +1527,7 @@ fn toggle_reaction(chat: &Rc<Chat>, channel_id: String, message_id: String, emoj
             .await;
         if let Ok(Err(err)) = result {
             tracing::warn!(%err, "failed to toggle reaction");
+            show_send_error(&chat, "Couldn't react. Try again.");
         }
     });
 }
@@ -1926,6 +1939,107 @@ fn membership_error_text(err: &brook_core::Error) -> String {
         brook_core::Error::NotAuthenticated => "You were signed out.".into(),
         _ => "Couldn't reach the server.".into(),
     }
+}
+
+/// A handle as typed: trimmed, without a leading `@`.
+fn clean_handle(typed: &str) -> String {
+    typed.trim().trim_start_matches('@').trim().to_string()
+}
+
+/// The thing the action was about is already gone (`not_found`): what it wanted, so nothing
+/// to report. The `channel.update` or `channel.delete` on its way redraws.
+fn already_gone(err: &brook_core::Error) -> bool {
+    matches!(err, brook_core::Error::Api { code, .. } if code == "not_found")
+}
+
+/// The conversation actions that can fail with a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConvAction {
+    StartDm,
+    CreateChannel,
+    Join,
+    Browse,
+    AddMember,
+    Update,
+    Delete,
+}
+
+const TRY_AGAIN: &str = "That didn't work. Try again.";
+const NO_ONE: &str = "No one has that handle.";
+const BAD_NAME: &str = "That name or topic can't be used.";
+
+impl ConvAction {
+    /// The alert's heading, then what a refusal by the server's rules says (`forbidden`), what a
+    /// rejected input says (`invalid`: an unknown handle, a name that doesn't fit) and what
+    /// anything else that was answered says.
+    fn texts(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            ConvAction::StartDm => (
+                "Couldn't Start the Conversation",
+                "You can't message them.",
+                NO_ONE,
+                TRY_AGAIN,
+            ),
+            ConvAction::CreateChannel => (
+                "Couldn't Create the Channel",
+                "Only admins can create channels.",
+                BAD_NAME,
+                TRY_AGAIN,
+            ),
+            ConvAction::Join => (
+                "Couldn't Join",
+                "You can't join that channel.",
+                TRY_AGAIN,
+                TRY_AGAIN,
+            ),
+            ConvAction::Browse => (
+                "Couldn't Load the Channels",
+                "You can't browse channels.",
+                TRY_AGAIN,
+                TRY_AGAIN,
+            ),
+            ConvAction::AddMember => (
+                "Couldn't Add Them",
+                "Only an owner or admin can add members.",
+                NO_ONE,
+                TRY_AGAIN,
+            ),
+            ConvAction::Update => (
+                "Couldn't Do That",
+                "Only an owner or admin can do that.",
+                BAD_NAME,
+                TRY_AGAIN,
+            ),
+            ConvAction::Delete => (
+                "Couldn't Delete",
+                "Only an owner or admin can delete it.",
+                TRY_AGAIN,
+                TRY_AGAIN,
+            ),
+        }
+    }
+
+    /// The alert's heading and text for `err`. A call that wasn't answered says so; one answered
+    /// in a shape the client didn't expect gets the generic text, since retrying may help.
+    fn failure(self, err: &brook_core::Error) -> (&'static str, String) {
+        let (heading, forbidden, invalid, fallback) = self.texts();
+        let body = match err {
+            brook_core::Error::Api { code, .. } => match code.as_str() {
+                "authz.forbidden" => forbidden,
+                "validation.error" => invalid,
+                _ => fallback,
+            },
+            brook_core::Error::NotAuthenticated => "You were signed out.",
+            brook_core::Error::UnexpectedResponse => fallback,
+            _ => "Couldn't reach the server.",
+        };
+        (heading, body.to_string())
+    }
+}
+
+fn show_conversation_failure(chat: &Rc<Chat>, action: ConvAction, err: &brook_core::Error) {
+    let (heading, body) = action.failure(err);
+    show_alert(chat, heading, &body);
 }
 
 fn show_alert(chat: &Rc<Chat>, heading: &str, body: &str) {
@@ -2541,6 +2655,12 @@ fn update_channel_async(chat: &Rc<Chat>, name: Option<String>, archived: Option<
             .await;
         if let Ok(Err(err)) = result {
             tracing::warn!(%err, "failed to update channel");
+            if already_gone(&err) {
+                // A missed event can leave a stale row: read the list again.
+                refresh_channels(&chat, None);
+            } else {
+                show_conversation_failure(&chat, ConvAction::Update, &err);
+            }
         }
     });
 }
@@ -2615,6 +2735,11 @@ fn delete_channel_confirm(chat: &Rc<Chat>) {
                     .await;
                 if let Ok(Err(err)) = result {
                     tracing::warn!(%err, "failed to delete channel");
+                    if already_gone(&err) {
+                        refresh_channels(&chat, None);
+                    } else {
+                        show_conversation_failure(&chat, ConvAction::Delete, &err);
+                    }
                 }
             });
         }
@@ -2784,29 +2909,197 @@ fn maybe_send_typing(chat: &Rc<Chat>) {
     }
 }
 
-/// Show "<name> is typing…" and (re)start the 4s auto-clear.
-fn show_typing(chat: &Rc<Chat>, name: &str) {
-    chat.typing_label
-        .set_label(&format!("{name} is typing\u{2026}"));
-    chat.typing_label.set_visible(true);
+/// How long an error keeps the typing line.
+const ERROR_SHOWN: Duration = Duration::from_secs(6);
+
+/// The typing line is shared with errors (a failed send or reaction). While an error is held,
+/// typing and messages leave the line alone; when the hold ends, typing is drawn again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ErrorHold {
+    until: Option<Instant>,
+}
+
+impl ErrorHold {
+    /// An error is shown now: it holds the line for `ERROR_SHOWN` (a newer one renews it).
+    fn hold(&mut self, now: Instant) {
+        self.until = Some(now + ERROR_SHOWN);
+    }
+
+    fn holding(&self, now: Instant) -> bool {
+        self.until.is_some_and(|until| until > now)
+    }
+
+    /// An error's timer fired. Over: draw the line again. Wait: the hold lasts longer (a newer
+    /// error renewed it, or GLib's loop clock ran ahead of ours and fired early), so the timer
+    /// is set again for what's left; nothing is ever left holding with no timer.
+    fn timer_fired(&mut self, now: Instant) -> HoldTimer {
+        match self.until {
+            Some(until) if until > now => HoldTimer::Wait(until - now),
+            _ => {
+                self.until = None;
+                HoldTimer::Over
+            }
+        }
+    }
+
+    /// Another channel was opened: an error about the last one goes now.
+    fn clear(&mut self) {
+        self.until = None;
+    }
+}
+
+/// What an error's timer should do when it fires.
+#[derive(Debug, PartialEq, Eq)]
+enum HoldTimer {
+    Over,
+    Wait(Duration),
+}
+
+/// What the typing line shows.
+#[derive(Debug, PartialEq, Eq)]
+enum LineShown {
+    /// An error holds it: leave it alone.
+    Error,
+    Typing(String),
+    Nothing,
+}
+
+/// The state half of opening another channel: nobody is typing there yet, and an error about the
+/// last one goes.
+fn switch_channel(typing: &mut TypingState, hold: &mut ErrorHold) {
+    typing.reset();
+    hold.clear();
+}
+
+fn line_shown(hold: &ErrorHold, typing: &TypingState, now: Instant) -> LineShown {
+    if hold.holding(now) {
+        return LineShown::Error;
+    }
+    typing
+        .line(now)
+        .map_or(LineShown::Nothing, LineShown::Typing)
+}
+
+/// Who is typing in the open channel, as events say. Each shows for `LIFETIME` after their
+/// last event, or until a message from them arrives.
+#[derive(Default)]
+struct TypingState {
+    seen: Vec<(String, String, Instant)>,
+    last_message: HashMap<String, Instant>,
+}
+
+impl TypingState {
+    const LIFETIME: Duration = Duration::from_secs(4);
+    /// A typing notice this soon after their message is the one sent just before it (two
+    /// requests, no ordering between them), not a new one.
+    const AFTER_MESSAGE: Duration = Duration::from_secs(2);
+
+    fn note(&mut self, user_id: &str, name: &str, at: Instant) {
+        if let Some(sent) = self.last_message.get(user_id) {
+            if at.saturating_duration_since(*sent) < Self::AFTER_MESSAGE {
+                return;
+            }
+        }
+        match self.seen.iter_mut().find(|(id, _, _)| id == user_id) {
+            Some(entry) => (entry.1, entry.2) = (name.to_string(), at),
+            None => self.seen.push((user_id.to_string(), name.to_string(), at)),
+        }
+    }
+
+    /// A message from them: they're done.
+    fn clear(&mut self, user_id: &str, at: Instant) {
+        self.seen.retain(|(id, _, _)| id != user_id);
+        self.last_message.insert(user_id.to_string(), at);
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn live(&self, now: Instant) -> impl Iterator<Item = &(String, String, Instant)> {
+        self.seen
+            .iter()
+            .filter(move |(_, _, at)| now.saturating_duration_since(*at) < Self::LIFETIME)
+    }
+
+    /// "Ann is typing…", "Ann and Bob are typing…", "Several people are typing…"; none when
+    /// nobody is.
+    fn line(&self, now: Instant) -> Option<String> {
+        let mut names: Vec<&str> = self.live(now).map(|(_, n, _)| n.as_str()).collect();
+        names.sort_unstable();
+        match names.as_slice() {
+            [] => None,
+            [one] => Some(format!("{one} is typing\u{2026}")),
+            [a, b] => Some(format!("{a} and {b} are typing\u{2026}")),
+            _ => Some("Several people are typing\u{2026}".to_string()),
+        }
+    }
+
+    /// How long until the first of those shown expires.
+    fn next_expiry(&self, now: Instant) -> Option<Duration> {
+        self.live(now)
+            .map(|(_, _, at)| Self::LIFETIME.saturating_sub(now.saturating_duration_since(*at)))
+            .min()
+    }
+}
+
+/// Note that `user_id` is typing, and redraw the line.
+fn show_typing(chat: &Rc<Chat>, user_id: &str, name: &str) {
+    chat.typing.borrow_mut().note(user_id, name, Instant::now());
+    render_typing(chat);
+}
+
+/// A message from `user_id` arrived: they're no longer typing.
+fn clear_typing_of(chat: &Rc<Chat>, user_id: &str) {
+    chat.typing.borrow_mut().clear(user_id, Instant::now());
+    render_typing(chat);
+}
+
+/// Draw who's typing, and wake up when the first of them expires.
+fn render_typing(chat: &Rc<Chat>) {
+    let now = Instant::now();
+    let (shown, expiry) = {
+        let state = chat.typing.borrow();
+        (
+            line_shown(&chat.error_hold.get(), &state, now),
+            state.next_expiry(now),
+        )
+    };
+    match shown {
+        // An error is showing: it keeps the line until its own timer ends it, which draws this.
+        LineShown::Error => return,
+        LineShown::Typing(line) => {
+            chat.typing_label.remove_css_class("error");
+            chat.typing_label.set_label(&line);
+            chat.typing_label.set_visible(true);
+        }
+        LineShown::Nothing => {
+            chat.typing_label.remove_css_class("error");
+            chat.typing_label.set_visible(false);
+        }
+    }
     if let Some(id) = chat.typing_timeout.borrow_mut().take() {
         id.remove();
     }
-    let chat2 = chat.clone();
-    let id = glib::timeout_add_seconds_local(4, move || {
-        chat2.typing_label.set_visible(false);
-        *chat2.typing_timeout.borrow_mut() = None;
-        glib::ControlFlow::Break
-    });
-    *chat.typing_timeout.borrow_mut() = Some(id);
+    if let Some(expiry) = expiry {
+        let chat2 = chat.clone();
+        let id = glib::timeout_add_local_once(expiry + Duration::from_millis(50), move || {
+            // Fired: forget the id first, so nothing removes a source that's gone.
+            *chat2.typing_timeout.borrow_mut() = None;
+            render_typing(&chat2);
+        });
+        *chat.typing_timeout.borrow_mut() = Some(id);
+    }
 }
 
 /// Clear any typing indicator (e.g. on channel switch).
 fn clear_typing(chat: &Rc<Chat>) {
-    chat.typing_label.set_visible(false);
-    if let Some(id) = chat.typing_timeout.borrow_mut().take() {
-        id.remove();
-    }
+    // An error about the channel just left doesn't follow you into the next.
+    let mut hold = chat.error_hold.get();
+    switch_channel(&mut chat.typing.borrow_mut(), &mut hold);
+    chat.error_hold.set(hold);
+    chat.typing_label.remove_css_class("error");
+    render_typing(chat);
 }
 
 /// Whether a message calls for this user's attention: someone else's, not deleted, naming
@@ -2917,13 +3210,14 @@ fn new_conversation_popover(chat: &Rc<Chat>) -> gtk::Popover {
         let dm_entry = dm_entry.clone();
         let popover = popover.clone();
         move |_| {
-            let handle = dm_entry.text().trim().to_string();
+            let handle = clean_handle(&dm_entry.text());
             if handle.is_empty() {
                 return;
             }
-            dm_entry.set_text("");
             popover.popdown();
-            open_dm(&chat, handle);
+            // The text stays until the server accepts the handle, so a typo is fixed, not retyped.
+            let entry = dm_entry.clone();
+            open_dm(&chat, handle, move || entry.set_text(""));
         }
     });
 
@@ -2953,10 +3247,12 @@ fn new_conversation_popover(chat: &Rc<Chat>) -> gtk::Popover {
                     return;
                 }
                 let public = public_check.is_active();
-                name_entry.set_text("");
-                public_check.set_active(false);
                 popover.popdown();
-                create_channel(&chat, name, public);
+                let (entry, check) = (name_entry.clone(), public_check.clone());
+                create_channel(&chat, name, public, move || {
+                    entry.set_text("");
+                    check.set_active(false);
+                });
             }
         });
     }
@@ -2972,8 +3268,13 @@ fn browse_public_channels(chat: &Rc<Chat>) {
             let client = chat.client.clone();
             async move { client.list_public_channels().await }
         });
-        let Ok(Ok(channels)) = handle.await else {
-            return;
+        let channels = match handle.await {
+            Ok(Ok(channels)) => channels,
+            Ok(Err(err)) => {
+                show_conversation_failure(&chat, ConvAction::Browse, &err);
+                return;
+            }
+            Err(_) => return,
         };
         let list = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -3028,8 +3329,16 @@ fn join_public(chat: &Rc<Chat>, channel_id: String) {
             let client = chat.client.clone();
             async move { client.join_channel(&channel_id).await }
         });
-        if let Ok(Ok(channel)) = handle.await {
-            refresh_channels(&chat, Some(channel.id));
+        match handle.await {
+            Ok(Ok(channel)) => refresh_channels(&chat, Some(channel.id)),
+            // Gone, archived or no longer public: retrying never helps.
+            Ok(Err(err)) if already_gone(&err) => show_alert(
+                &chat,
+                "Couldn't Join",
+                "That channel isn't open to join any more.",
+            ),
+            Ok(Err(err)) => show_conversation_failure(&chat, ConvAction::Join, &err),
+            Err(_) => {}
         }
     });
 }
@@ -3163,20 +3472,30 @@ fn jump_to_channel(chat: &Rc<Chat>, channel_id: &str) {
     }
 }
 
-fn open_dm(chat: &Rc<Chat>, handle: String) {
+fn open_dm(chat: &Rc<Chat>, handle: String, on_opened: impl FnOnce() + 'static) {
     let chat = chat.clone();
     glib::spawn_future_local(async move {
         let join = chat.runtime.spawn({
             let client = chat.client.clone();
             async move { client.open_dm(&handle).await }
         });
-        if let Ok(Ok(channel)) = join.await {
-            refresh_channels(&chat, Some(channel.id));
+        match join.await {
+            Ok(Ok(channel)) => {
+                on_opened();
+                refresh_channels(&chat, Some(channel.id));
+            }
+            Ok(Err(err)) => show_conversation_failure(&chat, ConvAction::StartDm, &err),
+            Err(_) => {}
         }
     });
 }
 
-fn create_channel(chat: &Rc<Chat>, name: String, public: bool) {
+fn create_channel(
+    chat: &Rc<Chat>,
+    name: String,
+    public: bool,
+    on_created: impl FnOnce() + 'static,
+) {
     let chat = chat.clone();
     glib::spawn_future_local(async move {
         let join = chat.runtime.spawn({
@@ -3189,8 +3508,13 @@ fn create_channel(chat: &Rc<Chat>, name: String, public: bool) {
                 }
             }
         });
-        if let Ok(Ok(channel)) = join.await {
-            refresh_channels(&chat, Some(channel.id));
+        match join.await {
+            Ok(Ok(channel)) => {
+                on_created();
+                refresh_channels(&chat, Some(channel.id));
+            }
+            Ok(Err(err)) => show_conversation_failure(&chat, ConvAction::CreateChannel, &err),
+            Err(_) => {}
         }
     });
 }
@@ -3222,16 +3546,16 @@ fn add_member_popover(chat: &Rc<Chat>) -> gtk::Popover {
         let entry = entry.clone();
         let popover = popover.clone();
         move |_| {
-            let handle = entry.text().trim().to_string();
+            let handle = clean_handle(&entry.text());
             let Some(channel_id) = chat.current.borrow().clone() else {
                 return;
             };
             if handle.is_empty() {
                 return;
             }
-            entry.set_text("");
             popover.popdown();
             let chat = chat.clone();
+            let entry = entry.clone();
             glib::spawn_future_local(async move {
                 let join = chat.runtime.spawn({
                     let client = chat.client.clone();
@@ -3239,8 +3563,17 @@ fn add_member_popover(chat: &Rc<Chat>) -> gtk::Popover {
                 });
                 // The server fans out channel.update; the new member's client
                 // refreshes itself. Reload ours too so the member count updates.
-                if let Ok(Ok(())) = join.await {
-                    refresh_channels(&chat, None);
+                match join.await {
+                    Ok(Ok(())) => {
+                        entry.set_text(""); // kept on a failure, so a typo isn't retyped
+                        refresh_channels(&chat, None);
+                    }
+                    Ok(Err(err)) if already_gone(&err) => {
+                        entry.set_text("");
+                        refresh_channels(&chat, None);
+                    }
+                    Ok(Err(err)) => show_conversation_failure(&chat, ConvAction::AddMember, &err),
+                    Err(_) => {}
                 }
             });
         }
@@ -3719,10 +4052,23 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
             .label("Remove this device's data")
             .active(true)
             .build();
+        let options = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .build();
+        options.append(&remove);
+        options.append(
+            &gtk::Label::builder()
+                .label(lost_device_help(*chat.is_admin.borrow()))
+                .wrap(true)
+                .xalign(0.0)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
         let known = chat.local_open.get();
         let body = sign_out_body(unsent, known, true);
         let dialog = adw::AlertDialog::new(Some("Sign Out?"), Some(&body));
-        dialog.set_extra_child(Some(&remove));
+        dialog.set_extra_child(Some(&options));
         remove.connect_toggled({
             let dialog = dialog.clone();
             move |check| dialog.set_body(&sign_out_body(unsent, known, check.is_active()))
@@ -3741,6 +4087,25 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
         });
         dialog.present(Some(&chat.message_list));
     });
+}
+
+/// Under the checkbox (owner decision, #46 §8): a lost device's *account* access is cut off by
+/// ending its sign-in. The data already saved on it is not: it is encrypted with that device's
+/// own random key, held in that device's keyring, so it stays readable to whoever can sign in
+/// to that computer. The text says both. An admin can't be reset by another admin (the server
+/// refuses), so they're only told the password route.
+fn lost_device_help(admin: bool) -> String {
+    let switch = crate::account::SIGN_OUT_OTHERS_LABEL;
+    let reset = if admin {
+        ""
+    } else {
+        ", or ask an admin to reset your account"
+    };
+    format!(
+        "If you lose a device, change your password with \"{switch}\" on{reset}. That ends its \
+         sign-in, but messages already saved on it stay readable to anyone who can sign in to \
+         that computer."
+    )
 }
 
 /// What signing out does to this device's data, in words.
@@ -3935,16 +4300,31 @@ fn send_error_text(err: &brook_core::Error) -> String {
     }
 }
 
-/// Show a send error in the typing line for a few seconds.
+/// Show an error in the typing line for a few seconds. Typing and messages arriving meanwhile
+/// leave it alone; when it ends, whoever is typing is drawn again.
 fn show_send_error(chat: &Rc<Chat>, text: &str) {
     chat.typing_label.set_text(text);
     chat.typing_label.add_css_class("error");
     chat.typing_label.set_visible(true);
-    let label = chat.typing_label.downgrade();
-    glib::timeout_add_seconds_local_once(6, move || {
-        if let Some(label) = label.upgrade() {
-            label.remove_css_class("error");
-            label.set_visible(false);
+    let mut hold = chat.error_hold.get();
+    hold.hold(Instant::now());
+    chat.error_hold.set(hold);
+    arm_error_timer(chat, ERROR_SHOWN);
+}
+
+/// End the hold after `delay`, or set the timer again for what's left if it fired early.
+fn arm_error_timer(chat: &Rc<Chat>, delay: Duration) {
+    let chat = chat.clone();
+    glib::timeout_add_local_once(delay, move || {
+        let mut hold = chat.error_hold.get();
+        let fired = hold.timer_fired(Instant::now());
+        chat.error_hold.set(hold);
+        match fired {
+            HoldTimer::Over => {
+                chat.typing_label.remove_css_class("error");
+                render_typing(&chat);
+            }
+            HoldTimer::Wait(left) => arm_error_timer(&chat, left + Duration::from_millis(20)),
         }
     });
 }
@@ -4239,6 +4619,40 @@ mod mention_tests {
 }
 
 #[cfg(test)]
+mod lost_device_help_tests {
+    use super::lost_device_help;
+    use crate::account::SIGN_OUT_OTHERS_LABEL;
+
+    #[test]
+    fn the_sign_out_help_names_the_ways_to_cut_off_a_lost_device() {
+        let member = lost_device_help(false);
+        assert!(member.contains("change your password"));
+        assert!(
+            member.contains(SIGN_OUT_OTHERS_LABEL),
+            "the switch's own label"
+        );
+        assert!(member.contains("ask an admin to reset your account"));
+    }
+
+    #[test]
+    fn the_help_doesnt_promise_protection_for_data_already_on_the_device() {
+        for admin in [false, true] {
+            let help = lost_device_help(admin);
+            assert!(help.contains("ends its sign-in, but"), "{help}");
+            assert!(help.contains("stay readable"), "{help}");
+        }
+    }
+
+    #[test]
+    fn an_admin_is_only_told_the_password_route() {
+        // The server refuses an admin resetting another admin (403).
+        let admin = lost_device_help(true);
+        assert!(admin.contains(SIGN_OUT_OTHERS_LABEL));
+        assert!(!admin.contains("admin"));
+    }
+}
+
+#[cfg(test)]
 mod manage_tests {
     use super::{management_shown, may_manage, ManageShown, QUICK_EMOJI};
 
@@ -4288,5 +4702,291 @@ mod manage_tests {
     fn the_quick_heart_is_the_emoji_form_the_mac_and_kde_send() {
         // The server keys reactions on the exact string: a bare U+2764 would be another one.
         assert_eq!(QUICK_EMOJI[1], "\u{2764}\u{fe0f}");
+    }
+}
+
+#[cfg(test)]
+mod typing_tests {
+    use super::*;
+
+    const S: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn the_line_names_one_two_or_several_and_expires() {
+        let t0 = Instant::now();
+        let mut state = TypingState::default();
+        assert_eq!(state.line(t0), None);
+        state.note("a", "Ann", t0);
+        assert_eq!(state.line(t0).as_deref(), Some("Ann is typing\u{2026}"));
+        state.note("b", "Bob", t0 + S);
+        assert_eq!(
+            state.line(t0 + S).as_deref(),
+            Some("Ann and Bob are typing\u{2026}")
+        );
+        state.note("c", "Cy", t0 + S);
+        assert_eq!(
+            state.line(t0 + S).as_deref(),
+            Some("Several people are typing\u{2026}")
+        );
+        // Ann's last event was 4 s ago: only Bob and Cy are left.
+        assert_eq!(
+            state.line(t0 + 4 * S).as_deref(),
+            Some("Bob and Cy are typing\u{2026}")
+        );
+        assert_eq!(state.next_expiry(t0 + 4 * S), Some(S));
+        assert_eq!(state.line(t0 + 6 * S), None);
+    }
+
+    #[test]
+    fn the_next_expiry_is_the_earliest_not_the_latest() {
+        let t0 = Instant::now();
+        let mut state = TypingState::default();
+        state.note("a", "Ann", t0);
+        state.note("b", "Bob", t0 + 3 * S);
+        // Ann expires in 2 s, Bob in 4: the refresh must come for Ann first.
+        assert_eq!(state.next_expiry(t0 + 2 * S), Some(2 * S));
+    }
+
+    #[test]
+    fn a_new_event_renews_the_same_person() {
+        let t0 = Instant::now();
+        let mut state = TypingState::default();
+        state.note("a", "Ann", t0);
+        state.note("a", "Ann", t0 + 3 * S);
+        assert_eq!(
+            state.line(t0 + 6 * S).as_deref(),
+            Some("Ann is typing\u{2026}")
+        );
+        assert_eq!(state.live(t0 + 6 * S).count(), 1);
+    }
+
+    #[test]
+    fn their_message_clears_them_and_ignores_the_notice_just_before_it() {
+        let t0 = Instant::now();
+        let mut state = TypingState::default();
+        state.note("a", "Ann", t0);
+        state.clear("a", t0 + S);
+        assert_eq!(state.line(t0 + S), None);
+        // The typing request that raced their message: dropped.
+        state.note("a", "Ann", t0 + S + Duration::from_millis(500));
+        assert_eq!(state.line(t0 + 2 * S), None);
+        // A real one for their next message, after the window: shown.
+        state.note("a", "Ann", t0 + 4 * S);
+        assert_eq!(
+            state.line(t0 + 4 * S).as_deref(),
+            Some("Ann is typing\u{2026}")
+        );
+    }
+
+    #[test]
+    fn switching_channels_forgets_everyone() {
+        let t0 = Instant::now();
+        let mut state = TypingState::default();
+        state.note("a", "Ann", t0);
+        state.clear("b", t0);
+        state.reset();
+        assert_eq!(state.line(t0), None);
+        state.note("b", "Bob", t0);
+        assert!(state.line(t0).is_some(), "no stale last-message window");
+    }
+}
+
+#[cfg(test)]
+mod conversation_error_tests {
+    use super::*;
+
+    fn api(code: &str) -> brook_core::Error {
+        brook_core::Error::Api {
+            code: code.into(),
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_handle_is_trimmed_and_loses_its_at_sign() {
+        assert_eq!(clean_handle("  @ana "), "ana");
+        assert_eq!(clean_handle("ana"), "ana");
+        assert_eq!(clean_handle("@@ana"), "ana");
+        assert_eq!(clean_handle(" @ "), "");
+    }
+
+    #[test]
+    fn what_already_happened_isnt_reported() {
+        assert!(already_gone(&api("not_found")));
+        assert!(!already_gone(&api("authz.forbidden")));
+        assert!(!already_gone(&brook_core::Error::UnexpectedResponse));
+    }
+
+    const ALL: [ConvAction; 7] = [
+        ConvAction::StartDm,
+        ConvAction::CreateChannel,
+        ConvAction::Join,
+        ConvAction::Browse,
+        ConvAction::AddMember,
+        ConvAction::Update,
+        ConvAction::Delete,
+    ];
+
+    fn body(action: ConvAction, code: &str) -> String {
+        action.failure(&api(code)).1
+    }
+
+    #[test]
+    fn each_action_says_why_in_its_own_words() {
+        for action in ALL {
+            let (heading, forbidden, invalid, fallback) = action.texts();
+            assert!(heading.starts_with("Couldn't"), "{action:?}");
+            assert_eq!(
+                action.failure(&api("authz.forbidden")),
+                (heading, forbidden.to_string())
+            );
+            assert_eq!(
+                action.failure(&api("validation.error")),
+                (heading, invalid.to_string())
+            );
+            assert_eq!(
+                action.failure(&api("whatever")),
+                (heading, fallback.to_string())
+            );
+        }
+        // The specific ones, so swapped columns can't pass.
+        assert_eq!(
+            body(ConvAction::StartDm, "validation.error"),
+            "No one has that handle."
+        );
+        assert_eq!(
+            body(ConvAction::AddMember, "validation.error"),
+            "No one has that handle."
+        );
+        assert_eq!(
+            body(ConvAction::CreateChannel, "validation.error"),
+            "That name or topic can't be used."
+        );
+        assert_eq!(
+            body(ConvAction::Update, "validation.error"),
+            "That name or topic can't be used."
+        );
+        assert_eq!(
+            body(ConvAction::CreateChannel, "authz.forbidden"),
+            "Only admins can create channels."
+        );
+        assert_eq!(
+            body(ConvAction::Join, "authz.forbidden"),
+            "You can't join that channel."
+        );
+        assert_eq!(
+            body(ConvAction::Browse, "authz.forbidden"),
+            "You can't browse channels."
+        );
+        assert_eq!(
+            body(ConvAction::Join, "validation.error"),
+            "That didn't work. Try again."
+        );
+        assert_eq!(
+            body(ConvAction::Delete, "authz.forbidden"),
+            "Only an owner or admin can delete it."
+        );
+        assert_eq!(
+            body(ConvAction::AddMember, "authz.forbidden"),
+            "Only an owner or admin can add members."
+        );
+    }
+
+    #[test]
+    fn an_unanswered_call_says_so_but_an_odd_answer_is_a_retry() {
+        for action in ALL {
+            assert_eq!(
+                action.failure(&brook_core::Error::Timeout).1,
+                "Couldn't reach the server."
+            );
+            assert_eq!(
+                action.failure(&brook_core::Error::NotAuthenticated).1,
+                "You were signed out."
+            );
+            assert_eq!(
+                action.failure(&brook_core::Error::UnexpectedResponse).1,
+                "That didn't work. Try again."
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_hold_tests {
+    use super::*;
+
+    const S: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn typing_noted_during_an_error_doesnt_show_until_the_hold_ends() {
+        let t0 = Instant::now();
+        let mut hold = ErrorHold::default();
+        let mut typing = TypingState::default();
+        hold.hold(t0);
+        typing.note("a", "Ann", t0 + S);
+        assert_eq!(line_shown(&hold, &typing, t0 + 2 * S), LineShown::Error);
+        // The hold ends at 6 s; Ann's notice (1 s) has expired at 5 s, so a fresh one shows.
+        typing.note("a", "Ann", t0 + 6 * S);
+        assert_eq!(hold.timer_fired(t0 + 6 * S), HoldTimer::Over);
+        assert_eq!(
+            line_shown(&hold, &typing, t0 + 6 * S),
+            LineShown::Typing("Ann is typing\u{2026}".into())
+        );
+    }
+
+    #[test]
+    fn a_new_error_renews_the_hold_so_the_first_timer_does_nothing() {
+        let t0 = Instant::now();
+        let mut hold = ErrorHold::default();
+        hold.hold(t0);
+        hold.hold(t0 + 3 * S);
+        // The first error's timer fires at 6 s: the second is still held until 9 s.
+        assert_eq!(hold.timer_fired(t0 + 6 * S), HoldTimer::Wait(3 * S));
+        assert!(hold.holding(t0 + 8 * S));
+        assert_eq!(hold.timer_fired(t0 + 9 * S), HoldTimer::Over);
+        assert!(!hold.holding(t0 + 9 * S));
+    }
+
+    #[test]
+    fn switching_channel_forgets_typing_and_drops_the_error() {
+        let t0 = Instant::now();
+        let mut hold = ErrorHold::default();
+        let mut typing = TypingState::default();
+        typing.note("a", "Ann", t0);
+        hold.hold(t0);
+        switch_channel(&mut typing, &mut hold);
+        assert_eq!(line_shown(&hold, &typing, t0 + S), LineShown::Nothing);
+        assert!(!hold.holding(t0 + S));
+    }
+
+    #[test]
+    fn opening_another_channel_drops_the_error() {
+        let t0 = Instant::now();
+        let mut hold = ErrorHold::default();
+        hold.hold(t0);
+        hold.clear();
+        assert!(!hold.holding(t0 + S));
+        assert_eq!(
+            line_shown(&hold, &TypingState::default(), t0 + S),
+            LineShown::Nothing
+        );
+        // The timer still pending from that error finds nothing held and just redraws.
+        assert_eq!(hold.timer_fired(t0 + 6 * S), HoldTimer::Over);
+    }
+
+    #[test]
+    fn a_timer_that_fires_early_is_set_again_for_what_is_left() {
+        // GLib's cached loop time can run slightly ahead of our clock: the timer fires before
+        // the deadline. It must not leave the error holding with nothing to end it.
+        let t0 = Instant::now();
+        let mut hold = ErrorHold::default();
+        hold.hold(t0);
+        let early = t0 + ERROR_SHOWN - Duration::from_millis(5);
+        assert_eq!(
+            hold.timer_fired(early),
+            HoldTimer::Wait(Duration::from_millis(5))
+        );
+        assert!(hold.holding(early), "still held");
+        assert_eq!(hold.timer_fired(t0 + ERROR_SHOWN), HoldTimer::Over);
     }
 }
