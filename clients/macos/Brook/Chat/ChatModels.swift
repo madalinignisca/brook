@@ -34,7 +34,10 @@ final class TimelineModel {
     /// The network's error. Hidden (`visibleError`) while offline with cached messages shown.
     private(set) var error: String?
     /// Set from the cache's state feed: the last sync couldn't reach the server.
-    var offline = false
+    var offline = false {
+        // The connection is back: a head load that failed is tried again.
+        didSet { if oldValue, !offline { retryFailedHead() } }
+    }
     /// Current names for authors (a `Users` notice): cached rows keep the name they were
     /// stored with.
     private(set) var authorNames: [String: String] = [:]
@@ -211,6 +214,16 @@ final class TimelineModel {
         }
     }
 
+    /// Retry a failed head load once, when a signal says the connection is back (`.ready`, or
+    /// offline going false). A retry that fails sets the error again and waits for the next
+    /// signal: no timer, no loop. `loading` is taken here, before the task runs, so two signals
+    /// arriving together start one fetch.
+    private func retryFailedHead() {
+        guard error != nil, !loading else { return }
+        loading = true
+        Task { await fetch(before: nil) }
+    }
+
     /// A live event, if it's this channel's.
     func apply(_ event: FfiServerEvent) {
         switch event {
@@ -260,7 +273,9 @@ final class TimelineModel {
                 let r = messages[i].reactions[j]
                 messages[i].reactions[j] = FfiReaction(emoji: r.emoji, count: r.count, me: added)
             }
-        case .ready, .channelCall, .channelUpdate, .channelDelete:
+        case .ready:
+            retryFailedHead() // every (re)connect
+        case .channelCall, .channelUpdate, .channelDelete:
             break
         }
     }

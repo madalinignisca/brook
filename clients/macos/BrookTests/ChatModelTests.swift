@@ -50,7 +50,12 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     var read: [String?] = []
 
     var historyFailure: Error?
+    /// `channelHistory` calls so far, and a gate that holds each one after it is counted.
+    let historyCalls = Mutex(0)
+    var historyGate: Gate?
     func channelHistory(channelId: String, before: String?) async throws -> [FfiMessage] {
+        historyCalls.withLock { $0 += 1 }
+        await historyGate?.wait()
         if let historyFailure { throw historyFailure }
         return pages.isEmpty ? [] : pages.removeFirst()
     }

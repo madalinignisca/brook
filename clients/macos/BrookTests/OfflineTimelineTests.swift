@@ -137,4 +137,78 @@ final class OfflineTimelineTests: XCTestCase {
         t.offline = false
         XCTAssertNotNil(t.visibleError)
     }
+
+    // ---- A failed head load is retried when the connection returns.
+
+    private func failedHead(_ chat: FakeChat) async -> TimelineModel {
+        chat.historyFailure = LoginError.Network(message: "offline")
+        let t = TimelineModel(channelId: "c", client: chat)
+        await t.load()
+        XCTAssertNotNil(t.error)
+        return t
+    }
+
+    /// Wait until `done` holds (the retry runs in a task), failing after a while.
+    private func settle(_ what: String, _ done: () -> Bool) async {
+        for _ in 0..<200 where !done() { try? await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(done(), what)
+    }
+
+    func testReadyRetriesAFailedHeadLoad() async {
+        let chat = FakeChat()
+        let t = await failedHead(chat)
+        chat.historyFailure = nil
+        chat.pages = [[msg("m1", "back")]]
+        t.apply(.ready)
+        await settle("no retry on ready") { t.error == nil && !t.loading }
+        XCTAssertEqual(t.messages.map(\.id), ["m1"])
+        XCTAssertEqual(chat.historyCalls.withLock { $0 }, 2)
+    }
+
+    func testOfflineGoingFalseRetriesAFailedHeadLoad() async {
+        let chat = FakeChat()
+        let t = await failedHead(chat)
+        t.offline = true
+        chat.historyFailure = nil
+        chat.pages = [[msg("m1", "back")]]
+        t.offline = false
+        await settle("no retry when offline cleared") { t.error == nil && !t.loading }
+        XCTAssertEqual(t.messages.map(\.id), ["m1"])
+    }
+
+    func testReadyWithoutAnErrorFetchesNothing() async {
+        let chat = FakeChat()
+        chat.pages = [[msg("m1", "a")]]
+        let t = TimelineModel(channelId: "c", client: chat)
+        await t.load()
+        t.apply(.ready)
+        t.offline = true
+        t.offline = false
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(chat.historyCalls.withLock { $0 }, 1)
+    }
+
+    func testAFailingRetryKeepsTheErrorAndDoesNotLoop() async {
+        let chat = FakeChat()
+        let t = await failedHead(chat)
+        t.apply(.ready)
+        await settle("retry didn't run") { chat.historyCalls.withLock { $0 } == 2 && !t.loading }
+        try? await Task.sleep(for: .milliseconds(200)) // a loop would keep calling
+        XCTAssertEqual(chat.historyCalls.withLock { $0 }, 2)
+        XCTAssertNotNil(t.error)
+    }
+
+    func testReadyAndOnlineTogetherRunOneFetch() async {
+        let chat = FakeChat()
+        let t = await failedHead(chat)
+        t.offline = true
+        chat.historyGate = Gate()
+        t.apply(.ready)
+        t.offline = false // while the first is in flight
+        await settle("retry didn't start") { chat.historyCalls.withLock { $0 } >= 2 }
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(chat.historyCalls.withLock { $0 }, 2, "two fetches at once")
+        chat.historyGate?.open()
+        await settle("retry didn't finish") { !t.loading }
+    }
 }
