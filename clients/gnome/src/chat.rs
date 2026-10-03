@@ -4467,11 +4467,13 @@ fn wipe_other_accounts(chat: &Rc<Chat>) {
         // is here) and before the wipe, which stops at the first error. Orphaned ones too,
         // even with no other data left (#235).
         let me = chat.me.borrow().clone().unwrap_or_default();
-        crate::prefs::forget_others_than(chat.ended.get(), &me);
+        // Ended by the user's sign-out, or the view torn down by an involuntary LoggedOut.
+        let ended = chat.ended.get() || chat.offline_banner.root().is_none();
+        crate::prefs::forget_others_than(ended, &me);
         if others.is_empty() {
             return;
         }
-        if chat.ended.get() {
+        if ended {
             return;
         }
         let wipe = chat.runtime.spawn({
