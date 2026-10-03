@@ -66,6 +66,8 @@ struct SignedInView: View {
         })
     }
     @Environment(\.openWindow) private var openWindow
+    /// The Settings window's preference: pushed into the model, which relabels the rows.
+    @AppStorage(Settings.showUsernamesKey) private var showUsernames = false
 
     var body: some View {
         NavigationSplitView {
@@ -178,10 +180,11 @@ struct SignedInView: View {
             MacNotifier.shared.onOpen = { selection = $0 } // a clicked notification opens its channel
             await channels.start()
         }
+        .onDisappear { channels.stop() } // the session ended: no late read may save its ranks
         // The feed arrives once local data is switched on, after this view appears.
         .onChange(of: feed.map(ObjectIdentifier.init), initial: true) { _, _ in registerWithFeed() }
         .safeAreaInset(edge: .top) {
-            if feed?.offline == true {
+            if feed?.showsOfflineBanner == true {
                 Label("Offline: showing messages saved on this Mac", systemImage: "wifi.slash")
                     .font(.callout).frame(maxWidth: .infinity).padding(6)
                     .background(.yellow.opacity(0.2))
@@ -201,6 +204,7 @@ struct SignedInView: View {
             prompt.opened()
             syncAnswering()
         }
+        .onChange(of: showUsernames, initial: true) { _, on in channels.showUsernames = on }
         .onChange(of: channels.channels) { _, _ in syncAnswering() } // an offer came or went
         .sheet(isPresented: Binding(
             get: {

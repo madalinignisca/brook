@@ -10,7 +10,7 @@ final class ChannelEventsTests: XCTestCase {
 
     private func started(_ channels: [FfiChannel]) async -> (FakeRealtime, ChannelsModel) {
         let client = FakeRealtime(channels: channels)
-        let model = ChannelsModel(client: client, me: "me", isActive: { true })
+        let model = ChannelsModel(client: client, me: "me", isActive: { true }, defaults: isolatedDefaults())
         await model.start()
         return (client, model)
     }
@@ -21,6 +21,25 @@ final class ChannelEventsTests: XCTestCase {
             await drainMain()
             await Task.yield()
         }
+    }
+
+    /// `.ready` reaches the open timeline through the model's event path: a head load that
+    /// failed is tried again on the reconnect.
+    func testReadyRetriesTheOpenTimelinesFailedHead() async {
+        let (client, model) = await started([channel("c1", "general")])
+        let chat = FakeChat()
+        chat.historyFailure = LoginError.Network(message: "offline")
+        let t = TimelineModel(channelId: "c1", client: chat)
+        model.openChannel = "c1"
+        model.timeline = t
+        await t.load()
+        XCTAssertNotNil(t.error)
+        chat.historyFailure = nil
+        chat.pages = [[msg("m1", "back", channel: "c1")]]
+        client.deliver(.ready)
+        await settle { chat.historyCalls.withLock { $0 } >= 2 && t.error == nil && !t.loading }
+        XCTAssertEqual(chat.historyCalls.withLock { $0 }, 2)
+        XCTAssertNil(t.error)
     }
 
     func testADeleteRemovesTheRowAndClosesTheOpenChannel() async {

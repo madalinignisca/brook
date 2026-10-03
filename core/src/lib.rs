@@ -7,6 +7,9 @@
 //! Phase 1 surface: configure a server, log in over TLS, list/create channels and
 //! DMs, send and page message history, and observe realtime [`ServerEvent`]s over
 //! a WebSocket — plus the observable [`AuthState`] the UI watches.
+// async_trait expands each method to a boxed future (already #[must_use]) and a newer clippy
+// reports that as double_must_use on every async_trait trait; the macro owns the expansion.
+#![allow(clippy::double_must_use)]
 
 mod account;
 #[cfg(test)]
@@ -54,6 +57,9 @@ mod preview;
 mod restore_tests;
 mod session;
 mod session_store;
+mod sidebar;
+#[cfg(test)]
+mod sidebar_tests;
 #[cfg(test)]
 mod signout_tests;
 mod snapshot;
@@ -99,6 +105,9 @@ pub use preview::{
     ImageKind, ImagePreview, PREVIEW_MAX_BYTES, PREVIEW_MAX_PIXELS, PREVIEW_MAX_SIDE,
 };
 pub use session::{Session, User};
+pub use sidebar::{
+    activity_moves, conversation_label, person_label, sidebar_order, sort_key, SidebarEntry,
+};
 pub use state::AuthState;
 pub use transfer::{
     is_transient, DownloadSink, FileInfo, FileSink, FileSource, SinkError, TransferEvent,

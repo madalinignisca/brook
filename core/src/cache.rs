@@ -25,6 +25,29 @@ use crate::sync::{self, event_batch, message_row, Fetch, SyncError, Synced};
 /// How long a hint (or an unappliable event) waits for others before the sync runs.
 pub(crate) const HINT_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// After a sync fails for lack of a network, try again after this, doubling up to the cap
+/// while the failures last. Without it `offline` would stay set until the next periodic
+/// sync (minutes) even when the network is back.
+const RETRY_START: Duration = Duration::from_secs(2);
+const RETRY_CAP: Duration = Duration::from_secs(30);
+
+/// The wait before the next retry, in ms: `start` after a success (`last` is 0), then double
+/// the previous wait, never beyond `cap`.
+pub(crate) fn retry_delay(last: u64, start: u64, cap: u64) -> u64 {
+    match last {
+        0 => start,
+        last => (last * 2).min(cap),
+    }
+}
+
+/// The server couldn't be reached (as opposed to refusing or failing the request).
+fn is_network_failure(e: &SyncError) -> bool {
+    matches!(
+        e,
+        SyncError::Net(crate::Error::Http(_) | crate::Error::Timeout | crate::Error::Disconnected)
+    )
+}
+
 /// What changed, after it was committed. The apps re-read what they show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheEvent {
@@ -75,6 +98,9 @@ pub struct CachedChannel {
     pub unread: u32,
     /// Of those, the ones naming this user (`mentions`) or everyone (`mention_everyone`).
     pub unread_mentions: u32,
+    /// The newest cached message's id, tombstones included (a deletion never lowers it).
+    /// UUIDv7, so it sorts by time: the sidebar's last-activity key.
+    pub last_message_id: Option<String>,
 }
 
 /// A page of cached messages, newest first.
@@ -103,6 +129,12 @@ pub(crate) struct Cache {
     again: std::sync::atomic::AtomicBool,
     /// Closing: no new syncs, and the debounced ones are aborted.
     closed: std::sync::atomic::AtomicBool,
+    /// A retry after a network failure is waiting.
+    retry_scheduled: std::sync::atomic::AtomicBool,
+    /// The wait before the last retry, in ms (0: none since the last success).
+    retry_ms: std::sync::atomic::AtomicU64,
+    /// The retry waits (start, cap) in ms; tests shorten them.
+    retry_bounds_ms: [std::sync::atomic::AtomicU64; 2],
     scheduled_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Signalled after a commit journalled file blobs: the file cache unlinks them.
     pub(crate) files_dropped: Arc<tokio::sync::Notify>,
@@ -128,6 +160,12 @@ impl Cache {
             scheduled: std::sync::atomic::AtomicBool::new(false),
             again: std::sync::atomic::AtomicBool::new(false),
             closed: std::sync::atomic::AtomicBool::new(false),
+            retry_scheduled: std::sync::atomic::AtomicBool::new(false),
+            retry_ms: std::sync::atomic::AtomicU64::new(0),
+            retry_bounds_ms: [
+                std::sync::atomic::AtomicU64::new(RETRY_START.as_millis() as u64),
+                std::sync::atomic::AtomicU64::new(RETRY_CAP.as_millis() as u64),
+            ],
             scheduled_tasks: std::sync::Mutex::default(),
             files_dropped: Arc::default(),
         })
@@ -197,7 +235,7 @@ impl Cache {
 
     /// Sync until caught up. Single-flight: asked while a run is going, that run goes round
     /// once more instead (it may already have fetched past the change that asked).
-    pub(crate) async fn sync_now(&self) -> Result<(), SyncError> {
+    pub(crate) async fn sync_now(self: &Arc<Self>) -> Result<(), SyncError> {
         use std::sync::atomic::Ordering;
         if self.closed.load(Ordering::SeqCst) {
             return Ok(());
@@ -206,19 +244,70 @@ impl Cache {
         // checks after every run and again after letting go), or the lock is free and this
         // caller runs it. No moment exists where neither happens.
         self.again.store(true, Ordering::SeqCst);
+        let mut result = Ok(());
         loop {
             let Ok(run) = self.running.try_lock() else {
-                return Ok(());
+                return result;
             };
             // Each run starts after the requests it clears, so it covers them.
             while self.again.swap(false, Ordering::SeqCst) {
-                self.run_once().await?;
+                result = self.run_once().await;
+                if result.is_err() {
+                    // Not `?`: a request that arrived during this run was told "the owner
+                    // will go again" and returned. Leaving now would drop it, and `offline`
+                    // could stay set although the network is back. The check below runs
+                    // another attempt for it; the outcome returned is the last one.
+                    break;
+                }
             }
             drop(run);
             if !self.again.load(Ordering::SeqCst) {
-                return Ok(());
+                break;
             }
         }
+        if result.as_ref().is_err_and(is_network_failure) {
+            self.schedule_retry();
+        }
+        result
+    }
+
+    /// One more sync after a short wait (doubling, capped), while the cache is offline.
+    fn schedule_retry(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        if self.closed.load(Ordering::SeqCst) || self.retry_scheduled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let start = self.retry_bounds_ms[0].load(Ordering::SeqCst);
+        let cap = self.retry_bounds_ms[1].load(Ordering::SeqCst);
+        let wait = retry_delay(self.retry_ms.load(Ordering::SeqCst), start, cap);
+        self.retry_ms.store(wait, Ordering::SeqCst);
+        let me = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            me.retry_scheduled.store(false, Ordering::SeqCst);
+            // Something else may have synced meanwhile: then there is nothing to retry.
+            if me.state.borrow().offline {
+                let _ = me.sync_now().await;
+            }
+        });
+        let mut tasks = self
+            .scheduled_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retry_wait_for_tests(&self) -> u64 {
+        self.retry_ms.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_retry_for_tests(&self, start: Duration, cap: Duration) {
+        use std::sync::atomic::Ordering;
+        self.retry_bounds_ms[0].store(start.as_millis() as u64, Ordering::SeqCst);
+        self.retry_bounds_ms[1].store(cap.as_millis() as u64, Ordering::SeqCst);
     }
 
     async fn run_once(&self) -> Result<(), SyncError> {
@@ -244,16 +333,14 @@ impl Cache {
         self.state.send_modify(|s| {
             // Offline means the server couldn't be reached: a refused token or a server error
             // is a different state (the app signs in again, or waits), not "offline".
-            s.offline = matches!(
-                result,
-                Err(SyncError::Net(
-                    crate::Error::Http(_) | crate::Error::Timeout | crate::Error::Disconnected
-                ))
-            );
+            s.offline = result.as_ref().is_err_and(is_network_failure);
             if result.is_ok() {
                 s.last_synced = Some(SystemTime::now());
             }
         });
+        if result.is_ok() {
+            self.retry_ms.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
         drop(applied); // announced now, before the outcome's own events
         match result {
             Ok(Synced::Done(_)) => Ok(()),
@@ -438,21 +525,28 @@ impl Cache {
                           AND json_type(m.json, '$.deleted_at') IS NOT 'text'
                           AND (json_extract(m.json, '$.mention_everyone') = 1
                                OR EXISTS (SELECT 1 FROM json_each(m.json, '$.mentions')
-                                          WHERE value = ?1)))
+                                          WHERE value = ?1))),
+                       (SELECT max(m.id) FROM messages m WHERE m.channel_id = ch.id)
                      FROM channels ch
                      JOIN memberships my ON my.channel_id = ch.id AND my.user_id = ?1 AND my.left = 0
                      ORDER BY ch.id",
                 )?;
                 let rows = stmt.query_map([&me], |r| {
                     let json: String = r.get(0)?;
-                    Ok((json, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?))
+                    Ok((
+                        json,
+                        r.get::<_, u32>(1)?,
+                        r.get::<_, u32>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
                 })?;
                 rows.map(|row| {
-                    let (json, unread, unread_mentions) = row?;
+                    let (json, unread, unread_mentions, last_message_id) = row?;
                     Ok(CachedChannel {
                         json: serde_json::from_str(&json).unwrap_or(Value::Null),
                         unread,
                         unread_mentions,
+                        last_message_id,
                     })
                 })
                 .collect()

@@ -62,5 +62,10 @@ struct BrookApp: App {
             CallWindow(center: calls)
         }
         .defaultSize(width: 800, height: 560)
+
+        // Named in full: the app has its own `Settings` (the login form's configuration).
+        SwiftUI.Settings {
+            SettingsView()
+        }
     }
 }

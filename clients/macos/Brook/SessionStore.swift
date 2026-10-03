@@ -259,7 +259,7 @@ final class SessionStore {
                 self.localData = .off
                 return
             }
-            let feed = CacheFeed(client: client)
+            let feed = CacheFeed(client: client, defaults: settings.defaults)
             feed.start() // before enabling: opening the stores can report a loss
             self.feed = feed
             let ok = await client.enableLocalData(slot: slot, dataDir: dataDir)
@@ -380,11 +380,17 @@ final class SessionStore {
     /// for an enable still opening the stores, so what it opens goes too. The next sign-in's
     /// enable waits for this task.
     func signOut(removeData: Bool) {
-        guard case .signedIn = phase, let client else { return }
+        guard case let .signedIn(user) = phase, let client else { return }
         let enabling = enableTask
+        let defaults = settings.defaults
         end()
         phase = .signedOut(error: nil)
         let before = signIns
+        // The user asked for removal: their opened-order ranks go even if the core's removal
+        // fails (a failure is said below and retried by the user). Here, before anything
+        // awaits: a same-user sign-in does not wait for the task below, and an erase landing
+        // after its new model loaded would wipe that session's ranks and block its saves.
+        if removeData { ChannelsModel.eraseRanks(for: user.id, defaults: defaults) }
         _ = tracked { [weak self] in
             var removalFailed = false
             if removeData {

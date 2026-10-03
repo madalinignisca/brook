@@ -446,7 +446,9 @@ async fn pump(
         tokio::select! {
             got = raw.recv() => match got {
                 Ok((ty, data)) => match ty.as_str() {
-                    "ready" => cache.schedule_sync(),
+                    // A (re)connect, or a lost connection: either way a sync shows whether
+                    // the server is reachable (the offline state), without waiting for the tick.
+                    "ready" | crate::ws::WS_DISCONNECTED => cache.schedule_sync(),
                     "sync.hint" => {
                         if let Some(seq) = data.get("seq").and_then(Value::as_i64) {
                             cache.hint(seq).await;

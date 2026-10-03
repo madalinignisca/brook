@@ -3,8 +3,8 @@ import XCTest
 
 @testable import Brook
 
-func cachedChannel(_ id: String, _ name: String, unread: Int64 = 0) -> FfiCachedChannel {
-    FfiCachedChannel(id: id, kind: "public", name: name, archived: false, unreadCount: unread, unreadMentions: 0, members: [], ownerOffers: [])
+func cachedChannel(_ id: String, _ name: String, unread: Int64 = 0, lastMessageId: String? = nil, kind: String = "public") -> FfiCachedChannel {
+    FfiCachedChannel(id: id, kind: kind, name: name, archived: false, unreadCount: unread, unreadMentions: 0, members: [], ownerOffers: [], lastMessageId: lastMessageId)
 }
 
 /// The channel list offline (#62 spec item 1): network first, the cache when it fails, the
@@ -44,10 +44,12 @@ final class ChannelsOfflineTests: XCTestCase {
         let model = ChannelsModel(client: client)
         model.openChannel = "c2"
         await model.start()
-        XCTAssertEqual(model.channels.map(\.unread), [2, 0])
+        // c2 was opened, so it leads the list.
+        XCTAssertEqual(model.channels.map(\.id), ["c2", "c1"])
+        XCTAssertEqual(model.channels.map(\.unread), [0, 2])
         client.cached = [cachedChannel("c1", "general", unread: 4), cachedChannel("c2", "random", unread: 9)]
         await model.cacheChannelsChanged()
-        XCTAssertEqual(model.channels.map(\.unread), [4, 0], "the open channel's badge moved")
+        XCTAssertEqual(model.channels.map(\.unread), [0, 4], "the open channel's badge moved")
     }
 
     func testARemovedChannelGoesAndAnOlderReadCantBringItBack() async {
