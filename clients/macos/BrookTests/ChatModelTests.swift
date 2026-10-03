@@ -15,6 +15,8 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     var loadFails = false
     /// Cached pages, handed out in order (the last one repeats).
     var cachePages: [FfiCachedMessages] = []
+    /// Holds the next `cachedMessages` call (after it is recorded), once.
+    var cacheGate: Gate?
     /// What the cache was asked, in order ("cached:<before>", "loadHead", "loadOlder", …).
     let cacheCalls = Mutex<[String]>([])
     var users: [FfiMember] = []
@@ -50,7 +52,12 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     var read: [String?] = []
 
     var historyFailure: Error?
+    /// `channelHistory` calls so far, and a gate that holds each one after it is counted.
+    let historyCalls = Mutex(0)
+    var historyGate: Gate?
     func channelHistory(channelId: String, before: String?) async throws -> [FfiMessage] {
+        historyCalls.withLock { $0 += 1 }
+        await historyGate?.wait()
         if let historyFailure { throw historyFailure }
         return pages.isEmpty ? [] : pages.removeFirst()
     }

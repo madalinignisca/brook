@@ -34,7 +34,10 @@ final class TimelineModel {
     /// The network's error. Hidden (`visibleError`) while offline with cached messages shown.
     private(set) var error: String?
     /// Set from the cache's state feed: the last sync couldn't reach the server.
-    var offline = false
+    var offline = false {
+        // The connection is back: a head load that failed is tried again.
+        didSet { if oldValue, !offline { retryFailedHead() } }
+    }
     /// Current names for authors (a `Users` notice): cached rows keep the name they were
     /// stored with.
     private(set) var authorNames: [String: String] = [:]
@@ -141,7 +144,7 @@ final class TimelineModel {
     /// then the network's newest page; then mark read.
     func load() async {
         await readCache(before: nil, loadIfIncomplete: true)
-        await fetch(before: nil)
+        await fetchHead() // returns when the page, and any resync queued behind it, is merged
         if let newest = messages.last {
             try? await client.markRead(channelId: channelId, messageId: newest.id)
         }
@@ -211,6 +214,62 @@ final class TimelineModel {
         }
     }
 
+    /// The running chain of head fetches, until the last one queued behind it ends.
+    private var headDrain: Task<Void, Never>?
+    private var headRefetchPending = false
+
+    /// The newest page, returning once it (and any fetch queued behind it) has landed. One
+    /// head fetch runs at a time: a request that arrives during one (a resync, say) is not
+    /// run beside it, and is not dropped either, since it may know of newer state than the
+    /// fetch in flight: one more fetch follows, however many arrived. The request waits for
+    /// that chain too, so a caller that reads the result (`load()`) sees the merged page.
+    private func fetchHead() async {
+        if let drain = headDrain {
+            headRefetchPending = true
+            await drain.value
+            return
+        }
+        await startHeadDrain().value
+    }
+
+    /// Takes the one-at-a-time slot (synchronously, so two callers can't both start).
+    private func startHeadDrain() -> Task<Void, Never> {
+        let drain = Task { [self] in
+            repeat {
+                headRefetchPending = false
+                await fetch(before: nil)
+            } while headRefetchPending
+            headDrain = nil
+        }
+        headDrain = drain
+        return drain
+    }
+
+    /// The newest message is read: now if the app is active, else when it becomes so.
+    private func markNewestRead() async {
+        guard let newest = messages.last else { return }
+        if isActive() {
+            try? await client.markRead(channelId: channelId, messageId: newest.id)
+        } else {
+            readOwed = true // shown, not seen yet
+        }
+    }
+
+    /// Retry the head load when a signal says the connection is back (`.ready`, or offline
+    /// going false), if there is an error to clear. The error may also come from a failed
+    /// older page; the retry then loads the head, which succeeding clears it. A retry that
+    /// fails sets the error again and waits for the next signal: no timer, no loop. The
+    /// slot is taken here, before the task runs, so two signals arriving together start one
+    /// fetch. A retry that succeeds reads the channel as `load()` would have.
+    private func retryFailedHead() {
+        guard error != nil, headDrain == nil else { return }
+        let drain = startHeadDrain()
+        Task {
+            await drain.value
+            if error == nil { await markNewestRead() }
+        }
+    }
+
     /// A live event, if it's this channel's.
     func apply(_ event: FfiServerEvent) {
         switch event {
@@ -238,7 +297,7 @@ final class TimelineModel {
             // A reconnect (or a restored server) may number events from lower values again.
             reactionSeqs = [:]
             reactionMineSeqs = [:]
-            Task { await fetch(before: nil) }
+            Task { await fetchHead() }
         case let .reactionUpdate(channel, messageId, emoji, userId, added, count, seq):
             guard channel == channelId, let i = messages.firstIndex(where: { $0.id == messageId }) else { return }
             // The server numbers changes in commit order. The count and my own flag are ordered
@@ -260,7 +319,9 @@ final class TimelineModel {
                 let r = messages[i].reactions[j]
                 messages[i].reactions[j] = FfiReaction(emoji: r.emoji, count: r.count, me: added)
             }
-        case .ready, .channelCall, .channelUpdate, .channelDelete:
+        case .ready:
+            retryFailedHead() // every (re)connect
+        case .channelCall, .channelUpdate, .channelDelete:
             break
         }
     }

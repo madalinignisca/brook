@@ -18,6 +18,10 @@ extension FakeChat: OfflineClient {
     func cachedMessages(channelId: String, before: String?, limit: UInt32) async throws -> FfiCachedMessages {
         try need()
         record("cached:\(before ?? "-")")
+        if let gate = cacheGate {
+            cacheGate = nil
+            await gate.wait()
+        }
         guard !cachePages.isEmpty else { return FfiCachedMessages(messages: [], needsNetwork: false) }
         return cachePages.count > 1 ? cachePages.removeFirst() : cachePages[0]
     }

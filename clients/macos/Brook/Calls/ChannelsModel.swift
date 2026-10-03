@@ -250,6 +250,7 @@ final class ChannelsModel {
         switch event {
         case .ready:
             ready = true
+            timeline?.apply(event)  // a failed head load is retried
         case let .channelCall(channelId, callId, count):
             liveCalls[channelId] = callId != nil && count > 0 ? count : nil
         case let .messageNew(message):
