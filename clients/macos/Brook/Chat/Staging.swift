@@ -26,9 +26,14 @@ struct SystemFileAccess: FileAccess {
         return (regular, UInt64(v.fileSize ?? 0), v.contentType?.preferredMIMEType)
     }
     func canRead(_ url: URL) -> Bool {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
-        try? handle.close()
-        return true
+        // Runs on the main actor, and the path may have become a pipe since `facts` looked: a
+        // blocking open would wait for a writer and freeze the UI. So open non-blocking and judge
+        // the descriptor itself (as core's snapshot does), never the path.
+        let fd = open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var st = stat()
+        return fstat(fd, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG
     }
 }
 

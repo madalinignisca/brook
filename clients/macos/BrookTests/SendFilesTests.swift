@@ -127,6 +127,35 @@ final class SendFilesTests: XCTestCase {
         XCTAssertEqual(Staging.stage(locked, already: [], access: access).failure, .unreadable("locked.txt"))
     }
 
+    /// A path swapped for a pipe after the facts check must not make `canRead` block (it runs on
+    /// the main actor): the open is non-blocking and judged on the descriptor.
+    func testCanReadRefusesAPipeWithoutBlockingAndAcceptsAPlainFile() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("brook-fifo-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fifo = dir.appendingPathComponent("pipe")
+        XCTAssertEqual(mkfifo(fifo.path, 0o600), 0)
+        let plain = dir.appendingPathComponent("plain.txt")
+        try Data("hello".utf8).write(to: plain)
+
+        let done = DispatchSemaphore(value: 0)
+        let result = Mutex<Bool?>(nil)
+        DispatchQueue.global().async {
+            let r = SystemFileAccess().canRead(fifo)
+            result.withLock { $0 = r }
+            done.signal()
+        }
+        let finished = done.wait(timeout: .now() + 2) == .success
+        if !finished {
+            // Free a regression's blocked open (a read-write open is a writer) so the thread ends.
+            let fd = open(fifo.path, O_RDWR | O_NONBLOCK)
+            if fd >= 0 { close(fd) }
+            XCTFail("canRead blocked on a pipe with no writer")
+        }
+        XCTAssertEqual(result.withLock { $0 }, false, "a pipe was called readable")
+        XCTAssertTrue(SystemFileAccess().canRead(plain))
+    }
+
     func testAtMostTenFilesAndRemovingOneEndsItsAccess() {
         var table: [String: (regular: Bool, size: UInt64, type: String?)] = [:]
         for i in 0 ..< 11 { table["f\(i)"] = ok }
