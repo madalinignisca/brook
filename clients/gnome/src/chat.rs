@@ -4463,13 +4463,14 @@ fn wipe_other_accounts(chat: &Rc<Chat>) {
         let Ok(Ok(others)) = lookup.await else {
             return;
         };
+        // Every other account's sidebar order goes, on this thread (every writer of that file
+        // is here) and before the wipe, which stops at the first error. Orphaned ones too,
+        // even with no other data left (#235).
+        let me = chat.me.borrow().clone().unwrap_or_default();
+        crate::prefs::forget_others_than(chat.ended.get(), &me);
         if others.is_empty() {
             return;
         }
-        // Their sidebar orders go on this thread (every writer of that file is here) and
-        // before the wipe, which stops at the first error (#235).
-        let ids: Vec<String> = others.iter().map(|o| o.user_id.clone()).collect();
-        crate::prefs::forget_all_opened(&crate::prefs::others_to_forget(chat.ended.get(), &ids));
         if chat.ended.get() {
             return;
         }
