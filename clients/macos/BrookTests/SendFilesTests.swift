@@ -147,8 +147,12 @@ final class SendFilesTests: XCTestCase {
         }
         let finished = done.wait(timeout: .now() + 2) == .success
         if !finished {
-            // Free a regression's blocked open (a read-write open is a writer) so the thread ends.
+            // Free a regression's blocked open: a read-write open is a writer, and it is held
+            // until the worker has finished (a worker that reaches `open` late would otherwise
+            // block for good), with a bounded wait.
             let fd = open(fifo.path, O_RDWR | O_NONBLOCK)
+            XCTAssertGreaterThanOrEqual(fd, 0, "could not open the pipe to release the stuck worker")
+            XCTAssertEqual(done.wait(timeout: .now() + 5), .success, "the stuck worker did not finish")
             if fd >= 0 { close(fd) }
             XCTFail("canRead blocked on a pipe with no writer")
         }
