@@ -286,6 +286,8 @@ mod tests {
         kf.set_string("login", "server", "https://x");
         kf.set_boolean("sidebar", "show-usernames", true);
         kf.set_integer("opened-orphan", "c1", 2);
+        // "ann" is not a prefix match for "anna": the sweep compares whole group names.
+        kf.set_integer("opened-anna", "c1", 4);
         kf.save_to_file(&file).unwrap();
         // An ended session, or no known user, erases nothing.
         forget_others_in(&file, true, "ann");
@@ -295,6 +297,7 @@ mod tests {
         assert_eq!(load_opened_from(&file, "ann").len(), 1, "mine stays");
         assert!(!file_has_group(&file, "opened-bob"));
         assert!(!file_has_group(&file, "opened-orphan"));
+        assert!(!file_has_group(&file, "opened-anna"));
         assert!(file_has_group(&file, "login"));
         assert!(file_has_group(&file, "sidebar"));
         let _ = std::fs::remove_dir_all(&dir);
