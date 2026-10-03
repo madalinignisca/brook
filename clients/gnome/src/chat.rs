@@ -47,6 +47,8 @@ struct Chat {
     sidebar: Rc<RefCell<crate::sidebar::SidebarState>>,
     /// This account's saved opened ranks are loaded into `sidebar` (once the user is known).
     sidebar_loaded: Rc<Cell<bool>>,
+    /// The user chose to remove this device's data: a late save mustn't bring their ranks back.
+    ranks_forgotten: Rc<Cell<bool>>,
     /// "Show usernames" (a per-device preference): people are named `@handle`, not by name.
     show_usernames: Rc<Cell<bool>>,
     /// Set while the list is rebuilt, so removing and re-adding rows doesn't "select" them.
@@ -267,6 +269,7 @@ pub fn build(
         channel_list: channel_list.clone(),
         sidebar: Rc::default(),
         sidebar_loaded: Rc::default(),
+        ranks_forgotten: Rc::default(),
         show_usernames: Rc::new(Cell::new(crate::prefs::show_usernames())),
         rebuilding: Rc::default(),
         channels: Rc::new(RefCell::new(Vec::new())),
@@ -902,6 +905,9 @@ fn load_sidebar_ranks(chat: &Rc<Chat>) {
 
 /// Save the opened ranks for this account (synchronously, so there is no ordering race).
 fn save_sidebar_ranks(chat: &Rc<Chat>, sidebar: &crate::sidebar::SidebarState) {
+    if chat.ranks_forgotten.get() {
+        return;
+    }
     let me = chat.me.borrow().clone().unwrap_or_default();
     crate::prefs::save_opened(&me, sidebar.opened_ranks());
 }
@@ -4451,6 +4457,11 @@ fn wipe_other_accounts(chat: &Rc<Chat>) {
                 // Their unsent counts are read before the wipe (#46 §8), so the notice can
                 // say what went with it.
                 let others = client.other_local_users().await?;
+                // Their sidebar orders go first: the wipe stops at the first error, and
+                // these are only ours to erase (#235).
+                for other in &others {
+                    crate::prefs::forget_opened(&other.user_id);
+                }
                 if !others.is_empty() {
                     client.wipe_other_local_users().await?;
                 }
@@ -4532,6 +4543,12 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
             let chat = chat.clone();
             move |_, response| {
                 if response == "sign-out" {
+                    if remove.is_active() {
+                        // Even if erasing the rest fails: the user asked for it (#235).
+                        chat.ranks_forgotten.set(true);
+                        let me = chat.me.borrow().clone().unwrap_or_default();
+                        crate::prefs::forget_opened(&me);
+                    }
                     (chat.sign_out)(remove.is_active());
                 }
             }

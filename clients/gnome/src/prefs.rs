@@ -135,11 +135,52 @@ fn save_opened_to(
     }
 }
 
+/// Erase the ranks for `user_id` (their data left this device). Other accounts' stay.
+pub fn forget_opened(user_id: &str) {
+    forget_opened_in(&path(), user_id);
+}
+
+fn forget_opened_in(path: &std::path::Path, user_id: &str) {
+    if user_id.is_empty() {
+        return;
+    }
+    let file = glib::KeyFile::new();
+    if file
+        .load_from_file(path, glib::KeyFileFlags::KEEP_COMMENTS)
+        .is_err()
+        || file.remove_group(&opened_group(user_id)).is_err()
+    {
+        // No file, or no ranks for them: nothing to erase.
+        return;
+    }
+    if let Err(err) = file.save_to_file(path) {
+        tracing::warn!(%err, path = %path.display(), "could not erase the sidebar order");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use super::{load_opened_from, save_opened_to};
+    use super::{forget_opened_in, load_opened_from, save_opened_to};
+
+    #[test]
+    fn forgetting_an_account_leaves_the_others_ranks() {
+        let dir = std::env::temp_dir().join(format!("brook-forget-test-{}", std::process::id()));
+        let file = dir.join("brook").join("gnome.ini");
+        let ann = HashMap::from([("c1".to_string(), 3)]);
+        let bob = HashMap::from([("c1".to_string(), 1)]);
+        forget_opened_in(&file, "ann"); // no file: no panic, no file made
+        assert!(!file.exists());
+        save_opened_to(&file, "ann", &ann);
+        save_opened_to(&file, "bob", &bob);
+        forget_opened_in(&file, "ann");
+        assert!(load_opened_from(&file, "ann").is_empty());
+        assert_eq!(load_opened_from(&file, "bob"), bob);
+        forget_opened_in(&file, "");
+        assert_eq!(load_opened_from(&file, "bob"), bob);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn opened_ranks_are_saved_per_account_and_read_back() {
