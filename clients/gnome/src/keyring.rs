@@ -41,10 +41,17 @@ pub struct SecretServiceSlot {
 impl SecretServiceSlot {
     /// Start the keyring thread. Cheap: it connects on first use.
     pub fn new() -> Self {
+        Self::with_application(APPLICATION)
+    }
+
+    /// The same, under another `application` attribute: tests use it so that nothing they
+    /// store is ever labelled or found as the real app's.
+    pub fn with_application(application: &str) -> Self {
         let (tx, rx) = mpsc::channel::<(Op, mpsc::Sender<Reply>)>();
+        let application = application.to_string();
         thread::Builder::new()
             .name("brook-keyring".into())
-            .spawn(move || worker(rx))
+            .spawn(move || worker(rx, application))
             .expect("spawn the keyring thread");
         Self { tx }
     }
@@ -83,7 +90,7 @@ impl KeySlot for SecretServiceSlot {
 }
 
 /// The keyring thread: its own runtime and connection, one request at a time.
-fn worker(rx: mpsc::Receiver<(Op, mpsc::Sender<Reply>)>) {
+fn worker(rx: mpsc::Receiver<(Op, mpsc::Sender<Reply>)>, application: String) {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -100,7 +107,7 @@ fn worker(rx: mpsc::Receiver<(Op, mpsc::Sender<Reply>)>) {
                 service = Some(oo7::dbus::Service::new().await.map_err(map_err)?);
             }
             let svc = service.as_ref().expect("just connected");
-            let outcome = run(svc, op).await;
+            let outcome = run(svc, op, &application).await;
             if matches!(outcome, Err(KeySlotError::Fatal(_))) {
                 service = None; // reconnect next time (the daemon may have restarted)
             }
@@ -114,7 +121,7 @@ fn worker(rx: mpsc::Receiver<(Op, mpsc::Sender<Reply>)>) {
     }
 }
 
-async fn run(service: &oo7::dbus::Service, op: Op) -> Reply {
+async fn run(service: &oo7::dbus::Service, op: Op, application: &str) -> Reply {
     // The existing default collection only: never create one (that prompts).
     let collection = service
         .with_alias("default")
@@ -127,7 +134,7 @@ async fn run(service: &oo7::dbus::Service, op: Op) -> Reply {
     }
     let attrs = |slot: &str| {
         [
-            ("application", APPLICATION.to_string()),
+            ("application", application.to_string()),
             ("slot", slot.to_string()),
         ]
     };
@@ -248,15 +255,16 @@ mod live {
     use super::*;
 
     /// Against the real desktop keyring: `cargo test -p brook-gnome -- --ignored keyring_live`.
-    /// Uses a throwaway slot and deletes it; reports and skips when no unlocked keyring answers.
+    /// Uses a throwaway slot (under the test application name) and deletes it. Fails when no
+    /// unlocked keyring answers: running an ignored test is the opt-in.
     #[test]
     #[ignore = "touches the desktop keyring"]
     fn keyring_live_round_trip() {
-        let slot = SecretServiceSlot::new();
-        if !slot.available() {
-            eprintln!("no unlocked keyring: skipped");
-            return;
-        }
+        let slot = SecretServiceSlot::with_application("dev.brook.Brook.selftest");
+        assert!(
+            slot.available(),
+            "no unlocked desktop keyring answered: this ignored test needs one"
+        );
         let name = format!("brook-selftest:{}", std::process::id());
         assert_eq!(slot.load(name.clone()), Ok(None));
         slot.create(name.clone(), b"first".to_vec()).unwrap();
@@ -273,33 +281,300 @@ mod live {
 }
 
 #[cfg(test)]
+mod live_support {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use brook_core::{KeySlot, KeySlotError};
+
+    use super::SecretServiceSlot;
+
+    /// The real desktop keyring, but under names of this run's own, so a live test can never
+    /// touch (or sign out) the developer's real app: the app's slots (`session:<origin>`,
+    /// `index`, `cache:<id>`, `outbox:<id>`) all live under a `brook-selftest-<time>/`
+    /// prefix here, and every slot written is deleted by [`ScopedSlot::purge`].
+    pub struct ScopedSlot {
+        inner: SecretServiceSlot,
+        run_id: String,
+        prefix: String,
+        used: Mutex<BTreeSet<String>>,
+    }
+
+    impl ScopedSlot {
+        /// The keyring under this run's own application name and slot prefix. A live test has
+        /// opted in (`--ignored`, and its environment), and the keyring is the very thing under
+        /// test, so one that doesn't answer is a failure, not a skip: it waits for a keyring
+        /// that is still starting, then panics.
+        pub fn require() -> Arc<Self> {
+            let inner = SecretServiceSlot::with_application("dev.brook.Brook.selftest");
+            let start = std::time::Instant::now();
+            while !inner.available() {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(20),
+                    "no unlocked desktop keyring answered in 20 s: this live test needs one \
+                     (unlock it, or don't run the ignored tests)"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            Arc::new(Self {
+                inner,
+                run_id: nanos.to_string(),
+                prefix: format!("brook-selftest-{nanos}/"),
+                used: Mutex::default(),
+            })
+        }
+
+        /// This run's unique id (nanoseconds at its start): live tests put it in every marker
+        /// they send, so an earlier run's leftovers can't satisfy a later run's wait.
+        pub fn run_id(&self) -> &str {
+            &self.run_id
+        }
+
+        fn scoped(&self, slot: &str) -> String {
+            format!("{}{slot}", self.prefix)
+        }
+
+        fn record(&self, slot: &str) {
+            self.used.lock().unwrap().insert(slot.to_string());
+        }
+
+        /// Delete every slot this run wrote.
+        pub fn purge(&self) {
+            let used = std::mem::take(&mut *self.used.lock().unwrap());
+            for slot in used {
+                if let Err(err) = self.inner.delete(self.scoped(&slot)) {
+                    // The slot's name only (never its contents).
+                    eprintln!(
+                        "could not delete keyring slot {}: {err:?}",
+                        self.scoped(&slot)
+                    );
+                }
+            }
+        }
+
+        /// How many slots this run still holds (the cleanup test).
+        pub fn held(&self) -> usize {
+            self.used.lock().unwrap().len()
+        }
+    }
+
+    impl KeySlot for ScopedSlot {
+        fn load(&self, slot: String) -> Result<Option<Vec<u8>>, KeySlotError> {
+            self.inner.load(self.scoped(&slot))
+        }
+        fn create(&self, slot: String, bytes: Vec<u8>) -> Result<(), KeySlotError> {
+            self.record(&slot);
+            self.inner.create(self.scoped(&slot), bytes)
+        }
+        fn replace(&self, slot: String, bytes: Vec<u8>) -> Result<(), KeySlotError> {
+            self.record(&slot);
+            self.inner.replace(self.scoped(&slot), bytes)
+        }
+        fn delete(&self, slot: String) -> Result<(), KeySlotError> {
+            self.inner.delete(self.scoped(&slot))
+        }
+    }
+
+    /// A live test's scratch: the slots it wrote and its temp dir, removed even when an
+    /// assertion fails.
+    pub struct Cleanup {
+        pub slot: Arc<ScopedSlot>,
+        pub dir: tempfile::TempDir,
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.slot.purge();
+        }
+    }
+
+    /// The `BROOK_LIVE_*` variables a live test needs, read together. None set: the test was not
+    /// asked for (it returns quietly). Some set: the developer opted in, so a missing one is a
+    /// failure naming it, not a quiet pass.
+    pub fn live_env(names: &[&str]) -> Option<Vec<String>> {
+        let values: Vec<Option<String>> = names.iter().map(|n| std::env::var(n).ok()).collect();
+        if values.iter().all(Option::is_none) {
+            eprintln!("{} not set: skipped", names.join(", "));
+            return None;
+        }
+        let missing: Vec<&str> = names
+            .iter()
+            .zip(&values)
+            .filter(|(_, v)| v.is_none())
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "a live test was asked for but these are not set: {}",
+            missing.join(", ")
+        );
+        Some(values.into_iter().flatten().collect())
+    }
+
+    /// What a scan of a data dir found.
+    #[derive(Debug, Default)]
+    pub struct Scan {
+        /// Every file read, by path relative to the scanned dir.
+        pub files: Vec<String>,
+        /// Files containing the needle, or starting as a plain SQLite database.
+        pub readable: Vec<String>,
+        /// Files that couldn't be read (a scan that skipped them proves nothing).
+        pub unreadable: Vec<String>,
+        /// Each file read, with its size.
+        pub sizes: Vec<(String, u64)>,
+    }
+
+    impl Scan {
+        pub fn has_file(&self, suffix: &str) -> bool {
+            self.files.iter().any(|f| f.ends_with(suffix))
+        }
+
+        /// A file whose path contains `part` and that is at least `min` bytes (a cached blob:
+        /// proof that what was scanned includes the file's own storage).
+        pub fn has_file_of(&self, part: &str, min: u64) -> bool {
+            self.sizes
+                .iter()
+                .any(|(f, n)| f.contains(part) && *n >= min)
+        }
+    }
+
+    /// Scan every file under `dir` (SQLite's `-wal` and `-shm` included) for `needle`.
+    pub fn scan(dir: &Path, needle: &str) -> Scan {
+        fn walk(root: &Path, dir: &Path, needle: &str, out: &mut Scan) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                out.unreadable.push(dir.display().to_string());
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                if path.is_dir() {
+                    walk(root, &path, needle, out);
+                    continue;
+                }
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let has =
+                            |n: &[u8]| !n.is_empty() && bytes.windows(n.len()).any(|w| w == n);
+                        if has(needle.as_bytes()) || bytes.starts_with(b"SQLite format 3\0") {
+                            out.readable.push(name.clone());
+                        }
+                        out.sizes.push((name.clone(), bytes.len() as u64));
+                        out.files.push(name);
+                    }
+                    Err(_) => out.unreadable.push(name),
+                }
+            }
+        }
+        let mut out = Scan::default();
+        walk(dir, dir, needle, &mut out);
+        out
+    }
+
+    #[test]
+    fn the_scan_finds_plain_text_and_plain_sqlite_and_reports_unreadable_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/notes.txt"), b"xx NEEDLE yy").unwrap();
+        std::fs::write(dir.path().join("plain.db"), b"SQLite format 3\0rest").unwrap();
+        std::fs::write(dir.path().join("cipher.db"), [7u8; 64]).unwrap();
+        let found = scan(dir.path(), "NEEDLE");
+        assert_eq!(found.files.len(), 3);
+        let mut readable = found.readable.clone();
+        readable.sort();
+        assert_eq!(readable, ["plain.db", "sub/notes.txt"]);
+        assert!(found.unreadable.is_empty());
+        assert!(found.has_file("cipher.db") && !found.has_file("other.db"));
+        // Sizes are recorded: a blob of at least that many bytes, under that part of the path.
+        assert!(
+            found.has_file_of("sub/", 12),
+            "notes.txt is 12 bytes under sub/"
+        );
+        assert!(!found.has_file_of("sub/", 13), "but not 13");
+        assert!(
+            !found.has_file_of("/files/", 1),
+            "no such directory was scanned"
+        );
+        // A dangling symlink can't be read: reported, not skipped.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/nonexistent/x", dir.path().join("dangling")).unwrap();
+            assert_eq!(scan(dir.path(), "NEEDLE").unreadable, ["dangling"]);
+        }
+    }
+
+    #[test]
+    fn a_scoped_slot_puts_every_name_under_its_own_prefix() {
+        // Needs no keyring: the slot connects lazily, and only the naming is checked.
+        let slot = ScopedSlot {
+            inner: SecretServiceSlot::with_application("dev.brook.Brook.selftest"),
+            run_id: "123".into(),
+            prefix: "brook-selftest-123/".into(),
+            used: Mutex::default(),
+        };
+        for name in ["index", "session:https://h", "cache:abc", "outbox:abc"] {
+            let scoped = slot.scoped(name);
+            assert!(scoped.starts_with("brook-selftest-123/"), "{scoped}");
+            assert_ne!(scoped, name, "never the app's own name");
+            assert!(scoped.ends_with(name));
+        }
+    }
+
+    #[test]
+    #[ignore = "touches the desktop keyring (under its own names)"]
+    fn a_scoped_slot_keeps_its_names_apart_and_forgets_them_on_purge() {
+        let slot = ScopedSlot::require();
+        slot.create("session:https://h".into(), b"a".to_vec())
+            .unwrap();
+        slot.replace("index".into(), b"b".to_vec()).unwrap();
+        assert_eq!(slot.held(), 2);
+        assert_eq!(slot.load("index".into()), Ok(Some(b"b".to_vec())));
+        // A name that was never written is absent (a name that cannot exist: the app's real
+        // slots are never read here, so a failure can't print a real key).
+        let absent = format!("brook-selftest-absent-{}/index", slot.run_id());
+        assert!(slot.inner.load(absent).unwrap().is_none());
+        slot.purge();
+        assert_eq!(slot.held(), 0);
+        assert_eq!(slot.load("index".into()), Ok(None));
+    }
+}
+
+#[cfg(test)]
 mod live_restore {
     use std::sync::Arc;
 
     use brook_core::{BrookClient, CoreConfig, LoginOutcome, RestoreOutcome};
 
-    use super::SecretServiceSlot;
+    use super::live_support::{live_env, Cleanup, ScopedSlot};
 
-    /// Stay signed in end to end: the real keyring + core's restore against a server.
-    /// `BROOK_LIVE_SERVER=... BROOK_LIVE_HANDLE=... BROOK_LIVE_PASSWORD=... cargo test
-    /// -p brook-gnome -- --ignored keyring_restore_live`
+    /// Stay signed in end to end: the real keyring (under this run's own names, never the
+    /// app's) + core's restore against a server. `BROOK_LIVE_SERVER=... BROOK_LIVE_HANDLE=...
+    /// BROOK_LIVE_PASSWORD=... cargo test -p brook-gnome -- --ignored keyring_restore_live --test-threads=1`
     #[test]
     #[ignore = "touches the desktop keyring and a live server"]
     fn keyring_restore_live() {
-        let (Ok(server), Ok(handle), Ok(password)) = (
-            std::env::var("BROOK_LIVE_SERVER"),
-            std::env::var("BROOK_LIVE_HANDLE"),
-            std::env::var("BROOK_LIVE_PASSWORD"),
-        ) else {
-            eprintln!("BROOK_LIVE_* not set: skipped");
+        let Some([server, handle, password]) = live_env(&[
+            "BROOK_LIVE_SERVER",
+            "BROOK_LIVE_HANDLE",
+            "BROOK_LIVE_PASSWORD",
+        ])
+        .and_then(|v| <[String; 3]>::try_from(v).ok()) else {
             return;
         };
-        let slot = Arc::new(SecretServiceSlot::new());
-        if !slot.available() {
-            eprintln!("no unlocked keyring: skipped");
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("brook-live-{}", std::process::id()));
+        let slot = ScopedSlot::require();
+        let scratch = Cleanup {
+            slot: slot.clone(),
+            dir: tempfile::tempdir().unwrap(),
+        };
+        let dir = scratch.dir.path().to_path_buf();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = || {
             let c = BrookClient::new(CoreConfig::with_options(&server, true).unwrap()).unwrap();
@@ -324,6 +599,261 @@ mod live_restore {
             println!("restore after sign-out -> {after:?}");
             assert_eq!(after, RestoreOutcome::NotSignedIn);
         });
-        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod live_local_data {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use brook_core::{
+        BrookClient, CoreConfig, FileCacheState, LoginOutcome, OutgoingFile, TransferId,
+    };
+
+    use super::live_support::{live_env, scan, Cleanup, Scan, ScopedSlot};
+
+    struct Live {
+        server: String,
+        handle: String,
+        password: String,
+        channel: String,
+    }
+
+    fn live() -> Option<(Live, Cleanup)> {
+        let [server, handle, password, channel] = <[String; 4]>::try_from(live_env(&[
+            "BROOK_LIVE_SERVER",
+            "BROOK_LIVE_HANDLE",
+            "BROOK_LIVE_PASSWORD",
+            "BROOK_LIVE_CHANNEL",
+        ])?)
+        .ok()?;
+        let slot = ScopedSlot::require();
+        let dir = tempfile::tempdir().unwrap();
+        Some((
+            Live {
+                server,
+                handle,
+                password,
+                channel,
+            },
+            Cleanup { slot, dir },
+        ))
+    }
+
+    /// A signed-in client with local data on, in `scratch`'s own dir and keyring names.
+    async fn signed_in(live: &Live, scratch: &Cleanup) -> Arc<BrookClient> {
+        let data_dir = scratch.dir.path().join("data");
+        let client = Arc::new(
+            BrookClient::new(CoreConfig::with_options(&live.server, true).unwrap()).unwrap(),
+        );
+        client.enable_persistence(scratch.slot.clone(), data_dir.clone());
+        assert!(
+            client
+                .enable_local_data(scratch.slot.clone(), data_dir)
+                .await,
+            "local data should turn on with a usable keyring"
+        );
+        assert!(matches!(
+            client.login(&live.handle, &live.password).await.unwrap(),
+            LoginOutcome::LoggedIn(_)
+        ));
+        client.start_realtime().await.unwrap();
+        client
+    }
+
+    /// What a good scan looks like: both stores' databases were read, nothing was unreadable,
+    /// and nothing was readable.
+    fn assert_ciphertext(found: &Scan, when: &str) {
+        println!("{when}: scanned {:?}", found.files);
+        assert!(
+            found.unreadable.is_empty(),
+            "{when}: unreadable {:?}",
+            found.unreadable
+        );
+        assert!(
+            found.has_file("cache.db"),
+            "{when}: no cache.db scanned: {:?}",
+            found.files
+        );
+        assert!(
+            found.has_file("outbox.db"),
+            "{when}: no outbox.db scanned: {:?}",
+            found.files
+        );
+        assert!(
+            found.readable.is_empty(),
+            "{when}: readable on disk: {:?}",
+            found.readable
+        );
+    }
+
+    /// Offline cache at rest, end to end on the real desktop keyring (under this run's own
+    /// names): with local data on, a message that went through the cache (and the outbox)
+    /// leaves nothing readable on disk, scanned while the stores are open (their `-wal` and
+    /// `-shm` exist then) and again after they close.
+    /// `BROOK_LIVE_SERVER=... BROOK_LIVE_HANDLE=... BROOK_LIVE_PASSWORD=... BROOK_LIVE_CHANNEL=<id>
+    /// cargo test -p brook-gnome -- --ignored local_data_is_ciphertext_on_disk --test-threads=1`
+    #[test]
+    #[ignore = "touches the desktop keyring and a live server"]
+    fn local_data_is_ciphertext_on_disk() {
+        let Some((live, scratch)) = live() else {
+            return;
+        };
+        let marker = format!("CIPHERCHECK-{}-needle", scratch.slot.run_id());
+        let outbox_marker = format!("{marker}-outbox");
+        let data_dir = scratch.dir.path().join("data");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let while_open = rt.block_on(async {
+            let client = signed_in(&live, &scratch).await;
+            client
+                .send_message(&live.channel, &marker, None)
+                .await
+                .unwrap();
+            client
+                .send_queued(&live.channel, &outbox_marker, None, None)
+                .await
+                .unwrap();
+            // Wait until both went through the cache, then read them back from it.
+            let mut seen = false;
+            for _ in 0..40 {
+                if let Ok(page) = client.cached_messages(&live.channel, None, 50).await {
+                    let bodies: Vec<&str> = page.messages.iter().map(|m| m.body.as_str()).collect();
+                    if bodies.contains(&marker.as_str()) && bodies.contains(&outbox_marker.as_str())
+                    {
+                        seen = true;
+                        break;
+                    }
+                }
+                let _ = client.load_head(&live.channel, 50).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert!(seen, "both messages should be readable from the cache");
+            // Still open: SQLite's write-ahead logs exist and can hold the newest pages.
+            let open = scan(&data_dir, &marker);
+            client.logout().await;
+            client.close_local_data().await;
+            open
+        });
+        assert!(
+            while_open.has_file("-wal"),
+            "the open stores should have write-ahead logs: {:?}",
+            while_open.files
+        );
+        assert_ciphertext(&while_open, "while open");
+        assert_ciphertext(&scan(&data_dir, &marker), "after close");
+        assert!(scratch.slot.held() > 0, "the run did write keyring slots");
+    }
+
+    /// Attachments end to end on the real keyring (under this run's own names) and a real
+    /// server: a file goes out through the outbox, is kept available offline, and is then
+    /// saved from the cache (which never touches the network), byte for byte, while the
+    /// data dir holds none of it. Same `BROOK_LIVE_*` as above.
+    /// cargo test -p brook-gnome -- --ignored attachment_is_kept_offline_and_ciphertext --test-threads=1
+    #[test]
+    #[ignore = "touches the desktop keyring and a live server"]
+    fn attachment_is_kept_offline_and_ciphertext() {
+        let Some((live, scratch)) = live() else {
+            return;
+        };
+        // RUST_LOG=brook_core=debug shows why core refused something.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+        let run = scratch.slot.run_id().to_string();
+        // 3 MiB: more than one encrypted chunk (1 MiB each), with a marker repeated through it.
+        let marker = format!("FILECHECK-{run}-needle");
+        let mut content = Vec::new();
+        while content.len() < 3 * 1024 * 1024 {
+            content.extend_from_slice(marker.as_bytes());
+            content.extend_from_slice(&(content.len() as u64).to_le_bytes());
+        }
+        let source = scratch.dir.path().join("source.bin");
+        std::fs::write(&source, &content).unwrap();
+        let caption = format!("attachment-check-{run}");
+        let data_dir = scratch.dir.path().join("data");
+        let target = scratch.dir.path().join("saved.bin");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let while_open = rt.block_on(async {
+            let client = signed_in(&live, &scratch).await;
+            let channel = &live.channel;
+            client
+                .send_queued_with_files(
+                    channel,
+                    &caption,
+                    None,
+                    None,
+                    vec![OutgoingFile {
+                        path: source.clone(),
+                        filename: "source.bin".into(),
+                        content_type: "application/octet-stream".into(),
+                        transfer_id: Some(TransferId::new()),
+                    }],
+                )
+                .await
+                .unwrap();
+            // The server has it: its message carries the file.
+            let mut file_id = None;
+            for _ in 0..60 {
+                let history = client.channel_history(channel, None).await.unwrap();
+                if let Some(file) = history
+                    .iter()
+                    .find(|m| m.body == caption)
+                    .and_then(|m| m.attachments.first())
+                {
+                    assert_eq!(file.size, content.len() as u64, "the server's size");
+                    file_id = Some(file.id.clone());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let file_id = file_id.expect("the file should reach the server");
+            // The cache indexes a file through its message: wait until it holds this one.
+            let mut cached = false;
+            for _ in 0..40 {
+                if let Ok(page) = client.cached_messages(channel, None, 50).await {
+                    if page.messages.iter().any(|m| m.body == caption) {
+                        cached = true;
+                        break;
+                    }
+                }
+                let _ = client.load_head(channel, 50).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert!(cached, "the message should reach the cache");
+            // Keep it offline, and wait until it is complete in the cache.
+            client.pin_file(&file_id).await.unwrap();
+            let mut pinned = false;
+            for _ in 0..80 {
+                if let Ok(FileCacheState::Pinned { cached: true, .. }) =
+                    client.file_state(&file_id).await
+                {
+                    pinned = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert!(pinned, "the pinned file should be complete in the cache");
+            // Saving from the cache: no network involved, and the bytes are the original's.
+            assert!(client.save_cached_file(&file_id, &target).await.unwrap());
+            let open = scan(&data_dir, &marker);
+            client.logout().await;
+            client.close_local_data().await;
+            open
+        });
+        let saved = std::fs::read(&target).unwrap();
+        assert_eq!(saved.len(), content.len());
+        assert!(saved == content, "the saved copy differs from the original");
+        // The file's own storage was scanned: a cached blob at least as big as the file.
+        assert!(
+            while_open.has_file_of("/files/", content.len() as u64),
+            "no cached blob under files/ of at least {} bytes was scanned: {:?}",
+            content.len(),
+            while_open.sizes
+        );
+        // Nothing the cache wrote holds the file's bytes or a plain database, open or closed.
+        assert_ciphertext(&while_open, "while open");
+        assert_ciphertext(&scan(&data_dir, &marker), "after close");
     }
 }
