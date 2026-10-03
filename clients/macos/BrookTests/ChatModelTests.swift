@@ -15,6 +15,8 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     var loadFails = false
     /// Cached pages, handed out in order (the last one repeats).
     var cachePages: [FfiCachedMessages] = []
+    /// Holds the next `cachedMessages` call (after it is recorded), once.
+    var cacheGate: Gate?
     /// What the cache was asked, in order ("cached:<before>", "loadHead", "loadOlder", …).
     let cacheCalls = Mutex<[String]>([])
     var users: [FfiMember] = []

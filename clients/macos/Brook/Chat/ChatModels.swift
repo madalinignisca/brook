@@ -144,7 +144,7 @@ final class TimelineModel {
     /// then the network's newest page; then mark read.
     func load() async {
         await readCache(before: nil, loadIfIncomplete: true)
-        await fetchHead()
+        await fetchHead() // returns when the page, and any resync queued behind it, is merged
         if let newest = messages.last {
             try? await client.markRead(channelId: channelId, messageId: newest.id)
         }
@@ -214,41 +214,60 @@ final class TimelineModel {
         }
     }
 
-    /// True from the start of a head fetch to the end of the last one queued behind it.
-    private var headFetchInFlight = false
+    /// The running chain of head fetches, until the last one queued behind it ends.
+    private var headDrain: Task<Void, Never>?
     private var headRefetchPending = false
 
-    /// The newest page. One head fetch runs at a time: a request that arrives during one
-    /// (a resync, say) is not run beside it, and is not dropped either, since it may know of
-    /// newer state than the fetch in flight: one more fetch follows, however many arrived.
+    /// The newest page, returning once it (and any fetch queued behind it) has landed. One
+    /// head fetch runs at a time: a request that arrives during one (a resync, say) is not
+    /// run beside it, and is not dropped either, since it may know of newer state than the
+    /// fetch in flight: one more fetch follows, however many arrived. The request waits for
+    /// that chain too, so a caller that reads the result (`load()`) sees the merged page.
     private func fetchHead() async {
-        if headFetchInFlight {
+        if let drain = headDrain {
             headRefetchPending = true
+            await drain.value
             return
         }
-        headFetchInFlight = true
-        await drainHeadFetches()
+        await startHeadDrain().value
     }
 
-    /// Runs with `headFetchInFlight` already taken.
-    private func drainHeadFetches() async {
-        repeat {
-            headRefetchPending = false
-            await fetch(before: nil)
-        } while headRefetchPending
-        headFetchInFlight = false
+    /// Takes the one-at-a-time slot (synchronously, so two callers can't both start).
+    private func startHeadDrain() -> Task<Void, Never> {
+        let drain = Task { [self] in
+            repeat {
+                headRefetchPending = false
+                await fetch(before: nil)
+            } while headRefetchPending
+            headDrain = nil
+        }
+        headDrain = drain
+        return drain
+    }
+
+    /// The newest message is read: now if the app is active, else when it becomes so.
+    private func markNewestRead() async {
+        guard let newest = messages.last else { return }
+        if isActive() {
+            try? await client.markRead(channelId: channelId, messageId: newest.id)
+        } else {
+            readOwed = true // shown, not seen yet
+        }
     }
 
     /// Retry the head load when a signal says the connection is back (`.ready`, or offline
     /// going false), if there is an error to clear. The error may also come from a failed
     /// older page; the retry then loads the head, which succeeding clears it. A retry that
     /// fails sets the error again and waits for the next signal: no timer, no loop. The
-    /// flag is taken here, before the task runs, so two signals arriving together start one
-    /// fetch.
+    /// slot is taken here, before the task runs, so two signals arriving together start one
+    /// fetch. A retry that succeeds reads the channel as `load()` would have.
     private func retryFailedHead() {
-        guard error != nil, !headFetchInFlight else { return }
-        headFetchInFlight = true
-        Task { await drainHeadFetches() }
+        guard error != nil, headDrain == nil else { return }
+        let drain = startHeadDrain()
+        Task {
+            await drain.value
+            if error == nil { await markNewestRead() }
+        }
     }
 
     /// A live event, if it's this channel's.

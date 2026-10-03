@@ -140,9 +140,9 @@ final class OfflineTimelineTests: XCTestCase {
 
     // ---- A failed head load is retried when the connection returns.
 
-    private func failedHead(_ chat: FakeChat) async -> TimelineModel {
+    private func failedHead(_ chat: FakeChat, isActive: @escaping @MainActor () -> Bool = { true }) async -> TimelineModel {
         chat.historyFailure = LoginError.Network(message: "offline")
-        let t = TimelineModel(channelId: "c", client: chat)
+        let t = TimelineModel(channelId: "c", client: chat, isActive: isActive)
         await t.load()
         XCTAssertNotNil(t.error)
         return t
@@ -244,5 +244,71 @@ final class OfflineTimelineTests: XCTestCase {
         await settle("follow-up didn't run") { chat.historyCalls.withLock { $0 } == 3 && !t.loading }
         try? await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(chat.historyCalls.withLock { $0 }, 3)
+    }
+
+    // ---- Reading what a coalesced head fetch brought.
+
+    /// A retry that succeeds marks the newest message read, as `load()` does.
+    func testSuccessfulRetryMarksTheNewestRead() async {
+        let chat = FakeChat()
+        let t = await failedHead(chat)
+        chat.historyFailure = nil
+        chat.pages = [[msg("m1", "a"), msg("m2", "b")]]
+        t.apply(.ready)
+        await settle("retry didn't mark read") { !chat.read.isEmpty }
+        XCTAssertEqual(chat.read, ["m2"])
+    }
+
+    /// With the app in the background the retry's read is owed, not sent.
+    func testRetryInTheBackgroundOwesTheReadInstead() async {
+        let chat = FakeChat()
+        let t = await failedHead(chat, isActive: { false })
+        chat.historyFailure = nil
+        chat.pages = [[msg("m1", "a"), msg("m2", "b")]]
+        t.apply(.ready)
+        await settle("retry didn't finish") { t.error == nil && !t.loading && t.messages.count == 2 }
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(chat.read.isEmpty, "read while the app was in the background")
+        XCTAssertTrue(t.readOwed)
+        t.appBecameActive()
+        await settle("owed read not sent") { !chat.read.isEmpty }
+        XCTAssertEqual(chat.read, ["m2"])
+    }
+
+    /// A retry that fails marks nothing.
+    func testFailedRetryMarksNothingRead() async {
+        let chat = FakeChat()
+        let t = await failedHead(chat)
+        t.apply(.ready)
+        await settle("retry didn't run") { chat.historyCalls.withLock { $0 } == 2 && !t.loading }
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(chat.read.isEmpty)
+    }
+
+    /// A resync that starts a head fetch while `load()` reads the cache: `load()` waits for
+    /// that fetch (not just queues behind it) and marks the page's newest read, not the
+    /// cached one.
+    func testLoadWaitsForAResyncsHeadFetchAndReadsItsNewest() async {
+        let chat = FakeChat()
+        chat.local = true
+        chat.cachePages = [cachedPage([msg("m1", "stale")])]
+        chat.pages = [[msg("m1", "a"), msg("m2", "b")]]
+        let cacheGate = Gate() // the fake takes it when it holds the read
+        chat.cacheGate = cacheGate
+        chat.historyGate = Gate()
+        let t = TimelineModel(channelId: "c", client: chat, isActive: { true })
+        var finished = false
+        let loading = Task { await t.load(); finished = true }
+        await settle("load didn't reach the cache") { chat.cacheCalls.withLock { $0.contains("cached:-") } }
+        t.apply(.resync) // its fetch is held at the history gate
+        await settle("resync didn't fetch") { chat.historyCalls.withLock { $0 } == 1 }
+        cacheGate.open()
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(finished, "load returned before the head page was merged")
+        XCTAssertTrue(chat.read.isEmpty, "read before the head page arrived: \(chat.read)")
+        chat.historyGate?.open()
+        await loading.value
+        XCTAssertEqual(t.messages.map(\.id), ["m1", "m2"])
+        XCTAssertEqual(chat.read, ["m2"])
     }
 }
