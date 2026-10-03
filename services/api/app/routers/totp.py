@@ -234,7 +234,7 @@ async def totp_login(
         user_id = uuid.UUID(str(payload["sub"]))
         issued_ms = issued_at_ms(payload)
         jti, exp = str(payload["jti"]), float(payload["exp"])
-    except (jwt.PyJWTError, KeyError, ValueError, TypeError):
+    except (jwt.PyJWTError, KeyError, ValueError, TypeError, RecursionError):
         limiter.failure(ip)  # a forged or foreign token is a probe
         raise _expired() from None
 

@@ -41,7 +41,7 @@ async def user_from_access_token(
             return None
         user_id = uuid.UUID(str(payload["sub"]))
         issued_ms = issued_at_ms(payload)
-    except (jwt.PyJWTError, KeyError, ValueError, TypeError):
+    except (jwt.PyJWTError, KeyError, ValueError, TypeError, RecursionError):
         return None
     user = await session.get(User, user_id)
     if user is None or user.status != "active" or user.session_revoked(issued_ms):

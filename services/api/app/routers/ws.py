@@ -180,7 +180,7 @@ async def _user_from_token(settings: Settings, token: object) -> tuple[User, int
         issued_ms = issued_at_ms(payload)
     except jwt.ExpiredSignatureError:
         return EXPIRED
-    except (jwt.PyJWTError, KeyError, ValueError, TypeError):
+    except (jwt.PyJWTError, KeyError, ValueError, TypeError, RecursionError):
         return None
     async with get_sessionmaker()() as session:
         user = await session.get(User, user_id)
@@ -250,7 +250,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
         return
     try:
         first = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):  # nested past the recursion limit is not JSON we accept
         first = None
     # Paced like /auth/login, and checked before any token or DB work.
     limiter = get_limiter()
@@ -307,7 +307,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 frame = json.loads(raw)
                 if not isinstance(frame, dict) or not isinstance(frame.get("type"), str):
                     raise ValueError("not an envelope")
-            except ValueError:
+            except (ValueError, RecursionError):
                 await conn.send(error_frame(None, "invalid", "frame is not a JSON envelope"))
                 continue
             if frame["type"] == "auth":
