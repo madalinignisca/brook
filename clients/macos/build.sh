@@ -4,23 +4,36 @@
 #   clients/macos/build.sh          → clients/macos/build/Build/Products/Debug/Brook.app
 #   clients/macos/build.sh test
 #   clients/macos/build.sh release → …/Release/Brook.app (hardened runtime, shipped entitlements only)
+#   clients/macos/build.sh notarize → release, then Apple's notary, stapling and a zip to ship (#68)
+#     Needs, in the gitignored Local.xcconfig, the name of a `notarytool store-credentials` profile:
+#       BROOK_NOTARY_PROFILE = <profile name>
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 command -v xcodegen >/dev/null || { echo "xcodegen not found (brew install xcodegen)" >&2; exit 1; }
 
-"$ROOT/bindings/apple/build-xcframework.sh"
-(cd "$HERE" && xcodegen --quiet)
-
 args=(build)
 config=Debug
-if [[ "${1:-}" == "release" ]]; then
+source "$HERE/notary-lib.sh"
+mode="${1:-}"
+notary_profile=""
+if [[ "$mode" == "release" || "$mode" == "notarize" ]]; then
   config=Release
   # Ad-hoc Release cannot launch (library validation vs. the embedded WebRTC.framework).
   grep -qs "^DEVELOPMENT_TEAM *= *[A-Z0-9]" "$HERE/Local.xcconfig" || {
     echo "Release needs a signing identity: see clients/macos/Signing.xcconfig" >&2; exit 1; }
 fi
+if [[ "$mode" == "notarize" ]]; then
+  # Before the long build: the profile's name (the credentials themselves stay in the keychain).
+  notary_profile="$(read_notary_profile "$HERE/Local.xcconfig")"
+  [[ -n "$notary_profile" ]] || {
+    echo "notarize needs BROOK_NOTARY_PROFILE in Local.xcconfig (see the header of build.sh)" >&2; exit 1; }
+fi
+# After the checks above, so a missing setting fails at once, not after the slow builds.
+"$ROOT/bindings/apple/build-xcframework.sh"
+(cd "$HERE" && xcodegen --quiet)
+
 # A test that deadlocks must fail, not hang the run: cap each test at 60 s.
 [[ "${1:-}" == "test" ]] && args=(test -test-timeouts-enabled YES -maximum-test-execution-time-allowance 60)
 # A Developer ID profile (#79): the keychain entitlements join the generated (gitignored)
@@ -52,4 +65,21 @@ if [[ "${1:-}" != "test" ]]; then
     $([[ "$config" == Release ]] && echo release)
 fi
 
-echo "app: $HERE/build/Build/Products/$config/Brook.app"
+app="$HERE/build/Build/Products/$config/Brook.app"
+
+# Release: every binary must be Developer ID signed with the hardened runtime and a secure
+# timestamp, or Apple's notary rejects it (#68). Caught here, offline, in seconds.
+[[ "$config" == Release ]] && "$HERE/check-notarizable.sh" "$app"
+
+if [[ "$mode" == "notarize" ]]; then
+  zip="$HERE/build/Brook-notarize.zip"
+  ditto -c -k --keepParent "$app" "$zip"
+  notarize_app "$app" "$zip" "$notary_profile" || exit 1
+  spctl -a -vvv "$app"
+  rm -f "$zip"
+  # What to ship: the stapled app, zipped (the stapled ticket lets it open offline).
+  ditto -c -k --keepParent "$app" "$HERE/build/Brook.zip"
+  echo "notarized: $HERE/build/Brook.zip"
+fi
+
+echo "app: $app"

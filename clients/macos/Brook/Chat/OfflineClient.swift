@@ -54,6 +54,12 @@ struct ChannelRow: Identifiable, Equatable {
     var unreadMentions: Int64
     let members: [FfiMember]
     let ownerOffers: [FfiOwnerOffer]
+    let topic: String?
+    /// What the sidebar and window title call it, and the lowercase name key that orders it
+    /// (the label with usernames off, so the preference never moves a row). Both set by the
+    /// model's row factory, never by a view.
+    var label = ""
+    var nameKey = ""
 
     /// `mentions`: this device's count, when it has one; else the server's (`GET /channels`).
     init(_ channel: FfiChannel, unread: Int64 = 0, mentions: Int64? = nil) {
@@ -62,6 +68,7 @@ struct ChannelRow: Identifiable, Equatable {
         unreadMentions = mentions ?? channel.unreadMentions
         members = channel.members
         ownerOffers = channel.ownerOffers
+        topic = channel.topic
     }
 
     init(_ channel: FfiCachedChannel) {
@@ -70,13 +77,16 @@ struct ChannelRow: Identifiable, Equatable {
         unreadMentions = channel.unreadMentions
         members = channel.members
         ownerOffers = channel.ownerOffers
+        topic = nil
     }
 
     init(id: String, kind: String = "public", name: String?, archived: Bool = false, unread: Int64 = 0,
-         unreadMentions: Int64 = 0, members: [FfiMember] = [], ownerOffers: [FfiOwnerOffer] = []) {
+         unreadMentions: Int64 = 0, members: [FfiMember] = [], ownerOffers: [FfiOwnerOffer] = [],
+         topic: String? = nil) {
         (self.id, self.kind, self.name, self.archived, self.unread) = (id, kind, name, archived, unread)
         self.unreadMentions = unreadMentions
         self.members = members
         self.ownerOffers = ownerOffers
+        self.topic = topic
     }
 }

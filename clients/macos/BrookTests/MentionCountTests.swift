@@ -33,10 +33,11 @@ final class MentionCountTests: XCTestCase {
         let model = ChannelsModel(client: client)
         model.openChannel = "c2"
         await model.start()
-        XCTAssertEqual(model.channels.map(\.unreadMentions), [1, 0], "the open channel's stays 0")
+        XCTAssertEqual(model.channels.map(\.id), ["c2", "c1"], "the open channel leads the list")
+        XCTAssertEqual(model.channels.map(\.unreadMentions), [0, 1], "the open channel's stays 0")
         client.cached = [cached("c1", unread: 6, mentions: 3), cached("c2", unread: 6, mentions: 3)]
         await model.cacheChannelsChanged()
-        XCTAssertEqual(model.channels.map(\.unreadMentions), [3, 0])
+        XCTAssertEqual(model.channels.map(\.unreadMentions), [0, 3])
     }
 
     func testAnUpdateKeepsTheRowsCount() async {
@@ -50,7 +51,7 @@ final class MentionCountTests: XCTestCase {
 
     func testALiveMentionRaisesItAndReadingClearsIt() async {
         let client = FakeRealtime(channels: [channel("c1", "general")])
-        let model = ChannelsModel(client: client, me: "me", isActive: { true })
+        let model = ChannelsModel(client: client, me: "me", isActive: { true }, defaults: isolatedDefaults())
         await model.start()
         client.deliver(.messageNew(message: msg("m1", "plain", channel: "c1")))
         var named = msg("m2", "@me", channel: "c1")

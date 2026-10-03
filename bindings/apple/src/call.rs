@@ -397,6 +397,26 @@ pub enum FfiServerEvent {
         call_id: Option<String>,
         participant_count: u32,
     },
+    /// Someone is typing in a channel. Expire it client-side (GTK and the Mac: 4 seconds).
+    Typing {
+        channel_id: String,
+        user_id: String,
+        display_name: String,
+    },
+    /// Someone added or removed a reaction on a message. Yours arrives too (another device, or
+    /// the echo of your own toggle).
+    ReactionUpdate {
+        channel_id: String,
+        message_id: String,
+        emoji: String,
+        user_id: String,
+        added: bool,
+        /// The emoji's new total on the message: apply it as is (0 removes the chip).
+        count: i64,
+        /// The server's commit-ordered counter: for one message and emoji, ignore an event
+        /// whose `seq` is not above the last one applied.
+        seq: i64,
+    },
     /// A channel you're in changed (renamed, members joined or left, archived): replace
     /// its row. Without local data this is the only way the list hears of it.
     ChannelUpdate { channel: crate::types::FfiChannel },

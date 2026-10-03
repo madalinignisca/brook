@@ -173,6 +173,7 @@ impl TestServer {
             .route("/api/v1/auth/logout", post(logout))
             .route("/api/v1/users", get(list_users))
             .route("/api/v1/users/{id}/password", post(reset_password))
+            .route("/api/v1/sync", get(sync_page))
             .route("/ws", get(ws_upgrade))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -780,6 +781,143 @@ async fn refresh(State(state): State<Shared>, Json(body): Json<Value>) -> Respon
     }
 }
 
+/// `/sync`: an empty page, already caught up.
+async fn sync_page() -> Response {
+    Json(json!({
+        "channels": [], "removed_channels": [], "left_members": [], "users": [],
+        "messages": [], "memberships": [], "next": "1", "more": false,
+    }))
+    .into_response()
+}
+
+/// A TCP hop between a client and a [`TestServer`] that a test can break two ways. `cut`:
+/// Wi-Fi going off with the stack noticing, so open connections die and new ones are dropped
+/// on arrival (a network error, not an HTTP status). `blackhole`: a path that silently stops
+/// carrying packets, so connections stay open and nothing arrives either way (no FIN, no
+/// RST), which is what an idle socket sees when the network vanishes under it. The client's
+/// origin is `base`.
+pub struct FlakyLink {
+    pub base: String,
+    down: Arc<std::sync::atomic::AtomicBool>,
+    blackholed: Arc<std::sync::atomic::AtomicBool>,
+    /// Aborting these closes both halves of every relayed connection. Registration and `cut`
+    /// both go through this lock, so no relay escapes a cut.
+    relays: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    accept: tokio::task::JoinHandle<()>,
+}
+
+/// Copy `from` to `to` until EOF; while blackholed, read and drop instead of forwarding.
+async fn pump(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    blackholed: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = [0u8; 4096];
+    loop {
+        match from.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if blackholed.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                if to.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = to.shutdown().await;
+}
+
+impl FlakyLink {
+    pub async fn to(server: &TestServer) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let target = server.base.trim_start_matches("http://").to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let down = Arc::new(AtomicBool::new(false));
+        let blackholed = Arc::new(AtomicBool::new(false));
+        let relays: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::default();
+        let (d, b, r) = (down.clone(), blackholed.clone(), relays.clone());
+        let accept = tokio::spawn(async move {
+            while let Ok((inbound, _)) = listener.accept().await {
+                if d.load(Ordering::SeqCst) {
+                    continue; // dropped: the client sees a reset
+                }
+                let (target, b) = (target.clone(), b.clone());
+                let relay = tokio::spawn(async move {
+                    if let Ok(outbound) = tokio::net::TcpStream::connect(target).await {
+                        let (ir, iw) = inbound.into_split();
+                        let (or, ow) = outbound.into_split();
+                        tokio::join!(pump(ir, ow, b.clone()), pump(or, iw, b));
+                    }
+                });
+                let mut relays = r.lock().unwrap();
+                // Checked under the lock `cut` takes: a cut that came while this relay was
+                // being spawned must still kill it.
+                if d.load(Ordering::SeqCst) {
+                    relay.abort();
+                } else {
+                    relays.retain(|h| !h.is_finished());
+                    relays.push(relay);
+                }
+            }
+        });
+        Self {
+            base,
+            down,
+            blackholed,
+            relays,
+            accept,
+        }
+    }
+
+    /// The network goes away.
+    pub fn cut(&self) {
+        let mut relays = self.relays.lock().unwrap();
+        self.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        for relay in relays.drain(..) {
+            relay.abort();
+        }
+    }
+
+    /// The path stops carrying data, silently: sockets stay open, nothing is delivered.
+    /// Connections made meanwhile are accepted and swallowed the same way.
+    pub fn blackhole(&self) {
+        self.blackholed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The network comes back: new connections are relayed again. Connections that existed
+    /// before are ended (after a black hole their byte streams have gaps, so they are dead).
+    pub fn restore(&self) {
+        let mut relays = self.relays.lock().unwrap();
+        for relay in relays.drain(..) {
+            relay.abort();
+        }
+        self.blackholed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.down.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for FlakyLink {
+    fn drop(&mut self) {
+        // Like `cut`: `down` is set under the relay lock before the drain, so an accept
+        // task running on another worker that is registering a relay right now either
+        // registered before (and is drained here) or sees `down` and aborts its own relay.
+        // Aborting `accept` first would leave that window open. Not testable
+        // deterministically: it needs a task preempted between spawn and registration.
+        let mut relays = self.relays.lock().unwrap();
+        self.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        for relay in relays.drain(..) {
+            relay.abort();
+        }
+        self.accept.abort(); // drops the listener
+    }
+}
+
 async fn ws_upgrade(State(state): State<Shared>, upgrade: WebSocketUpgrade) -> Response {
     let sockets = state.lock().unwrap().sockets.clone();
     upgrade.on_upgrade(move |socket| async move {
@@ -807,6 +945,14 @@ impl WsPeer {
                 _ => continue,
             }
         }
+    }
+
+    /// A protocol-level ping, as the server's websocket library sends on its interval.
+    pub async fn ping(&mut self) {
+        self.socket
+            .send(AxMessage::Ping(Vec::new().into()))
+            .await
+            .unwrap();
     }
 
     pub async fn send(&mut self, frame: Value) {
@@ -1325,6 +1471,116 @@ mod tests {
             .await
             .expect("never timed out");
         assert_eq!(res.unwrap(), Err(CommandError::Timeout));
+    }
+
+    /// A connection that delivers nothing is dropped after the idle timeout, and the socket
+    /// reconnects by itself (a vanished network gives an idle socket no EOF).
+    #[tokio::test]
+    async fn a_silent_connection_is_dropped_after_the_idle_timeout() {
+        let mut server = TestServer::start().await;
+        let (client, _peer, generation) =
+            connected(&mut server, |t| t.idle_timeout = Duration::from_millis(500)).await;
+        let mut conn = client.commands.conn();
+        tokio::time::timeout(Duration::from_secs(5), conn.wait_for(|c| !c.ready))
+            .await
+            .expect("a silent connection was never dropped")
+            .unwrap();
+        // ... and it came back as a new connection.
+        let mut again = server.accept().await;
+        again.accept_auth().await;
+        let ready = *conn.wait_for(|c| c.ready).await.unwrap();
+        assert!(ready.generation > generation);
+    }
+
+    /// Pings alone (no text frames at all) keep a connection alive: the server's library
+    /// pings an idle link, and that must count as the link being up.
+    #[tokio::test]
+    async fn pings_alone_keep_an_idle_connection_open() {
+        let mut server = TestServer::start().await;
+        let (client, mut peer, _generation) =
+            connected(&mut server, |t| t.idle_timeout = Duration::from_millis(500)).await;
+        let mut conn = client.commands.conn();
+        for _ in 0..16 {
+            // 1.6 s: three idle timeouts, a ping each 100 ms
+            peer.ping().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(conn.borrow_and_update().ready, "dropped despite the pings");
+        }
+    }
+
+    /// Dropping a link stops its listener and ends its relays.
+    #[tokio::test]
+    async fn a_dropped_link_closes_its_listener_and_relays() {
+        use tokio::io::AsyncReadExt;
+        let server = TestServer::start().await;
+        let link = FlakyLink::to(&server).await;
+        let addr = link.base.trim_start_matches("http://").to_string();
+        let mut open = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await; // the relay is registered
+        drop(link);
+        let mut buf = [0u8; 1];
+        let ended = tokio::time::timeout(Duration::from_secs(2), open.read(&mut buf)).await;
+        assert!(
+            matches!(ended, Ok(Ok(0) | Err(_))),
+            "relay outlived the link"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(tokio::net::TcpStream::connect(&addr).await.is_err());
+    }
+
+    /// A server that accepts the TCP connection and never answers the websocket upgrade does
+    /// not hang the attempt: it ends within the idle timeout, like any failed connect, so the
+    /// disconnect is announced and the backoff applies.
+    #[tokio::test]
+    async fn an_upgrade_that_is_never_answered_ends_within_the_idle_timeout() {
+        use crate::ws::WS_DISCONNECTED;
+        let server = TestServer::start().await;
+        let link = FlakyLink::to(&server).await;
+        let client = BrookClient::new(CoreConfig::new(&link.base).unwrap()).unwrap();
+        client.login("alice", "pw").await.unwrap();
+        // From here connections are accepted and swallowed: the upgrade gets no answer.
+        link.blackhole();
+        client.with_transport(|t| t.idle_timeout = Duration::from_secs(1));
+        let mut raw = client.commands.raw_events_sender().subscribe();
+        client.start_realtime().await.unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(4), async {
+            while let Ok((ty, _)) = raw.recv().await {
+                if ty == WS_DISCONNECTED {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(end.is_ok(), "the connect attempt hung");
+    }
+
+    /// A lost connection is announced to the cache; a sign-out is not a lost connection.
+    #[tokio::test]
+    async fn only_a_lost_connection_is_announced_not_a_session_change() {
+        use crate::ws::WS_DISCONNECTED;
+        let mut server = TestServer::start().await;
+        let (client, mut peer, _) = connected(&mut server, |_| {}).await;
+        let mut raw = client.commands.raw_events_sender().subscribe();
+        let disconnects = |raw: &mut tokio::sync::broadcast::Receiver<(String, Value)>| {
+            let mut n = 0;
+            while let Ok((ty, _)) = raw.try_recv() {
+                n += usize::from(ty == WS_DISCONNECTED);
+            }
+            n
+        };
+
+        client.logout().await;
+        peer.expect_closed().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(disconnects(&mut raw), 0, "announced a sign-out");
+
+        // Control: a server-side close is announced, so the check above can see one.
+        client.login("alice", "pw").await.unwrap();
+        let mut peer = server.accept().await;
+        peer.accept_auth().await;
+        peer.close(1000, "bye").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(disconnects(&mut raw), 1);
     }
 
     /// The reply window starts when the frame is written, not when it was submitted: a

@@ -23,7 +23,9 @@ for KDE Plasma, Windows, Android, and iOS are planned, all sharing one core.
 ## Getting the GNOME client
 
 **Release builds** (stable and beta) are on the GitHub Releases page as
-`brook-gnome-<version>-linux-<arch>.tar.gz` (x86_64 and aarch64). Unpack one and
+`brook-gnome-<version>-linux-<arch>.tar.gz` (x86_64 and aarch64; for Debian 13 and
+Ubuntu 26.04) and `brook-gnome-<version>-linux-musl-<arch>.tar.gz`
+(Alpine; chat works, calls need a glibc distribution). Unpack one and
 run `./install.sh`: it installs for your user only (no root), and
 `./install.sh --uninstall` removes it. The tarball's `INSTALL.md` lists the GTK 4,
 libadwaita and GStreamer packages your distribution needs.
