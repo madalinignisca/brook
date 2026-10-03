@@ -135,11 +135,170 @@ fn save_opened_to(
     }
 }
 
+/// Every writer of this file runs on the GTK main thread (each rewrites the whole file).
+/// At the first-sync wipe, erase every account's ranks but `me`'s: those whose data is being
+/// wiped, and any orphaned ones (a remove-data sign-out before ranks were erased, ranks
+/// written with persistence off, a sign-out before the user was known) (#235). Nothing once
+/// this session has ended (the wipe can't run then) or with no known user.
+pub fn forget_others_than(ended: bool, me: &str) {
+    forget_others_in(&path(), ended, me);
+}
+
+fn forget_others_in(path: &std::path::Path, ended: bool, me: &str) {
+    if ended || me.is_empty() {
+        return;
+    }
+    let file = glib::KeyFile::new();
+    if file
+        .load_from_file(path, glib::KeyFileFlags::KEEP_COMMENTS)
+        .is_err()
+    {
+        return;
+    }
+    let mine = opened_group(me);
+    let groups = file.groups();
+    let mut changed = false;
+    for group in groups.iter().filter(|g| g.starts_with("opened-")) {
+        if group.as_str() != mine {
+            changed |= file.remove_group(group).is_ok();
+        }
+    }
+    if changed {
+        if let Err(err) = file.save_to_file(path) {
+            tracing::warn!(%err, path = %path.display(), "could not erase the sidebar orders");
+        }
+    }
+}
+
+/// Whether the opened ranks may be written: not once the user chose to remove this device's
+/// data (a late save from the ended session would bring them back), and only for a known user.
+pub fn may_save_opened(forgotten: bool, user_id: &str) -> bool {
+    !forgotten && !user_id.is_empty()
+}
+
+/// What the sign-out choice does to the ranks of `user_id`: erased with "Remove this
+/// device's data", kept otherwise. Returns whether they were erased.
+pub fn sign_out_forgets(remove_data: bool, user_id: &str) -> bool {
+    sign_out_forgets_in(&path(), remove_data, user_id)
+}
+
+fn sign_out_forgets_in(path: &std::path::Path, remove_data: bool, user_id: &str) -> bool {
+    if remove_data {
+        forget_opened_in(path, user_id);
+    }
+    remove_data
+}
+
+fn forget_opened_in(path: &std::path::Path, user_id: &str) {
+    if user_id.is_empty() {
+        return;
+    }
+    let file = glib::KeyFile::new();
+    if file
+        .load_from_file(path, glib::KeyFileFlags::KEEP_COMMENTS)
+        .is_err()
+        || file.remove_group(&opened_group(user_id)).is_err()
+    {
+        // No file, or no ranks for them: nothing to erase.
+        return;
+    }
+    if let Err(err) = file.save_to_file(path) {
+        tracing::warn!(%err, path = %path.display(), "could not erase the sidebar order");
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use gtk::glib;
     use std::collections::HashMap;
 
-    use super::{load_opened_from, save_opened_to};
+    use super::{
+        forget_opened_in, forget_others_in, load_opened_from, may_save_opened, save_opened_to,
+        sign_out_forgets_in,
+    };
+
+    fn two_accounts(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("brook-{tag}-{}", std::process::id()));
+        let file = dir.join("brook").join("gnome.ini");
+        save_opened_to(&file, "ann", &HashMap::from([("c1".to_string(), 3)]));
+        save_opened_to(&file, "bob", &HashMap::from([("c1".to_string(), 1)]));
+        (dir, file)
+    }
+
+    #[test]
+    fn forgetting_an_account_leaves_the_others_ranks() {
+        let (dir, file) = two_accounts("forget");
+        let kf = glib::KeyFile::new();
+        kf.load_from_file(&file, glib::KeyFileFlags::NONE).unwrap();
+        kf.set_string("login", "server", "https://x");
+        kf.set_boolean("sidebar", "show-usernames", true);
+        kf.save_to_file(&file).unwrap();
+        forget_opened_in(&file, "ann");
+        assert!(load_opened_from(&file, "ann").is_empty());
+        assert_eq!(load_opened_from(&file, "bob").len(), 1);
+        assert!(file_has_group(&file, "login") && file_has_group(&file, "sidebar"));
+        let _ = std::fs::remove_dir_all(&dir);
+        forget_opened_in(&file, "ann"); // no file: no panic, none made
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn an_empty_user_id_erases_nothing() {
+        let (dir, file) = two_accounts("empty");
+        // A group literally named "opened-" would be the one an empty id points at.
+        let kf = glib::KeyFile::new();
+        let _ = kf.load_from_file(&file, glib::KeyFileFlags::NONE);
+        kf.set_integer("opened-", "c9", 5);
+        kf.save_to_file(&file).unwrap();
+        forget_opened_in(&file, "");
+        assert!(file_has_group(&file, "opened-"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn file_has_group(file: &std::path::Path, group: &str) -> bool {
+        let kf = glib::KeyFile::new();
+        kf.load_from_file(file, glib::KeyFileFlags::NONE).is_ok() && kf.has_group(group)
+    }
+
+    #[test]
+    fn signing_out_erases_the_ranks_only_with_remove_data() {
+        let (dir, file) = two_accounts("signout");
+        assert!(!sign_out_forgets_in(&file, false, "ann"));
+        assert_eq!(load_opened_from(&file, "ann").len(), 1, "kept");
+        assert!(sign_out_forgets_in(&file, true, "ann"));
+        assert!(load_opened_from(&file, "ann").is_empty(), "erased");
+        assert_eq!(load_opened_from(&file, "bob").len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_late_save_after_remove_data_is_refused() {
+        assert!(may_save_opened(false, "ann"));
+        assert!(!may_save_opened(true, "ann"));
+        assert!(!may_save_opened(false, ""));
+    }
+
+    #[test]
+    fn the_wipe_sweep_keeps_mine_and_everything_that_isnt_ranks() {
+        let (dir, file) = two_accounts("sweep");
+        let kf = glib::KeyFile::new();
+        kf.load_from_file(&file, glib::KeyFileFlags::NONE).unwrap();
+        kf.set_string("login", "server", "https://x");
+        kf.set_boolean("sidebar", "show-usernames", true);
+        kf.set_integer("opened-orphan", "c1", 2);
+        kf.save_to_file(&file).unwrap();
+        // An ended session, or no known user, erases nothing.
+        forget_others_in(&file, true, "ann");
+        forget_others_in(&file, false, "");
+        assert!(file_has_group(&file, "opened-bob"));
+        forget_others_in(&file, false, "ann");
+        assert_eq!(load_opened_from(&file, "ann").len(), 1, "mine stays");
+        assert!(!file_has_group(&file, "opened-bob"));
+        assert!(!file_has_group(&file, "opened-orphan"));
+        assert!(file_has_group(&file, "login"));
+        assert!(file_has_group(&file, "sidebar"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn opened_ranks_are_saved_per_account_and_read_back() {

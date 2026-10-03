@@ -47,6 +47,10 @@ struct Chat {
     sidebar: Rc<RefCell<crate::sidebar::SidebarState>>,
     /// This account's saved opened ranks are loaded into `sidebar` (once the user is known).
     sidebar_loaded: Rc<Cell<bool>>,
+    /// The user chose to remove this device's data: a late save mustn't bring their ranks back.
+    ranks_forgotten: Rc<Cell<bool>>,
+    /// This session was signed out by the user (either way): nothing it started may erase.
+    ended: Rc<Cell<bool>>,
     /// "Show usernames" (a per-device preference): people are named `@handle`, not by name.
     show_usernames: Rc<Cell<bool>>,
     /// Set while the list is rebuilt, so removing and re-adding rows doesn't "select" them.
@@ -267,6 +271,8 @@ pub fn build(
         channel_list: channel_list.clone(),
         sidebar: Rc::default(),
         sidebar_loaded: Rc::default(),
+        ranks_forgotten: Rc::default(),
+        ended: Rc::default(),
         show_usernames: Rc::new(Cell::new(crate::prefs::show_usernames())),
         rebuilding: Rc::default(),
         channels: Rc::new(RefCell::new(Vec::new())),
@@ -903,6 +909,9 @@ fn load_sidebar_ranks(chat: &Rc<Chat>) {
 /// Save the opened ranks for this account (synchronously, so there is no ordering race).
 fn save_sidebar_ranks(chat: &Rc<Chat>, sidebar: &crate::sidebar::SidebarState) {
     let me = chat.me.borrow().clone().unwrap_or_default();
+    if !crate::prefs::may_save_opened(chat.ranks_forgotten.get(), &me) {
+        return;
+    }
     crate::prefs::save_opened(&me, sidebar.opened_ranks());
 }
 
@@ -4445,29 +4454,40 @@ fn report_outbox_lost(chat: &Rc<Chat>) {
 fn wipe_other_accounts(chat: &Rc<Chat>) {
     let chat = chat.clone();
     glib::spawn_future_local(async move {
-        let handle = chat.runtime.spawn({
+        // Their unsent counts are read before the wipe (#46 §8), so the notice can say what
+        // went with it.
+        let lookup = chat.runtime.spawn({
             let client = chat.client.clone();
-            async move {
-                // Their unsent counts are read before the wipe (#46 §8), so the notice can
-                // say what went with it.
-                let others = client.other_local_users().await?;
-                if !others.is_empty() {
-                    client.wipe_other_local_users().await?;
-                }
-                Ok::<_, brook_core::Error>(others)
-            }
+            async move { client.other_local_users().await }
         });
-        if let Ok(Ok(others)) = handle.await {
-            if !others.is_empty() {
-                let unsent: Vec<Option<u64>> = others.iter().map(|o| o.unsent).collect();
-                let alert = adw::AlertDialog::new(
-                    Some("Saved Data Removed"),
-                    Some(&others_removed_text(&unsent)),
-                );
-
-                alert.add_response("ok", "OK");
-                alert.present(Some(&chat.message_list));
-            }
+        let Ok(Ok(others)) = lookup.await else {
+            return;
+        };
+        // Every other account's sidebar order goes, on this thread (every writer of that file
+        // is here) and before the wipe, which stops at the first error. Orphaned ones too,
+        // even with no other data left (#235).
+        let me = chat.me.borrow().clone().unwrap_or_default();
+        // Ended by the user's sign-out, or the view torn down by an involuntary LoggedOut.
+        let ended = chat.ended.get() || chat.offline_banner.root().is_none();
+        crate::prefs::forget_others_than(ended, &me);
+        if others.is_empty() {
+            return;
+        }
+        if ended {
+            return;
+        }
+        let wipe = chat.runtime.spawn({
+            let client = chat.client.clone();
+            async move { client.wipe_other_local_users().await }
+        });
+        if let Ok(Ok(())) = wipe.await {
+            let unsent: Vec<Option<u64>> = others.iter().map(|o| o.unsent).collect();
+            let alert = adw::AlertDialog::new(
+                Some("Saved Data Removed"),
+                Some(&others_removed_text(&unsent)),
+            );
+            alert.add_response("ok", "OK");
+            alert.present(Some(&chat.message_list));
         }
     });
 }
@@ -4532,6 +4552,12 @@ fn sign_out_dialog(chat: &Rc<Chat>) {
             let chat = chat.clone();
             move |_, response| {
                 if response == "sign-out" {
+                    chat.ended.set(true);
+                    // Even if erasing the rest fails: the user asked for it (#235).
+                    let me = chat.me.borrow().clone().unwrap_or_default();
+                    if crate::prefs::sign_out_forgets(remove.is_active(), &me) {
+                        chat.ranks_forgotten.set(true);
+                    }
                     (chat.sign_out)(remove.is_active());
                 }
             }
