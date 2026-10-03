@@ -29,18 +29,25 @@ pgrep() {
   return "$PGREP_RC"
 }
 codesign() { return "$CODESIGN_RC"; }
-MV_SIGNAL=""; MV_SIGNAL_AFTER=0 # a signal sent to the install subshell instead of (or just after) moving the staged copy into place
+# A signal sent to the install subshell just before (or, with _AFTER=1, just after) a mv whose first
+# argument ends in MV_SIGNAL_ON; MV_EXIT does the same with `exit 9` (the shell ends there and the
+# EXIT trap runs): what is left behind must be recoverable whichever way the shell ends. RM_SIGNAL:
+# the same for an rm whose last argument ends in RM_SIGNAL_ON.
+MV_SIGNAL=""; MV_SIGNAL_ON=""; MV_SIGNAL_AFTER=0; MV_EXIT=""; MV_EXIT_AFTER=0; RM_SIGNAL=""; RM_SIGNAL_ON=""
 mv() {
   # bash 3.2 has no $BASHPID, and $$ is the test itself: the external `sh` has the subshell as parent.
-  if [[ -n "$MV_SIGNAL" && "$MV_SIGNAL_AFTER" != 1 && "$1" == *".Brook.app.installing" ]]; then sh -c "kill -$MV_SIGNAL \$PPID"; fi
+  if [[ -n "$MV_SIGNAL" && "$MV_SIGNAL_AFTER" != 1 && "$1" == *"$MV_SIGNAL_ON" ]]; then sh -c "kill -$MV_SIGNAL \$PPID"; fi
+  if [[ -n "$MV_EXIT" && "$MV_EXIT_AFTER" != 1 && "$1" == *"$MV_EXIT" ]]; then MV_EXIT=""; exit 9; fi
   if [[ -n "$MV_FAIL" && "$1" == *"$MV_FAIL" ]]; then return 1; fi
   if [[ "$MV_FAIL_BACK" == 1 && "$1" == *".Brook.app.old" ]]; then return 1; fi
   command mv "$@"
   local rc=$?
-  if [[ "$MV_SIGNAL_AFTER" == 1 && "$1" == *".Brook.app.installing" ]]; then sh -c "kill -INT \$PPID"; fi
+  if [[ -n "$MV_SIGNAL" && "$MV_SIGNAL_AFTER" == 1 && "$1" == *"$MV_SIGNAL_ON" ]]; then sh -c "kill -$MV_SIGNAL \$PPID"; fi
+  if [[ -n "$MV_EXIT" && "$MV_EXIT_AFTER" == 1 && "$1" == *"$MV_EXIT" ]]; then MV_EXIT=""; exit 9; fi
   return "$rc"
 }
 rm() {
+  if [[ -n "$RM_SIGNAL" && "${*: -1}" == *"$RM_SIGNAL_ON" ]]; then sh -c "kill -$RM_SIGNAL \$PPID"; fi
   if [[ -n "$RM_FAIL" && "${*: -1}" == *"$RM_FAIL" ]]; then return 1; fi
   command rm "$@"
 }
@@ -54,7 +61,7 @@ ditto() { # a failing one leaves half a copy behind, like a full disk would
   if [[ -n "$DITTO_HOOK" ]]; then local h="$DITTO_HOOK"; DITTO_HOOK=""; eval "$h"; fi
 }
 fresh() { # a built app (version new) and an installed one (version old)
-  PGREP_AFTER=-1; PGREP_CALLS=0; MV_FAIL=""; MV_FAIL_BACK=0; MV_SIGNAL=""; MV_SIGNAL_AFTER=0; RM_FAIL=""; CODESIGN_RC=0; PGREP_RC=1; DITTO_FAILS=0; DITTO_HOOK=""; DITTO_LOG=""
+  PGREP_AFTER=-1; PGREP_CALLS=0; MV_FAIL=""; MV_FAIL_BACK=0; MV_SIGNAL=""; MV_SIGNAL_ON=""; MV_SIGNAL_AFTER=0; MV_EXIT=""; MV_EXIT_AFTER=0; RM_SIGNAL=""; RM_SIGNAL_ON=""; RM_FAIL=""; CODESIGN_RC=0; PGREP_RC=1; DITTO_FAILS=0; DITTO_HOOK=""; DITTO_LOG=""
   rm -rf "$T/src" "$T/dest"
   mkdir -p "$T/src/Brook.app/Contents" "$T/dest/Brook.app/Contents"
   echo new > "$T/src/Brook.app/Contents/version"; echo old > "$T/dest/Brook.app/Contents/version"
@@ -157,18 +164,76 @@ check "and leaves the old app" old "$(installed)"
 nolock "an uncleared staging path"
 
 # ---- an interrupt (INT, TERM) in and around the swap ----------------------------
-# (a) between "old app moved aside" and "new app in place": the old app must come back.
+# The swap (move the old app aside, rename the staged copy in, or roll back) runs with INT and TERM
+# ignored: a signal in it is dropped, and the install ends consistent (the new app in place, nothing
+# left over). Outside it the signal still ends the install (130/143) and the lock is released.
 for sig in INT TERM; do
-  want=130; [[ "$sig" == TERM ]] && want=143
-  fresh; MV_SIGNAL="$sig"
-  # Stock bash 3.2 runs the exit trap after the call's own redirection is undone: an outer subshell keeps it.
+  # (a) in the move-aside, in the final rename, just after it
+  for on in "/Brook.app" ".Brook.app.installing"; do
+    for after in 0 1; do
+      fresh; MV_SIGNAL="$sig"; MV_SIGNAL_ON="$on"; MV_SIGNAL_AFTER="$after"
+      # Stock bash 3.2 runs the exit trap after the call's own redirection is undone: an outer subshell keeps it.
+      out="$( (install_app "$T/src/Brook.app") 2>&1)"; rc=$?
+      tag="$sig at $on (after=$after)"
+      check "$tag: the install completes" 0 "$rc"; check "$tag: the new app is in place" new "$(installed)"
+      [[ ! -e "$T/dest/.Brook.app.old" && ! -e "$T/dest/.Brook.app.installing" ]] && ok || bad "$tag leaves no backup or staged copy"
+      lacks "$tag restores nothing" "$out" "restored"
+      nolock "$tag"
+    done
+  done
+  # (a2) in the explicit rollback after a failed final rename: the old app ends in place
+  fresh; MV_FAIL=".Brook.app.installing"; MV_SIGNAL="$sig"; MV_SIGNAL_ON=".Brook.app.old"
   out="$( (install_app "$T/src/Brook.app") 2>&1)"; rc=$?
-  check "$sig in the swap exits $want" "$want" "$rc"
-  check "$sig in the swap: the old app is back" old "$(installed)"
-  has "$sig in the swap: it says so" "$out" "interrupted: restored the previous Brook.app"
-  [[ ! -e "$T/dest/.Brook.app.old" ]] && ok || bad "$sig in the swap leaves no backup"
-  nolock "an $sig in the swap"
+  check "$sig in the rollback: the install fails" 1 "$rc"; check "$sig in the rollback: the old app is back" old "$(installed)"
+  [[ ! -e "$T/dest/.Brook.app.old" && ! -e "$T/dest/.Brook.app.installing" ]] && ok || bad "$sig in the rollback leaves no backup or staged copy"
+  nolock "an $sig in the rollback"
+  # (a3) after the swap (removing the backup) the signal is live again
+  want=130; [[ "$sig" == TERM ]] && want=143
+  fresh; RM_SIGNAL="$sig"; RM_SIGNAL_ON=".Brook.app.old"
+  out="$( (install_app "$T/src/Brook.app") 2>&1)"; rc=$?
+  check "$sig after the swap exits $want" "$want" "$rc"; check "$sig after the swap: the new app stays" new "$(installed)"
+  nolock "an $sig after the swap"
 done
+# (a4) the shell ending (not a signal) inside the swap: the EXIT trap puts the old app back. After the
+# move-aside (the flag must be set before it), and after a failed final rename, before the rollback.
+fresh; MV_EXIT="/Brook.app"; MV_EXIT_AFTER=1
+out="$( (install_app "$T/src/Brook.app") 2>&1)"; rc=$?
+check "an exit just after the move-aside ends 9" 9 "$rc"; check "and the old app is back" old "$(installed)"
+has "and says so" "$out" "interrupted: restored the previous Brook.app"
+[[ ! -e "$T/dest/.Brook.app.old" ]] && ok || bad "an exit after the move-aside leaves no backup"
+nolock "an exit just after the move-aside"
+fresh; MV_FAIL=".Brook.app.installing"; MV_EXIT=".Brook.app.old"
+out="$( (install_app "$T/src/Brook.app") 2>&1)"; rc=$?
+check "an exit in the rollback after a failed rename ends 9" 9 "$rc"; check "and the old app is back" old "$(installed)"
+nolock "an exit in the rollback"
+# (a5) a second signal during the EXIT cleanup must not cut it short: the first signal ends the install
+# (in the copy, nothing swapped), the second arrives as the lock is released.
+for sig2 in INT TERM; do
+  fresh; DITTO_HOOK='sh -c "kill -INT \$PPID"'; RM_SIGNAL="$sig2"; RM_SIGNAL_ON=".Brook.app.lock"
+  out="$( (install_app "$T/src/Brook.app") 2>&1)"; rc=$?
+  check "a first INT then a second $sig2 in the cleanup exits 130" 130 "$rc"
+  nolock "a $sig2 during the cleanup"
+  check "and the old app is untouched" old "$(installed)"
+done
+# (a6) ... nor the restore: the cleanup entered with the swap flag set and the app moved aside.
+for sig2 in INT TERM; do
+  fresh; command mv "$T/dest/Brook.app" "$T/dest/.Brook.app.old"
+  MV_SIGNAL="$sig2"; MV_SIGNAL_ON=".Brook.app.old"
+  out="$( (
+    _INSTALL_LOCK="$T/dest/.Brook.app.lock"; _INSTALL_TOKEN=tok; _INSTALL_SWAPPING=1
+    trap '_install_on_exit' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+    _install_lock_acquire "$_INSTALL_LOCK"; exit 9
+  ) 2>&1)"; rc=$?
+  check "a $sig2 during the restore: the exit status is the shell's own" 9 "$rc"
+  check "a $sig2 during the restore: the old app is back" old "$(installed)"
+  nolock "a $sig2 during the restore"
+done
+# (a7) no installed app, a stale backup of an earlier run, a failed final rename: the stale backup is
+# not made the app by the rollback.
+fresh; command rm -rf "$T/dest/Brook.app"; mkdir -p "$T/dest/.Brook.app.old"; echo stale > "$T/dest/.Brook.app.old/s"; MV_FAIL=".Brook.app.installing"
+out="$( (install_app "$T/src/Brook.app") 2>&1)"; rc=$?
+check "a failed first install fails" 1 "$rc"
+[[ ! -e "$T/dest/Brook.app" && -f "$T/dest/.Brook.app.old/s" ]] && ok || bad "a stale backup is not rolled back into place"
 # (b) during the copy: nothing was touched yet, so nothing is restored.
 fresh; DITTO_HOOK='sh -c "kill -INT \$PPID"'
 out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?
@@ -183,14 +248,14 @@ out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?
 check "a leftover backup after a good swap: success" 0 "$rc"; check "and the new app stays" new "$(installed)"
 [[ -f "$T/dest/.Brook.app.old/Contents/version" && ! -e "$T/dest/Brook.app/.Brook.app.old" ]] && ok || bad "the leftover backup stays put, nothing is nested in the app"
 lacks "and nothing is restored" "$out" "restored"
-# (c2) an INT just after the new app landed, before the swap is over: the target exists, the backup
-# does too, and the exit must leave both alone.
-fresh; MV_SIGNAL_AFTER=1
+# (c2) the same with an exit just after the final rename: the target exists, the backup does too, and
+# the exit must leave both alone.
+fresh; MV_EXIT=".Brook.app.installing"; MV_EXIT_AFTER=1
 out="$( (install_app "$T/src/Brook.app") 2>&1)"; rc=$?
-check "INT just after the swap exits 130" 130 "$rc"; check "and the new app stays" new "$(installed)"
+check "an exit just after the final rename ends 9" 9 "$rc"; check "and the new app stays" new "$(installed)"
 [[ ! -e "$T/dest/Brook.app/.Brook.app.old" ]] && ok || bad "an existing target gets no backup nested in it"
 lacks "and nothing is restored" "$out" "restored"
-nolock "an INT just after the swap"
+nolock "an exit just after the final rename"
 # (d) a refusal that never moved anything aside leaves a stale backup of an earlier run alone.
 fresh; command rm -rf "$T/dest/Brook.app"; mkdir -p "$T/dest/.Brook.app.old"; echo stale > "$T/dest/.Brook.app.old/s"; PGREP_RC=0
 out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?

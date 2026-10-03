@@ -117,18 +117,30 @@ install_app() (
   _INSTALL_TOKEN="$(/usr/bin/uuidgen)" || exit 1
   _INSTALL_SWAPPING=0
   # The restore runs before the release: the lock is held until the app is back.
-  trap '_install_restore_if_swapping; _install_lock_release "$_INSTALL_LOCK"' EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  trap '_install_on_exit' EXIT
+  _install_signals_live
   _install_lock_acquire "$_INSTALL_LOCK" || exit 1
   _install_app_locked "$@"
 )
 
-# Runs on every exit of install_app. An INT or TERM between "old app moved aside" and "new app in
-# place" would leave no Brook.app at all, so the backup is moved back. Only while the swap flag is
-# set (this run moved the app aside itself: a stale backup of an earlier run, or a refusal that
-# never owned the lock, is never restored) and only into an absent target (an existing target is
-# never touched, so a backup that could not be removed after a good swap stays where it is).
+# The handlers for a signal outside the swap: end the install, which runs the EXIT trap.
+_install_signals_live() {
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+# Runs on every exit of install_app. A second INT or TERM must not cut the cleanup short (an `exit`
+# inside the EXIT trap would skip the restore and the lock release), so both are ignored first.
+_install_on_exit() {
+  trap '' INT TERM
+  _install_restore_if_swapping
+  _install_lock_release "$_INSTALL_LOCK"
+}
+
+# An exit while the app is moved aside would leave no Brook.app at all, so the backup is moved back.
+# Only while the swap flag is set (this run is inside its own swap: a stale backup of an earlier run,
+# or a refusal that never owned the lock, is never restored) and only into an absent target (an
+# existing target is never touched, so a backup that could not be removed after a good swap stays).
 _install_restore_if_swapping() {
   local dir="${BROOK_INSTALL_DIR:-/Applications}"
   if [[ "$_INSTALL_SWAPPING" == 1 && -e "$dir/.Brook.app.old" && ! -e "$dir/Brook.app" ]]; then
@@ -137,6 +149,44 @@ _install_restore_if_swapping() {
     fi
   fi
   return 0
+}
+
+# The swap: move the installed app ($3) aside, put the staged copy ($1) at $2, or roll back. Runs with
+# INT and TERM ignored (a few renames: a Ctrl-C is dropped rather than leaving no app), so no signal
+# can end the shell inside it; the flag is set before the first move and cleared only once the swap
+# or its rollback is over, which covers any other way the shell could end in between.
+_install_swap() {
+  local tmp="$1" target="$2" old="$3" moved=0
+  trap '' INT TERM
+  if [[ -e "$target" ]]; then
+    _INSTALL_SWAPPING=1
+    if ! mv "$target" "$old"; then
+      rm -rf "$tmp"
+      echo "couldn't move the installed app aside; it is unchanged" >&2
+      _INSTALL_SWAPPING=0; _install_signals_live
+      return 1
+    fi
+    moved=1
+  fi
+  if mv "$tmp" "$target"; then
+    _INSTALL_SWAPPING=0; _install_signals_live
+    return 0
+  fi
+  echo "couldn't put the new app in place at $target" >&2
+  # Only a backup this swap made is put back, never a stale one beside an absent target.
+  if (( moved )); then
+    if mv "$old" "$target"; then
+      echo "the previous app was put back" >&2
+    else
+      # Both ways failed: the verified staged copy is a second way back, so it stays.
+      echo "the previous app is at $old and the new, verified copy is at $tmp (put one in place by hand)" >&2
+      _INSTALL_SWAPPING=0; _install_signals_live
+      return 1
+    fi
+  fi
+  rm -rf "$tmp"
+  _INSTALL_SWAPPING=0; _install_signals_live
+  return 1
 }
 
 _install_app_locked() {
@@ -160,38 +210,13 @@ _install_app_locked() {
     rm -rf "$tmp"
     return 1
   fi
-  if [[ -e "$target" ]]; then
-    # A backup left by an earlier failed run would make the mv nest the app inside it.
-    if [[ -e "$old" ]] && ! rm -rf "$old"; then
-      rm -rf "$tmp"
-      echo "couldn't clear the stale $old; the installed app is unchanged" >&2
-      return 1
-    fi
-    if ! mv "$target" "$old"; then
-      rm -rf "$tmp"
-      echo "couldn't move the installed app aside; it is unchanged" >&2
-      return 1
-    fi
-    _INSTALL_SWAPPING=1
-  fi
-  mv "$tmp" "$target"
-  local swap_rc=$?
-  # Past the window: from here the explicit handling below owns the way back.
-  _INSTALL_SWAPPING=0
-  if (( swap_rc != 0 )); then
-    echo "couldn't put the new app in place at $target" >&2
-    if [[ -e "$old" ]]; then
-      if mv "$old" "$target"; then
-        echo "the previous app was put back" >&2
-      else
-        # Both ways failed: the verified staged copy is a second way back, so it stays.
-        echo "the previous app is at $old and the new, verified copy is at $tmp (put one in place by hand)" >&2
-        return 1
-      fi
-    fi
+  # A backup left by an earlier failed run would make the mv nest the app inside it.
+  if [[ -e "$target" && -e "$old" ]] && ! rm -rf "$old"; then
     rm -rf "$tmp"
+    echo "couldn't clear the stale $old; the installed app is unchanged" >&2
     return 1
   fi
+  _install_swap "$tmp" "$target" "$old" || return 1
   rm -rf "$old" || echo "warning: couldn't remove the previous app at $old; delete it by hand" >&2
   echo "installed: $target"
   echo "codesign --verify --deep --strict: ok"
