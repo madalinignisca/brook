@@ -8,21 +8,31 @@ import XCTest
 /// A file system for staging tests: each URL's facts, and every start and stop counted.
 final class FakeFileAccess: FileAccess, @unchecked Sendable {
     let files: [String: (regular: Bool, size: UInt64, type: String?)]
-    let refuseAccess: Set<String>
+    /// Names whose `startAccessing` is false (a dropped file: no scope), though readable.
+    let unscoped: Set<String>
+    /// Names `canRead` refuses.
+    let unreadable: Set<String>
     let starts = Mutex<[String]>([])
     let stops = Mutex<[String]>([])
-    init(_ files: [String: (regular: Bool, size: UInt64, type: String?)], refuseAccess: Set<String> = []) {
+    init(_ files: [String: (regular: Bool, size: UInt64, type: String?)], unscoped: Set<String> = [],
+         unreadable: Set<String> = []) {
         self.files = files
-        self.refuseAccess = refuseAccess
+        self.unscoped = unscoped
+        self.unreadable = unreadable
     }
     func startAccessing(_ url: URL) -> Bool {
-        if refuseAccess.contains(url.lastPathComponent) { return false }
+        if unscoped.contains(url.lastPathComponent) { return false }
         starts.withLock { $0.append(url.lastPathComponent) }
         return true
     }
     func stopAccessing(_ url: URL) { stops.withLock { $0.append(url.lastPathComponent) } }
     func facts(_ url: URL) -> (regular: Bool, size: UInt64, type: String?)? { files[url.lastPathComponent] }
+    func canRead(_ url: URL) -> Bool { !unreadable.contains(url.lastPathComponent) }
     var balanced: Bool { starts.withLock { $0.sorted() } == stops.withLock { $0.sorted() } }
+}
+
+extension Result {
+    var failure: Failure? { if case let .failure(e) = self { e } else { nil } }
 }
 
 func fileURL(_ name: String) -> URL { URL(fileURLWithPath: "/tmp/brook-test/\(name)") }
@@ -40,9 +50,9 @@ final class SendFilesTests: XCTestCase {
 
     func testStagingRefusesAsGtkAndStopsTheAccessItStarted() {
         let access = FakeFileAccess([
-            "a.png": ok, "folder": (false, 0, nil), "empty.txt": (true, 0, "text/plain"),
+            "a.png": ok, "locked.txt": ok, "folder": (false, 0, nil), "empty.txt": (true, 0, "text/plain"),
             "huge.bin": (true, maxFileBytes() + 1, nil),
-        ], refuseAccess: ["locked.txt"])
+        ], unreadable: ["locked.txt"])
         let chat = FakeChat()
         chat.local = true
         let c = composer(chat, access)
@@ -63,6 +73,58 @@ final class SendFilesTests: XCTestCase {
         c.attach([fileURL("a.png")]) // the same one again: ignored
         XCTAssertEqual(c.staged.map(\.name), ["a.png"])
         XCTAssertEqual(c.staged.first?.contentType, "image/png")
+    }
+
+    func testADroppedFileWithNoScopeIsStagedAndNeverStopped() {
+        let access = FakeFileAccess(["d.jpg": ok], unscoped: ["d.jpg"])
+        let r = Staging.stage(fileURL("d.jpg"), already: [], access: access)
+        guard case let .success(file) = r else { return XCTFail("refused: \(r)") }
+        file.release()
+        XCTAssertTrue(access.stops.withLock { $0 }.isEmpty, "stopped a scope that was never started")
+    }
+
+    func testAScopedFileIsStoppedOnceOnRelease() {
+        let access = FakeFileAccess(["s.jpg": ok])
+        guard case let .success(file) = Staging.stage(fileURL("s.jpg"), already: [], access: access)
+        else { return XCTFail("refused") }
+        XCTAssertTrue(access.stops.withLock { $0 }.isEmpty)
+        file.release()
+        file.release()
+        XCTAssertEqual(access.stops.withLock { $0 }, ["s.jpg"])
+    }
+
+    func testUnscopedAndUnreadableOrUnknownIsRefused() {
+        let access = FakeFileAccess(["u.jpg": ok], unscoped: ["u.jpg", "n.jpg"], unreadable: ["u.jpg"])
+        XCTAssertEqual(Staging.stage(fileURL("u.jpg"), already: [], access: access).failure, .unreadable("u.jpg"))
+        XCTAssertEqual(Staging.stage(fileURL("n.jpg"), already: [], access: access).failure, .unreadable("n.jpg"))
+        XCTAssertTrue(access.stops.withLock { $0 }.isEmpty)
+    }
+
+    func testALaterRefusalStopsOnlyAScopeThatWasStarted() {
+        let big: (regular: Bool, size: UInt64, type: String?) = (true, maxFileBytes() + 1, nil)
+        let access = FakeFileAccess(["scoped.bin": big, "plain.bin": big], unscoped: ["plain.bin"])
+        XCTAssertEqual(Staging.stage(fileURL("scoped.bin"), already: [], access: access).failure, .tooLarge("scoped.bin"))
+        XCTAssertEqual(Staging.stage(fileURL("plain.bin"), already: [], access: access).failure, .tooLarge("plain.bin"))
+        XCTAssertEqual(access.stops.withLock { $0 }, ["scoped.bin"])
+    }
+
+    func testRealFileSystemStagesAPlainFileAndRefusesTheRest() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("brook-stage-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let plain = dir.appendingPathComponent("plain.txt")
+        try Data("hello".utf8).write(to: plain)
+        let access = SystemFileAccess()
+        guard case let .success(file) = Staging.stage(plain, already: [], access: access)
+        else { return XCTFail("a plain file was refused") }
+        file.release()
+        XCTAssertEqual(Staging.stage(dir.appendingPathComponent("nope.txt"), already: [], access: access).failure,
+                       .unreadable("nope.txt"))
+        guard getuid() != 0 else { return }
+        let locked = dir.appendingPathComponent("locked.txt")
+        try Data("hello".utf8).write(to: locked)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: locked.path)
+        XCTAssertEqual(Staging.stage(locked, already: [], access: access).failure, .unreadable("locked.txt"))
     }
 
     func testAtMostTenFilesAndRemovingOneEndsItsAccess() {
