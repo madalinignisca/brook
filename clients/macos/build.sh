@@ -5,7 +5,8 @@
 #   clients/macos/build.sh test
 #   clients/macos/build.sh release → …/Release/Brook.app (hardened runtime, shipped entitlements only)
 #   clients/macos/build.sh install  → release, then copies it to ${BROOK_INSTALL_DIR:-/Applications}/Brook.app
-#     (refuses while Brook runs). The build output is build.noindex so Spotlight finds only that app.
+#     (refuses while Brook runs). The build output is build.noindex so Spotlight (for builds made
+#     with this script) finds only that app.
 #   clients/macos/build.sh notarize → release, then Apple's notary, stapling and a zip to ship (#68)
 #     Needs, in the gitignored Local.xcconfig, the name of a `notarytool store-credentials` profile:
 #       BROOK_NOTARY_PROFILE = <profile name>
@@ -14,6 +15,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 command -v xcodegen >/dev/null || { echo "xcodegen not found (brew install xcodegen)" >&2; exit 1; }
+# The install path is destructive: its tests (fast, no build) run before anything is built.
+[[ "${1:-}" == "test" ]] && { "$HERE/test-install.sh" || exit 1; }
 
 args=(build)
 config=Debug
@@ -33,6 +36,10 @@ if [[ "$mode" == "notarize" ]]; then
   notary_profile="$(read_notary_profile "$HERE/Local.xcconfig")"
   [[ -n "$notary_profile" ]] || {
     echo "notarize needs BROOK_NOTARY_PROFILE in Local.xcconfig (see the header of build.sh)" >&2; exit 1; }
+fi
+if [[ "$mode" == "install" ]]; then
+  # Before the long builds too; install_app checks again, right before the swap.
+  refuse_if_brook_running || exit 1
 fi
 # After the checks above, so a missing setting fails at once, not after the slow builds.
 "$ROOT/bindings/apple/build-xcframework.sh"

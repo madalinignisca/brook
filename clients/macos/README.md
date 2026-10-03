@@ -13,8 +13,9 @@ clients/macos/build.sh test     # + unit tests (60 s cap per test, so a deadlock
 clients/macos/build.sh install  # Release build, then installs /Applications/Brook.app (quit Brook first)
 ```
 
-Build output goes to `build.noindex/` so Spotlight finds only the installed app, not a Debug
-and a Release copy. A Debug build titles its window "Brook (Debug)" and, being ad-hoc signed
+For builds made with `build.sh`, the output goes to `build.noindex/` (Spotlight skips it), so
+Spotlight finds the installed app, not a Debug and a Release copy. Builds from the Xcode IDE
+still land in DerivedData. A Debug build titles its window "Brook (Debug)" and, being ad-hoc signed
 without the keychain group, can't stay signed in; use `install` for the app you live in.
 
 `Brook.xcodeproj`, `Info.plist` and `Brook.entitlements` are **generated** from

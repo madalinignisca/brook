@@ -10,4 +10,11 @@ final class AppTitleTests: XCTestCase {
     func testReleaseTitleIsPlain() {
         XCTAssertEqual(AppTitle.window(debug: false), "Brook")
     }
+
+    /// The title the app really uses; the test host is a Debug build.
+    func testMainTitleMatchesTheBuildConfiguration() {
+        #if DEBUG
+            XCTAssertEqual(AppTitle.main, "Brook (Debug)")
+        #endif
+    }
 }
