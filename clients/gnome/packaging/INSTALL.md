@@ -43,4 +43,17 @@ Calls use H.264 (x264 or openh264, whichever is installed) and fall back to VP8.
 `BROOK_HW_ENCODE=1 brook-gnome` tries GPU H.264 encoding (Intel/AMD, needs the
 VA-API GStreamer plugin). Screen sharing uses your desktop's own picker.
 
+## Troubleshooting
+
+Start Brook from a terminal to see its log on stderr. It logs at `info` by default:
+
+```sh
+RUST_LOG=debug brook-gnome          # more detail from Brook (and its core)
+G_MESSAGES_DEBUG=all brook-gnome    # GTK, libadwaita and GLib messages
+GST_DEBUG=3 brook-gnome             # GStreamer warnings, for calls (4 or 5 for more)
+```
+
+The WebSocket libraries stay at `info` even under `RUST_LOG=trace`. Debug logs can
+name servers, users and channels: read one before posting it publicly.
+
 Uninstall: `./install.sh --uninstall`.
