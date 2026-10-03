@@ -63,30 +63,45 @@ refuse_if_brook_running() {
 }
 
 # One install at a time per destination: two would share the staged copy and the backup, and one
-# could install the other's half-written copy and delete the working backup. The lock is a
-# directory (mkdir is atomic) holding the pid of its owner. A lock whose owner is gone is taken
-# over; a live one is a refusal that touches nothing. Runs in install_app's own subshell, so
-# $BASHPID is the owner and the traps below are the subshell's: build.sh's traps are not touched.
+# could install the other's half-written copy and delete the working backup. The lock is a SYMLINK
+# whose target string is its owner, "<pid> <token>": creating a symlink is atomic and carries the
+# owner with it, so there is no half-made lock (no empty-owner window, nothing a failed or
+# interrupted write can leave behind). The pid is $$, the process running build.sh, which a
+# subshell inherits (stock bash 3.2 has no $BASHPID). Liveness looks at the pid field only; the
+# token (unique per call) is what release compares, so a second install made by the same process
+# still finds the first one's lock held.
+#
+# An existing lock is always a refusal that touches nothing: a live owner is named, and a lock
+# whose pid is not alive (dead, empty, not a number, 0) is left for the user to remove, with the
+# command to do it. It is never removed automatically. A lock path that is a real file or
+# directory is not ours and is refused. Runs in install_app's own subshell, so the traps below
+# are the subshell's: build.sh's traps are not touched.
 _install_lock_acquire() {
-  local lock="$1" pid
+  local lock="$1" owner="$$ $_INSTALL_TOKEN" cur pid
   mkdir -p "$(dirname "$lock")" 2>/dev/null
-  if ! mkdir "$lock" 2>/dev/null; then
-    pid="$(cat "$lock/pid" 2>/dev/null)"
-    # No pid yet: its owner is between mkdir and the write, so it is live.
-    if [[ -z "$pid" ]] || kill -0 "$pid" 2>/dev/null; then
-      echo "another install is running (pid ${pid:-unknown}); nothing was changed (a stale $lock can be deleted by hand)" >&2
-      return 1
-    fi
-    echo "taking over the lock of the install that died (pid $pid)" >&2
-    rm -rf "$lock" || { echo "couldn't clear the stale lock $lock" >&2; return 1; }
-    mkdir "$lock" 2>/dev/null || { echo "another install took the lock first; nothing was changed" >&2; return 1; }
+  # A real file or directory at the path is not one of ours: ln would create the link inside a
+  # directory, so it is checked first. -n: never follow an existing link that points at a directory.
+  if [[ -e "$lock" && ! -L "$lock" ]]; then
+    echo "$lock is not an install lock; nothing was changed (delete it by hand)" >&2
+    return 1
   fi
-  echo "$BASHPID" > "$lock/pid"
+  if ln -sn -- "$owner" "$lock" 2>/dev/null; then return 0; fi
+  cur="$(readlink "$lock" 2>/dev/null)"
+  pid="${cur%% *}"
+  case "$pid" in
+    ''|*[!0-9]*) ;;
+    *) if (( 10#$pid > 0 )) && kill -0 "$pid" 2>/dev/null; then
+         echo "another install is running (pid $pid); nothing was changed" >&2
+         return 1
+       fi ;;
+  esac
+  echo "a lock from an install that is no longer running is in the way: remove it with: rm \"$lock\" and run the install again" >&2
+  return 1
 }
 
 # Only the owner's lock is removed.
 _install_lock_release() {
-  if [[ "$(cat "$1/pid" 2>/dev/null)" == "$BASHPID" ]]; then rm -rf "$1"; fi
+  if [[ "$(readlink "$1" 2>/dev/null)" == "$$ $_INSTALL_TOKEN" ]]; then rm -f "$1"; fi
   return 0
 }
 
@@ -96,11 +111,14 @@ _install_lock_release() {
 # which turns `set -e` off here: every command checks its own status. A subshell, so the lock is
 # released on every way out (return, INT, TERM) without replacing the caller's traps.
 install_app() (
-  local lock="${BROOK_INSTALL_DIR:-/Applications}/.Brook.app.lock"
-  trap '_install_lock_release "$lock"' EXIT
+  # Plain variables, not `local`: bash 3.2 runs the EXIT trap after the locals are gone (under
+  # `set -u` that is "unbound variable"). They are this subshell's own.
+  _INSTALL_LOCK="${BROOK_INSTALL_DIR:-/Applications}/.Brook.app.lock"
+  _INSTALL_TOKEN="$(/usr/bin/uuidgen)" || exit 1
+  trap '_install_lock_release "$_INSTALL_LOCK"' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  _install_lock_acquire "$lock" || exit 1
+  _install_lock_acquire "$_INSTALL_LOCK" || exit 1
   _install_app_locked "$@"
 )
 

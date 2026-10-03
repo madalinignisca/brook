@@ -4,6 +4,12 @@
 #   clients/macos/test-install.sh
 # Fake `pgrep`, `ditto`, `codesign`, `mv` and `rm` are shell functions shadowing the real tools.
 set -uo pipefail
+# Stock macOS /bin/bash is 3.2, and the scripts must run there too; anything newer is a bonus. The
+# version and tools this file needs are checked first, so a lacking one fails loudly, not in a check.
+if (( BASH_VERSINFO[0] < 3 || (BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] < 2) )); then
+  echo "test-install: needs bash 3.2 or newer (this is $BASH_VERSION)" >&2; exit 2
+fi
+[[ -x /usr/bin/uuidgen && -x /usr/bin/python3 ]] || { echo "test-install: needs /usr/bin/uuidgen and /usr/bin/python3" >&2; exit 2; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/install-lib.sh"
 pass=0; fail=0
@@ -32,21 +38,24 @@ rm() {
   if [[ -n "$RM_FAIL" && "${*: -1}" == *"$RM_FAIL" ]]; then return 1; fi
   command rm "$@"
 }
-DITTO_CALLS=0; DITTO_HOOK="" # DITTO_HOOK runs once, right after a copy (an install overlapping this one)
+# Installs run in subshells, so a counter variable would never reach the test: copies are logged to
+# the file DITTO_LOG. DITTO_HOOK runs once, right after a copy (an install overlapping this one).
+DITTO_LOG=""; DITTO_HOOK=""
 ditto() { # a failing one leaves half a copy behind, like a full disk would
-  DITTO_CALLS=$((DITTO_CALLS + 1))
+  if [[ -n "$DITTO_LOG" ]]; then echo copy >> "$DITTO_LOG"; fi
   if [[ "$DITTO_FAILS" == 1 ]]; then mkdir -p "$2"; echo partial > "$2/partial"; return 1; fi
   command ditto "$@" || return 1
   if [[ -n "$DITTO_HOOK" ]]; then local h="$DITTO_HOOK"; DITTO_HOOK=""; eval "$h"; fi
 }
 fresh() { # a built app (version new) and an installed one (version old)
-  PGREP_AFTER=-1; PGREP_CALLS=0; MV_FAIL=""; MV_FAIL_BACK=0; RM_FAIL=""; CODESIGN_RC=0; PGREP_RC=1; DITTO_FAILS=0; DITTO_HOOK=""
+  PGREP_AFTER=-1; PGREP_CALLS=0; MV_FAIL=""; MV_FAIL_BACK=0; RM_FAIL=""; CODESIGN_RC=0; PGREP_RC=1; DITTO_FAILS=0; DITTO_HOOK=""; DITTO_LOG=""
   rm -rf "$T/src" "$T/dest"
   mkdir -p "$T/src/Brook.app/Contents" "$T/dest/Brook.app/Contents"
   echo new > "$T/src/Brook.app/Contents/version"; echo old > "$T/dest/Brook.app/Contents/version"
   export BROOK_INSTALL_DIR="$T/dest"
 }
-nolock() { [[ ! -e "$T/dest/.Brook.app.lock" ]] && ok || bad "$1 releases the lock"; }
+# The lock is a (dangling) symlink: -e alone would say it is absent while it is held.
+nolock() { [[ ! -e "$T/dest/.Brook.app.lock" && ! -L "$T/dest/.Brook.app.lock" ]] && ok || bad "$1 releases the lock"; }
 installed() { cat "$T/dest/Brook.app/Contents/version" 2>/dev/null; }
 
 # ---- install ----------------------------------------------------------------
@@ -142,25 +151,53 @@ check "and leaves the old app" old "$(installed)"
 nolock "an uncleared staging path"
 
 # ---- the per-destination lock --------------------------------------------------
-fresh; mkdir -p "$T/dest/.Brook.app.lock"; echo "$$" > "$T/dest/.Brook.app.lock/pid"; mkdir "$T/dest/.Brook.app.installing"; echo mine > "$T/dest/.Brook.app.installing/x"
-DITTO_CALLS=0
+L="$T/dest/.Brook.app.lock"
+fresh; ln -s "$$ othertoken" "$L"; mkdir "$T/dest/.Brook.app.installing"; echo mine > "$T/dest/.Brook.app.installing/x"
+DITTO_LOG="$T/ditto.log"; : > "$DITTO_LOG"
 out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?
 check "a live lock refuses" 1 "$rc"; has "and names the pid" "$out" "another install is running (pid $$)"
 check "a refused install leaves the old app" old "$(installed)"
 [[ -f "$T/dest/.Brook.app.installing/x" ]] && ok || bad "a refused install does not touch the other's staged copy"
-check "a refused install copies nothing" 0 "$DITTO_CALLS"
-[[ "$(cat "$T/dest/.Brook.app.lock/pid")" == "$$" ]] && ok || bad "a refused install leaves the other's lock"
+check "a refused install copies nothing" 0 "$(wc -l < "$DITTO_LOG" | tr -d ' ')"
+check "a refused install leaves the other's lock" "$$ othertoken" "$(readlink "$L")"
 
-fresh; mkdir -p "$T/dest/.Brook.app.lock"; : > "$T/dest/.Brook.app.lock/pid"
+# Not a live pid: not a number, 0, negative. Treated as dead: refused with the rm hint, never removed.
+for tgt in "garbage" "garbage with words" "0 tok" "-1 tok" ""; do
+  fresh; ln -s -- "$tgt" "$L"
+  out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?
+  check "a lock owned by '$tgt' (no live pid) refuses" 1 "$rc"
+  has "and gives the rm hint" "$out" "remove it with: rm \"$L\" and run the install again"
+  lacks "and does not call it running" "$out" "another install is running"
+  check "and the lock is left in place" "$tgt" "$(readlink "$L")"
+  check "and nothing was installed" old "$(installed)"
+done
+# A lock path that is a real directory is not ours: refused, and no link is made inside it.
+fresh; mkdir "$L"
 out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?
-check "a lock with no pid yet counts as live" 1 "$rc"; check "and the old app stays" old "$(installed)"
+check "a lock path that is a plain directory refuses" 1 "$rc"; has "and says so" "$out" "not an install lock"
+[[ -z "$(ls -A "$L")" ]] && ok || bad "no link is created inside a directory at the lock path"
+# A link whose target is a real directory must not be followed.
+fresh; mkdir "$T/elsewhere"; ln -s "$T/elsewhere" "$L"
+out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?
+check "a link pointing at a directory refuses" 1 "$rc"
+[[ -z "$(ls -A "$T/elsewhere")" ]] && ok || bad "the link target directory is not written into"
+rm -rf "$T/elsewhere"
+# A live pid with no token is still live.
+fresh; ln -s "$$" "$L"
+out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?
+check "a lock with a live pid and no token refuses" 1 "$rc"; check "and stays" "$$" "$(readlink "$L")"
 
 fresh; sleep 0 & dead=$!; wait "$dead"
-mkdir -p "$T/dest/.Brook.app.lock"; echo "$dead" > "$T/dest/.Brook.app.lock/pid"
+ln -s "$dead tok" "$L"
 out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?
-check "a lock of a dead pid is taken over" 0 "$rc"; has "and the takeover is announced" "$out" "taking over the lock"
-check "and the install happens" new "$(installed)"
-nolock "a takeover"
+check "a lock of a dead pid refuses" 1 "$rc"
+has "and says how to remove it" "$out" "a lock from an install that is no longer running is in the way: remove it with: rm \"$L\" and run the install again"
+check "and does NOT delete it" "$dead tok" "$(readlink "$L")"
+check "and nothing was installed" old "$(installed)"
+command rm -f "$L"
+out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?
+check "after the lock is removed by hand the install succeeds" 0 "$rc"; check "and installs" new "$(installed)"
+nolock "the install after a hand-removed lock"
 
 fresh
 out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?
@@ -172,10 +209,11 @@ check "and a second one right after succeeds" 0 "$rc"
 # A second install starting between the first one's stage and swap.
 fresh
 # B runs inside A's copy step (a subshell), so what B saw goes to a file.
-DITTO_HOOK='{ install_app "$T/src/Brook.app" 2>&1; echo "rc=$?"; echo "staged=$(cat "$T/dest/.Brook.app.installing/Contents/version" 2>/dev/null)"; } > "$T/b.out"'
+DITTO_HOOK='{ install_app "$T/src/Brook.app" 2>&1; echo "rc=$?"; echo "staged=$(cat "$T/dest/.Brook.app.installing/Contents/version" 2>/dev/null)"; [[ -L "$T/dest/.Brook.app.lock" ]] && echo lock=held; } > "$T/b.out"'
 out="$(install_app "$T/src/Brook.app" 2>&1)"; outB="$(cat "$T/b.out")"
 has "the overlapping install refuses" "$outB" "rc=1"; has "and names the running one" "$outB" "another install is running"
 has "and the staged copy it saw is the first one's, complete" "$outB" "staged=new"
+has "and the refused one leaves the first one's lock (same pid, another token)" "$outB" "lock=held"
 has "the first install completes" "$out" "installed: $T/dest/Brook.app"
 check "and leaves a complete app" new "$(installed)"; [[ -f "$T/dest/Brook.app/Contents/version" ]] && ok || bad "the app is complete"
 [[ ! -e "$T/dest/.Brook.app.installing" && ! -e "$T/dest/.Brook.app.old" ]] && ok || bad "no staged copy or backup remains after the overlap"
