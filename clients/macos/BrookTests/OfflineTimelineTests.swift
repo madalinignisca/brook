@@ -211,4 +211,38 @@ final class OfflineTimelineTests: XCTestCase {
         chat.historyGate?.open()
         await settle("retry didn't finish") { !t.loading }
     }
+
+    /// A resync while a retry's fetch is in flight neither runs beside it nor is lost: one
+    /// more head fetch follows when it ends.
+    func testResyncDuringARetryWaitsThenFetchesAgain() async {
+        let chat = FakeChat()
+        let t = await failedHead(chat)
+        chat.historyGate = Gate()
+        t.apply(.ready) // the retry, held at the gate
+        await settle("retry didn't start") { chat.historyCalls.withLock { $0 } == 2 }
+        t.apply(.resync)
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(chat.historyCalls.withLock { $0 }, 2, "a second fetch beside the first")
+        chat.historyFailure = nil
+        chat.historyGate?.open()
+        await settle("resync's fetch didn't follow") { chat.historyCalls.withLock { $0 } == 3 && !t.loading }
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(chat.historyCalls.withLock { $0 }, 3)
+        XCTAssertNil(t.error)
+    }
+
+    /// Several resyncs while one fetch is in flight are one more fetch, not one each.
+    func testResyncsDuringAFetchCoalesce() async {
+        let chat = FakeChat()
+        let t = await failedHead(chat)
+        chat.historyGate = Gate()
+        t.apply(.resync)
+        await settle("resync didn't start") { chat.historyCalls.withLock { $0 } == 2 }
+        t.apply(.resync)
+        t.apply(.resync)
+        chat.historyGate?.open()
+        await settle("follow-up didn't run") { chat.historyCalls.withLock { $0 } == 3 && !t.loading }
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(chat.historyCalls.withLock { $0 }, 3)
+    }
 }
