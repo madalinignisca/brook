@@ -115,12 +115,29 @@ install_app() (
   # `set -u` that is "unbound variable"). They are this subshell's own.
   _INSTALL_LOCK="${BROOK_INSTALL_DIR:-/Applications}/.Brook.app.lock"
   _INSTALL_TOKEN="$(/usr/bin/uuidgen)" || exit 1
-  trap '_install_lock_release "$_INSTALL_LOCK"' EXIT
+  _INSTALL_SWAPPING=0
+  # The restore runs before the release: the lock is held until the app is back.
+  trap '_install_restore_if_swapping; _install_lock_release "$_INSTALL_LOCK"' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   _install_lock_acquire "$_INSTALL_LOCK" || exit 1
   _install_app_locked "$@"
 )
+
+# Runs on every exit of install_app. An INT or TERM between "old app moved aside" and "new app in
+# place" would leave no Brook.app at all, so the backup is moved back. Only while the swap flag is
+# set (this run moved the app aside itself: a stale backup of an earlier run, or a refusal that
+# never owned the lock, is never restored) and only into an absent target (an existing target is
+# never touched, so a backup that could not be removed after a good swap stays where it is).
+_install_restore_if_swapping() {
+  local dir="${BROOK_INSTALL_DIR:-/Applications}"
+  if [[ "$_INSTALL_SWAPPING" == 1 && -e "$dir/.Brook.app.old" && ! -e "$dir/Brook.app" ]]; then
+    if mv "$dir/.Brook.app.old" "$dir/Brook.app"; then
+      echo "interrupted: restored the previous Brook.app" >&2
+    fi
+  fi
+  return 0
+}
 
 _install_app_locked() {
   local app="$1" dir="${BROOK_INSTALL_DIR:-/Applications}"
@@ -155,8 +172,13 @@ _install_app_locked() {
       echo "couldn't move the installed app aside; it is unchanged" >&2
       return 1
     fi
+    _INSTALL_SWAPPING=1
   fi
-  if ! mv "$tmp" "$target"; then
+  mv "$tmp" "$target"
+  local swap_rc=$?
+  # Past the window: from here the explicit handling below owns the way back.
+  _INSTALL_SWAPPING=0
+  if (( swap_rc != 0 )); then
     echo "couldn't put the new app in place at $target" >&2
     if [[ -e "$old" ]]; then
       if mv "$old" "$target"; then

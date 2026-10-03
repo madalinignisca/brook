@@ -29,10 +29,16 @@ pgrep() {
   return "$PGREP_RC"
 }
 codesign() { return "$CODESIGN_RC"; }
+MV_SIGNAL=""; MV_SIGNAL_AFTER=0 # a signal sent to the install subshell instead of (or just after) moving the staged copy into place
 mv() {
+  # bash 3.2 has no $BASHPID, and $$ is the test itself: the external `sh` has the subshell as parent.
+  if [[ -n "$MV_SIGNAL" && "$MV_SIGNAL_AFTER" != 1 && "$1" == *".Brook.app.installing" ]]; then sh -c "kill -$MV_SIGNAL \$PPID"; fi
   if [[ -n "$MV_FAIL" && "$1" == *"$MV_FAIL" ]]; then return 1; fi
   if [[ "$MV_FAIL_BACK" == 1 && "$1" == *".Brook.app.old" ]]; then return 1; fi
   command mv "$@"
+  local rc=$?
+  if [[ "$MV_SIGNAL_AFTER" == 1 && "$1" == *".Brook.app.installing" ]]; then sh -c "kill -INT \$PPID"; fi
+  return "$rc"
 }
 rm() {
   if [[ -n "$RM_FAIL" && "${*: -1}" == *"$RM_FAIL" ]]; then return 1; fi
@@ -48,7 +54,7 @@ ditto() { # a failing one leaves half a copy behind, like a full disk would
   if [[ -n "$DITTO_HOOK" ]]; then local h="$DITTO_HOOK"; DITTO_HOOK=""; eval "$h"; fi
 }
 fresh() { # a built app (version new) and an installed one (version old)
-  PGREP_AFTER=-1; PGREP_CALLS=0; MV_FAIL=""; MV_FAIL_BACK=0; RM_FAIL=""; CODESIGN_RC=0; PGREP_RC=1; DITTO_FAILS=0; DITTO_HOOK=""; DITTO_LOG=""
+  PGREP_AFTER=-1; PGREP_CALLS=0; MV_FAIL=""; MV_FAIL_BACK=0; MV_SIGNAL=""; MV_SIGNAL_AFTER=0; RM_FAIL=""; CODESIGN_RC=0; PGREP_RC=1; DITTO_FAILS=0; DITTO_HOOK=""; DITTO_LOG=""
   rm -rf "$T/src" "$T/dest"
   mkdir -p "$T/src/Brook.app/Contents" "$T/dest/Brook.app/Contents"
   echo new > "$T/src/Brook.app/Contents/version"; echo old > "$T/dest/Brook.app/Contents/version"
@@ -149,6 +155,47 @@ out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?
 check "an uncleared staging path fails" 1 "$rc"; has "and says so" "$out" "couldn't clear $T/dest/.Brook.app.installing"
 check "and leaves the old app" old "$(installed)"
 nolock "an uncleared staging path"
+
+# ---- an interrupt (INT, TERM) in and around the swap ----------------------------
+# (a) between "old app moved aside" and "new app in place": the old app must come back.
+for sig in INT TERM; do
+  want=130; [[ "$sig" == TERM ]] && want=143
+  fresh; MV_SIGNAL="$sig"
+  # Stock bash 3.2 runs the exit trap after the call's own redirection is undone: an outer subshell keeps it.
+  out="$( (install_app "$T/src/Brook.app") 2>&1)"; rc=$?
+  check "$sig in the swap exits $want" "$want" "$rc"
+  check "$sig in the swap: the old app is back" old "$(installed)"
+  has "$sig in the swap: it says so" "$out" "interrupted: restored the previous Brook.app"
+  [[ ! -e "$T/dest/.Brook.app.old" ]] && ok || bad "$sig in the swap leaves no backup"
+  nolock "an $sig in the swap"
+done
+# (b) during the copy: nothing was touched yet, so nothing is restored.
+fresh; DITTO_HOOK='sh -c "kill -INT \$PPID"'
+out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?
+check "INT during the copy exits 130" 130 "$rc"; check "INT during the copy leaves the old app" old "$(installed)"
+[[ ! -e "$T/dest/.Brook.app.old" ]] && ok || bad "INT during the copy leaves no backup"
+lacks "INT during the copy restores nothing" "$out" "restored"
+nolock "an INT during the copy"
+# (c) a backup that could not be removed after a good swap sits beside an existing target: the exit
+# must not move it over (into) the new app.
+fresh; RM_FAIL=".Brook.app.old"
+out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?
+check "a leftover backup after a good swap: success" 0 "$rc"; check "and the new app stays" new "$(installed)"
+[[ -f "$T/dest/.Brook.app.old/Contents/version" && ! -e "$T/dest/Brook.app/.Brook.app.old" ]] && ok || bad "the leftover backup stays put, nothing is nested in the app"
+lacks "and nothing is restored" "$out" "restored"
+# (c2) an INT just after the new app landed, before the swap is over: the target exists, the backup
+# does too, and the exit must leave both alone.
+fresh; MV_SIGNAL_AFTER=1
+out="$( (install_app "$T/src/Brook.app") 2>&1)"; rc=$?
+check "INT just after the swap exits 130" 130 "$rc"; check "and the new app stays" new "$(installed)"
+[[ ! -e "$T/dest/Brook.app/.Brook.app.old" ]] && ok || bad "an existing target gets no backup nested in it"
+lacks "and nothing is restored" "$out" "restored"
+nolock "an INT just after the swap"
+# (d) a refusal that never moved anything aside leaves a stale backup of an earlier run alone.
+fresh; command rm -rf "$T/dest/Brook.app"; mkdir -p "$T/dest/.Brook.app.old"; echo stale > "$T/dest/.Brook.app.old/s"; PGREP_RC=0
+out="$(install_app "$T/src/Brook.app" 2>&1)"; rc=$?
+check "a refusal beside a stale backup fails" 1 "$rc"
+[[ ! -e "$T/dest/Brook.app" && -f "$T/dest/.Brook.app.old/s" ]] && ok || bad "a stale backup is not made the app by a refusal"
 
 # ---- the per-destination lock --------------------------------------------------
 L="$T/dest/.Brook.app.lock"
