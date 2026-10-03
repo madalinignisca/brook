@@ -143,9 +143,9 @@ async def test_an_undecodable_token_is_refused_never_a_server_error(
     # The JWS header is parsed before the signature is checked, so it is attacker-controlled.
     # Nested past Python's recursion limit it escaped pyjwt <= 2.13 as a raw RecursionError,
     # which none of our handlers catches (a 500). pyjwt 2.15 raises DecodeError: a 401.
-    # A real deployment never gets this far (the web server's header limit and the 64 KiB
-    # WebSocket frame are far below the ~100k nesting it takes); this pins the contract that
-    # any token we cannot decode is "invalid token", whatever the library does with it.
+    # The depth that triggers it depends on the Python version: about 10k levels (a 27 KB
+    # token, small enough for a header or a WebSocket frame) on 3.12, which production and CI
+    # run, and about 100k on 3.14. 200k fails on both, so the test does not depend on it.
     depth = 200_000
     header = _b64(b"[" * depth + b"]" * depth)
     token = f"{header}.{_b64(b'{}')}.{_b64(b'sig')}"
