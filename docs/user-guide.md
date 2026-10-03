@@ -67,7 +67,7 @@ Silicon Mac with **macOS 26** or later:
 git clone https://github.com/madalinignisca/brook.git
 cd brook
 clients/macos/build.sh
-open clients/macos/build/Build/Products/Debug/Brook.app
+open clients/macos/build.noindex/Build/Products/Debug/Brook.app
 ```
 
 - Type your **server address** on the sign-in screen. Brook remembers it (once a
