@@ -14,7 +14,6 @@ import uuid
 from datetime import timedelta
 from typing import Annotated
 
-import jwt
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,7 +36,7 @@ from ..schemas import (
     TotpStepIn,
 )
 from ..secretbox import DecryptError, Purpose, get_secret_box
-from ..security import decode_totp_pending_token, issued_at_ms, verify_password
+from ..security import TOKEN_REJECTS, decode_totp_pending_token, issued_at_ms, verify_password
 from .auth import _issue_tokens, lock_user, sign_out_everywhere
 from .ws import revoke_sessions
 
@@ -234,7 +233,7 @@ async def totp_login(
         user_id = uuid.UUID(str(payload["sub"]))
         issued_ms = issued_at_ms(payload)
         jti, exp = str(payload["jti"]), float(payload["exp"])
-    except (jwt.PyJWTError, KeyError, ValueError, TypeError, RecursionError):
+    except TOKEN_REJECTS:
         limiter.failure(ip)  # a forged or foreign token is a probe
         raise _expired() from None
 

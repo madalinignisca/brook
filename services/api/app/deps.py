@@ -5,7 +5,6 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,7 +32,11 @@ async def user_from_access_token(
     had signed out everywhere. The WebSocket keeps its own variant only because
     it must tell an expired token apart from a bad one (routers/ws.py).
     """
-    from .security import decode_access_token, issued_at_ms  # local import avoids cycle
+    from .security import (  # local import avoids cycle
+        TOKEN_REJECTS,
+        decode_access_token,
+        issued_at_ms,
+    )
 
     try:
         payload = decode_access_token(settings, token)
@@ -41,7 +44,7 @@ async def user_from_access_token(
             return None
         user_id = uuid.UUID(str(payload["sub"]))
         issued_ms = issued_at_ms(payload)
-    except (jwt.PyJWTError, KeyError, ValueError, TypeError, RecursionError):
+    except TOKEN_REJECTS:
         return None
     user = await session.get(User, user_id)
     if user is None or user.status != "active" or user.session_revoked(issued_ms):

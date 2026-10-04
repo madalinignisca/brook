@@ -145,7 +145,9 @@ async def test_an_undecodable_token_is_refused_never_a_server_error(
     # which none of our handlers catches (a 500). pyjwt 2.15 raises DecodeError: a 401.
     # The depth that triggers it depends on the Python version: about 10k levels (a 27 KB
     # token, small enough for a header or a WebSocket frame) on 3.12, which production and CI
-    # run, and about 100k on 3.14. 200k fails on both, so the test does not depend on it.
+    # run, and about 100k on 3.14. 200k fails on both, so the test does not depend on it
+    # (the WebSocket tests in test_ws_commands.py use smaller payloads and only discriminate
+    # on 3.12 and 3.13).
     depth = 200_000
     header = _b64(b"[" * depth + b"]" * depth)
     token = f"{header}.{_b64(b'{}')}.{_b64(b'sig')}"

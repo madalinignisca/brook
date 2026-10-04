@@ -82,6 +82,9 @@ class Participant:
     # subscribe anyone to a feed before that ("No such feed"), so a participant only
     # counts as a subscribable publisher from then on; "hangup" clears it.
     media_up: bool = False
+    # Candidates refused by _client_candidate: the first is logged as a warning (a client shape
+    # the filter refuses would otherwise degrade calls silently), the rest at debug.
+    ice_refused: int = 0
     # Announced mute state (contract §3.4), derived by refresh_media(): never set directly.
     audio: bool = False
     video: bool = False
@@ -807,6 +810,43 @@ def _candidate(c: Any) -> dict[str, Any] | None:
     return {k: c.get(k) for k in ("candidate", "sdpMid", "sdpMLineIndex")}
 
 
+_ICE_TEXT_MAX = 2048  # a candidate line is about 200 bytes; sdpMid is a short media id
+_ICE_INDEX_MAX = 65535
+
+
+def _client_candidate(c: Any) -> dict[str, Any] | None:
+    """What a client may relay to Janus: ``{candidate, sdpMid?, sdpMLineIndex?}``, or None
+    for end-of-candidates (a null, or ``{"completed": true}``). The contract fixes the shape
+    (a string, a string and a small int), so anything else raises ValueError and is dropped:
+    a client's dict used to be forwarded verbatim, extra keys and arbitrarily nested values
+    included, which a later ``json.dumps`` towards Janus could recurse out on."""
+    if c is None:
+        return None
+    if not isinstance(c, dict):
+        raise ValueError("candidate must be an object or null")
+    if c.get("completed") is True:
+        return None
+    text = c.get("candidate")
+    if not isinstance(text, str) or len(text) > _ICE_TEXT_MAX:
+        raise ValueError("candidate must be a string")
+    out: dict[str, Any] = {"candidate": text}
+    mid = c.get("sdpMid")
+    if mid is not None:
+        if not isinstance(mid, str) or len(mid) > _ICE_TEXT_MAX:
+            raise ValueError("sdpMid must be a string")
+        out["sdpMid"] = mid
+    index = c.get("sdpMLineIndex")
+    if index is not None:
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index <= _ICE_INDEX_MAX
+        ):
+            raise ValueError("sdpMLineIndex must be a small integer")
+        out["sdpMLineIndex"] = index
+    return out
+
+
 def _require(frame: dict[str, Any], *keys: str) -> dict[str, Any]:
     data = frame.get("data")
     if not isinstance(data, dict) or any(k not in data for k in keys):
@@ -890,9 +930,15 @@ async def _ice(conn: Connection, frame: dict[str, Any], re: str | None) -> None:
     hid = p.pub_hid if data["pc"] == "publish" else p.sub_hid
     if hid is None or data["pc"] not in ("publish", "subscribe"):
         return  # no reply for call.ice (contract §3.3); nothing to relay to
-    cand = data["candidate"]
     try:
-        await manager.janus().trickle(p.sid, hid, cand if isinstance(cand, dict) else None)
+        cand = _client_candidate(data["candidate"])
+    except ValueError as exc:
+        p.ice_refused += 1
+        level = logging.WARNING if p.ice_refused == 1 else logging.DEBUG
+        log.log(level, "dropped a malformed ICE candidate from %s: %s", p.participant_id, exc)
+        return  # no reply for call.ice (contract §3.3)
+    try:
+        await manager.janus().trickle(p.sid, hid, cand)
     except JanusError as exc:
         # call.ice has no reply (contract §3.3), so this log is the only trace.
         log.warning("trickle to %s handle failed for %s: %s", data["pc"], p.participant_id, exc)

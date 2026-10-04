@@ -39,7 +39,7 @@ from ..db import get_sessionmaker
 from ..hub import get_hub
 from ..models import User
 from ..ratelimit import client_ip, get_limiter
-from ..security import decode_access_token, issued_at_ms
+from ..security import TOKEN_REJECTS, decode_access_token, issued_at_ms
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -180,7 +180,7 @@ async def _user_from_token(settings: Settings, token: object) -> tuple[User, int
         issued_ms = issued_at_ms(payload)
     except jwt.ExpiredSignatureError:
         return EXPIRED
-    except (jwt.PyJWTError, KeyError, ValueError, TypeError, RecursionError):
+    except TOKEN_REJECTS:
         return None
     async with get_sessionmaker()() as session:
         user = await session.get(User, user_id)
