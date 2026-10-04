@@ -182,6 +182,33 @@ def test_full_call_flow(sync_client: TestClient, fake: FakeJanus) -> None:
         assert trickles[-2]["handle"] == _participant(call_id, pb).pub_hid
         assert trickles[-1] == {"handle": _participant(call_id, pb).sub_hid, "candidate": None}
 
+        # a malformed candidate (here a nested sdpMid) is dropped, never relayed to Janus,
+        # and a well-formed one still is, with only the three fields the contract defines
+        seen = len(trickles)
+        wb.send_json(
+            {
+                "type": "call.ice",
+                "data": {
+                    "call_id": call_id,
+                    "pc": "publish",
+                    "candidate": {"candidate": "c", "sdpMid": [[[[1]]]], "extra": 1},
+                },
+            }
+        )
+        wb.send_json(
+            {
+                "type": "call.ice",
+                "data": {
+                    "call_id": call_id,
+                    "pc": "publish",
+                    "candidate": {**cand, "extra": {"x": 1}},
+                },
+            }
+        )
+        collect(wb, wait=0.1)
+        later = [r for n, r in fake.requests if n == "trickle"][seen:]
+        assert [t["candidate"] for t in later] == [cand], "only the well-formed one, cleaned"
+
         # Janus-side trickle reaches the client as call.ice
         sync_client.portal.call(
             fake.fire,

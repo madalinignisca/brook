@@ -72,6 +72,8 @@ def test_bad_first_frame_closes_1008_auth_failed(sync_client: TestClient, first:
 # Nested JSON raises RecursionError, which is not a ValueError: a ~40 KB frame (inside the
 # 64 KiB WebSocket frame) does it on Python 3.12, which production and CI run. It used to
 # escape the frame parse and drop the socket with a traceback, before the rate limiter.
+# On Python 3.14 the limit is far higher (about 100k levels): these payloads no longer raise
+# there, so the tests below only discriminate on 3.12 and 3.13, which is what CI runs.
 NESTED = "[" * 20_000 + "]" * 20_000
 
 
