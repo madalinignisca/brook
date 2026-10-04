@@ -8,6 +8,7 @@ its pong, so a missing event fails an assert instead of hanging CI.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -107,7 +108,9 @@ def _publish_live(tc: TestClient, fake: FakeJanus, ws: Any, call_id: str, pid: s
     tc.portal.call(fake.fire, _participant(call_id, pid).pub_hid, {"janus": "webrtcup"})
 
 
-def test_full_call_flow(sync_client: TestClient, fake: FakeJanus) -> None:
+def test_full_call_flow(
+    sync_client: TestClient, fake: FakeJanus, caplog: pytest.LogCaptureFixture
+) -> None:
     a, b, _c, ch = _setup(sync_client)
     with _ws(sync_client, a) as wa, _ws(sync_client, b) as wb:
         ja = cmd(wa, "call.join", {"channel_id": ch})["data"]
@@ -185,6 +188,7 @@ def test_full_call_flow(sync_client: TestClient, fake: FakeJanus) -> None:
         # a malformed candidate (here a nested sdpMid) is dropped, never relayed to Janus,
         # and a well-formed one still is, with only the three fields the contract defines
         seen = len(trickles)
+        caplog.set_level(logging.DEBUG, logger="app.calls")
         wb.send_json(
             {
                 "type": "call.ice",
@@ -205,7 +209,9 @@ def test_full_call_flow(sync_client: TestClient, fake: FakeJanus) -> None:
                 },
             }
         )
-        collect(wb, wait=0.1)
+        assert collect(wb, wait=0.1) == [], "call.ice has no reply, a refused one included"
+        refused = [r for r in caplog.records if "malformed ICE candidate" in r.getMessage()]
+        assert [r.levelno for r in refused] == [logging.WARNING], "one visible warning"
         later = [r for n, r in fake.requests if n == "trickle"][seen:]
         assert [t["candidate"] for t in later] == [cand], "only the well-formed one, cleaned"
 

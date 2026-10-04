@@ -82,6 +82,9 @@ class Participant:
     # subscribe anyone to a feed before that ("No such feed"), so a participant only
     # counts as a subscribable publisher from then on; "hangup" clears it.
     media_up: bool = False
+    # Candidates refused by _client_candidate: the first is logged as a warning (a client shape
+    # the filter refuses would otherwise degrade calls silently), the rest at debug.
+    ice_refused: int = 0
     # Announced mute state (contract §3.4), derived by refresh_media(): never set directly.
     audio: bool = False
     video: bool = False
@@ -930,7 +933,9 @@ async def _ice(conn: Connection, frame: dict[str, Any], re: str | None) -> None:
     try:
         cand = _client_candidate(data["candidate"])
     except ValueError as exc:
-        log.debug("dropped a malformed ICE candidate from %s: %s", p.participant_id, exc)
+        p.ice_refused += 1
+        level = logging.WARNING if p.ice_refused == 1 else logging.DEBUG
+        log.log(level, "dropped a malformed ICE candidate from %s: %s", p.participant_id, exc)
         return  # no reply for call.ice (contract §3.3)
     try:
         await manager.janus().trickle(p.sid, hid, cand)

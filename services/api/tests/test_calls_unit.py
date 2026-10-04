@@ -193,3 +193,14 @@ def test_end_of_candidates_is_none(end: object) -> None:
 def test_a_malformed_candidate_is_refused(bad: object) -> None:
     with pytest.raises(ValueError):
         calls._client_candidate(bad)
+
+
+def test_token_rejects_is_exactly_the_agreed_exceptions_and_never_a_cancellation() -> None:
+    import jwt
+
+    from app.security import TOKEN_REJECTS
+
+    # The three token handlers deny on these and nothing else: a new member is a decision.
+    assert set(TOKEN_REJECTS) == {jwt.PyJWTError, KeyError, ValueError, TypeError, RecursionError}
+    # Catching a cancellation or an interrupt there would swallow a shutdown.
+    assert all(issubclass(e, Exception) for e in TOKEN_REJECTS)

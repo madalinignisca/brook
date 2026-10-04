@@ -77,7 +77,7 @@ def issued_at_ms(payload: dict[str, Any]) -> int:
 # the library's own errors, the lookups and conversions on the claims, and RecursionError
 # (a JWS header nested past the recursion limit raised it from inside pyjwt <= 2.13, and
 # it is not a ValueError). One tuple, so a new call site cannot forget one of them.
-TOKEN_REJECTS: tuple[type[BaseException], ...] = (
+TOKEN_REJECTS: tuple[type[Exception], ...] = (
     jwt.PyJWTError,
     KeyError,
     ValueError,
