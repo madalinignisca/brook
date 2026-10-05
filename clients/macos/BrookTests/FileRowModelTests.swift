@@ -517,6 +517,20 @@ final class FileRowModelTests: XCTestCase {
         guard case .offer = m.preview else { return XCTFail("a failed fetch took the button away after turning off") }
     }
 
+    func testANetworkFailureOnTheClickKeepsTheButtonAndARefusalDoesNot() async {
+        let net = local()
+        net.previewResult = .failure(LoginError.Network(message: "offline"))
+        let a = await started(net, previews: false)
+        await a.showPreview()
+        guard case .offer = a.preview else { return XCTFail("a network blip took the button away") }
+
+        let refused = local()
+        refused.previewResult = .failure(LoginError.Api(code: "file.preview_refused", message: ""))
+        let b = await started(refused, previews: false)
+        await b.showPreview()
+        guard case .none = b.preview else { return XCTFail("a refused preview kept its button") }
+    }
+
     func testASecondClickWhileOneRunsStartsNoSecondFetch() async {
         let gate = Gate()
         let chat = local()
@@ -530,9 +544,15 @@ final class FileRowModelTests: XCTestCase {
         guard case .offer = m.preview else { return XCTFail("no button") }
         let first = Task { await m.showPreview() }
         for _ in 0 ..< 40 { await Task.yield(); try? await Task.sleep(for: .milliseconds(5)) }
-        await m.showPreview() // the second click
+        guard case .loading = m.preview else { return XCTFail("not fetching yet") }
+        // The second click, while the first waits in the fetch: it must return at once (run apart, so a
+        // missing guard fails the count below instead of waiting on the fetch's gate for good).
+        let second = Task { await m.showPreview() }
+        for _ in 0 ..< 40 { await Task.yield(); try? await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(previewCalls(chat), 1, "two fetches for one row")
         gate.open()
         await first.value
+        await second.value
         XCTAssertEqual(chat.cacheCalls.withLock { $0 }.filter { $0 == "preview" }.count, 1, "two fetches for one row")
     }
 

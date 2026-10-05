@@ -234,7 +234,9 @@ final class FileRowModel {
         do {
             bytes = try await client.previewFile(transferId: UInt64.random(in: 1 ... UInt64.max), fileId: file.id)
         } catch {
-            if epoch == previewEpoch { preview = .none }
+            // A network failure keeps the button: with previews off the click is the only way in,
+            // and a passing blip must not take it away. A refusal (not an image, too big, gone) is final.
+            if epoch == previewEpoch { preview = Self.isNetworkFailure(error) ? .offer : .none }
             return
         }
         guard epoch == previewEpoch else { return }
@@ -242,6 +244,11 @@ final class FileRowModel {
         let image = await decode(bytes, { visible.value && allowed.value })
         guard epoch == previewEpoch else { return }
         preview = image.map(Preview.shown) ?? .none
+    }
+
+    nonisolated static func isNetworkFailure(_ error: Error) -> Bool {
+        if case .Network? = error as? LoginError { return true }
+        return false
     }
 
     /// The setting changed. Off: previews on screen go back to "Show preview" at once, and
