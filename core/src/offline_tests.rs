@@ -532,6 +532,89 @@ mod client {
         assert!(c.cached_channels().await.is_err());
     }
 
+    /// "Remove this device's data" with stores on disk that this session never opened (the key
+    /// store was locked or slow at launch) used to answer `Ok(())` and erase nothing, so the
+    /// app told the user their data was removed. It must be an error, distinct from success,
+    /// while the sign-out still happens and the data is left for a later launch.
+    #[tokio::test]
+    async fn forget_with_stores_that_never_opened_is_an_error() {
+        let server = TestServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let slot = Arc::new(InMemoryKeySlot::default());
+        let stores = dir.path().join("stores");
+        let store_dirs = || {
+            std::fs::read_dir(&stores)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_type().unwrap().is_dir())
+                .count()
+        };
+
+        // An earlier session stored alice's data.
+        let first = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        assert!(
+            first
+                .enable_local_data(slot.clone() as Arc<dyn KeySlot>, dir.path().to_path_buf())
+                .await
+        );
+        first.login("alice", "pw").await.unwrap();
+        assert!(active(&first).await);
+        first.close_local_data().await;
+        drop(first);
+        assert_eq!(store_dirs(), 1);
+
+        // This session: the key store is locked, so local data stays off.
+        let c = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        slot.fail_next("load", crate::KeySlotError::Unavailable);
+        assert!(
+            !c.enable_local_data(slot.clone() as Arc<dyn KeySlot>, dir.path().to_path_buf())
+                .await,
+            "the locked key store left local data off"
+        );
+        assert!(matches!(
+            c.login("alice", "pw").await.unwrap(),
+            LoginOutcome::LoggedIn(_)
+        ));
+
+        let err = c.sign_out_and_forget().await.unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Api { code, .. } if code == "local.not_open"),
+            "an unopened store reported as {err:?}, or as success"
+        );
+        assert_eq!(
+            store_dirs(),
+            1,
+            "nothing was erased, and nothing claims it was"
+        );
+        assert!(
+            matches!(*c.state().borrow(), crate::AuthState::LoggedOut),
+            "the sign-out happens either way"
+        );
+    }
+
+    /// The two cases that must stay a success: local data was never turned on, and a first
+    /// launch whose key store was locked before anything had been stored.
+    #[tokio::test]
+    async fn forget_with_nothing_stored_is_still_ok() {
+        let server = TestServer::start().await;
+
+        let never_enabled = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        never_enabled.login("alice", "pw").await.unwrap();
+        never_enabled.sign_out_and_forget().await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let slot = Arc::new(InMemoryKeySlot::default());
+        let locked_first_launch = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        slot.fail_next("load", crate::KeySlotError::Unavailable);
+        assert!(
+            !locked_first_launch
+                .enable_local_data(slot as Arc<dyn KeySlot>, dir.path().to_path_buf())
+                .await
+        );
+        locked_first_launch.login("alice", "pw").await.unwrap();
+        locked_first_launch.sign_out_and_forget().await.unwrap();
+    }
+
     /// Between a switch of user and the watcher catching up, the previous user's stores are
     /// still open: they answer nobody else. (tokio's mutex is FIFO, so the read below gets
     /// the lock before the watcher does.)

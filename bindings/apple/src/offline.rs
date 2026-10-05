@@ -944,7 +944,10 @@ impl FfiBrookClient {
     }
 
     /// "Remove this device's data", then sign out. The erase is local and happens first;
-    /// an error means some of it couldn't be erased (the sign-out still happened).
+    /// an error means some of it couldn't be erased (the sign-out still happened). Tell the
+    /// two apart by the `LoginError.Api` code: `local.store` (the erase ran and failed, e.g. a
+    /// key the key store would not delete; the next launch finishes it) and `local.not_open`
+    /// (stores exist on this device but this session never opened them, so nothing was erased).
     pub async fn sign_out_and_forget(&self) -> Result<(), LoginError> {
         let inner = Arc::clone(&self.inner);
         run(async move { inner.sign_out_and_forget().await }).await

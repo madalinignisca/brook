@@ -42,6 +42,18 @@ fn unavailable() -> Error {
     }
 }
 
+/// "Remove this device's data" could not run: stores exist on this device, but this session
+/// never opened them (the key store was locked or slow, or damaged), so nothing was erased.
+/// The sign-out still happened. Distinct from success and from `local.store` (an erase that
+/// ran and failed, e.g. a key the key store would not delete).
+fn not_open() -> Error {
+    Error::Api {
+        code: "local.not_open".into(),
+        message: "saved data on this device could not be erased: offline storage was not open"
+            .into(),
+    }
+}
+
 fn store_error() -> Error {
     Error::Api {
         code: "local.store".into(),
@@ -107,6 +119,12 @@ impl BrookClient {
         if !crate::store::stores_enabled() {
             return false;
         }
+        // Before the open can fail: a locked key store leaves local data off, but what an
+        // earlier session stored is still on disk, and a later erase has to know to say so.
+        *self
+            .local_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(data_dir.join("stores"));
         let Ok(Some(local)) = LocalData::open(&data_dir.join("stores"), slot).await else {
             return false;
         };
@@ -219,16 +237,40 @@ impl BrookClient {
 
     /// Sign out, first erasing this user's local data ("Remove this device's data", #46
     /// §8). The erase is local and happens first, whether or not the server can be reached.
+    /// The sign-out happens either way; an error means some of the data is still there:
+    /// `local.store` (the erase ran and failed, e.g. a key the key store would not delete;
+    /// the next launch finishes it) or `local.not_open` (stores exist on this device but
+    /// this session never opened them, so nothing was erased). `Ok` means nothing is left,
+    /// or nothing was ever stored.
     pub async fn sign_out_and_forget(&self) -> Result<()> {
         let erased = match (self.offline.lock().await.as_mut(), self.who().await) {
             (Some(off), Some((user, epoch))) => off
                 .forget(&self.origin(), &user, epoch)
                 .await
                 .map_err(|_| store_error()),
+            (None, _) if self.stores_on_disk().await => Err(not_open()),
             _ => Ok(()),
         };
         self.logout().await;
         erased
+    }
+
+    /// Whether the stores `enable_local_data` was pointed at have an index on disk: data an
+    /// earlier session stored. False when local data was never enabled (or switched off in
+    /// this build): nothing to erase. When that can't be read, assume it does exist, since
+    /// "erased" would be a claim nothing supports.
+    async fn stores_on_disk(&self) -> bool {
+        let root = self
+            .local_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match root {
+            Some(root) => tokio::fs::try_exists(root.join("index.db"))
+                .await
+                .unwrap_or(true),
+            None => false,
+        }
     }
 
     /// Syncing, last synced, and whether the last sync couldn't reach the server (spec
