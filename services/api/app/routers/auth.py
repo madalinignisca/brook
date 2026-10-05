@@ -57,22 +57,15 @@ async def _optional_user(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_optional_bearer)],
     session: Annotated[AsyncSession, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_settings)],
-) -> User | None:
-    """Resolve the caller if a token is presented; ``None`` only when there is none.
-
-    A token that is presented but refused (expired, revoked, user disabled) is a 401,
-    not "anonymous": clients refresh on 401 only, so answering 403 here left an admin
-    whose token had expired (a Mac after sleep) staring at "not allowed"."""
+) -> tuple[User | None, bool]:
+    """``(caller, token_was_sent)``. ``caller`` is ``None`` without a token or when the
+    token is refused (expired, revoked, user disabled); the route tells the two apart
+    through the flag, because refused must be a 401 (clients refresh on 401 only, and a
+    403 left an admin whose token had expired staring at "not allowed") while the
+    bootstrap, which needs no token, must ignore a stale one."""
     if credentials is None:
-        return None
-    user = await user_from_access_token(session, settings, credentials.credentials)
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"code": "auth.invalid_token", "message": "Invalid or expired token"},
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return user
+        return None, False
+    return await user_from_access_token(session, settings, credentials.credentials), True
 
 
 def confirm_admin_password(
@@ -145,7 +138,7 @@ async def register(
     body: RegisterIn,
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
-    caller: Annotated[User | None, Depends(_optional_user)],
+    who: Annotated[tuple[User | None, bool], Depends(_optional_user)],
     limiter: Annotated[AuthLimiter, Depends(get_limiter)],
 ) -> User:
     """Create a user.
@@ -159,7 +152,14 @@ async def register(
     enforce(limiter, ip)
     count = await session.scalar(select(func.count()).select_from(User))
     is_first = (count or 0) == 0
+    caller, token_sent = who
     if not is_first:
+        if caller is None and token_sent:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"code": "auth.invalid_token", "message": "Invalid or expired token"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         if caller is None or caller.global_role != "admin":
             limiter.failure(ip)  # an unauthenticated attempt on a closed endpoint
             raise HTTPException(

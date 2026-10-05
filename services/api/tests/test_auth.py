@@ -236,6 +236,14 @@ async def test_register_with_a_refused_token_is_401_not_403(client: httpx.AsyncC
     assert await _count_users("bob") == 0
 
 
+async def test_bootstrap_ignores_a_stale_token(client: httpx.AsyncClient) -> None:
+    """A client that kept a token from a wiped server must still be able to set up the
+    first account: there is nobody to refresh against."""
+    r = await _register(client, "alice", headers={"Authorization": "Bearer stale-token"})
+    assert r.status_code == 201
+    assert r.json()["global_role"] == "admin"
+
+
 async def test_register_display_name_limit_is_one_rule(client: httpx.AsyncClient) -> None:
     admin = await _admin_headers(client)
     base = {"password": "supersecret", "admin_password": "supersecret"}
