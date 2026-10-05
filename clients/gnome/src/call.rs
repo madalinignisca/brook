@@ -553,8 +553,9 @@ fn detach(widget: &gtk::Overlay) {
         slot.set_child(None::<&gtk::Widget>);
     } else if let Some(frame) = parent.downcast_ref::<gtk::AspectFrame>() {
         frame.set_child(None::<&gtk::Widget>);
-    } else if let Some(slot) = parent.downcast_ref::<gtk::ScrolledWindow>() {
-        slot.set_child(None::<&gtk::Widget>);
+    } else if let Some(viewport) = parent.downcast_ref::<gtk::Viewport>() {
+        // A scrolled window wraps a child that isn't scrollable in a viewport of its own.
+        viewport.set_child(None::<&gtk::Widget>);
     }
 }
 
