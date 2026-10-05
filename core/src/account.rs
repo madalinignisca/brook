@@ -534,6 +534,42 @@ impl BrookClient {
         Ok(resp)
     }
 
+    /// Admin: add a user (always a `member`). The admin re-enters their own password, as for a
+    /// reset. Errors by code: `conflict` (handle taken), `authz.forbidden` (not an admin),
+    /// `auth.invalid_credentials` (the admin password is wrong), the server's 422 code (`profile.invalid`,
+    /// `validation.error`; `validation` when it sent none; a fixed message, nothing of the body is carried), `auth.rate_limited`. A 201 that does not parse is
+    /// `UnexpectedResponse`: the account may exist. Needs a signed-in admin: with no session
+    /// nothing is sent, so this cannot create the first user (the open bootstrap of a new
+    /// server); never wire a first-run flow to it. A rejected (expired or revoked) access token
+    /// is a refresh and one retry only if the server answers 401 for it; a 403 is never retried.
+    pub async fn create_user(
+        &self,
+        handle: &str,
+        display_name: &str,
+        password: &str,
+        admin_password: &str,
+    ) -> Result<UserSummary> {
+        let epoch = self.session.snapshot().await.0.epoch;
+        let url = self.base.join("api/v1/auth/register")?;
+        // Never logged or formatted: both passwords are in here.
+        let body = json!({
+            "handle": handle,
+            "display_name": display_name,
+            "password": password,
+            "admin_password": admin_password,
+        });
+        let (resp, _) = self
+            .ctx()
+            .send(epoch, OnExpired::SingleFlight, |access| {
+                self.http.post(url.clone()).bearer_auth(access).json(&body)
+            })
+            .await?;
+        if !resp.status().is_success() {
+            return Err(account_error_keeping_422(resp).await);
+        }
+        resp.json().await.map_err(|_| Error::UnexpectedResponse)
+    }
+
     /// Admin: every user, by handle.
     pub async fn list_users(&self) -> Result<Vec<UserSummary>> {
         let epoch = self.session.snapshot().await.0.epoch;
@@ -554,6 +590,26 @@ impl BrookClient {
 /// Errors of the account endpoints, from the status and the envelope's `code` only. The body is
 /// never carried: FastAPI's 422 echoes the submitted value (the password) back.
 pub(crate) async fn account_error(resp: Response) -> Error {
+    account_error_with(resp, false).await
+}
+
+/// A short identifier of lowercase letters, digits, dots and underscores: what the server's codes are.
+fn is_plain_code(code: &str) -> bool {
+    (1..=48).contains(&code.len())
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_')
+}
+
+/// `account_error`, but a 422 keeps the server's own code (`profile.invalid` for characters a
+/// name cannot hold, `validation.error` for a malformed body) so a client can word them apart,
+/// with a fixed message: the body is never read for text. A code that is not a short identifier
+/// is `validation`.
+pub(crate) async fn account_error_keeping_422(resp: Response) -> Error {
+    account_error_with(resp, true).await
+}
+
+async fn account_error_with(resp: Response, keep_422: bool) -> Error {
     #[derive(Deserialize)]
     struct Envelope {
         error: Option<Code>,
@@ -571,6 +627,13 @@ pub(crate) async fn account_error(resp: Response) -> Error {
         .map(|c| c.code);
     let (code, message) = match (status.as_u16(), code) {
         (401, _) => return Error::NotAuthenticated,
+        (422, Some(code)) if keep_422 && is_plain_code(&code) => {
+            (code, "the handle, display name or password was refused")
+        }
+        (422, _) if keep_422 => (
+            "validation".to_string(),
+            "the handle, display name or password was refused",
+        ),
         (422, _) => ("validation".to_string(), "the new password was refused"),
         (429, _) => (
             "auth.rate_limited".to_string(),
