@@ -24,9 +24,8 @@ for KDE Plasma, Windows, Android, and iOS are planned, all sharing one core.
 ## Getting the GNOME client
 
 **Release builds** (stable and beta) are on the GitHub Releases page as
-`brook-gnome-<version>-linux-<arch>.tar.gz` (x86_64 and aarch64; for Debian 13 and
-Ubuntu 26.04) and `brook-gnome-<version>-linux-musl-<arch>.tar.gz`
-(Alpine; chat works, calls need a glibc distribution). Unpack one and
+`brook-gnome-<version>-linux-<arch>.tar.gz` (x86_64 and aarch64; supported on Debian 13
+and Ubuntu 26.04). Unpack one and
 run `./install.sh`: it installs for your user only (no root), and
 `./install.sh --uninstall` removes it. The tarball's `INSTALL.md` lists the GTK 4,
 libadwaita and GStreamer packages your distribution needs.
@@ -38,8 +37,7 @@ apps out of Brook's local data (a native install can't promise that).
 **From source:**
 
 **Prerequisites:** the Rust toolchain (`rustup`), plus GTK 4 and libadwaita
-development libraries (e.g. on Arch: `gtk4 libadwaita`; on Fedora:
-`gtk4-devel libadwaita-devel`; on Debian/Ubuntu: `libgtk-4-dev libadwaita-1-dev`).
+development libraries (on Debian 13 and Ubuntu 26.04: `libgtk-4-dev libadwaita-1-dev`).
 
 ```bash
 git clone https://github.com/madalinignisca/brook.git
