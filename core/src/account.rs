@@ -538,7 +538,10 @@ impl BrookClient {
     /// reset. Errors by code: `conflict` (handle taken), `authz.forbidden` (not an admin),
     /// `auth.invalid_credentials` (the admin password is wrong), `validation` (a limit; nothing
     /// of the body is carried), `auth.rate_limited`. A 201 that does not parse is
-    /// `UnexpectedResponse`: the account may exist.
+    /// `UnexpectedResponse`: the account may exist. Needs a signed-in admin: with no session
+    /// nothing is sent, so this cannot create the first user (the open bootstrap of a new
+    /// server); never wire a first-run flow to it. A rejected (expired or revoked) access token
+    /// is a refresh and one retry only if the server answers 401 for it; a 403 is never retried.
     pub async fn create_user(
         &self,
         handle: &str,

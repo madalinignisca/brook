@@ -645,7 +645,10 @@ async fn reset_password(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// `POST /auth/register` as an admin calls it. A scripted 401 is held like the user list's.
+/// `POST /auth/register` as an admin calls it. A scripted 401 is held like the user list's. It
+/// deliberately leaves out the real route's admin-role check and first-user bootstrap (any signed-in
+/// caller creates; `Forbidden` is only scripted), and it answers 401 for an unknown token where the
+/// real route answers 403 today (the server is to answer 401 for a presented-but-rejected token).
 async fn register(
     State(state): State<Shared>,
     headers: HeaderMap,
