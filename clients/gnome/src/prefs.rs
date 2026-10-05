@@ -56,6 +56,37 @@ pub fn show_usernames() -> bool {
         && file.boolean(SIDEBAR, SHOW_USERNAMES).unwrap_or(false)
 }
 
+const ATTACHMENTS: &str = "attachments";
+const SHOW_IMAGE_PREVIEWS: &str = "show_image_previews";
+
+/// "Show image previews": small images preview by themselves. Off unless set (an absent value
+/// is off); per device (#259).
+pub fn show_image_previews() -> bool {
+    let file = glib::KeyFile::new();
+    file.load_from_file(path(), glib::KeyFileFlags::NONE)
+        .is_ok()
+        && file
+            .boolean(ATTACHMENTS, SHOW_IMAGE_PREVIEWS)
+            .unwrap_or(false)
+}
+
+/// Remember the "Show image previews" choice. Failures are logged, not fatal.
+pub fn save_show_image_previews(on: bool) {
+    let path = path();
+    let file = glib::KeyFile::new();
+    let _ = file.load_from_file(&path, glib::KeyFileFlags::KEEP_COMMENTS);
+    file.set_boolean(ATTACHMENTS, SHOW_IMAGE_PREVIEWS, on);
+    let result = path
+        .parent()
+        .map(std::fs::create_dir_all)
+        .transpose()
+        .map_err(|e| e.to_string())
+        .and_then(|_| file.save_to_file(&path).map_err(|e| e.to_string()));
+    if let Err(err) = result {
+        tracing::warn!(%err, path = %path.display(), "could not save the preference");
+    }
+}
+
 /// Remember the "Show usernames" choice. Failures are logged, not fatal.
 pub fn save_show_usernames(on: bool) {
     let path = path();

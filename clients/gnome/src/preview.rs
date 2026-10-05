@@ -22,6 +22,35 @@ pub const DECODE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Decodes running at once.
 pub const IN_FLIGHT: usize = 2;
 
+/// Whether glycin can decode here: not known until the probe has run once, then yes, or no
+/// (its loaders are too old or missing, or it can't sandbox).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Availability {
+    Unknown,
+    Yes,
+    No,
+}
+
+thread_local! { static AVAILABLE: Cell<Availability> = const { Cell::new(Availability::Unknown) }; }
+
+pub fn availability() -> Availability {
+    AVAILABLE.with(Cell::get)
+}
+
+pub fn set_availability(a: Availability) {
+    AVAILABLE.with(|c| c.set(a));
+}
+
+/// A 1x1 PNG that Brook ships: decoded once, in the sandbox, to learn whether previews can work
+/// here at all (so "Show preview" isn't offered where it can't).
+pub const PROBE_PNG: [u8; 70] = [
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0,
+    0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
 /// Decoded pixels, RGBA, ready for a `gdk::MemoryTexture`.
 pub struct Pixels {
     pub width: u32,

@@ -2088,6 +2088,20 @@ fn main_menu_popover(chat: &Rc<Chat>) -> gtk::Popover {
         }
     });
     menu.append(&show_usernames);
+    // Per device (#259): image previews are off until asked for; this turns small ones on,
+    // for every attachment on screen at once.
+    let show_previews = gtk::CheckButton::builder()
+        .label("Show image previews")
+        .active(crate::attachments::show_image_previews())
+        .margin_start(8)
+        .margin_end(8)
+        .margin_top(4)
+        .margin_bottom(4)
+        .build();
+    show_previews.connect_toggled(|check| {
+        crate::attachments::set_show_image_previews(check.is_active());
+    });
+    menu.append(&show_previews);
     menu.append(&change_password);
     menu.append(&two_factor);
     menu.append(&sign_out);
