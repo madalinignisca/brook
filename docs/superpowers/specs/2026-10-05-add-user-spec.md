@@ -40,7 +40,7 @@ and a server contract change in flight (`admin_password` on register).
    strings (both passwords, Confirm, generated text) are emptied.
 9. Failures, one line each, fields stay so a typo can be fixed: conflict ("handle taken; handles are case-sensitive and a
    disabled account keeps its handle"); conflict right after a no-answer try on the same handle ("your previous try got no
-   answer and probably created it, with the password you entered"); `auth.invalid_credentials` ("Your own password is
+   answer and probably created it, with the password of that try"); `auth.invalid_credentials` ("Your own password is
    wrong."); `authz.forbidden` ("not allowed: your account may no longer be an admin, or your sign-in expired: try
    again"); `validation` (the limits); `auth.rate_limited` (the existing text); Network/Timeout/Disconnected/Unexpected
    ("no clear answer, the account may have been created; try again, and if it says the handle is taken, it was");
@@ -64,7 +64,7 @@ calls); a local admin check in core (the server decides); showing `Retry-After`;
   real refusal and does not refresh; the server should answer 401 for a presented-but-rejected token (server agent's call). **Gate: no client sheet (Mac or GTK) ships until register answers 401 for a presented-but-rejected token; if the server keeps 403, core adds one SingleFlight refresh-and-retry on `authz.forbidden`, never on `auth.invalid_credentials`.**
 - Role changes mid-sheet: the server reads the role from the database, so a demotion is refused at once.
 - A timeout after the server created the account: a retry says 409; the model remembers a no-answer try for that handle.
-- Two admins adding the same handle at once: the loser gets a server 500 (unique-constraint race); shown as "unexpected".
+- A server 500 (or a bare gateway 5xx) can follow a committed insert: shown as 'no clear answer', and a retry's 409 says it was probably created (with the password of that try). The two-admins race is a 409 once the register PR lands.
 - Rate limit shared per IP with login and refresh; five wrong admin passwords put the IP in backoff (as the reset routes).
 - The generated password is visible until the sheet closes; if copied it goes to the pasteboard, which Brook does not clear.
 - Autofill / password managers: no content types are set; third-party managers may offer to save; check by hand.
