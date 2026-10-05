@@ -158,8 +158,9 @@ scripts are transliterated to Latin letters (`Ștefan–raport.pdf` becomes
 or harm a computer (hidden characters, paths, reserved names) is removed. That way a file
 opens the same on Windows, macOS, Linux and phones. The name exactly as it was sent is
 still shown next to the file, so nothing is lost. A file is only saved, to a place you choose, or opened in another app when you ask: the Save
-dialog suggests the plain name (on GNOME it starts in your Downloads folder). On the Mac, small
-images may preview by themselves, which fetches them.
+dialog suggests the plain name (on GNOME it starts in your Downloads folder). On the Mac an image
+shows a **Show preview** button, and **Show image previews** in Settings makes small images preview
+by themselves; nothing is fetched for a preview until you ask, or turn that on.
 
 ## See also
 
