@@ -293,6 +293,8 @@ final class AddUserModel {
         "Not allowed: your account may no longer be an admin, or your sign-in expired. Try again."
     static let limits =
         "The server refused it: a handle is 2 to 64 letters, digits, dots, dashes or underscores; a name 1 to 64 characters; a password 8 to 256."
+    static let badName =
+        "The server refused the display name: it can't hold invisible or control characters. Retype it."
     static let noAnswer =
         "No clear answer came back, so the account may have been created. Try again; if it says the handle is taken, it was."
 
@@ -345,9 +347,11 @@ final class AddUserModel {
                 return lastNoAnswerHandle == handle ? Self.probablyCreated : Self.taken
             case "auth.invalid_credentials": return AdminResetModel.wrongAdmin
             case "authz.forbidden": return Self.notAllowed
-            case "validation": return Self.limits
+            case "validation", "validation.error": return Self.limits
+            case "profile.invalid": return Self.badName
             case "auth.rate_limited": return AccountMessage.tooManyAttempts
-            case "http_5xx":
+            // A bare gateway error or the server's own 500: either can follow a committed insert.
+            case "http_5xx", "internal_error":
                 lastNoAnswerHandle = handle
                 return Self.noAnswer
             default: return AccountMessage.unexpected
