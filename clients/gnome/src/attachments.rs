@@ -525,6 +525,10 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
                     run: Box::new(move |done| {
                         let (fetching, drawing) = (token.clone(), token);
                         let decoded = runtime.spawn(async move {
+                            // A job admitted just before the setting went off: no fetch at all.
+                            if !fetching.is_current() {
+                                return None;
+                            }
                             let bytes = client
                                 .preview_file(TransferId::new(), &file_id)
                                 .await
