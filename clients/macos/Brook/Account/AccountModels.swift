@@ -265,7 +265,10 @@ enum AddUserMenu {
 @MainActor
 @Observable
 final class AddUserModel {
-    var handle = ""
+    /// Editing it drops a shown failure: "probably created it" is about the handle that was sent.
+    var handle = "" {
+        didSet { if handle != oldValue { error = nil } }
+    }
     var displayName = ""
     /// Editing it after `generate()` hides the generated text and empties Confirm.
     var password = "" {
@@ -288,7 +291,7 @@ final class AddUserModel {
 
     static let taken = "That handle is taken. Handles are case-sensitive, and a disabled account keeps its handle."
     static let probablyCreated =
-        "Your previous try got no answer and probably created it, with the password you entered."
+        "Your previous try got no answer and probably created it, with the password of that try."
     static let notAllowed =
         "Not allowed: your account may no longer be an admin, or your sign-in expired. Try again."
     static let limits =
@@ -339,6 +342,10 @@ final class AddUserModel {
         }
     }
 
+    nonisolated static func isNoAnswer(code: String) -> Bool {
+        code.hasPrefix("http_5") || code == "internal_error"
+    }
+
     private func text(for error: Error, handle: String) -> String {
         switch error as? LoginError {
         case let .Api(code, _)?:
@@ -350,11 +357,14 @@ final class AddUserModel {
             case "validation", "validation.error": return Self.limits
             case "profile.invalid": return Self.badName
             case "auth.rate_limited": return AccountMessage.tooManyAttempts
-            // A bare gateway error or the server's own 500: either can follow a committed insert.
-            case "http_5xx", "internal_error":
-                lastNoAnswerHandle = handle
-                return Self.noAnswer
-            default: return AccountMessage.unexpected
+            default:
+                // A bare gateway error (core's codes are `http_` and the status: `http_502`) or the
+                // server's own 500: either can follow a committed insert.
+                if Self.isNoAnswer(code: code) {
+                    lastNoAnswerHandle = handle
+                    return Self.noAnswer
+                }
+                return AccountMessage.unexpected
             }
         case .Network?, .Timeout?, .Disconnected?, .UnexpectedResponse?:
             lastNoAnswerHandle = handle
@@ -364,7 +374,8 @@ final class AddUserModel {
         }
     }
 
-    /// When the sheet closes (and after success): nothing keeps the passwords.
+    /// When the sheet closes (and after success): the model no longer holds the passwords. Memory is
+    /// not wiped (Swift strings are not, and a request in flight keeps the arguments it started with).
     func clear() {
         password = ""
         confirm = ""

@@ -173,6 +173,9 @@ final class AddUserModelTests: XCTestCase {
             (.UnexpectedResponse, AddUserModel.noAnswer),
             (api("http_5xx"), AddUserModel.noAnswer),
             (api("internal_error"), AddUserModel.noAnswer),
+            (api("http_502"), AddUserModel.noAnswer),
+            (api("http_500"), AddUserModel.noAnswer),
+            (api("http_404"), AccountMessage.unexpected),
             (.NotAuthenticated, AccountMessage.signedOut),
             (api("something_else"), AccountMessage.unexpected),
             (.InsecureServerUrl, AccountMessage.unexpected),
@@ -210,7 +213,7 @@ final class AddUserModelTests: XCTestCase {
 
     func testAHttp5xxIsANoAnswerTryToo() async {
         // A bare gateway error, and the server's own 500 (which can follow the commit).
-        for code in ["http_5xx", "internal_error"] {
+        for code in ["http_5xx", "http_502", "internal_error"] {
             let account = FakeAccount()
             account.createScript = [.Api(code: code, message: "x"), .Api(code: "conflict", message: "x")]
             let model = filled(account)
@@ -218,6 +221,18 @@ final class AddUserModelTests: XCTestCase {
             await model.submit()
             XCTAssertEqual(model.error, AddUserModel.probablyCreated, code)
         }
+    }
+
+    /// "Probably created it" belongs to the handle that was sent: editing the handle drops it.
+    func testEditingTheHandleDropsAShownFailure() async {
+        let account = FakeAccount()
+        account.createScript = [.Timeout, .Api(code: "conflict", message: "x")]
+        let model = filled(account)
+        await model.submit()
+        await model.submit()
+        XCTAssertEqual(model.error, AddUserModel.probablyCreated)
+        model.handle = "bob"
+        XCTAssertNil(model.error, "a stale 'probably created it' beside another handle")
     }
 
     func testConflictForAnotherHandleIsTheOrdinaryText() async {

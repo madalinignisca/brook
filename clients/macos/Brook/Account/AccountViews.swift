@@ -122,14 +122,19 @@ struct AddUserSheet: View {
                 }
                 Text("The new account is a member. Give them the password; they can change it under Change Password.")
                     .font(.callout).foregroundStyle(.secondary)
-                if let error = model.error {
-                    Text(error).foregroundStyle(.red)
-                } else if let problem = model.problem {
+                // What is wrong now comes first: after a failure the fields may have been changed to
+                // something invalid, and the old failure would hide why Add User is disabled.
+                if let problem = model.problem {
                     Text(problem).font(.callout).foregroundStyle(.secondary)
+                } else if let error = model.error {
+                    Text(error).foregroundStyle(.red)
                 }
                 HStack {
                     Spacer()
+                    // Not while a request is out: closing would clear the sheet's memory of it, and the
+                    // account may still be created.
                     Button("Cancel", role: .cancel) { dismiss() }
+                        .disabled(model.busy)
                     Button("Add User") { Task { await model.submit() } }
                         .keyboardShortcut(.defaultAction)
                         .disabled(model.problem != nil || model.busy)
@@ -138,6 +143,9 @@ struct AddUserSheet: View {
         }
         .padding(20)
         .frame(width: 460)
-        .onDisappear { model.clear() }  // nothing keeps the passwords once the sheet is gone
+        .interactiveDismissDisabled(model.busy)
+        // The model and the fields no longer hold the passwords once the sheet is gone; Swift strings
+        // are not wiped, and an in-flight request keeps the arguments it was started with.
+        .onDisappear { model.clear() }
     }
 }
