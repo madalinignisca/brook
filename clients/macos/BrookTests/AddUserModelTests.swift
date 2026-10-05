@@ -164,12 +164,15 @@ final class AddUserModelTests: XCTestCase {
             (api("auth.invalid_credentials"), AdminResetModel.wrongAdmin),
             (api("authz.forbidden"), AddUserModel.notAllowed),
             (api("validation"), AddUserModel.limits),
+            (api("validation.error"), AddUserModel.limits),
+            (api("profile.invalid"), AddUserModel.badName),
             (api("auth.rate_limited"), AccountMessage.tooManyAttempts),
             (.Network(message: "x"), AddUserModel.noAnswer),
             (.Timeout, AddUserModel.noAnswer),
             (.Disconnected, AddUserModel.noAnswer),
             (.UnexpectedResponse, AddUserModel.noAnswer),
             (api("http_5xx"), AddUserModel.noAnswer),
+            (api("internal_error"), AddUserModel.noAnswer),
             (.NotAuthenticated, AccountMessage.signedOut),
             (api("something_else"), AccountMessage.unexpected),
             (.InsecureServerUrl, AccountMessage.unexpected),
@@ -206,12 +209,15 @@ final class AddUserModelTests: XCTestCase {
     }
 
     func testAHttp5xxIsANoAnswerTryToo() async {
-        let account = FakeAccount()
-        account.createScript = [.Api(code: "http_5xx", message: "x"), .Api(code: "conflict", message: "x")]
-        let model = filled(account)
-        await model.submit()
-        await model.submit()
-        XCTAssertEqual(model.error, AddUserModel.probablyCreated)
+        // A bare gateway error, and the server's own 500 (which can follow the commit).
+        for code in ["http_5xx", "internal_error"] {
+            let account = FakeAccount()
+            account.createScript = [.Api(code: code, message: "x"), .Api(code: "conflict", message: "x")]
+            let model = filled(account)
+            await model.submit()
+            await model.submit()
+            XCTAssertEqual(model.error, AddUserModel.probablyCreated, code)
+        }
     }
 
     func testConflictForAnotherHandleIsTheOrdinaryText() async {
