@@ -544,6 +544,9 @@ fn end_text(reason: &EndReason) -> String {
     }
 }
 
+/// Names a participant from their user id and display name, by the "Show usernames" preference.
+pub type PersonLabel = Rc<dyn Fn(&str, &str) -> String>;
+
 /// Open a call window for `channel_id` and join its call through core.
 /// Closing the window (or hanging up) leaves the call.
 pub fn open_call(
@@ -552,6 +555,7 @@ pub fn open_call(
     runtime: Handle,
     channel_id: String,
     title: &str,
+    person_label: PersonLabel,
 ) -> adw::Window {
     let view = CallView::new(title);
     let window = adw::Window::builder()
@@ -594,6 +598,8 @@ pub fn open_call(
 
     let name_of = {
         let (mids, state) = (mids.clone(), state.clone());
+        // Named as the "Show usernames" preference says, by the caller's rule.
+        let person_label = person_label.clone();
         move |mid: &str| -> String {
             let Some((pid, screen)) = mids.borrow().get(mid).cloned() else {
                 return String::new();
@@ -605,7 +611,7 @@ pub fn open_call(
                     s.participants
                         .iter()
                         .find(|p| p.participant_id == pid)
-                        .map(|p| p.display_name.clone())
+                        .map(|p| person_label(&p.user_id, &p.display_name))
                 })
                 .unwrap_or_default();
             if screen {

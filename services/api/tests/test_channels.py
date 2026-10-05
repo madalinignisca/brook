@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
+import pytest
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models import Reaction
 
 API = "/api/v1"
 
@@ -386,6 +393,64 @@ async def test_reactions_toggle_and_aggregate(client: httpx.AsyncClient) -> None
     hist = await client.get(f"{API}/channels/{cid}/messages", headers=_auth(bob))
     msg = next(m for m in hist.json() if m["id"] == mid)
     assert msg["reactions"] == [{"emoji": "👍", "count": 1, "me": True}]
+
+
+async def test_two_overlapping_adds_toggle_in_sequence_not_a_500(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two overlapping adds by one user both read "no reaction yet" (the gate holds each read
+    # until both have happened), then both insert. The second waits on the sync counter lock
+    # and hits the primary key: that used to be a 500. Now it reads again and removes.
+    alice, bob = await _two_users(client)
+    cid, mid = await _dm_with_message(client, alice, bob)
+    url = f"{API}/channels/{cid}/messages/{mid}/reactions"
+
+    real_get = AsyncSession.get
+    gate = asyncio.Event()
+    arrived = 0
+
+    async def gated_get(self, entity, ident, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal arrived
+        found = await real_get(self, entity, ident, *args, **kwargs)
+        if entity is Reaction and not gate.is_set():
+            arrived += 1
+            if arrived == 2:
+                gate.set()
+            await gate.wait()
+        return found
+
+    monkeypatch.setattr(AsyncSession, "get", gated_get)
+    first, second = await asyncio.gather(
+        client.post(url, json={"emoji": "👍"}, headers=_auth(alice)),
+        client.post(url, json={"emoji": "👍"}, headers=_auth(alice)),
+    )
+    assert (first.status_code, second.status_code) == (200, 200), "the loser is retried"
+    assert arrived == 2, "both requests really read before either wrote"
+    hist = await client.get(f"{API}/channels/{cid}/messages", headers=_auth(alice))
+    msg = next(m for m in hist.json() if m["id"] == mid)
+    assert msg["reactions"] == [], "two toggles in sequence: the add, then the removal"
+
+
+async def test_a_persistent_insert_conflict_is_raised_not_swallowed(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The retry covers the one race; a conflict that survives it is a real error and must
+    # surface (a 500), never a 200 with a made-up answer and no seq.
+    alice, bob = await _two_users(client)
+    cid, mid = await _dm_with_message(client, alice, bob)
+    url = f"{API}/channels/{cid}/messages/{mid}/reactions"
+    assert (await client.post(url, json={"emoji": "👍"}, headers=_auth(alice))).status_code == 200
+
+    real_get = AsyncSession.get
+
+    async def always_stale(self, entity, ident, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if entity is Reaction:
+            return None  # every read says "no reaction", although the row exists
+        return await real_get(self, entity, ident, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "get", always_stale)
+    with pytest.raises(IntegrityError):
+        await client.post(url, json={"emoji": "👍"}, headers=_auth(alice))
 
 
 async def test_reaction_requires_membership(client: httpx.AsyncClient) -> None:

@@ -34,6 +34,7 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     var stateGate: Gate?
     var pinFailure: Error?
     var pinGate: Gate?
+    var previewGate: Gate?
     let pins = Mutex<[String]>([])
     var previewResult: Result<FfiImagePreview, Error> = .failure(LoginError.Api(code: "file.preview_refused", message: ""))
     let queued = Mutex<[String]>([]) // "clientId|body|reply"

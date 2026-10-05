@@ -68,4 +68,16 @@ final class ImageDecoderQueueTests: XCTestCase {
         _ = await decoder.thumbnail(bytes: Data(), kind: .png, header: (1, 1), alive: { true })
         XCTAssertEqual(count.lock.withLock { count.sent }, 3, "a request was sent after previews went off")
     }
+
+    /// The row asks from the main thread, the decoder's state lives on its actor: the flag
+    /// is what makes the answer readable without awaiting.
+    func testAnUnreachableDecoderReadsAsOffFromAnyThread() async {
+        let decoder = ImageDecoder(send: { _, _ in nil })
+        XCTAssertFalse(decoder.isOff)
+        for _ in 0 ..< ImageDecoder.unreachableLimit {
+            _ = await decoder.thumbnail(bytes: Data(), kind: .png, header: (1, 1), alive: { true })
+        }
+        let fromElsewhere = await Task.detached { decoder.isOff }.value
+        XCTAssertTrue(fromElsewhere)
+    }
 }

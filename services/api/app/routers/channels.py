@@ -1135,14 +1135,28 @@ async def toggle_reaction(
     await _require_member(session, channel_id, user)
     await _get_message(session, channel_id, message_id)  # 404 if not a live message here
 
-    existing = await session.get(Reaction, (message_id, user.id, body.emoji))
-    if existing is None:
-        session.add(Reaction(message_id=message_id, user_id=user.id, emoji=body.emoji))
-        added = True
-    else:
-        await session.delete(existing)
-        added = False
-    await session.flush()  # stamps the message's seq (app/sync.py)
+    # Read before any rollback: a rolled-back session expires `user`, and an expired
+    # attribute cannot be reloaded from async code.
+    user_id = user.id
+    for attempt in (1, 2):
+        existing = await session.get(Reaction, (message_id, user_id, body.emoji))
+        if existing is None:
+            session.add(Reaction(message_id=message_id, user_id=user_id, emoji=body.emoji))
+            added = True
+        else:
+            await session.delete(existing)
+            added = False
+        try:
+            await session.flush()  # stamps the message's seq (app/sync.py)
+        except IntegrityError:
+            # Two overlapping adds by the same user: both saw no reaction, and the second
+            # waited on the counter lock and then hit the primary key. Read again: it is
+            # now a removal, which is what the two toggles amount to in sequence.
+            await session.rollback()
+            if attempt == 2:
+                raise
+            continue
+        break
     seq = transaction_seq(session.sync_session)
     await session.commit()
 
@@ -1165,7 +1179,7 @@ async def toggle_reaction(
                 "message_id": str(message_id),
                 "channel_id": str(channel_id),
                 "emoji": body.emoji,
-                "user_id": str(user.id),
+                "user_id": str(user_id),
                 "added": added,
                 "count": count,
                 "seq": seq,
@@ -1173,7 +1187,7 @@ async def toggle_reaction(
         ),
     )
 
-    summary = await _reactions_for(session, [message_id], user.id)
+    summary = await _reactions_for(session, [message_id], user_id)
     return summary.get(message_id, [])
 
 
