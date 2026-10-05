@@ -16,10 +16,16 @@ use zeroize::Zeroize;
 
 // TEMP until core's `create_user` lands (#265): the call the dialog makes, so this compiles.
 trait CreateUserStub {
-    async fn create_user(&self, handle: &str, name: &str, password: &str) -> Result<(), Error>;
+    async fn create_user(
+        &self,
+        handle: &str,
+        name: &str,
+        password: &str,
+        admin_password: &str,
+    ) -> Result<(), Error>;
 }
 impl CreateUserStub for BrookClient {
-    async fn create_user(&self, _: &str, _: &str, _: &str) -> Result<(), Error> {
+    async fn create_user(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), Error> {
         Err(Error::UnexpectedResponse)
     }
 }
@@ -42,6 +48,7 @@ pub fn check(
     display_name: &str,
     password: &str,
     confirm: &str,
+    admin_password: &str,
 ) -> Result<(), &'static str> {
     let len = handle.chars().count();
     if !(HANDLE_MIN..=HANDLE_MAX).contains(&len) {
@@ -69,6 +76,9 @@ pub fn check(
     }
     if password != confirm {
         return Err("The passwords don't match.");
+    }
+    if admin_password.is_empty() {
+        return Err("Enter your own password to confirm.");
     }
     Ok(())
 }
@@ -116,7 +126,7 @@ pub fn error_text(err: &Error) -> String {
                 "You can't add users any more: your role changed. Sign in again.".into()
             }
             "auth.rate_limited" => "Too many attempts. Try again later.".into(),
-            "validation" => "The server refused these details.".into(),
+            "validation.error" => "The server refused these details.".into(),
             _ => "The server refused to add the user.".into(),
         },
         Error::NotAuthenticated => "You were signed out. Sign in again and retry.".into(),
@@ -149,6 +159,10 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
         .css_classes(["flat"])
         .build();
     password.add_suffix(&generate);
+    // The admin's own password, asked again for this (the server re-authenticates them).
+    let admin = adw::PasswordEntryRow::builder()
+        .title("Your password")
+        .build();
 
     let who = adw::PreferencesGroup::new();
     who.add(&handle);
@@ -156,6 +170,10 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
     let secret = adw::PreferencesGroup::new();
     secret.add(&password);
     secret.add(&confirm);
+    let you = adw::PreferencesGroup::builder()
+        .description("Your own password confirms that it is you adding someone.")
+        .build();
+    you.add(&admin);
 
     let error = gtk::Label::builder()
         .wrap(true)
@@ -181,6 +199,7 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
         .build();
     column.append(&who);
     column.append(&secret);
+    column.append(&you);
     column.append(&error);
     column.append(&spinner);
     column.append(&add);
@@ -199,7 +218,7 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
     // every field has something in it.
     let revalidate = {
         let (handle, name) = (handle.clone(), name.clone());
-        let (password, confirm) = (password.clone(), confirm.clone());
+        let (password, confirm, admin) = (password.clone(), confirm.clone(), admin.clone());
         let (add, error) = (add.clone(), error.clone());
         move || {
             let verdict = check(
@@ -207,12 +226,14 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
                 &name.text(),
                 &password.text(),
                 &confirm.text(),
+                &admin.text(),
             );
             add.set_sensitive(verdict.is_ok());
             let filled = !handle.text().is_empty()
                 && !name.text().trim().is_empty()
                 && !password.text().is_empty()
-                && !confirm.text().is_empty();
+                && !confirm.text().is_empty()
+                && !admin.text().is_empty();
             match verdict {
                 Err(reason) if filled => {
                     error.set_text(reason);
@@ -226,7 +247,7 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
         let revalidate = revalidate.clone();
         row.connect_changed(move |_| revalidate());
     }
-    for row in [&password, &confirm] {
+    for row in [&password, &confirm, &admin] {
         let revalidate = revalidate.clone();
         row.connect_changed(move |_| revalidate());
     }
@@ -242,6 +263,16 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
         }
     });
 
+    // Whatever was typed is wiped when the sheet goes away, sent or cancelled.
+    dialog.connect_closed({
+        let (password, confirm, admin) = (password.clone(), confirm.clone(), admin.clone());
+        move |_| {
+            password.set_text("");
+            confirm.set_text("");
+            admin.set_text("");
+        }
+    });
+
     let dialog_weak = dialog.downgrade();
     add.connect_clicked(move |button| {
         if check(
@@ -249,6 +280,7 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
             &name.text(),
             &password.text(),
             &confirm.text(),
+            &admin.text(),
         )
         .is_err()
         {
@@ -256,6 +288,7 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
         }
         let (new_handle, new_name) = (handle.text().to_string(), name.text().trim().to_string());
         let mut new_password = password.text().to_string();
+        let mut admin_password = admin.text().to_string();
         // One attempt at a time; the fields stay as typed so a taken handle can be changed
         // without retyping the rest.
         button.set_sensitive(false);
@@ -264,13 +297,16 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
         let request = runtime.spawn({
             let (client, handle) = (client.clone(), new_handle.clone());
             async move {
-                let result = client.create_user(&handle, &new_name, &new_password).await;
+                let result = client
+                    .create_user(&handle, &new_name, &new_password, &admin_password)
+                    .await;
                 new_password.zeroize();
+                admin_password.zeroize();
                 result
             }
         });
         let (button, spinner, error) = (button.clone(), spinner.clone(), error.clone());
-        let (password, confirm) = (password.clone(), confirm.clone());
+        let (password, confirm, admin) = (password.clone(), confirm.clone(), admin.clone());
         let dialog_weak = dialog_weak.clone();
         glib::spawn_future_local(async move {
             let result = request.await.unwrap_or(Err(Error::UnexpectedResponse));
@@ -280,6 +316,7 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
                     // Gone from the fields as soon as it is done with.
                     password.set_text("");
                     confirm.set_text("");
+                    admin.set_text("");
                     let Some(dialog) = dialog_weak.upgrade() else {
                         return;
                     };
@@ -308,9 +345,10 @@ mod tests {
     use super::*;
 
     const OK: (&str, &str, &str, &str) = ("alice", "Alice", "a-long-password", "a-long-password");
+    const ADMIN: &str = "my-own-password";
 
     fn run(handle: &str, name: &str, pw: &str, confirm: &str) -> Result<(), &'static str> {
-        check(handle, name, pw, confirm)
+        check(handle, name, pw, confirm, ADMIN)
     }
 
     #[test]
@@ -367,6 +405,14 @@ mod tests {
     }
 
     #[test]
+    fn the_admin_must_confirm_with_their_own_password() {
+        assert!(check(OK.0, OK.1, OK.2, OK.3, "")
+            .unwrap_err()
+            .contains("your own password"));
+        assert_eq!(check(OK.0, OK.1, OK.2, OK.3, "x"), Ok(()));
+    }
+
+    #[test]
     fn a_generated_password_passes_the_checks_and_avoids_lookalikes() {
         let mut next = 0u8;
         let pw = generate_with(|buf| {
@@ -376,7 +422,7 @@ mod tests {
             }
         });
         assert_eq!(pw.chars().count(), GENERATED_LEN);
-        assert_eq!(check("alice", "Alice", &pw, &pw), Ok(()));
+        assert_eq!(check("alice", "Alice", &pw, &pw, ADMIN), Ok(()));
         assert!(pw.chars().all(|c| !"0O1lI".contains(c)), "{pw}");
         assert!(pw.chars().all(|c| c.is_ascii_alphanumeric()), "{pw}");
     }
@@ -416,7 +462,7 @@ mod tests {
         assert!(error_text(&api("conflict")).contains("already taken"));
         assert!(error_text(&api("authz.forbidden")).contains("role changed"));
         assert!(error_text(&api("auth.rate_limited")).contains("Too many"));
-        assert!(error_text(&api("validation")).contains("refused these details"));
+        assert!(error_text(&api("validation.error")).contains("refused these details"));
         assert!(error_text(&api("something.new")).contains("refused to add"));
         assert!(error_text(&Error::NotAuthenticated).contains("signed out"));
     }
