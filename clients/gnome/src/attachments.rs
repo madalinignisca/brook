@@ -457,10 +457,11 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
     });
     // An inline preview under a declared image (previews spec §1, §3), by "Show image
     // previews" (#259): off unless the user turned it on, then only the "Show preview" button.
-    ensure_probe(&p_runtime);
     if !previewable_type(&p_file.content_type) || p_file.size > brook_core::PREVIEW_MAX_BYTES {
         return row.upcast();
     }
+    // Only an image row needs to know whether glycin can decode here (once per run).
+    ensure_probe(&p_runtime);
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -494,14 +495,20 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
         }
     });
     picture.add_controller(click);
+    // Bumped when the row goes back to plain (the setting turned off, or no decoder): a preview
+    // queued, fetching or decoding for an earlier value is dropped instead of drawn.
+    let generation: Rc<Cell<u64>> = Rc::default();
     let start: Rc<dyn Fn()> = Rc::new({
         let (client, runtime, file_id) = (p_client.clone(), p_runtime.clone(), p_file.id.clone());
         let (picture, show) = (picture.downgrade(), show.downgrade());
+        let generation = generation.clone();
         move || {
             if let Some(show) = show.upgrade() {
                 show.set_visible(false);
             }
-            let alive = picture.clone();
+            let wanted = generation.get();
+            let (alive, current) = (picture.clone(), generation.clone());
+            let drawn_if = generation.clone();
             let (client, runtime, file_id, picture) = (
                 client.clone(),
                 runtime.clone(),
@@ -510,7 +517,7 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
             );
             crate::preview::QUEUE.with(|q| {
                 q.push(crate::preview::Job {
-                    alive: Box::new(move || alive.upgrade().is_some()),
+                    alive: Box::new(move || alive.upgrade().is_some() && current.get() == wanted),
                     run: Box::new(move |done| {
                         let decoded = runtime.spawn(async move {
                             let bytes = client
@@ -524,7 +531,9 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
                             if let (Ok(Some(px)), Some(picture)) =
                                 (decoded.await, picture.upgrade())
                             {
-                                show_pixels(&picture, px);
+                                if drawn_if.get() == wanted {
+                                    show_pixels(&picture, px);
+                                }
                             }
                             done();
                         });
@@ -542,22 +551,20 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
     let apply: Rc<dyn Fn()> = Rc::new({
         let (picture, show, start) = (picture.downgrade(), show.downgrade(), start.clone());
         let (content_type, size) = (p_file.content_type.clone(), p_file.size);
+        let generation = generation.clone();
         let (client, runtime, file_id) = (p_client.clone(), p_runtime.clone(), p_file.id.clone());
         move || {
             let (Some(picture), Some(show)) = (picture.upgrade(), show.upgrade()) else {
                 return;
             };
-            match preview_plan(
-                show_image_previews(),
-                &content_type,
-                size,
-                crate::preview::availability(),
-            ) {
+            match row_plan(&content_type, size) {
                 PreviewPlan::Plain => {
+                    generation.set(generation.get() + 1);
                     clear_picture(&picture);
                     show.set_visible(false);
                 }
                 PreviewPlan::Button => {
+                    generation.set(generation.get() + 1);
                     clear_picture(&picture);
                     show.set_visible(true);
                 }
@@ -637,6 +644,17 @@ pub fn preview_plan(
     }
 }
 
+/// The plan for a row now: the one thing a row's `apply` calls, so a row that ignored the
+/// setting or the probe would fail a test of this.
+fn row_plan(content_type: &str, size: u64) -> PreviewPlan {
+    preview_plan(
+        show_image_previews(),
+        content_type,
+        size,
+        crate::preview::availability(),
+    )
+}
+
 fn clear_picture(picture: &gtk::Picture) {
     picture.set_visible(false);
     picture.set_paintable(None::<&gdk::Paintable>);
@@ -668,7 +686,11 @@ pub fn set_show_image_previews(on: bool) {
 }
 
 fn register_listener(apply: &Rc<dyn Fn()>) {
-    LISTENERS.with(|l| l.borrow_mut().push(Rc::downgrade(apply)));
+    LISTENERS.with(|l| {
+        let mut l = l.borrow_mut();
+        l.retain(|w| w.upgrade().is_some());
+        l.push(Rc::downgrade(apply));
+    });
 }
 
 fn notify_listeners() {
@@ -688,10 +710,20 @@ fn ensure_probe(runtime: &Handle) {
     if PROBING.with(|p| p.replace(true)) {
         return;
     }
+    // A slow first start of the sandbox can time out once: only a second failure says no.
     let probe = runtime.spawn(async {
-        crate::preview::decode(crate::preview::PROBE_PNG.to_vec())
-            .await
-            .is_some()
+        for attempt in 0..2 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            if crate::preview::decode(crate::preview::PROBE_PNG.to_vec())
+                .await
+                .is_some()
+            {
+                return true;
+            }
+        }
+        false
     });
     glib::spawn_future_local(async move {
         let ok = probe.await.unwrap_or(false);
@@ -1065,5 +1097,19 @@ mod preview_setting_tests {
             preview_plan(false, "image/png", SMALL, Unknown),
             PreviewPlan::Button
         );
+    }
+
+    #[test]
+    fn a_row_follows_the_setting_and_the_probe() {
+        use super::{row_plan, SETTING};
+        crate::preview::set_availability(Yes);
+        SETTING.with(|s| s.set(Some(false)));
+        assert_eq!(row_plan("image/png", SMALL), PreviewPlan::Button);
+        SETTING.with(|s| s.set(Some(true)));
+        assert_eq!(row_plan("image/png", SMALL), PreviewPlan::Auto);
+        crate::preview::set_availability(No);
+        assert_eq!(row_plan("image/png", SMALL), PreviewPlan::Plain);
+        crate::preview::set_availability(Unknown);
+        SETTING.with(|s| s.set(None));
     }
 }
