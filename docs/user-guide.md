@@ -36,8 +36,7 @@ apps out of Brook's local data (a native install can't promise that).
 **From source:**
 
 **Prerequisites:** the Rust toolchain (`rustup`), plus GTK 4 and libadwaita
-development libraries (e.g. on Arch: `gtk4 libadwaita`; on Fedora:
-`gtk4-devel libadwaita-devel`; on Debian/Ubuntu: `libgtk-4-dev libadwaita-1-dev`).
+development libraries (on Debian 13 and Ubuntu 26.04: `libgtk-4-dev libadwaita-1-dev`).
 
 ```bash
 git clone https://github.com/madalinignisca/brook.git
