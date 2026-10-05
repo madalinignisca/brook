@@ -16,22 +16,6 @@ use gtk::glib;
 use tokio::runtime::Handle;
 use zeroize::Zeroize;
 
-// TEMP until core's `create_user` lands (#265): the call the dialog makes, so this compiles.
-trait CreateUserStub {
-    async fn create_user(
-        &self,
-        handle: &str,
-        name: &str,
-        password: &str,
-        admin_password: &str,
-    ) -> Result<(), Error>;
-}
-impl CreateUserStub for BrookClient {
-    async fn create_user(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), Error> {
-        Err(Error::UnexpectedResponse)
-    }
-}
-
 const HANDLE_MIN: usize = 2;
 const HANDLE_MAX: usize = 64;
 const NAME_MAX: usize = 64;
