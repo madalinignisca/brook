@@ -75,6 +75,9 @@ final class FakeRealtime: FfiBrookClientProtocol, @unchecked Sendable {
     func adminResetTotp(userId: String, adminPassword: String) async throws {}
     func adminResetPassword(userId: String, adminPassword: String, new: String) async throws {}
     func listUsers() async throws -> [FfiUserSummary] { [] }
+    func createUser(handle: String, displayName: String, password: String, adminPassword: String) async throws -> FfiUserSummary {
+        FfiUserSummary(id: "", handle: handle, displayName: displayName, globalRole: "member")
+    }
 
     func deliver(_ event: FfiServerEvent) { listener.withLock { $0 }?.onEvent(event: event) }
 }
