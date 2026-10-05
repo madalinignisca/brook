@@ -24,6 +24,7 @@ struct BrookApp: App {
     @State private var calls = CallCenter()
 
     init() {
+        DropImport.sweep()
         let store = SessionStore(persistence: .live())
         _store = State(initialValue: store)
         _form = State(initialValue: LoginForm(store: store))

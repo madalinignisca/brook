@@ -93,9 +93,9 @@ struct ChatView: View {
         }
         // Files dropped anywhere on the conversation join the next message (not while
         // editing, and only with this Mac's storage).
-        .dropDestination(for: URL.self) { urls, _ in
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             guard composer.canAttach else { return false }
-            composer.attach(urls.filter(\.isFileURL))
+            Task { await composer.attach(dropped: providers) }
             return true
         }
         // Archived: nothing writes (the composer is replaced, and Reply, Edit and dropped files are off).

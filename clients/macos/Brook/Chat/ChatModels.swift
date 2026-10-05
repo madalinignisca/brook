@@ -448,6 +448,25 @@ final class ComposerModel {
         }
     }
 
+    /// Files dropped on the conversation: each is copied at once (see `DropImport`), then staged
+    /// like a picked one. Whatever isn't staged leaves no copy behind.
+    func attach(dropped providers: [NSItemProvider]) async {
+        guard canAttach else { return }
+        for provider in providers {
+            let outcome = await DropImport.copy(provider)
+            switch outcome {
+            case let .refused(refusal): if let text = refusal.text { error = text }
+            case let .copied(url, dir):
+                // The composer may have moved on during the copy (a send began, edit started).
+                guard canAttach else { try? FileManager.default.removeItem(at: dir); continue }
+                switch Staging.stage(url, already: staged, access: fileAccess, ownedDir: dir) {
+                case let .success(file): staged.append(file)
+                case let .failure(refusal): if let text = refusal.text { error = text }
+                }
+            }
+        }
+    }
+
     func remove(_ file: StagedFile) {
         guard !preparing else { return } // its access is in use by the enqueue
         staged.removeAll { $0 === file }

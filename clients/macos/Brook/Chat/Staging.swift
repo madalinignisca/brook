@@ -47,14 +47,18 @@ final class StagedFile: Identifiable, @unchecked Sendable {
     /// Its upload's transfer id, fixed while staged (the retry key uses it, as GTK #173).
     let transferId: UInt64
     private let access: any FileAccess
+    /// A dropped file's private copy: the folder holding it, removed with the file.
+    private let ownedDir: URL?
     private let lock = NSLock()
     private var held: Bool
 
     var id: UInt64 { transferId }
 
     /// `scoped`: `startAccessing` returned true, so a `stopAccessing` is owed.
-    fileprivate init(url: URL, size: UInt64, contentType: String, access: any FileAccess, scoped: Bool) {
+    fileprivate init(url: URL, size: UInt64, contentType: String, access: any FileAccess, scoped: Bool,
+                     ownedDir: URL?) {
         held = scoped
+        self.ownedDir = ownedDir
         self.url = url
         name = url.lastPathComponent
         self.size = size
@@ -70,6 +74,7 @@ final class StagedFile: Identifiable, @unchecked Sendable {
             return held
         }
         if wasHeld { access.stopAccessing(url) }
+        if let ownedDir { try? FileManager.default.removeItem(at: ownedDir) }
     }
 
     var outgoing: FfiOutgoingFile {
@@ -80,7 +85,11 @@ final class StagedFile: Identifiable, @unchecked Sendable {
 enum Staging {
     /// Stage `url` beside `already` (GTK's refusals and texts, spec §1): its scope, if it has
     /// one, is held only if it's staged, and stopped on every refusal.
-    static func stage(_ url: URL, already: [StagedFile], access: any FileAccess) -> Result<StagedFile, StagingRefusal> {
+    static func stage(_ url: URL, already: [StagedFile], access: any FileAccess,
+                      ownedDir: URL? = nil) -> Result<StagedFile, StagingRefusal> {
+        var staged = false
+        // A dropped file's copy goes with a refusal; a staged one goes when its file is released.
+        defer { if !staged, let ownedDir { try? FileManager.default.removeItem(at: ownedDir) } }
         let name = url.lastPathComponent
         if already.contains(where: { $0.url.standardizedFileURL == url.standardizedFileURL }) {
             return .failure(.duplicate)
@@ -91,7 +100,6 @@ enum Staging {
         // A dropped file has no scope (false) yet is readable: facts and a real open decide, and
         // only a scope that was started is ever stopped.
         let scoped = access.startAccessing(url)
-        var staged = false
         defer { if scoped, !staged { access.stopAccessing(url) } }
         guard let facts = access.facts(url) else { return .failure(.unreadable(name)) }
         guard facts.regular else { return .failure(.notAFile) }
@@ -102,7 +110,73 @@ enum Staging {
         staged = true
         return .success(StagedFile(url: url, size: facts.size,
                                    contentType: facts.type ?? "application/octet-stream", access: access,
-                                   scoped: scoped))
+                                   scoped: scoped, ownedDir: ownedDir))
+    }
+}
+
+/// Files dropped on the conversation. A drop hands each file over through its item provider,
+/// readable only while the system's load callback runs (the sandbox's access to a file the
+/// user dragged in, an iCloud file's download): the plain URL SwiftUI would give is not
+/// reliably readable ("couldn't be read"). So each file is copied at once into this app's own
+/// temp folder, and the copy is what gets staged.
+enum DropImport {
+    enum Outcome {
+        /// The copy, in its own folder (removed with the staged file).
+        case copied(URL, dir: URL)
+        case refused(StagingRefusal)
+    }
+
+    static let root = FileManager.default.temporaryDirectory.appendingPathComponent("brook-drops", isDirectory: true)
+
+    /// `limit`: larger files aren't copied at all (the staging limit would refuse them later).
+    @MainActor static func copy(_ provider: NSItemProvider, limit: UInt64 = maxFileBytes(), root: URL = DropImport.root) async -> Outcome {
+        let name = provider.suggestedName ?? "The file"
+        if provider.hasItemConformingToTypeIdentifier(UTType.folder.identifier) { return .refused(.notAFile) }
+        return await withCheckedContinuation { c in
+            _ = provider.loadInPlaceFileRepresentation(forTypeIdentifier: UTType.item.identifier) { url, _, error in
+                guard let url, error == nil else { return c.resume(returning: .refused(.unreadable(name))) }
+                let fm = FileManager.default
+                // The system may hand over a hidden temporary name (".com.apple.Foundation.NSItemProvider…"):
+                // the file is sent under the name the user dragged, never that one.
+                let name = displayName(of: url, suggested: provider.suggestedName)
+                let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
+                if values?.isDirectory == true { return c.resume(returning: .refused(.notAFile)) }
+                if let size = values?.fileSize.map(UInt64.init), size > limit {
+                    return c.resume(returning: .refused(.tooLarge(name)))
+                }
+                let dir = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                let dest = dir.appendingPathComponent(name)
+                do {
+                    try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                    try fm.copyItem(at: url, to: dest)
+                    c.resume(returning: .copied(dest, dir: dir))
+                } catch {
+                    try? fm.removeItem(at: dir)
+                    c.resume(returning: .refused(.unreadable(name)))
+                }
+            }
+        }
+    }
+
+    /// The name to send under: the file's own, unless the system's is a hidden temporary one, then
+    /// the provider's suggested name with the file's extension.
+    static func displayName(of url: URL, suggested: String?) -> String {
+        let own = url.lastPathComponent
+        guard own.hasPrefix(".com.apple.Foundation.NSItemProvider") else { return own }
+        let ext = url.pathExtension
+        let base = (suggested?.isEmpty == false ? suggested : nil) ?? "Dropped file"
+        return ext.isEmpty || base.hasSuffix("." + ext) ? base : base + "." + ext
+    }
+
+    /// Copies left by a run that quit before sending (staged files don't outlive the app).
+    /// Only day-old ones: a second running instance shares this folder.
+    static func sweep(root: URL = DropImport.root, olderThan age: TimeInterval = 86_400, now: Date = Date()) {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        for item in items {
+            let modified = (try? item.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            if let modified, now.timeIntervalSince(modified) > age { try? fm.removeItem(at: item) }
+        }
     }
 }
 
