@@ -1,5 +1,6 @@
 import Foundation
 import UniformTypeIdentifiers
+import BrookCore
 import XCTest
 
 @testable import Brook
@@ -33,7 +34,7 @@ import XCTest
 
     func testCopiesTheFileUnderItsNameIntoItsOwnFolder() async throws {
         let src = try source("1.png")
-        guard case let .copied(url, dir) = await DropImport.copy(provider(src), root: root) else {
+        guard case let .copied(url, dir, _) = await DropImport.copy(provider(src), root: root) else {
             return XCTFail("expected a copy")
         }
         XCTAssertEqual(url.lastPathComponent, "1.png")
@@ -69,7 +70,7 @@ import XCTest
 
     func testTheCopyGoesWithItsStagedFile() async throws {
         let src = try source("2.png")
-        guard case let .copied(url, dir) = await DropImport.copy(provider(src), root: root) else {
+        guard case let .copied(url, dir, _) = await DropImport.copy(provider(src), root: root) else {
             return XCTFail("expected a copy")
         }
         guard case let .success(file) = Staging.stage(url, already: [], access: SystemFileAccess(), ownedDir: dir) else {
@@ -83,7 +84,7 @@ import XCTest
 
     func testARefusedCopyLeavesNothingBehind() async throws {
         let src = try source("empty.bin", bytes: 0)
-        guard case let .copied(url, dir) = await DropImport.copy(provider(src), root: root) else {
+        guard case let .copied(url, dir, _) = await DropImport.copy(provider(src), root: root) else {
             return XCTFail("expected a copy")
         }
         XCTAssertEqual(Staging.stage(url, already: [], access: SystemFileAccess(), ownedDir: dir).failure, .empty("empty.bin"))
@@ -97,6 +98,113 @@ import XCTest
         XCTAssertEqual(DropImport.displayName(of: hidden, suggested: nil), "Dropped file.png")
         XCTAssertEqual(DropImport.displayName(of: hidden, suggested: ""), "Dropped file.png")
         XCTAssertEqual(DropImport.displayName(of: URL(fileURLWithPath: "/x/IMG-99.jpg"), suggested: "other"), "IMG-99.jpg")
+    }
+
+    /// A provider that offers only a file URL (as a Finder drag may): the file is read through the
+    /// URL, and what is staged is the file, never the URL's text.
+    func testAProviderWithOnlyAFileURLCopiesTheFileNotTheURLText() async throws {
+        let src = try source("only-url.png", bytes: 33)
+        let p = NSItemProvider()
+        p.suggestedName = "only-url"
+        p.registerDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier, visibility: .all) { done in
+            done(src.dataRepresentation, nil)
+            return nil
+        }
+        guard case let .copied(url, _, _) = await DropImport.copy(p, root: root) else { return XCTFail("expected a copy") }
+        XCTAssertEqual(try Data(contentsOf: url), try Data(contentsOf: src), "the file's bytes, not 'file:///…'")
+        XCTAssertEqual(url.lastPathComponent, "only-url.png")
+    }
+
+    func testAProviderWithNothingFileLikeIsRefused() async {
+        let p = NSItemProvider()
+        p.registerDataRepresentation(forTypeIdentifier: UTType.url.identifier, visibility: .all) { done in
+            done(Data("https://example.com".utf8), nil)
+            return nil
+        }
+        guard case let .refused(refusal) = await DropImport.copy(p, root: root) else { return XCTFail("expected a refusal") }
+        XCTAssertEqual(refusal, .unreadable("Dropped file"))
+    }
+
+    func testNamesAreSafePathComponentsAndExtensionsMatchWithoutCase() {
+        XCTAssertEqual(DropImport.safeName("../../evil.png"), "evil.png")
+        XCTAssertEqual(DropImport.safeName(".."), "Dropped file")
+        XCTAssertEqual(DropImport.safeName(""), "Dropped file")
+        XCTAssertEqual(DropImport.safeName(nil), "Dropped file")
+        let hidden = URL(fileURLWithPath: "/x/.com.apple.Foundation.NSItemProvider1.PNG")
+        XCTAssertEqual(DropImport.displayName(of: hidden, suggested: "Photo.png"), "Photo.png", "no Photo.png.PNG")
+    }
+
+    func testTheSameFileDroppedTwiceIsStagedOnceAndTheSecondCopyIsRemoved() async throws {
+        let src = try source("same.png")
+        // A Finder drop is in place: the provider hands over the file where it lies.
+        func inPlace() -> NSItemProvider {
+            let p = NSItemProvider()
+            p.registerFileRepresentation(forTypeIdentifier: UTType.png.identifier, fileOptions: [.openInPlace], visibility: .all) { done in
+                done(src, true, nil)
+                return nil
+            }
+            return p
+        }
+        guard case let .copied(u1, d1, s1) = await DropImport.copy(inPlace(), root: root),
+              case let .copied(u2, d2, s2) = await DropImport.copy(inPlace(), root: root)
+        else { return XCTFail("expected copies") }
+        XCTAssertNotEqual(u1, u2, "each drop has its own copy")
+        guard case let .success(first) = Staging.stage(u1, already: [], access: SystemFileAccess(), ownedDir: d1, source: s1)
+        else { return XCTFail("expected it staged") }
+        XCTAssertEqual(Staging.stage(u2, already: [first], access: SystemFileAccess(), ownedDir: d2, source: s2).failure, .duplicate)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: d2.path), "the refused copy is gone")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: d1.path))
+    }
+
+    // ---- The composer's side ----
+
+    private func composer() -> ComposerModel {
+        let chat = FakeChat()
+        chat.local = true
+        return ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+    }
+
+    func testAComposerThatClosedDuringTheCopyStagesNothingAndRemovesTheCopy() async throws {
+        let c = composer()
+        let src = try source("late.png")
+        c.importer = { [root] p in
+            c.readOnly = true // the composer moved on while the file was being copied
+            return await DropImport.copy(p, root: root!)
+        }
+        await c.attach(dropped: [provider(src)])
+        XCTAssertTrue(c.staged.isEmpty)
+        XCTAssertEqual(c.error, "late.png wasn't attached.")
+        let left = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
+        XCTAssertTrue(left.isEmpty, "no copy left behind")
+    }
+
+    func testAFullMessageCopiesNothingMore() async throws {
+        let c = composer()
+        var copies = 0
+        c.importer = { [root] p in
+            copies += 1
+            return await DropImport.copy(p, root: root!)
+        }
+        let limit = Int(maxFilesPerMessage())
+        var providers: [NSItemProvider] = []
+        for i in 0 ..< limit + 3 { providers.append(provider(try source("f\(i).png"))) }
+        await c.attach(dropped: providers)
+        XCTAssertEqual(c.staged.count, limit)
+        XCTAssertEqual(copies, limit, "the files past the limit were not copied")
+        XCTAssertEqual(c.error, StagingRefusal.tooMany.text)
+    }
+
+    func testStagedCopiesGoWhenTheComposerGoes() async throws {
+        var dir: URL?
+        do {
+            let c = composer()
+            c.importer = { [root] p in await DropImport.copy(p, root: root!) }
+            await c.attach(dropped: [provider(try source("abandoned.png"))])
+            dir = c.staged.first?.url.deletingLastPathComponent()
+            XCTAssertNotNil(dir)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: dir!.path))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir!.path), "the abandoned draft's copy is gone")
     }
 
     func testSweepRemovesOnlyOldCopies() throws {

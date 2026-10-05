@@ -448,24 +448,36 @@ final class ComposerModel {
         }
     }
 
+    /// How a dropped file is copied out of its provider (a test passes its own).
+    var importer: (NSItemProvider) async -> DropImport.Outcome = { await DropImport.copy($0) }
+
     /// Files dropped on the conversation: each is copied at once (see `DropImport`), then staged
     /// like a picked one. Whatever isn't staged leaves no copy behind.
     func attach(dropped providers: [NSItemProvider]) async {
         guard canAttach else { return }
         for provider in providers {
-            let outcome = await DropImport.copy(provider)
-            switch outcome {
+            // Before the copy: a full message needs no further 100 MiB copies to say so.
+            guard staged.count < Int(maxFilesPerMessage()) else { error = StagingRefusal.tooMany.text; break }
+            switch await importer(provider) {
             case let .refused(refusal): if let text = refusal.text { error = text }
-            case let .copied(url, dir):
-                // The composer may have moved on during the copy (a send began, edit started).
-                guard canAttach else { try? FileManager.default.removeItem(at: dir); continue }
-                switch Staging.stage(url, already: staged, access: fileAccess, ownedDir: dir) {
+            case let .copied(url, dir, source):
+                // The composer may have moved on during the copy (a send began, an edit started).
+                guard canAttach else {
+                    try? FileManager.default.removeItem(at: dir)
+                    error = "\(url.lastPathComponent) wasn't attached."
+                    continue
+                }
+                switch Staging.stage(url, already: staged, access: fileAccess, ownedDir: dir, source: source) {
                 case let .success(file): staged.append(file)
                 case let .failure(refusal): if let text = refusal.text { error = text }
                 }
             }
         }
     }
+
+    /// Staged files not sent when the composer goes (a channel left, a draft abandoned): their
+    /// copies and access end with it.
+    isolated deinit { staged.forEach { $0.release() } }
 
     func remove(_ file: StagedFile) {
         guard !preparing else { return } // its access is in use by the enqueue

@@ -46,6 +46,9 @@ final class StagedFile: Identifiable, @unchecked Sendable {
     let contentType: String
     /// Its upload's transfer id, fixed while staged (the retry key uses it, as GTK #173).
     let transferId: UInt64
+    /// What the user chose, for telling duplicates apart: a dropped file's copy has a new path
+    /// each time, its source does not.
+    let source: URL
     private let access: any FileAccess
     /// A dropped file's private copy: the folder holding it, removed with the file.
     private let ownedDir: URL?
@@ -56,9 +59,10 @@ final class StagedFile: Identifiable, @unchecked Sendable {
 
     /// `scoped`: `startAccessing` returned true, so a `stopAccessing` is owed.
     fileprivate init(url: URL, size: UInt64, contentType: String, access: any FileAccess, scoped: Bool,
-                     ownedDir: URL?) {
+                     ownedDir: URL?, source: URL) {
         held = scoped
         self.ownedDir = ownedDir
+        self.source = source.standardizedFileURL
         self.url = url
         name = url.lastPathComponent
         self.size = size
@@ -86,12 +90,12 @@ enum Staging {
     /// Stage `url` beside `already` (GTK's refusals and texts, spec §1): its scope, if it has
     /// one, is held only if it's staged, and stopped on every refusal.
     static func stage(_ url: URL, already: [StagedFile], access: any FileAccess,
-                      ownedDir: URL? = nil) -> Result<StagedFile, StagingRefusal> {
+                      ownedDir: URL? = nil, source: URL? = nil) -> Result<StagedFile, StagingRefusal> {
         var staged = false
         // A dropped file's copy goes with a refusal; a staged one goes when its file is released.
         defer { if !staged, let ownedDir { try? FileManager.default.removeItem(at: ownedDir) } }
         let name = url.lastPathComponent
-        if already.contains(where: { $0.url.standardizedFileURL == url.standardizedFileURL }) {
+        if already.contains(where: { $0.source == (source ?? url).standardizedFileURL }) {
             return .failure(.duplicate)
         }
         guard already.count < Int(maxFilesPerMessage()) else {
@@ -110,7 +114,7 @@ enum Staging {
         staged = true
         return .success(StagedFile(url: url, size: facts.size,
                                    contentType: facts.type ?? "application/octet-stream", access: access,
-                                   scoped: scoped, ownedDir: ownedDir))
+                                   scoped: scoped, ownedDir: ownedDir, source: source ?? url))
     }
 }
 
@@ -121,8 +125,8 @@ enum Staging {
 /// temp folder, and the copy is what gets staged.
 enum DropImport {
     enum Outcome {
-        /// The copy, in its own folder (removed with the staged file).
-        case copied(URL, dir: URL)
+        /// The copy, in its own folder (removed with the staged file), and the file it came from.
+        case copied(URL, dir: URL, source: URL)
         case refused(StagingRefusal)
     }
 
@@ -130,42 +134,76 @@ enum DropImport {
 
     /// `limit`: larger files aren't copied at all (the staging limit would refuse them later).
     @MainActor static func copy(_ provider: NSItemProvider, limit: UInt64 = maxFileBytes(), root: URL = DropImport.root) async -> Outcome {
-        let name = provider.suggestedName ?? "The file"
-        if provider.hasItemConformingToTypeIdentifier(UTType.folder.identifier) { return .refused(.notAFile) }
-        return await withCheckedContinuation { c in
-            _ = provider.loadInPlaceFileRepresentation(forTypeIdentifier: UTType.item.identifier) { url, _, error in
-                guard let url, error == nil else { return c.resume(returning: .refused(.unreadable(name))) }
-                let fm = FileManager.default
-                // The system may hand over a hidden temporary name (".com.apple.Foundation.NSItemProvider…"):
-                // the file is sent under the name the user dragged, never that one.
-                let name = displayName(of: url, suggested: provider.suggestedName)
-                let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
-                if values?.isDirectory == true { return c.resume(returning: .refused(.notAFile)) }
-                if let size = values?.fileSize.map(UInt64.init), size > limit {
-                    return c.resume(returning: .refused(.tooLarge(name)))
-                }
-                let dir = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
-                let dest = dir.appendingPathComponent(name)
-                do {
-                    try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-                    try fm.copyItem(at: url, to: dest)
-                    c.resume(returning: .copied(dest, dir: dir))
-                } catch {
-                    try? fm.removeItem(at: dir)
-                    c.resume(returning: .refused(.unreadable(name)))
+        let types = provider.registeredTypeIdentifiers.compactMap { UTType($0) }
+        if types.contains(where: { $0.conforms(to: .folder) }) { return .refused(.notAFile) }
+        let suggested = provider.suggestedName
+        // The file's own type (not a URL: asking for "any item" of a provider that only offers
+        // a file URL would hand over the URL's text as if it were the file).
+        if let own = types.first(where: { ($0.conforms(to: .data) || $0.conforms(to: .content)) && !$0.conforms(to: .url) }) {
+            return await withCheckedContinuation { c in
+                _ = provider.loadInPlaceFileRepresentation(forTypeIdentifier: own.identifier) { url, _, error in
+                    guard let url, error == nil else {
+                        return c.resume(returning: .refused(.unreadable(safeName(suggested))))
+                    }
+                    c.resume(returning: take(url, suggested: suggested, limit: limit, root: root))
                 }
             }
         }
+        // Only a file URL on offer: read the URL (the load carries the drop's access to it).
+        guard types.contains(where: { $0.conforms(to: .fileURL) }) else { return .refused(.unreadable(safeName(suggested))) }
+        return await withCheckedContinuation { c in
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                let url = (item as? URL) ?? (item as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
+                guard let url, url.isFileURL else { return c.resume(returning: .refused(.unreadable(safeName(suggested)))) }
+                c.resume(returning: take(url, suggested: suggested, limit: limit, root: root))
+            }
+        }
+    }
+
+    /// Copies `url` into its own folder, coordinated (an iCloud file is downloaded first), after
+    /// the checks that need no copy.
+    private static func take(_ url: URL, suggested: String?, limit: UInt64, root: URL) -> Outcome {
+        let name = displayName(of: url, suggested: suggested)
+        var outcome = Outcome.refused(.unreadable(name))
+        var coordinationError: NSError?
+        NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { readURL in
+            let fm = FileManager.default
+            guard let values = try? readURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey]),
+                  let size = values.fileSize
+            else { return }
+            if values.isDirectory == true { outcome = .refused(.notAFile); return }
+            if UInt64(size) > limit { outcome = .refused(.tooLarge(name)); return }
+            let dir = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            do {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                let dest = dir.appendingPathComponent(name)
+                try fm.copyItem(at: readURL, to: dest)
+                // A file dragged from a folder is its own source; a handed-over temporary has none.
+                let hidden = url.lastPathComponent.hasPrefix(Self.temporaryPrefix)
+                outcome = .copied(dest, dir: dir, source: hidden ? dest : url)
+            } catch {
+                try? fm.removeItem(at: dir)
+            }
+        }
+        return coordinationError == nil ? outcome : .refused(.unreadable(name))
+    }
+
+    private static let temporaryPrefix = ".com.apple.Foundation.NSItemProvider"
+
+    /// A name safe to use as one path component, never empty.
+    static func safeName(_ name: String?) -> String {
+        let last = ((name ?? "") as NSString).lastPathComponent
+        return last.isEmpty || last == "." || last == ".." ? "Dropped file" : last
     }
 
     /// The name to send under: the file's own, unless the system's is a hidden temporary one, then
     /// the provider's suggested name with the file's extension.
     static func displayName(of url: URL, suggested: String?) -> String {
         let own = url.lastPathComponent
-        guard own.hasPrefix(".com.apple.Foundation.NSItemProvider") else { return own }
+        guard own.hasPrefix(temporaryPrefix) else { return safeName(own) }
         let ext = url.pathExtension
-        let base = (suggested?.isEmpty == false ? suggested : nil) ?? "Dropped file"
-        return ext.isEmpty || base.hasSuffix("." + ext) ? base : base + "." + ext
+        let base = safeName(suggested)
+        return ext.isEmpty || base.lowercased().hasSuffix("." + ext.lowercased()) ? base : base + "." + ext
     }
 
     /// Copies left by a run that quit before sending (staged files don't outlive the app).
