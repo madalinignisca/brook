@@ -4636,8 +4636,8 @@ fn sign_out_body(unsent: u64, known: bool, remove: bool) -> String {
         // This session has not opened the saved data (local data is off, or the keyring was
         // locked): a removal can't be promised, and nothing unsent is touched either (#249).
         return String::from(
-            "Brook can't open this device's saved data in this session, so it may not be able to \
-             remove it.",
+            "Brook hasn't opened this device's saved data in this session (yet), so it may not be \
+             able to remove it.",
         );
     }
     let mut text = if remove {
