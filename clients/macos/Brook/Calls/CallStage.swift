@@ -25,6 +25,17 @@ enum CallStage {
         return pinned
     }
 
+    /// Who is sharing, in the order the shares arrived: those still sharing keep their place, a new
+    /// share goes last (several in one update by participant id, so the order is the same every run).
+    /// The first share on the stage is then the one everyone was already watching, whoever comes
+    /// earlier in the roster.
+    static func arrivalOrder(previous: [String], current: [String]) -> [String] {
+        let now = Set(current)
+        let kept = previous.filter { now.contains($0) }
+        let known = Set(kept)
+        return kept + current.filter { !known.contains($0) }.sorted()
+    }
+
     /// A click on a tile: on the stage it releases the pin (back to the automatic choice), anywhere
     /// else it pins that tile.
     static func toggled(_ pinned: String?, clicked id: String, onStage: String?) -> String? {
