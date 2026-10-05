@@ -44,7 +44,7 @@ pub fn check(
     confirm: &str,
 ) -> Result<(), &'static str> {
     let len = handle.chars().count();
-    if len < HANDLE_MIN || len > HANDLE_MAX {
+    if !(HANDLE_MIN..=HANDLE_MAX).contains(&len) {
         return Err("The handle needs 2 to 64 characters.");
     }
     if !handle
