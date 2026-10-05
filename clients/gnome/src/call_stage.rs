@@ -54,6 +54,24 @@ pub fn toggled(pinned: Option<&str>, clicked: &str, on_stage: Option<&str>) -> O
     }
 }
 
+/// The pin after a tile left: a pin for someone who is no longer in the call is dropped for good,
+/// so that when the id is used again (a participant joins and takes the same stream) the new tile
+/// is not put on the stage by a pin meant for the one who left.
+pub fn pruned(pinned: Option<&str>, tiles: &[TileRef]) -> Option<String> {
+    pinned
+        .filter(|p| tiles.iter().any(|t| t.id == *p))
+        .map(str::to_string)
+}
+
+/// Where a new tile goes in the order: a remote screen after the screens already there (so the
+/// first share stays on the stage and a second one waits in the strip), anything else at the end.
+pub fn insert_at(tiles: &[TileRef], screen: bool) -> usize {
+    if !screen {
+        return tiles.len();
+    }
+    tiles.iter().rposition(|t| t.screen).map_or(0, |i| i + 1)
+}
+
 /// How tall a strip tile is: about a fifth of the window, kept between a usable minimum and a
 /// sensible maximum.
 pub fn strip_height(window_height: i32) -> i32 {
@@ -161,5 +179,31 @@ mod tests {
         assert_eq!(strip_height(640), 128);
         assert_eq!(strip_height(300), 72, "never below a usable size");
         assert_eq!(strip_height(2000), 200, "never huge");
+    }
+
+    #[test]
+    fn a_pin_for_someone_who_left_is_dropped_for_good() {
+        let tiles = [tile("scr", true), tile("cam", false)];
+        assert_eq!(pruned(Some("cam"), &tiles).as_deref(), Some("cam"));
+        assert_eq!(pruned(Some("gone"), &tiles), None);
+        assert_eq!(pruned(None, &tiles), None);
+        // The id comes back as someone else's stream: nothing is pinned any more.
+        let later = [tile("scr", true), tile("cam", false), tile("gone", false)];
+        assert_eq!(
+            split(&later, pruned(Some("gone"), &tiles).as_deref())
+                .stage
+                .as_deref(),
+            Some("scr")
+        );
+    }
+
+    #[test]
+    fn a_new_screen_goes_after_the_screens_and_a_camera_at_the_end() {
+        let tiles = [tile("s1", true), tile("s2", true), tile("cam", false)];
+        assert_eq!(insert_at(&tiles, true), 2, "the first share stays first");
+        assert_eq!(insert_at(&tiles, false), 3);
+        assert_eq!(insert_at(&[tile("cam", false)], true), 0);
+        assert_eq!(insert_at(&[], true), 0);
+        assert_eq!(insert_at(&[], false), 0);
     }
 }
