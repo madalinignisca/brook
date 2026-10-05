@@ -114,10 +114,16 @@ pub fn left_uncertain(err: &Error) -> bool {
     match err {
         Error::Timeout | Error::UnexpectedResponse => true,
         Error::Http(e) => !e.is_connect(),
+        // A refusal the server stated, not a lost answer.
+        Error::NotAuthenticated => false,
         // A bare 5xx from something in front of the server, or the server's own 500: either can
         // follow a committed insert.
-        Error::Api { code, .. } => code.starts_with("http_5") || code == "internal_error",
-        _ => false,
+        Error::Api { code, .. } => {
+            code.starts_with("http_5") || code == "internal_error" || code == "service_unavailable"
+        }
+        // Anything else the client cannot name (a dropped socket, a variant added later) is not a
+        // "no": only a failed connect proves nothing was sent.
+        _ => true,
     }
 }
 
@@ -130,9 +136,11 @@ pub fn error_text(err: &Error, same_handle_uncertain: bool) -> String {
     }
     match err {
         Error::Api { code, .. } => match code.as_str() {
-            "conflict" if same_handle_uncertain => "Your previous try got no answer and probably \
-                                                    created it, with the password you entered."
-                .into(),
+            "conflict" if same_handle_uncertain => {
+                "Your previous try got no answer and probably \
+                                                    created it, with the password sent in that try."
+                    .into()
+            }
             "conflict" => "That handle is taken. Handles are case-sensitive, and a disabled \
                            account keeps its handle."
                 .into(),
@@ -192,7 +200,12 @@ pub fn request(handle: &str, display_name: &str, password: &str, admin_password:
 /// is never logged, kept or shown again, and is wiped from the fields after use and, best effort,
 /// from memory (one copy is zeroized; the toolkit's own copies of what `.text()` returned and core's
 /// request body are not).
-pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>, runtime: Handle) {
+pub fn add_user_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    client: Arc<BrookClient>,
+    runtime: Handle,
+    uncertain: Rc<RefCell<Uncertain>>,
+) {
     let client_for_logout = client.clone();
     let handle = adw::EntryRow::builder().title("Handle").build();
     let name = adw::EntryRow::builder().title("Display name").build();
@@ -202,9 +215,9 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
         .build();
     // One attempt at a time: set while a request is out, so no field change re-enables the button.
     let in_flight = Rc::new(Cell::new(false));
-    // Handles whose last attempt got no clear answer (per handle: a lost answer for one says
-    // nothing about another).
-    let uncertain: Rc<RefCell<Uncertain>> = Rc::default();
+    // Set when the sheet has been closed (the dialog can outlive that for a moment, so asking
+    // whether it still exists is not the same).
+    let closed = Rc::new(Cell::new(false));
     // The window the sheet sits over, so the outcome still shows if the sheet is closed mid-request.
     // The window itself (not a widget in it: sign-out removes the chat page and what is in it).
     let origin = parent.root().map_or_else(
@@ -221,6 +234,15 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
     // The admin's own password, asked again for this (the server re-authenticates them).
     let admin = adw::PasswordEntryRow::builder()
         .title("Your password")
+        .build();
+
+    // The generated password, shown as text that can be selected and copied: it is the only time
+    // the admin sees it (the account is created with it).
+    let generated_label = gtk::Label::builder()
+        .selectable(true)
+        .xalign(0.0)
+        .visible(false)
+        .css_classes(["monospace"])
         .build();
 
     let who = adw::PreferencesGroup::new();
@@ -258,6 +280,7 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
         .build();
     column.append(&who);
     column.append(&secret);
+    column.append(&generated_label);
     column.append(&you);
     column.append(&error);
     column.append(&spinner);
@@ -314,25 +337,62 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
     // pass it on.
     generate.connect_clicked({
         let (password, confirm) = (password.clone(), confirm.clone());
+        let generated_label = generated_label.clone();
         move |_| {
             let mut generated = generate_password();
             password.set_text(&generated);
             confirm.set_text(&generated);
+            // Shown until the sheet is used or closed, so it can be copied and handed on.
+            generated_label.set_text(&format!("Generated password: {generated}"));
+            generated_label.set_visible(true);
             generated.zeroize();
+        }
+    });
+    // Typing a password of one's own replaces the generated one: it is not shown any more.
+    password.connect_changed({
+        let generated_label = generated_label.clone();
+        move |row| {
+            let shown = generated_label.text();
+            let typed = row.text();
+            if generated_label.is_visible() && !shown.ends_with(typed.as_str()) {
+                generated_label.set_visible(false);
+                generated_label.set_text("");
+            }
         }
     });
 
     // Whatever was typed is wiped when the sheet goes away, sent or cancelled.
     dialog.connect_closed({
         let (password, confirm, admin) = (password.clone(), confirm.clone(), admin.clone());
+        let (closed, generated_label) = (closed.clone(), generated_label.clone());
         move |_| {
+            closed.set(true);
             password.set_text("");
             confirm.set_text("");
             admin.set_text("");
+            generated_label.set_text("");
         }
     });
 
+    // The fields can't be changed while a request is out: what was sent stays what the fields
+    // say, so "try again" and "with the password sent in that try" mean what they say.
+    let lock: Rc<dyn Fn(bool)> = Rc::new({
+        let rows: Vec<gtk::Widget> = vec![
+            handle.clone().upcast(),
+            name.clone().upcast(),
+            password.clone().upcast(),
+            confirm.clone().upcast(),
+            admin.clone().upcast(),
+            generate.clone().upcast(),
+        ];
+        move |enabled| {
+            for row in &rows {
+                row.set_sensitive(enabled);
+            }
+        }
+    });
     let dialog_weak = dialog.downgrade();
+    let revalidate_after = revalidate.clone();
     add.connect_clicked(move |button| {
         if check(
             &handle.text(),
@@ -362,6 +422,7 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
         // One attempt at a time; the fields stay as typed so a taken handle can be changed
         // without retyping the rest.
         button.set_sensitive(false);
+        lock(false);
         spinner.set_spinning(true);
         error.set_visible(false);
         let request = runtime.spawn({
@@ -375,14 +436,16 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
                 result
             }
         });
-        let (button, spinner, error) = (button.clone(), spinner.clone(), error.clone());
+        let (spinner, error) = (spinner.clone(), error.clone());
         let (password, confirm, admin) = (password.clone(), confirm.clone(), admin.clone());
-        let dialog_weak = dialog_weak.clone();
+        let (dialog_weak, closed, lock) = (dialog_weak.clone(), closed.clone(), lock.clone());
+        let revalidate = revalidate_after.clone();
         let (uncertain, in_flight, origin) = (uncertain.clone(), in_flight.clone(), origin.clone());
         glib::spawn_future_local(async move {
             let result = request.await.unwrap_or(Err(Error::UnexpectedResponse));
             spinner.set_spinning(false);
             in_flight.set(false);
+            lock(true);
             match result {
                 Ok(_) => {
                     // Gone from the fields as soon as it is done with.
@@ -409,12 +472,18 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
                     }
                     // The sheet may be gone (closed mid-request): then the outcome is shown on
                     // the window it sat over instead.
-                    if dialog_weak.upgrade().is_some() {
+                    if !closed.get() {
                         error.set_text(&text);
                         error.set_visible(true);
-                        button.set_sensitive(true);
+                        revalidate();
                     } else {
-                        let failed = adw::AlertDialog::new(Some("User Not Added"), Some(&text));
+                        // Not "not added" when it may have been.
+                        let title = if left_uncertain(&err) {
+                            "No Clear Answer"
+                        } else {
+                            "User Not Added"
+                        };
+                        let failed = adw::AlertDialog::new(Some(title), Some(&text));
                         failed.add_response("ok", "OK");
                         failed.present(origin.upgrade().as_ref());
                     }
@@ -671,11 +740,28 @@ mod tests {
             message: String::new(),
         };
         assert!(error_text(&taken, true).contains("probably created it"));
-        assert!(error_text(&taken, true).contains("password you entered"));
+        assert!(error_text(&taken, true).contains("password sent in that try"));
         assert!(error_text(&taken, false).contains("case-sensitive"));
         assert!(left_uncertain(&Error::Timeout));
         assert!(left_uncertain(&Error::UnexpectedResponse));
         assert!(!left_uncertain(&taken));
         assert!(!left_uncertain(&Error::NotAuthenticated));
+    }
+
+    #[test]
+    fn what_the_client_cannot_name_is_not_told_as_not_added() {
+        // A dropped socket, a service-unavailable code, any variant added later: not a "no".
+        let api = |code: &str| Error::Api {
+            code: code.into(),
+            message: String::new(),
+        };
+        assert!(left_uncertain(&api("service_unavailable")));
+        assert_eq!(error_text(&api("service_unavailable"), false), UNCERTAIN);
+        assert!(left_uncertain(&Error::Disconnected));
+        assert!(error_text(&Error::Disconnected, false).contains("No clear answer"));
+        // Only a definite refusal or a failed connect is a "no".
+        assert!(!left_uncertain(&Error::NotAuthenticated));
+        assert!(!left_uncertain(&api("conflict")));
+        assert!(!left_uncertain(&api("auth.invalid_credentials")));
     }
 }

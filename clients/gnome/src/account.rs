@@ -92,7 +92,9 @@ pub(crate) fn close_on_logout(dialog: &adw::Dialog, client: &Arc<BrookClient>) {
     let dialog = dialog.downgrade();
     glib::spawn_future_local(async move {
         loop {
-            if matches!(*state.borrow(), AuthState::LoggedOut) {
+            // Not signed in any more: whatever it is now (a watch holds only the latest value, so a
+            // quick sign-out followed by a sign-in must not leave the sheet open either).
+            if !matches!(*state.borrow(), AuthState::LoggedIn(_)) {
                 if let Some(dialog) = dialog.upgrade() {
                     dialog.force_close();
                 }
