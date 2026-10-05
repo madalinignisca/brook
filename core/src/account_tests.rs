@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::client::Refresher;
-use crate::test_support::{PasswordMode, RefreshMode, TestServer};
+use crate::test_support::{PasswordMode, RefreshMode, RegisterMode, TestServer};
 use crate::{AuthState, BrookClient, CoreConfig, Error};
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -819,5 +819,209 @@ async fn an_older_server_reports_no_outcome() {
         refresh_token(&client).await,
         old,
         "the new pair was not committed"
+    );
+}
+
+// ---- create_user ----
+
+const NEW_PW: &str = "Sekret-New-3";
+const ADMIN_PW: &str = "admin-own-pw";
+
+fn register_requests(server: &TestServer) -> Vec<(String, serde_json::Value)> {
+    password_requests(server, "/auth/register")
+}
+
+#[tokio::test]
+async fn create_user_sends_four_fields_with_the_bearer_and_returns_the_summary() {
+    let server = strict().await;
+    let admin = signed_in(&server, "admin").await;
+    let access = admin
+        .session
+        .with_session(|s| s.access_token.clone())
+        .await
+        .unwrap();
+
+    let user = admin
+        .create_user("carol", "Carol C", NEW_PW, ADMIN_PW)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (
+            user.id.as_str(),
+            user.handle.as_str(),
+            user.display_name.as_str(),
+            user.global_role.as_str()
+        ),
+        ("id-carol", "carol", "Carol C", "member")
+    );
+    let sent = register_requests(&server);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, access, "not sent with the admin's bearer");
+    assert_eq!(
+        sent[0].1,
+        json!({
+            "handle": "carol", "display_name": "Carol C",
+            "password": NEW_PW, "admin_password": ADMIN_PW,
+        })
+    );
+}
+
+#[tokio::test]
+async fn create_user_errors_keep_their_stable_codes() {
+    let server = strict().await;
+    let admin = signed_in(&server, "admin").await;
+    for (mode, code) in [
+        (RegisterMode::Conflict, "conflict"),
+        (RegisterMode::Forbidden, "authz.forbidden"),
+        (RegisterMode::WrongAdmin, "auth.invalid_credentials"),
+        (RegisterMode::RateLimited, "auth.rate_limited"),
+        (RegisterMode::Echo422, "validation"),
+    ] {
+        server.set_register_mode(mode);
+        let err = admin
+            .create_user("carol", "Carol C", NEW_PW, ADMIN_PW)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Api { code: c, .. } if c == code),
+            "{mode:?}: {err:?}"
+        );
+        secret_free(&err, &[NEW_PW, ADMIN_PW]);
+    }
+}
+
+/// A 403 is a refusal, not an expired token: no refresh, one request.
+#[tokio::test]
+async fn create_user_403_neither_refreshes_nor_retries() {
+    let server = strict().await;
+    let admin = signed_in(&server, "admin").await;
+    for mode in [RegisterMode::Forbidden, RegisterMode::WrongAdmin] {
+        server.set_register_mode(mode);
+        let _ = admin
+            .create_user("carol", "Carol C", NEW_PW, ADMIN_PW)
+            .await;
+    }
+    assert_eq!(server.refresh_calls(), 0);
+    assert_eq!(register_requests(&server).len(), 2);
+}
+
+#[tokio::test]
+async fn create_user_422_message_carries_nothing_from_the_body() {
+    let server = strict().await;
+    let admin = signed_in(&server, "admin").await;
+    server.set_register_mode(RegisterMode::Echo422);
+    let err = admin
+        .create_user("carol", "Carol C", NEW_PW, ADMIN_PW)
+        .await
+        .unwrap_err();
+    let Error::Api { message, .. } = &err else {
+        panic!("{err:?}")
+    };
+    assert_eq!(message, "the handle, display name or password was refused");
+    assert!(!message.contains("8 characters"), "server text carried");
+}
+
+#[tokio::test]
+async fn create_user_refreshes_once_on_401_and_does_not_loop() {
+    let server = strict().await;
+    let admin = signed_in(&server, "admin").await;
+    server.expire_next(1);
+    admin
+        .create_user("carol", "Carol C", NEW_PW, ADMIN_PW)
+        .await
+        .unwrap();
+    assert_eq!(server.refresh_calls(), 1);
+    assert_eq!(register_requests(&server).len(), 2);
+
+    server.expire_next(10);
+    let err = admin
+        .create_user("dave", "Dave D", NEW_PW, ADMIN_PW)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotAuthenticated), "{err:?}");
+    assert_eq!(server.refresh_calls(), 2, "more than one refresh per call");
+}
+
+#[tokio::test]
+async fn create_user_signed_out_sends_nothing() {
+    let server = strict().await;
+    let client = Arc::new(server.client());
+    let err = client
+        .create_user("carol", "Carol C", NEW_PW, ADMIN_PW)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotAuthenticated), "{err:?}");
+    assert!(register_requests(&server).is_empty());
+}
+
+#[tokio::test]
+async fn create_user_unparseable_201_is_unexpected_response() {
+    let server = strict().await;
+    let admin = signed_in(&server, "admin").await;
+    server.set_register_mode(RegisterMode::BadBody);
+    let err = admin
+        .create_user("carol", "Carol C", NEW_PW, ADMIN_PW)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::UnexpectedResponse), "{err:?}");
+}
+
+/// Its 401 refresh goes through the single-flight path: with a refresh already holding the
+/// lock it waits rather than sending the same refresh token a second time.
+#[tokio::test]
+async fn create_user_401_refresh_waits_for_a_refresh_in_flight() {
+    let server = strict().await;
+    let admin = signed_in(&server, "admin").await;
+    let held = admin.session.refresh_lock.clone().lock_owned().await;
+    server.expire_next(1);
+    let a = admin.clone();
+    let call =
+        tokio::spawn(async move { a.create_user("carol", "Carol C", NEW_PW, ADMIN_PW).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        server.refresh_calls(),
+        0,
+        "refreshed without waiting for the lock"
+    );
+    drop(held);
+    tokio::time::timeout(WAIT, call)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(server.refresh_calls(), 1);
+}
+
+/// A 401 in flight while another sign-in replaced the session: nothing of the new session is
+/// refreshed or used on the old call's behalf.
+#[tokio::test]
+async fn create_user_is_bound_to_the_session_it_started_in() {
+    let server = strict().await;
+    let admin = signed_in(&server, "admin").await;
+    let gate = server.gate_expired();
+    server.expire_next(1);
+    let a = admin.clone();
+    let call =
+        tokio::spawn(async move { a.create_user("carol", "Carol C", NEW_PW, ADMIN_PW).await });
+    eventually("the request reached the server", || {
+        !register_requests(&server).is_empty()
+    })
+    .await;
+    let bob = signed_in(&server, "bob").await;
+    let bobs = bob.session.snapshot().await.1.unwrap();
+    admin.session.replace(Some(bobs)).await;
+    gate.add_permits(1);
+    let err = tokio::time::timeout(WAIT, call)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(err, Error::NotAuthenticated), "{err:?}");
+    assert_eq!(server.refresh_calls(), 0, "refreshed another session");
+    assert_eq!(
+        register_requests(&server).len(),
+        1,
+        "retried as another user"
     );
 }

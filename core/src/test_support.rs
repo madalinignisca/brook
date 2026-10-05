@@ -68,6 +68,25 @@ pub enum PasswordMode {
     Legacy,
 }
 
+/// How `POST /auth/register` answers (an admin adding a user).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisterMode {
+    /// 201 with the new user (always a `member`).
+    Created,
+    /// 409 `conflict` (the handle is taken).
+    Conflict,
+    /// 403 `authz.forbidden` (not an admin).
+    Forbidden,
+    /// 403 `auth.invalid_credentials` (the admin's own password is wrong).
+    WrongAdmin,
+    /// 422 whose body echoes the submitted passwords, as FastAPI's validation errors do.
+    Echo422,
+    /// 429 `auth.rate_limited`.
+    RateLimited,
+    /// 201 whose body is not a user (`{}`).
+    BadBody,
+}
+
 struct ServerState {
     next: u32,
     /// access token → user handle
@@ -84,6 +103,7 @@ struct ServerState {
     /// Held before a refresh *rejection* is sent (a scripted `Fail`).
     refresh_reject_gate: Option<Arc<Semaphore>>,
     password_mode: PasswordMode,
+    register_mode: RegisterMode,
     /// Answer this many authenticated calls (password, users) with 401 first.
     expire_next: u32,
     /// Held after the server-side commit of a password call, before the response is sent.
@@ -140,6 +160,7 @@ impl TestServer {
             stall_logout: false,
             refresh_reject_gate: None,
             password_mode: PasswordMode::Ok,
+            register_mode: RegisterMode::Created,
             expire_next: 0,
             password_gate: None,
             expired_gate: None,
@@ -170,6 +191,7 @@ impl TestServer {
                 post(totp_recovery_codes),
             )
             .route("/api/v1/users/{id}/totp/reset", post(totp_admin_reset))
+            .route("/api/v1/auth/register", post(register))
             .route("/api/v1/auth/logout", post(logout))
             .route("/api/v1/users", get(list_users))
             .route("/api/v1/users/{id}/password", post(reset_password))
@@ -314,6 +336,10 @@ impl TestServer {
 
     pub fn set_password_mode(&self, mode: PasswordMode) {
         self.state.lock().unwrap().password_mode = mode;
+    }
+
+    pub fn set_register_mode(&self, mode: RegisterMode) {
+        self.state.lock().unwrap().register_mode = mode;
     }
 
     /// Answer the next `n` authenticated calls (password, users) with 401.
@@ -617,6 +643,56 @@ async fn reset_password(
     };
     after_commit(gate).await;
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /auth/register` as an admin calls it. A scripted 401 is held like the user list's.
+async fn register(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let token = bearer(&headers);
+    let held = {
+        let mut state = state.lock().unwrap();
+        match authed(&mut state, "/auth/register", &token, body.clone()) {
+            Ok(_) => None,
+            Err(r) => Some((r, state.expired_gate.clone())),
+        }
+    };
+    if let Some((r, gate)) = held {
+        after_commit(gate).await;
+        return r;
+    }
+    let mode = state.lock().unwrap().register_mode;
+    match mode {
+        RegisterMode::Conflict => error(409, "conflict", "handle taken"),
+        RegisterMode::Forbidden => error(403, "authz.forbidden", "admins only"),
+        RegisterMode::WrongAdmin => error(403, "auth.invalid_credentials", "wrong admin password"),
+        RegisterMode::Echo422 => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "detail": [{ "loc": ["body", "password"],
+                "msg": "String should have at least 8 characters",
+                "input": body["password"], "ctx": { "admin": body["admin_password"] } }] })),
+        )
+            .into_response(),
+        RegisterMode::RateLimited => {
+            let mut r = error(429, "auth.rate_limited", "slow down");
+            r.headers_mut().insert("retry-after", "30".parse().unwrap());
+            r
+        }
+        RegisterMode::BadBody => (StatusCode::CREATED, Json(json!({}))).into_response(),
+        RegisterMode::Created => {
+            let handle = body["handle"].as_str().unwrap_or_default();
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "id": format!("id-{handle}"), "handle": handle,
+                    "display_name": body["display_name"], "global_role": "member",
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn list_users(State(state): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
