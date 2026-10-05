@@ -946,7 +946,11 @@ async fn create_user_refreshes_once_on_401_and_does_not_loop() {
     assert!(matches!(err, Error::NotAuthenticated), "{err:?}");
     assert_eq!(server.refresh_calls(), 2, "more than one refresh per call");
     // Two sends for the call (the first and its one retry), so four in all, never more.
-    assert_eq!(register_requests(&server).len(), 4, "extra sends after a refused refresh");
+    assert_eq!(
+        register_requests(&server).len(),
+        4,
+        "extra sends after a refused refresh"
+    );
 }
 
 #[tokio::test]
