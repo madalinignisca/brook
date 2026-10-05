@@ -544,6 +544,9 @@ fn end_text(reason: &EndReason) -> String {
     }
 }
 
+/// Names a participant from their user id and display name, by the "Show usernames" preference.
+pub type PersonLabel = Rc<dyn Fn(&str, &str) -> String>;
+
 /// Open a call window for `channel_id` and join its call through core.
 /// Closing the window (or hanging up) leaves the call.
 pub fn open_call(
@@ -552,7 +555,7 @@ pub fn open_call(
     runtime: Handle,
     channel_id: String,
     title: &str,
-    person_label: Rc<dyn Fn(&str, &str) -> String>,
+    person_label: PersonLabel,
 ) -> adw::Window {
     let view = CallView::new(title);
     let window = adw::Window::builder()
