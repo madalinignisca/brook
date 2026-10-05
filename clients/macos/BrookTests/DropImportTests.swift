@@ -200,8 +200,8 @@ import XCTest
     func testAComposerThatClosedDuringTheCopyStagesNothingAndRemovesTheCopy() async throws {
         let c = composer()
         let src = try source("late.png")
-        c.importer = { [root] p in
-            c.readOnly = true // the composer moved on while the file was being copied
+        c.importer = { [root, weak c] p in
+            c?.readOnly = true // the composer moved on while the file was being copied
             return await DropImport.copy(p, root: root!)
         }
         await c.attach(dropped: [provider(src)])
@@ -246,8 +246,10 @@ import XCTest
         try fm.createDirectory(at: old, withIntermediateDirectories: true)
         try fm.createDirectory(at: fresh, withIntermediateDirectories: true)
         try fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -200_000)], ofItemAtPath: old.path)
-        DropImport.sweep(root: root)
+        DropImport.sweep(root: root, olderThan: 86_400)
         XCTAssertFalse(fm.fileExists(atPath: old.path))
         XCTAssertTrue(fm.fileExists(atPath: fresh.path))
+        DropImport.sweep(root: root, olderThan: 0) // the launch: every earlier copy
+        XCTAssertFalse(fm.fileExists(atPath: fresh.path))
     }
 }

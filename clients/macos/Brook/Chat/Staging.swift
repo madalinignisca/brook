@@ -213,9 +213,10 @@ enum DropImport {
         return ext.isEmpty || base.lowercased().hasSuffix("." + ext.lowercased()) ? base : base + "." + ext
     }
 
-    /// Copies left by a run that quit before sending (staged files don't outlive the app).
-    /// Only day-old ones: a second running instance shares this folder.
-    static func sweep(root: URL = DropImport.root, olderThan age: TimeInterval = 86_400, now: Date = Date()) {
+    /// Copies left by a run that quit before sending (staged files don't outlive the app): those older
+    /// than `age` (0: all). The launch passes 0 and only when no other instance runs, since a second
+    /// instance shares this folder.
+    static func sweep(root: URL = DropImport.root, olderThan age: TimeInterval, now: Date = Date()) {
         let fm = FileManager.default
         guard let items = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
         for item in items {
