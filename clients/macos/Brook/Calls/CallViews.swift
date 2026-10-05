@@ -34,6 +34,8 @@ struct VideoTile: NSViewRepresentable {
 
 struct TileView: View {
     let tile: CallModel.Tile
+    /// On the stage: as large as the window allows (16:9 kept), not a fixed-width cell.
+    var fills = false
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
@@ -56,6 +58,7 @@ struct TileView: View {
             .padding(8)
         }
         .aspectRatio(16 / 9, contentMode: .fit)
+        .frame(maxWidth: fills ? .infinity : nil, maxHeight: fills ? .infinity : nil)
         .clipShape(RoundedRectangle(cornerRadius: 10))
         // The tile is always black: its icon and name chip use dark-scheme colours in light mode too.
         .environment(\.colorScheme, .dark)
@@ -68,6 +71,48 @@ struct CallView: View {
     let call: CallModel
     var pickScreen: () async -> VideoCapture? = { nil }
     let leave: () async -> Void
+    /// The tile the user put on the stage; nil leaves the choice to `CallStage` (a shared screen).
+    @State private var pinned: String?
+
+    /// A stage (a shared screen, or the tile the user chose) with the rest in a strip below it, or
+    /// the equal grid when nothing is on the stage.
+    @ViewBuilder
+    private var tilesArea: some View {
+        let split = CallStage.split(call.tiles, pinned: pinned)
+        if let stage = split.stage {
+            VStack(spacing: 10) {
+                TileView(tile: stage, fills: true)
+                    .onTapGesture {
+                        pinned = CallStage.toggled(pinned, clicked: stage.id, onStage: stage.id)
+                    }
+                    .help(pinned == stage.id ? "Click to release" : "Click to keep this on the stage")
+                if !split.strip.isEmpty {
+                    ScrollView(.horizontal) {
+                        HStack(spacing: 8) {
+                            ForEach(split.strip) { tile in
+                                TileView(tile: tile)
+                                    .frame(width: 160)
+                                    .onTapGesture {
+                                        pinned = CallStage.toggled(pinned, clicked: tile.id, onStage: stage.id)
+                                    }
+                                    .help("Click to put this on the stage")
+                            }
+                        }
+                    }
+                    .frame(height: 100)
+                }
+            }
+        } else {
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 10)], spacing: 10) {
+                    ForEach(split.strip) { tile in
+                        TileView(tile: tile)
+                            .onTapGesture { pinned = CallStage.toggled(pinned, clicked: tile.id, onStage: nil) }
+                    }
+                }
+            }
+        }
+    }
 
     var body: some View {
         VStack(spacing: 12) {
@@ -90,11 +135,7 @@ struct CallView: View {
             if let error = call.shareError {
                 Text(error).font(.callout).foregroundStyle(.red)
             }
-            ScrollView {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 10)], spacing: 10) {
-                    ForEach(call.tiles) { TileView(tile: $0) }
-                }
-            }
+            tilesArea
             HStack(spacing: 16) {
                 Button {
                     Task { await call.toggleMic() }
