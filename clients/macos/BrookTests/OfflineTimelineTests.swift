@@ -94,6 +94,29 @@ final class OfflineTimelineTests: XCTestCase {
         XCTAssertFalse(t.olderFailed, "a Retry left over from behind the failed head")
     }
 
+    /// A newest-page fetch that starts while an older ask reads the cache decides whether the network may
+    /// be asked for an older page: if it fails, none is asked (an empty answer would read as the start).
+    func testAHeadFetchStartingDuringAnOlderCacheReadIsWaitedFor() async {
+        let chat = FakeChat()
+        chat.local = true
+        chat.cachePages = [cachedPage([msg("m5", "newest")])]
+        let t = TimelineModel(channelId: "c", client: chat)
+        await t.load() // head fine
+        let gate = Gate()
+        chat.historyGate = gate
+        chat.historyFailure = LoginError.Network(message: "offline")
+        chat.cachePages = [cachedPage([], needsNetwork: true)]
+        chat.loadFails = true
+        let older = Task { await t.loadOlder() } // the cache cannot answer: the network fallback
+        for _ in 0 ..< 3 { await Task.yield() }
+        t.apply(.resync) // a head fetch begins (held in the gate)
+        for _ in 0 ..< 20 { await Task.yield(); try? await Task.sleep(for: .milliseconds(5)) }
+        gate.open()
+        await older.value
+        await settle("head did not finish") { !t.loading }
+        XCTAssertFalse(t.atStart, "an empty older answer behind a failed head read as the start")
+    }
+
     func testAFailedLoadOfAnIncompletePageFallsBackToTheNetwork() async {
         let chat = FakeChat()
         chat.local = true

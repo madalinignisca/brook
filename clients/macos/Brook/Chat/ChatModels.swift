@@ -32,14 +32,14 @@ final class TimelineModel {
     /// No older page: the start of the channel is on screen.
     private(set) var atStart = false
     /// The last older page failed: the view offers a retry instead of a spinner. It stays until
-    /// tapped (a returning connection reloads the head, not this): a chosen simplicity, since a
-    /// spinner that retried by itself is what looped.
+    /// tapped, or until the newest page loads again (then the loader asks by itself): a spinner that
+    /// retried on every change is what looped.
     private(set) var olderFailed = false
     /// An older page is being asked for: another ask (the Retry button's new spinner appearing, say)
     /// joins it instead of waiting to start one more.
     private var olderInFlight = false
-    /// The newest page failed to load: an older page is not asked for behind it (it would end at an
-    /// empty "start of the conversation" over history that never loaded).
+    /// The newest page failed to load: the network is not asked for an older page behind it (it would
+    /// end at an empty "start of the conversation" over history that never loaded); cached pages are.
     private(set) var headFailed = false
     /// The network's error. Hidden (`visibleError`) while offline with cached messages shown.
     private(set) var error: String?
@@ -168,7 +168,9 @@ final class TimelineModel {
         // appears. Only the newest page's load is waited for: asks for older pages join each other.
         // (`loading` covers the network fetches; a cached head's own load, in `readCache`, is not
         // waited for: an older read then runs beside it and still ends at the start or a page.)
-        while loading, !olderInFlight, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(25)) }
+        while loading || headDrain != nil, !olderInFlight, !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
         guard !Task.isCancelled, !olderInFlight, !atStart, !loading,
               let oldest = messages.first else { return }
         olderInFlight = true
@@ -178,6 +180,9 @@ final class TimelineModel {
         let fromCache = await readCache(before: oldest.id, loadIfIncomplete: true)
         loading = false
         if fromCache { return }
+        // A newest-page fetch may have started meanwhile (a returning connection, a resync): its
+        // outcome decides whether an older page may be asked for, so it is waited for.
+        if let drain = headDrain { await drain.value }
         // Cached history is paged whatever the network does, but behind a newest page that failed the
         // network is not asked for older ones (an empty answer would read as the start of the
         // conversation): the Retry button instead, so no spinner is left that nothing will end.
