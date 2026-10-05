@@ -54,6 +54,9 @@ final class FileRowModel {
     private(set) var previewsOn: Bool
     /// Bumped when previews are turned off: a fetch or decode that finishes after it is dropped.
     private var previewEpoch = 0
+    /// What a decode request asks before it starts (it may wait in the decoder's queue): ended
+    /// with the epoch when previews are turned off, so queued work is dropped, not just hidden.
+    private var decodeAllowed = Flag.on()
 
     /// Automatic previews up to this size (larger ones wait for "Show preview").
     nonisolated static let autoMaxBytes: UInt64 = 4 * 1024 * 1024
@@ -190,14 +193,20 @@ final class FileRowModel {
         }
         var here = keep == .kept
         if !here, case .cached? = try? await client.fileState(fileId: file.id) { here = true }
-        // Turned off, or started by someone else, while the cache was asked.
-        guard previewsOn, case .none = preview else { return }
+        // Started by someone else while the cache was asked.
+        guard case .none = preview else { return }
+        // Turned off while the cache was asked: the button, nothing fetched.
+        guard previewsOn else {
+            preview = canPreview ? .offer : .none
+            return
+        }
         if Self.shouldAutoPreview(setting: previewsOn, size: file.size, type: file.contentType,
                                   hasLocalData: hasLocalData, decoderOff: decoderOff(),
                                   expensive: expensive(), here: here) {
             await showPreview()
         } else {
-            preview = .offer
+            // The decoder may have gone off meanwhile: no button for it.
+            preview = canPreview ? .offer : .none
         }
     }
 
@@ -208,12 +217,18 @@ final class FileRowModel {
     /// Fetch into the cache, decode in the sandboxed broker, show; any failure: no preview.
     func showPreview() async {
         guard hasLocalData, onScreen else { return }
+        // One request per row: a second click, or a start while one is running, is a no-op.
+        switch preview {
+        case .none, .offer: break
+        case .loading, .shown: return
+        }
         // A decoder that went off after the button was offered: nothing is fetched for it.
         guard canPreview else {
             if case .offer = preview { preview = .none }
             return
         }
         let epoch = previewEpoch
+        let allowed = decodeAllowed
         preview = .loading
         let bytes: FfiImagePreview
         do {
@@ -224,7 +239,7 @@ final class FileRowModel {
         }
         guard epoch == previewEpoch else { return }
         let visible = self.visible
-        let image = await decode(bytes, { visible.value })
+        let image = await decode(bytes, { visible.value && allowed.value })
         guard epoch == previewEpoch else { return }
         preview = image.map(Preview.shown) ?? .none
     }
@@ -237,6 +252,8 @@ final class FileRowModel {
         previewsOn = on
         if !on {
             previewEpoch += 1
+            decodeAllowed.set(false)
+            decodeAllowed = Flag.on()
             switch preview {
             case .shown, .loading: preview = canPreview ? .offer : .none
             case .none, .offer: break
@@ -263,6 +280,11 @@ final class FileRowModel {
 
 /// A flag any thread may read.
 final class Flag: @unchecked Sendable {
+    static func on() -> Flag {
+        let f = Flag()
+        f.set(true)
+        return f
+    }
     private let lock = NSLock()
     private var current = false
     var value: Bool { lock.withLock { current } }

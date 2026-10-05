@@ -16,6 +16,8 @@ final class FileRowModelTests: XCTestCase {
     private final class Opened: @unchecked Sendable { var urls: [URL] = []; var result = true }
     private final class Decoded: @unchecked Sendable {
         var calls = 0; var image: CGImage?; var aliveSeen: Bool?
+        /// The request's own liveness check, as the decoder's queue asks it before starting.
+        var alive: (@Sendable () -> Bool)?
         /// Held until opened: the decode finishes when the test says.
         var gate: Gate?
     }
@@ -34,6 +36,7 @@ final class FileRowModelTests: XCTestCase {
                              exists: { _ in exists }, expensive: { expensive },
                              decode: { _, alive in
                                  decoded.calls += 1
+                                 decoded.alive = alive
                                  // As the decoder's queue does: from another thread.
                                  decoded.aliveSeen = await Task.detached { alive() }.value
                                  await decoded.gate?.wait()
@@ -438,11 +441,99 @@ final class FileRowModelTests: XCTestCase {
         await n.reloadKeep()
         let fetching = Task { await n.startPreview() }
         for _ in 0 ..< 40 { await Task.yield(); try? await Task.sleep(for: .milliseconds(5)) }
+        guard case .loading = n.preview else { return XCTFail("not fetching yet") }
         await n.previewSetting(false)
         fetchGate.open()
         await fetching.value
         guard case .offer = n.preview else { return XCTFail("a late fetch changed the row after turning off") }
         XCTAssertEqual(decoded2.calls, 0, "a fetch that arrived after turning off was decoded")
+    }
+
+    /// A decode waiting in the decoder's queue asks `alive` before it starts: turning previews off
+    /// must end that request, not only hide its result.
+    func testTurningOffEndsTheDecodeRequestSoQueuedWorkIsDropped() async {
+        let decoded = Decoded()
+        decoded.image = Self.image
+        let gate = Gate()
+        decoded.gate = gate
+        let chat = local()
+        chat.previewResult = .success(imageBytes())
+        let m = model(chat, file: info("image/png"), decoded: decoded)
+        await m.reloadKeep()
+        let loading = Task { await m.startPreview() }
+        for _ in 0 ..< 40 { await Task.yield(); try? await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(decoded.alive?(), true, "wanted while previews are on")
+        await m.previewSetting(false)
+        XCTAssertEqual(decoded.alive?(), false, "a queued decode would still start with previews off")
+        gate.open()
+        await loading.value
+    }
+
+    func testTurningOffWhileTheCacheIsAskedLeavesTheButton() async {
+        let chat = local()
+        chat.states = [.notCached]
+        let lookup = Gate()
+        let m = model(chat, file: info("image/png"))
+        await m.reloadKeep()
+        chat.stateGate = lookup // after reloadKeep: that call must not take the gate
+        let starting = Task { await m.startPreview() }
+        for _ in 0 ..< 40 { await Task.yield(); try? await Task.sleep(for: .milliseconds(5)) }
+        await m.previewSetting(false)
+        lookup.open()
+        await starting.value
+        guard case .offer = m.preview else { return XCTFail("no button after turning off during the lookup") }
+        XCTAssertFalse(chat.cacheCalls.withLock { $0 }.contains("preview"), "something was fetched with previews off")
+    }
+
+    func testADecoderThatDiesDuringTheLookupOffersNoButton() async {
+        let chat = local()
+        chat.states = [.notCached]
+        let lookup = Gate()
+        let off = Flag()
+        let m = model(chat, file: info("image/png"), decoderOff: off)
+        await m.reloadKeep()
+        chat.stateGate = lookup // after reloadKeep: that call must not take the gate
+        let starting = Task { await m.startPreview() }
+        for _ in 0 ..< 40 { await Task.yield(); try? await Task.sleep(for: .milliseconds(5)) }
+        off.set(true)
+        lookup.open()
+        await starting.value
+        guard case .none = m.preview else { return XCTFail("a button for a dead decoder") }
+    }
+
+    func testAFetchThatFailsAfterTurningOffLeavesTheButton() async {
+        let gate = Gate()
+        let chat = local()
+        chat.previewResult = .failure(LoginError.Network(message: "offline"))
+        chat.previewGate = gate
+        let m = model(chat, file: info("image/png"))
+        await m.reloadKeep()
+        let fetching = Task { await m.startPreview() }
+        for _ in 0 ..< 40 { await Task.yield(); try? await Task.sleep(for: .milliseconds(5)) }
+        guard case .loading = m.preview else { return XCTFail("not fetching yet") }
+        await m.previewSetting(false)
+        gate.open()
+        await fetching.value
+        guard case .offer = m.preview else { return XCTFail("a failed fetch took the button away after turning off") }
+    }
+
+    func testASecondClickWhileOneRunsStartsNoSecondFetch() async {
+        let gate = Gate()
+        let chat = local()
+        chat.previewResult = .success(imageBytes())
+        chat.previewGate = gate
+        let decoded = Decoded()
+        decoded.image = Self.image
+        let m = model(chat, file: info("image/png"), decoded: decoded, previews: false)
+        await m.reloadKeep()
+        await m.startPreview()
+        guard case .offer = m.preview else { return XCTFail("no button") }
+        let first = Task { await m.showPreview() }
+        for _ in 0 ..< 40 { await Task.yield(); try? await Task.sleep(for: .milliseconds(5)) }
+        await m.showPreview() // the second click
+        gate.open()
+        await first.value
+        XCTAssertEqual(chat.cacheCalls.withLock { $0 }.filter { $0 == "preview" }.count, 1, "two fetches for one row")
     }
 
     func testTurningOnDecidesEveryButtonAsOnOpeningAndLeavesShownRowsAlone() async {
