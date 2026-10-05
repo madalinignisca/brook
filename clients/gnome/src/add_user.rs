@@ -6,7 +6,8 @@
 //! while it can still be fixed. Plain functions, so they are unit-tested; the dialog only wires
 //! them to widgets.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -102,58 +103,89 @@ pub fn added_text(handle: &str) -> String {
     format!("{handle} was added. Give them the password; they can change it under Change Password.")
 }
 
-/// A failed creation, in words. A timeout or an unreadable answer is not a "no": the server may
-/// have created the account, so the text says to look before trying again; and a "taken" after
-/// such an attempt probably means that attempt went through (`after_uncertain`).
-pub fn error_text(err: &Error, after_uncertain: bool) -> String {
+/// What to say when the answer was lost: the account may have been created.
+const UNCERTAIN: &str = "No clear answer: the account may have been created. Try again, and if it \
+                         says the handle is taken, it was.";
+
+/// Whether a failed attempt may nevertheless have created the account (the answer was lost, or a
+/// gateway failed after the insert committed): a timeout, an unreadable answer, a transport
+/// failure after the request left, or a bare 5xx from something in front of the server.
+pub fn left_uncertain(err: &Error) -> bool {
+    match err {
+        Error::Timeout | Error::UnexpectedResponse => true,
+        Error::Http(e) => !e.is_connect(),
+        Error::Api { code, .. } => code.starts_with("http_5"),
+        _ => false,
+    }
+}
+
+/// A failed creation, in words (the spec's lines). `same_handle_uncertain`: an earlier attempt for
+/// this same handle got no clear answer, so a "taken" now probably means that attempt went
+/// through (a different handle's lost answer says nothing about this one).
+pub fn error_text(err: &Error, same_handle_uncertain: bool) -> String {
+    if left_uncertain(err) {
+        return UNCERTAIN.into();
+    }
     match err {
         Error::Api { code, .. } => match code.as_str() {
-            "conflict" if after_uncertain => {
-                "That handle exists now: the earlier attempt probably \
-                                              went through. Check the member list."
-                    .into()
-            }
-            "conflict" => "That handle is already taken.".into(),
-            "authz.forbidden" => {
-                "You can't add users any more: your role changed. Sign in again.".into()
-            }
+            "conflict" if same_handle_uncertain => "Your previous try got no answer and probably \
+                                                    created it, with the password you entered."
+                .into(),
+            "conflict" => "That handle is taken. Handles are case-sensitive, and a disabled \
+                           account keeps its handle."
+                .into(),
+            "authz.forbidden" => "Not allowed: your account may no longer be an admin, or your \
+                                  sign-in expired. Try again."
+                .into(),
             "auth.invalid_credentials" => "Your own password is wrong.".into(),
             "auth.rate_limited" => "Too many attempts. Try again later.".into(),
             "validation" | "validation.error" => "The server refused these details.".into(),
             _ => "The server refused to add the user.".into(),
         },
         Error::NotAuthenticated => "You were signed out. Sign in again and retry.".into(),
-        Error::Timeout => "The server didn't answer in time. The user may have been added: \
-                           check the member list before trying again."
-            .into(),
-        Error::Http(e) if e.is_connect() => {
-            "Couldn't reach the server. The user was not added.".into()
-        }
-        _ => "Something went wrong. The user may have been added: check the member list \
-              before trying again."
-            .into(),
+        // Only a failed connect proves nothing was sent.
+        _ => "Couldn't reach the server. The user was not added.".into(),
     }
 }
 
-/// Whether a failed attempt may nevertheless have created the account (the answer was lost).
-pub fn left_uncertain(err: &Error) -> bool {
-    match err {
-        Error::Timeout | Error::UnexpectedResponse => true,
-        Error::Http(e) => !e.is_connect(),
-        _ => false,
+/// What the request carries, built from the form as it was checked: the display name trimmed,
+/// both secrets as typed.
+pub struct Request {
+    pub handle: String,
+    pub display_name: String,
+    pub password: String,
+    pub admin_password: String,
+}
+
+pub fn request(handle: &str, display_name: &str, password: &str, admin_password: &str) -> Request {
+    Request {
+        handle: handle.to_string(),
+        display_name: display_name.trim().to_string(),
+        password: password.to_string(),
+        admin_password: admin_password.to_string(),
     }
 }
 
 /// The Add User… sheet over `parent`: handle, display name, password (with a generate button)
 /// and its confirmation. It creates the account through core and says so plainly; the password
-/// is never logged, kept or shown again, and is wiped from the fields and from memory after use.
+/// is never logged, kept or shown again, and is wiped from the fields after use and, best effort,
+/// from memory (one copy is zeroized; the toolkit's own copies of what `.text()` returned and core's
+/// request body are not).
 pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>, runtime: Handle) {
+    let client_for_logout = client.clone();
     let handle = adw::EntryRow::builder().title("Handle").build();
     let name = adw::EntryRow::builder().title("Display name").build();
     let password = adw::PasswordEntryRow::builder().title("Password").build();
     let confirm = adw::PasswordEntryRow::builder()
         .title("Repeat password")
         .build();
+    // One attempt at a time: set while a request is out, so no field change re-enables the button.
+    let in_flight = Rc::new(Cell::new(false));
+    // Handles whose last attempt got no clear answer (per handle: a lost answer for one says
+    // nothing about another).
+    let uncertain: Rc<RefCell<HashSet<String>>> = Rc::default();
+    // The window the sheet sits over, so the outcome still shows if the sheet is closed mid-request.
+    let origin = parent.upcast_ref::<gtk::Widget>().downgrade();
     let generate = gtk::Button::builder()
         .icon_name("view-refresh-symbolic")
         .tooltip_text("Generate a password")
@@ -221,7 +253,7 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
     let revalidate = {
         let (handle, name) = (handle.clone(), name.clone());
         let (password, confirm, admin) = (password.clone(), confirm.clone(), admin.clone());
-        let (add, error) = (add.clone(), error.clone());
+        let (add, error, in_flight) = (add.clone(), error.clone(), in_flight.clone());
         move || {
             let verdict = check(
                 &handle.text(),
@@ -230,7 +262,7 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
                 &confirm.text(),
                 &admin.text(),
             );
-            add.set_sensitive(verdict.is_ok());
+            add.set_sensitive(verdict.is_ok() && !in_flight.get());
             let filled = !handle.text().is_empty()
                 && !name.text().trim().is_empty()
                 && !password.text().is_empty()
@@ -275,8 +307,6 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
         }
     });
 
-    // An earlier attempt whose answer was lost: a "taken" now probably means it went through.
-    let uncertain = Rc::new(Cell::new(false));
     let dialog_weak = dialog.downgrade();
     add.connect_clicked(move |button| {
         if check(
@@ -290,9 +320,20 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
         {
             return;
         }
-        let (new_handle, new_name) = (handle.text().to_string(), name.text().trim().to_string());
-        let mut new_password = password.text().to_string();
-        let mut admin_password = admin.text().to_string();
+        if in_flight.replace(true) {
+            return; // a second click while one is out: a no-op
+        }
+        let Request {
+            handle: new_handle,
+            display_name: new_name,
+            password: mut new_password,
+            mut admin_password,
+        } = request(
+            &handle.text(),
+            &name.text(),
+            &password.text(),
+            &admin.text(),
+        );
         // One attempt at a time; the fields stay as typed so a taken handle can be changed
         // without retyping the rest.
         button.set_sensitive(false);
@@ -312,10 +353,11 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
         let (button, spinner, error) = (button.clone(), spinner.clone(), error.clone());
         let (password, confirm, admin) = (password.clone(), confirm.clone(), admin.clone());
         let dialog_weak = dialog_weak.clone();
-        let uncertain = uncertain.clone();
+        let (uncertain, in_flight, origin) = (uncertain.clone(), in_flight.clone(), origin.clone());
         glib::spawn_future_local(async move {
             let result = request.await.unwrap_or(Err(Error::UnexpectedResponse));
             spinner.set_spinning(false);
+            in_flight.set(false);
             match result {
                 Ok(_) => {
                     // Gone from the fields as soon as it is done with.
@@ -334,17 +376,30 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
                 }
                 Err(err) => {
                     tracing::warn!(%err, "adding a user failed");
-                    error.set_text(&error_text(&err, uncertain.get()));
+                    let same = uncertain.borrow().contains(&new_handle);
+                    let text = error_text(&err, same);
                     if left_uncertain(&err) {
-                        uncertain.set(true);
+                        uncertain.borrow_mut().insert(new_handle.clone());
                     }
-                    error.set_visible(true);
-                    button.set_sensitive(true);
+                    // The sheet may be gone (closed mid-request): then the outcome is shown on
+                    // the window it sat over instead.
+                    if dialog_weak.upgrade().is_some() {
+                        error.set_text(&text);
+                        error.set_visible(true);
+                        button.set_sensitive(true);
+                    } else {
+                        let failed = adw::AlertDialog::new(Some("User Not Added"), Some(&text));
+                        failed.add_response("ok", "OK");
+                        failed.present(origin.upgrade().as_ref());
+                    }
                 }
             }
         });
     });
 
+    // Gone with the session: the admin's own password must not sit in an open sheet over the
+    // login screen after a sign-out the user did not ask for.
+    crate::account::close_on_logout(&dialog, &client_for_logout);
     dialog.present(Some(parent));
 }
 
@@ -467,8 +522,8 @@ mod tests {
             code: code.into(),
             message: String::new(),
         };
-        assert!(error_text(&api("conflict"), false).contains("already taken"));
-        assert!(error_text(&api("authz.forbidden"), false).contains("role changed"));
+        assert!(error_text(&api("conflict"), false).contains("is taken"));
+        assert!(error_text(&api("authz.forbidden"), false).contains("sign-in expired"));
         assert!(error_text(&api("auth.rate_limited"), false).contains("Too many"));
         assert!(error_text(&api("validation"), false).contains("refused these details"));
         assert!(error_text(&api("validation.error"), false).contains("refused these details"));
@@ -484,8 +539,73 @@ mod tests {
     fn a_timeout_never_says_the_user_was_not_added() {
         for err in [Error::Timeout, Error::UnexpectedResponse] {
             let text = error_text(&err, false);
-            assert!(text.contains("may have been added"), "{text}");
+            assert!(text.contains("may have been created"), "{text}");
             assert!(!text.contains("was not added"), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_alphabet_has_no_lookalikes_and_no_repeats() {
+        assert_eq!(ALPHABET.len(), 56);
+        let mut seen = std::collections::HashSet::new();
+        for &c in ALPHABET {
+            assert!(c.is_ascii_alphanumeric(), "{}", c as char);
+            assert!(!b"0O1lI".contains(&c), "look-alike {}", c as char);
+            assert!(seen.insert(c), "repeated {}", c as char);
+        }
+    }
+
+    #[test]
+    fn the_request_carries_the_trimmed_name_and_both_passwords() {
+        let r = request("alice", "  Alice B  ", "pw-one-two", "my-own-password");
+        assert_eq!(r.handle, "alice");
+        assert_eq!(r.display_name, "Alice B");
+        assert_eq!(r.password, "pw-one-two");
+        assert_eq!(
+            r.admin_password, "my-own-password",
+            "the admin's own password goes in its own field"
+        );
+    }
+
+    #[test]
+    fn a_bare_gateway_failure_may_have_created_the_account() {
+        let api = |code: &str| Error::Api {
+            code: code.into(),
+            message: String::new(),
+        };
+        for code in ["http_502", "http_503", "http_504"] {
+            assert!(left_uncertain(&api(code)), "{code}");
+            assert_eq!(error_text(&api(code), false), UNCERTAIN);
+        }
+        assert!(!left_uncertain(&api("http_404")));
+        assert!(!left_uncertain(&api("conflict")));
+    }
+
+    #[test]
+    fn what_is_uncertain_and_what_is_said_always_agree() {
+        // Whatever left_uncertain says, error_text says the same: no error is told as 'not added'
+        // when it may have been, and none as 'maybe' when the server answered no.
+        let api = |code: &str| Error::Api {
+            code: code.into(),
+            message: String::new(),
+        };
+        for err in [
+            Error::Timeout,
+            Error::UnexpectedResponse,
+            Error::NotAuthenticated,
+            api("conflict"),
+            api("authz.forbidden"),
+            api("auth.invalid_credentials"),
+            api("auth.rate_limited"),
+            api("validation"),
+            api("http_504"),
+            api("something.new"),
+        ] {
+            assert_eq!(
+                error_text(&err, false) == UNCERTAIN,
+                left_uncertain(&err),
+                "{err:?}"
+            );
         }
     }
 
@@ -495,8 +615,9 @@ mod tests {
             code: "conflict".into(),
             message: String::new(),
         };
-        assert!(error_text(&taken, true).contains("probably went through"));
-        assert!(error_text(&taken, false).contains("already taken"));
+        assert!(error_text(&taken, true).contains("probably created it"));
+        assert!(error_text(&taken, true).contains("password you entered"));
+        assert!(error_text(&taken, false).contains("case-sensitive"));
         assert!(left_uncertain(&Error::Timeout));
         assert!(left_uncertain(&Error::UnexpectedResponse));
         assert!(!left_uncertain(&taken));

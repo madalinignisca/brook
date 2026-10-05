@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use adw::prelude::*;
-use brook_core::{BrookClient, Error};
+use brook_core::{AuthState, BrookClient, Error};
 use gtk::glib;
 use tokio::runtime::Handle;
 
@@ -82,6 +82,27 @@ pub fn error_text(err: &Error) -> String {
               sign in with the new password."
             .into(),
     }
+}
+
+/// Close `dialog` (`force_close`, so its secrets are wiped) when the session ends, whoever ended
+/// it: a sign-out the user did not ask for (a rejected refresh, "sign out everywhere") removes
+/// only the chat page, and a sheet holding a password must not stay open over the login screen.
+pub(crate) fn close_on_logout(dialog: &adw::Dialog, client: &Arc<BrookClient>) {
+    let mut state = client.state();
+    let dialog = dialog.downgrade();
+    glib::spawn_future_local(async move {
+        loop {
+            if matches!(*state.borrow(), AuthState::LoggedOut) {
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.force_close();
+                }
+                return;
+            }
+            if state.changed().await.is_err() || dialog.upgrade().is_none() {
+                return;
+            }
+        }
+    });
 }
 
 /// Present the Change Password dialog over `parent`.
@@ -174,6 +195,7 @@ pub fn change_password_dialog(
         row.connect_changed(move |_| revalidate());
     }
 
+    close_on_logout(&dialog, &client);
     let dialog_weak = dialog.downgrade();
     change.connect_clicked(move |button| {
         if check(&current.text(), &new.text(), &confirm.text()).is_err() {
