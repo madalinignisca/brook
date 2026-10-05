@@ -634,7 +634,7 @@ pub fn preview_plan(
 ) -> PreviewPlan {
     if !previewable_type(content_type)
         || size > brook_core::PREVIEW_MAX_BYTES
-        || availability == crate::preview::Availability::No
+        || availability != crate::preview::Availability::Yes
     {
         PreviewPlan::Plain
     } else if should_auto_preview(setting, size, content_type) {
@@ -705,7 +705,7 @@ fn notify_listeners() {
 }
 
 /// Learn once whether glycin can decode here, by decoding the 1x1 PNG Brook ships in the
-/// sandbox. Rows drawn before it answers behave as if previews work; a "no" removes their button.
+/// sandbox. Rows drawn before it answers are plain; a "yes" gives them their button or preview.
 fn ensure_probe(runtime: &Handle) {
     if PROBING.with(|p| p.replace(true)) {
         return;
@@ -732,9 +732,8 @@ fn ensure_probe(runtime: &Handle) {
         } else {
             crate::preview::Availability::No
         });
-        if !ok {
-            notify_listeners();
-        }
+        // Rows drawn before the answer are plain until it says yes, then get their plan.
+        notify_listeners();
     });
 }
 
@@ -1092,11 +1091,13 @@ mod preview_setting_tests {
                 PreviewPlan::Plain
             );
         }
-        // Until the probe has answered, rows behave as if it works.
-        assert_eq!(
-            preview_plan(false, "image/png", SMALL, Unknown),
-            PreviewPlan::Button
-        );
+        // Until the probe has answered, no button: it is offered only where it can work.
+        for setting in [true, false] {
+            assert_eq!(
+                preview_plan(setting, "image/png", SMALL, Unknown),
+                PreviewPlan::Plain
+            );
+        }
     }
 
     #[test]
@@ -1110,6 +1111,7 @@ mod preview_setting_tests {
         crate::preview::set_availability(No);
         assert_eq!(row_plan("image/png", SMALL), PreviewPlan::Plain);
         crate::preview::set_availability(Unknown);
+        assert_eq!(row_plan("image/png", SMALL), PreviewPlan::Plain);
         SETTING.with(|s| s.set(None));
     }
 }
