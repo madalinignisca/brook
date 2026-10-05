@@ -371,8 +371,8 @@ fn sign_out_notice(session_forgotten: bool, erase: Option<&brook_core::Error>) -
     let session = (!session_forgotten).then_some("forget this sign-in on this computer");
     let data = erase.map(|err| match err {
         brook_core::Error::Api { code, .. } if code == "local.not_open" => {
-            "check this device's saved data (nothing was removed; sign in and sign out again to \
-             retry)"
+            "check this device's saved data (nothing was removed; if your keyring was locked, \
+             unlock it and restart Brook, then sign in and sign out to try again)"
         }
         brook_core::Error::Api { code, .. } if code == "local.store" => {
             "finish removing this device's saved data (it tries again the next time it starts)"
@@ -675,10 +675,9 @@ mod sign_out_notice_tests {
             "{text}"
         );
         assert!(text.contains("nothing was removed"), "{text}");
-        assert!(
-            !text.contains("keyring"),
-            "core can't say it is the keyring: {text}"
-        );
+        // The launch probe is the only thing that sets the keyring usable: signing in again
+        // without a restart would loop, so the advice includes the restart.
+        assert!(text.contains("restart Brook"), "{text}");
     }
 
     #[test]
