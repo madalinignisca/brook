@@ -2,7 +2,7 @@
 # Create the integration-test account on a Brook server and write bindings/apple/.itest.env.
 #
 # Run it yourself, as the server's admin. Your admin password is read without echo and
-# used for one login; the test account's password is generated here and written only to
+# used to log in and to confirm the new account (the server asks for it again); the test account's password is generated here and written only to
 # .itest.env (mode 600). Neither is printed, logged, or passed on the command line.
 #
 #   bindings/apple/provision-itest-account.sh [server]            # default: the shared LAN test server
