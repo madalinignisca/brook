@@ -47,6 +47,13 @@ struct Chat {
     sidebar: Rc<RefCell<crate::sidebar::SidebarState>>,
     /// This account's saved opened ranks are loaded into `sidebar` (once the user is known).
     sidebar_loaded: Rc<Cell<bool>>,
+    /// Paging back through the open channel's history (#248).
+    pager: Rc<RefCell<crate::history::Pager>>,
+    /// Older rows are being put above the view: don't jump to the bottom for them.
+    paging: Rc<Cell<bool>>,
+    /// The scroll adjustment's (upper, value) from before older rows were added, so the view
+    /// can stay on the same message once they are laid out.
+    scroll_anchor: Rc<Cell<Option<(f64, f64)>>>,
     /// The user chose to remove this device's data: a late save mustn't bring their ranks back.
     ranks_forgotten: Rc<Cell<bool>>,
     /// This session was signed out by the user (either way): nothing it started may erase.
@@ -271,6 +278,9 @@ pub fn build(
         channel_list: channel_list.clone(),
         sidebar: Rc::default(),
         sidebar_loaded: Rc::default(),
+        pager: Rc::default(),
+        paging: Rc::default(),
+        scroll_anchor: Rc::default(),
         ranks_forgotten: Rc::default(),
         ended: Rc::default(),
         show_usernames: Rc::new(Cell::new(crate::prefs::show_usernames())),
@@ -408,6 +418,38 @@ pub fn build(
 
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content_box.append(&chat.offline_banner);
+    // Scrolled to the top, or still scrolling up from it: bring in the page before the oldest
+    // message shown (#248).
+    for overshot in [false, true] {
+        let on_top = {
+            let chat = Rc::downgrade(&chat);
+            move |position: gtk::PositionType| {
+                if position == gtk::PositionType::Top {
+                    if let Some(chat) = chat.upgrade() {
+                        load_older(&chat);
+                    }
+                }
+            }
+        };
+        if overshot {
+            message_scroll.connect_edge_overshot(move |_, position| on_top(position));
+        } else {
+            message_scroll.connect_edge_reached(move |_, position| on_top(position));
+        }
+    }
+    // Once the rows added above are laid out, keep the view on the message it was on.
+    message_scroll.vadjustment().connect_changed({
+        let chat = Rc::downgrade(&chat);
+        move |adj| {
+            let Some(chat) = chat.upgrade() else { return };
+            if let Some(before) = chat.scroll_anchor.get() {
+                if adj.upper() > before.0 {
+                    chat.scroll_anchor.set(None);
+                    adj.set_value(crate::history::anchored_value(before, adj.upper()));
+                }
+            }
+        }
+    });
     content_box.append(&message_scroll);
     content_box.append(&typing_label);
     content_box.append(&reply_bar);
@@ -1053,6 +1095,9 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
     chat.reaction_order.borrow_mut().clear();
     chat.pending_rows.borrow_mut().clear();
     chat.shown_client_ids.borrow_mut().clear();
+    chat.pager.borrow_mut().reset();
+    chat.scroll_anchor.set(None);
+    let generation = chat.pager.borrow().generation();
     while let Some(row) = chat.message_list.row_at_index(0) {
         chat.message_list.remove(&row);
     }
@@ -1105,8 +1150,74 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
         }
         if is_current(&chat) {
             render_pending(&chat);
+            chat.pager.borrow_mut().ready(generation);
         }
     });
+}
+
+/// Scrolled to the top of the open channel: put the page before the oldest message shown above
+/// it (#248), the cache's first and the network's when there is no local data, one at a time.
+fn load_older(chat: &Rc<Chat>) {
+    let Some(channel_id) = chat.current.borrow().clone() else {
+        return;
+    };
+    let oldest = crate::history::oldest(chat.message_rows.borrow().keys());
+    let Some((generation, before)) = chat.pager.borrow_mut().begin(oldest) else {
+        return;
+    };
+    let chat = chat.clone();
+    glib::spawn_future_local(async move {
+        let page = chat.runtime.spawn({
+            let client = chat.client.clone();
+            let (channel_id, before) = (channel_id.clone(), before.clone());
+            async move { older_page(&client, &channel_id, &before).await }
+        });
+        let Ok(Ok((messages, vouched))) = page.await else {
+            chat.pager.borrow_mut().failed(generation);
+            return;
+        };
+        if !chat
+            .pager
+            .borrow_mut()
+            .done(generation, messages.is_empty(), vouched)
+        {
+            return;
+        }
+        let adj = chat.message_scroll.vadjustment();
+        chat.scroll_anchor.set(Some((adj.upper(), adj.value())));
+        chat.paging.set(true);
+        for message in &messages {
+            if !chat.message_rows.borrow().contains_key(&message.id) {
+                append_message(&chat, message);
+            }
+        }
+        chat.paging.set(false);
+    });
+}
+
+/// The page before `before`: from the cache when it can vouch for it (loading it into the
+/// cache when it can't), else from the network. `true` when what came back is certain to be
+/// all there is before `before` (so an empty page is the start of the channel).
+async fn older_page(
+    client: &BrookClient,
+    channel_id: &str,
+    before: &str,
+) -> Result<(Vec<Message>, bool), brook_core::Error> {
+    const PAGE: usize = 50;
+    if let Ok(mut page) = client.cached_messages(channel_id, Some(before), PAGE).await {
+        if page.needs_network && client.load_older(channel_id, PAGE).await.is_ok() {
+            if let Ok(again) = client.cached_messages(channel_id, Some(before), PAGE).await {
+                page = again;
+            }
+        }
+        // The cache answered for this page; one it still can't vouch for, and that is empty,
+        // is left to the network rather than stalling the paging.
+        if !(page.needs_network && page.messages.is_empty()) {
+            return Ok((page.messages, !page.needs_network));
+        }
+    }
+    let messages = client.channel_history(channel_id, Some(before)).await?;
+    Ok((messages, true))
 }
 
 /// Send the composer's text into the current channel (the WS echo renders it).
@@ -1650,9 +1761,11 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
         .insert(message.id.clone(), widgets);
     render_reactions(chat, &message.id);
 
-    // Scroll to bottom after layout settles.
-    let adj = chat.message_scroll.vadjustment();
-    glib::idle_add_local_once(move || adj.set_value(adj.upper()));
+    // Scroll to bottom after layout settles (not while older rows are added above the view).
+    if !chat.paging.get() {
+        let adj = chat.message_scroll.vadjustment();
+        glib::idle_add_local_once(move || adj.set_value(adj.upper()));
+    }
 }
 
 /// Rebuild a message's reaction chips from its tracked tallies.

@@ -13,6 +13,7 @@ mod account;
 mod attachments;
 mod call;
 mod chat;
+mod history;
 mod keyring;
 mod outgoing;
 mod prefs;
