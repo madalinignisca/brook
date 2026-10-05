@@ -18,6 +18,7 @@ mod keyring;
 mod outgoing;
 mod prefs;
 mod preview;
+mod preview_gate;
 mod sidebar;
 mod totp;
 mod totp_ui;

@@ -22,6 +22,8 @@ use brook_core::{BrookClient, FileCacheState, FileInfo, FileSink, TransferId, Tr
 use gtk::{gdk, gio, glib};
 use tokio::runtime::Handle;
 
+use crate::preview_gate::Gate;
+
 /// An icon for the declared type. Only cosmetic: the type is the uploader's claim.
 pub fn icon_for(content_type: &str) -> &'static str {
     let kind = content_type.split('/').next().unwrap_or("");
@@ -495,20 +497,22 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
         }
     });
     picture.add_controller(click);
-    // Bumped when the row goes back to plain (the setting turned off, or no decoder): a preview
-    // queued, fetching or decoding for an earlier value is dropped instead of drawn.
-    let generation: Rc<Cell<u64>> = Rc::default();
+    // What this row's preview is asked for through: the setting turning off cancels it, and every
+    // step (the queued job, the fetch, the decode, the draw) checks it (see preview_gate.rs).
+    let gate: Rc<Gate> = Rc::default();
     let start: Rc<dyn Fn()> = Rc::new({
         let (client, runtime, file_id) = (p_client.clone(), p_runtime.clone(), p_file.id.clone());
         let (picture, show) = (picture.downgrade(), show.downgrade());
-        let generation = generation.clone();
+        let gate = gate.clone();
         move || {
+            // One preview per ask: a click and the setting turning on don't fetch twice.
+            let Some(token) = gate.begin() else {
+                return;
+            };
             if let Some(show) = show.upgrade() {
                 show.set_visible(false);
             }
-            let wanted = generation.get();
-            let (alive, current) = (picture.clone(), generation.clone());
-            let drawn_if = generation.clone();
+            let (alive, queued) = (picture.clone(), token.clone());
             let (client, runtime, file_id, picture) = (
                 client.clone(),
                 runtime.clone(),
@@ -517,21 +521,26 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
             );
             crate::preview::QUEUE.with(|q| {
                 q.push(crate::preview::Job {
-                    alive: Box::new(move || alive.upgrade().is_some() && current.get() == wanted),
+                    alive: Box::new(move || alive.upgrade().is_some() && queued.is_current()),
                     run: Box::new(move |done| {
+                        let (fetching, drawing) = (token.clone(), token);
                         let decoded = runtime.spawn(async move {
                             let bytes = client
                                 .preview_file(TransferId::new(), &file_id)
                                 .await
                                 .ok()?
                                 .bytes;
+                            // Turned off while it was being fetched: no decode.
+                            if !fetching.is_current() {
+                                return None;
+                            }
                             crate::preview::decode(bytes).await
                         });
                         glib::spawn_future_local(async move {
                             if let (Ok(Some(px)), Some(picture)) =
                                 (decoded.await, picture.upgrade())
                             {
-                                if drawn_if.get() == wanted {
+                                if drawing.is_current() {
                                     show_pixels(&picture, px);
                                 }
                             }
@@ -547,11 +556,11 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
         move |_| start()
     });
     // What the row shows follows the setting, now and whenever it changes (and when the probe
-    // learns that previews can't work here).
+    // answers).
     let apply: Rc<dyn Fn()> = Rc::new({
         let (picture, show, start) = (picture.downgrade(), show.downgrade(), start.clone());
         let (content_type, size) = (p_file.content_type.clone(), p_file.size);
-        let generation = generation.clone();
+        let gate = gate.clone();
         let (client, runtime, file_id) = (p_client.clone(), p_runtime.clone(), p_file.id.clone());
         move || {
             let (Some(picture), Some(show)) = (picture.upgrade(), show.upgrade()) else {
@@ -559,31 +568,42 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
             };
             match row_plan(&content_type, size) {
                 PreviewPlan::Plain => {
-                    generation.set(generation.get() + 1);
+                    gate.cancel();
                     clear_picture(&picture);
                     show.set_visible(false);
                 }
+                // With the setting off, whatever was asked for goes (drawn, queued, fetching);
+                // with it on (a larger image, which keeps its button), a preview the user asked
+                // for stays.
                 PreviewPlan::Button => {
-                    generation.set(generation.get() + 1);
-                    clear_picture(&picture);
-                    show.set_visible(true);
+                    if !show_image_previews() {
+                        gate.cancel();
+                        clear_picture(&picture);
+                    }
+                    show.set_visible(!gate.is_asked());
                 }
                 PreviewPlan::Auto => {
-                    if picture.is_visible() {
-                        return; // already drawn
+                    if gate.is_asked() {
+                        return; // drawn, or on its way
                     }
                     // Unless the connection is metered and it isn't cached yet.
                     if !gio::NetworkMonitor::default().is_network_metered() {
                         start();
                         return;
                     }
+                    // Taken before the lookup: turned off meanwhile, nothing starts.
+                    let wanted = gate.token();
                     let cached = runtime.spawn({
                         let (client, file_id) = (client.clone(), file_id.clone());
                         async move { client.file_state(&file_id).await }
                     });
                     let (start, show) = (start.clone(), show.downgrade());
                     glib::spawn_future_local(async move {
-                        match cached.await {
+                        let result = cached.await;
+                        if !wanted.is_current() {
+                            return;
+                        }
+                        match result {
                             Ok(Ok(
                                 FileCacheState::Cached
                                 | FileCacheState::Pinned { cached: true, .. },
