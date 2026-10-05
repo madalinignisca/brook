@@ -70,8 +70,10 @@ clients/macos/build.sh install   # Release build, installed as /Applications/Bro
 
 This needs a signing setup in `Local.xcconfig` (see `clients/macos/README.md`): `build.sh`
 refuses without `DEVELOPMENT_TEAM`, and for the app to **stay signed in and keep saved data**
-you also need `CODE_SIGN_IDENTITY = Developer ID Application` and `BROOK_APP_PROFILE` naming a
-Developer ID provisioning profile for `dev.brook.Brook`. Without that profile the app works but
+you also need `BROOK_APP_PROFILE` naming a Developer ID provisioning profile for
+`dev.brook.Brook` that authorises the keychain access group `<team id>.dev.brook.shared` (a
+profile for the app id alone leaves saving data off). `CODE_SIGN_IDENTITY = Developer ID Application`
+is part of the basic Release identity. Without that profile the app works but
 keeps its keys in memory and signs in by hand each launch. A plain `build.sh` build is a Debug
 build, ad-hoc signed without the keychain access group: it can't stay signed in and has no saved
 data (no offline cache, no sending or opening files, no Keep available offline).
