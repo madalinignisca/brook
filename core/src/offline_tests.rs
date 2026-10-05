@@ -615,6 +615,73 @@ mod client {
         locked_first_launch.sign_out_and_forget().await.unwrap();
     }
 
+    /// The index file outlives every erase (it is made by the first open and holds no
+    /// messages), so "an index exists" must not count as stored data: after an erase that
+    /// worked, or on a device where nobody ever stored anything, a later launch with a locked
+    /// key store has nothing to erase and must not be told it failed.
+    #[tokio::test]
+    async fn an_index_with_no_stores_is_nothing_to_erase() {
+        let server = TestServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let slot = Arc::new(InMemoryKeySlot::default());
+
+        // Alice stores data and erases it: only the index files are left.
+        let first = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        assert!(
+            first
+                .enable_local_data(slot.clone() as Arc<dyn KeySlot>, dir.path().to_path_buf())
+                .await
+        );
+        first.login("alice", "pw").await.unwrap();
+        assert!(active(&first).await);
+        first.sign_out_and_forget().await.unwrap();
+        first.close_local_data().await;
+        drop(first);
+        let left: Vec<String> = std::fs::read_dir(dir.path().join("stores"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            left.iter().all(|n| n.starts_with("index")),
+            "the erase left more than the index: {left:?}"
+        );
+
+        // Next launch, the key store is locked: nothing stored, nothing to erase.
+        let c = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        slot.fail_next("load", crate::KeySlotError::Unavailable);
+        assert!(
+            !c.enable_local_data(slot as Arc<dyn KeySlot>, dir.path().to_path_buf())
+                .await
+        );
+        c.login("alice", "pw").await.unwrap();
+        c.sign_out_and_forget()
+            .await
+            .expect("an index with no stores reported as data that could not be erased");
+    }
+
+    /// When the stores root can't be read, nobody can say nothing is stored there: the
+    /// answer is the error, never "erased".
+    #[tokio::test]
+    async fn an_unreadable_stores_root_is_not_reported_as_empty() {
+        let server = TestServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("stores"), b"not a directory").unwrap();
+        let slot = Arc::new(InMemoryKeySlot::default());
+        let c = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        assert!(
+            !c.enable_local_data(slot as Arc<dyn KeySlot>, dir.path().to_path_buf())
+                .await,
+            "local data opened under a file"
+        );
+        c.login("alice", "pw").await.unwrap();
+        let err = c.sign_out_and_forget().await.unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Api { code, .. } if code == "local.not_open"),
+            "an unreadable root reported as {err:?}, or as success"
+        );
+    }
+
     /// Between a switch of user and the watcher catching up, the previous user's stores are
     /// still open: they answer nobody else. (tokio's mutex is FIFO, so the read below gets
     /// the lock before the watcher does.)

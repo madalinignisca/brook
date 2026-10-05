@@ -42,15 +42,17 @@ fn unavailable() -> Error {
     }
 }
 
-/// "Remove this device's data" could not run: stores exist on this device, but this session
-/// never opened them (the key store was locked or slow, or damaged), so nothing was erased.
+/// "Remove this device's data" could not run: a store may exist on this device, but this
+/// session never opened them (the key store was locked or slow, or damaged), so nothing was
+/// checked or erased. With the index unreadable, core cannot tell whose store it is.
 /// The sign-out still happened. Distinct from success and from `local.store` (an erase that
 /// ran and failed, e.g. a key the key store would not delete).
 fn not_open() -> Error {
     Error::Api {
         code: "local.not_open".into(),
-        message: "saved data on this device could not be erased: offline storage was not open"
-            .into(),
+        message:
+            "saved data on this device could not be checked or erased: offline storage was not open"
+                .into(),
     }
 }
 
@@ -255,21 +257,37 @@ impl BrookClient {
         erased
     }
 
-    /// Whether the stores `enable_local_data` was pointed at have an index on disk: data an
-    /// earlier session stored. False when local data was never enabled (or switched off in
-    /// this build): nothing to erase. When that can't be read, assume it does exist, since
-    /// "erased" would be a claim nothing supports.
+    /// Whether the stores `enable_local_data` was pointed at hold any user's store on disk:
+    /// data an earlier session stored. Counted by store directories, not by the index file:
+    /// `index.db` is made by the first successful open and never removed (it holds no
+    /// messages), so counting it would report data after every erase that worked. False when
+    /// local data was never enabled, or nothing is stored. When the root can't be read
+    /// (anything but "not there"), assume data exists: "erased" would be a claim nothing
+    /// supports.
     async fn stores_on_disk(&self) -> bool {
         let root = self
             .local_root
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        match root {
-            Some(root) => tokio::fs::try_exists(root.join("index.db"))
-                .await
-                .unwrap_or(true),
-            None => false,
+        let Some(root) = root else {
+            return false;
+        };
+        let mut entries = match tokio::fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        };
+        loop {
+            match entries.next_entry().await {
+                Ok(Some(entry)) => {
+                    if entry.file_type().await.map_or(true, |t| t.is_dir()) {
+                        return true;
+                    }
+                }
+                Ok(None) => return false,
+                Err(_) => return true,
+            }
         }
     }
 
