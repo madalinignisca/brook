@@ -4,8 +4,8 @@ Using the Brook desktop client. To run a server, see the
 [Administrator Guide](admin-guide.md).
 
 > **Status: beta.** What works today: signing in (with a second factor if you turned
-> one on), channels and direct messages, files, working offline, and calls on the GNOME
-> client. Bots are **planned** (see [ROADMAP.md](ROADMAP.md)); this guide grows as they
+> one on), channels and direct messages, files, working offline, and calls (voice, video
+> and screen sharing) on GNOME and macOS. Bots are **planned** (see [ROADMAP.md](ROADMAP.md)); this guide grows as they
 > ship.
 
 ## What is Brook?
@@ -67,9 +67,13 @@ Silicon Mac with **macOS 26** or later:
 ```bash
 git clone https://github.com/madalinignisca/brook.git
 cd brook
-clients/macos/build.sh
-open clients/macos/build.noindex/Build/Products/Debug/Brook.app
+clients/macos/build.sh install   # Release build, installed as /Applications/Brook.app (quit Brook first)
 ```
+
+This needs a signing identity (set `DEVELOPMENT_TEAM` in `Local.xcconfig`; `build.sh` refuses
+without it). Use `install` for the app you live in: a plain `build.sh` build is a Debug build,
+ad-hoc signed without the keychain access group, so it can't stay signed in and has no saved
+data (no offline cache, no sending files, no Keep available offline).
 
 - Type your **server address** on the sign-in screen. Brook remembers it (once a
   sign-in succeeds) and fills it in next time.
@@ -90,7 +94,8 @@ open clients/macos/build.noindex/Build/Products/Debug/Brook.app
 2. Enter your **handle** and **password**, and click **Log in** (or press Enter).
 3. If you turned on a second factor, enter the **code from your authenticator app**, or
    choose **Use a recovery code instead**. You can turn it on, get new recovery codes or
-   turn it off under **Two-Factor Sign-In…** in the main menu.
+   turn it off under **Two-Factor Sign-In…** in the main menu (GNOME) or in the **Account**
+   menu (macOS).
 4. On success the app shows your conversations. A wrong handle or password shows an inline
    error; fix it and try again.
 
@@ -108,7 +113,8 @@ the offline cache, sending and opening files, and keeping files offline.
 
 **Sign Out** ends this device's sign-in. **Remove this device's data** (on by default) also
 deletes the messages and files Brook saved on this computer, and any messages you had not
-sent yet. Tick it off to keep them for your next sign-in. To cut off a device you have
+sent yet. Tick it off to keep them for your next sign-in. With the keyring locked, Brook
+can't open the saved data, so it can't remove it either. To cut off a device you have
 lost, change your password with **Sign out of other devices** on; messages already saved on that
 device stay readable to anyone who can sign in to that computer.
 
@@ -120,12 +126,14 @@ device stay readable to anyone who can sign in to that computer.
 - Send messages, **reply**, **edit** and **delete** your own, add **reactions**, and search.
   Messages that mention you are marked, and the sidebar shows unread and mention counts.
   You see when someone is typing.
-- **Attach files** with the paperclip (**Add files**) or by dragging them into the window. A
-  file you receive is opened or saved from its row: **Save…** asks where (starting in your
-  Downloads folder), **Open** hands a copy to another app. Images can show a preview where the
-  system can decode them safely (see the install notes). **Keep available offline** pins a file
-  so you can open it without a connection.
-- **Calls** (voice, video, screen share) work in the GNOME client on a glibc distribution.
+- **Attach files** with the paperclip (**Add files** on GNOME, **Attach files** on the Mac) or
+  by dragging them into the window. A file you receive is opened or saved from its row:
+  **Save…** asks where (on GNOME the dialog starts in your Downloads folder), **Open** hands a
+  copy to another app. Images can show a preview where the system can decode them safely (on
+  Linux, see the tarball's `INSTALL.md`). **Keep available offline** pins a file so you can
+  open it without a connection.
+- **Calls** (voice, video, screen share) work on macOS and on GNOME (on Linux they need
+  Debian 13 or Ubuntu 26.04).
 
 ## Working offline
 
@@ -145,7 +153,7 @@ scripts are transliterated to Latin letters (`Ștefan–raport.pdf` becomes
 or harm a computer (hidden characters, paths, reserved names) is removed. That way a file
 opens the same on Windows, macOS, Linux and phones. The name exactly as it was sent is
 still shown next to the file, so nothing is lost. A file is only saved or opened when you ask:
-the Save dialog suggests the plain name, starting in your Downloads folder.
+the Save dialog suggests the plain name (on GNOME it starts in your Downloads folder).
 
 ## See also
 
