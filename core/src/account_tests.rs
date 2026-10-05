@@ -935,12 +935,18 @@ async fn create_user_refreshes_once_on_401_and_does_not_loop() {
     assert_eq!(register_requests(&server).len(), 2);
 
     server.expire_next(10);
-    let err = admin
-        .create_user("dave", "Dave D", NEW_PW, ADMIN_PW)
-        .await
-        .unwrap_err();
+    // Bounded: a loop must fail the test promptly, not hang it.
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        admin.create_user("dave", "Dave D", NEW_PW, ADMIN_PW),
+    )
+    .await
+    .expect("create_user kept retrying a 401")
+    .unwrap_err();
     assert!(matches!(err, Error::NotAuthenticated), "{err:?}");
     assert_eq!(server.refresh_calls(), 2, "more than one refresh per call");
+    // Two sends for the call (the first and its one retry), so four in all, never more.
+    assert_eq!(register_requests(&server).len(), 4, "extra sends after a refused refresh");
 }
 
 #[tokio::test]
