@@ -72,6 +72,22 @@ pub fn insert_at(tiles: &[TileRef], screen: bool) -> usize {
     tiles.iter().rposition(|t| t.screen).map_or(0, |i| i + 1)
 }
 
+/// The stream ids (mids) that are in both offers but now belong to a different stream (another
+/// participant, or a camera turned screen share): the server can hand the same mid on within one
+/// offer. A pin made for the old stream must not carry over to the new one.
+pub fn reused_ids<V: PartialEq>(
+    old: &std::collections::HashMap<String, V>,
+    new: &std::collections::HashMap<String, V>,
+) -> Vec<String> {
+    let mut ids: Vec<String> = new
+        .iter()
+        .filter(|(id, v)| old.get(*id).is_some_and(|o| o != *v))
+        .map(|(id, _)| id.clone())
+        .collect();
+    ids.sort();
+    ids
+}
+
 /// How tall a strip tile is: about a fifth of the window, kept between a usable minimum and a
 /// sensible maximum.
 pub fn strip_height(window_height: i32) -> i32 {
@@ -205,5 +221,32 @@ mod tests {
         assert_eq!(insert_at(&[tile("cam", false)], true), 0);
         assert_eq!(insert_at(&[], true), 0);
         assert_eq!(insert_at(&[], false), 0);
+    }
+
+    #[test]
+    fn a_stream_id_handed_to_someone_else_is_reported() {
+        use std::collections::HashMap;
+        let map = |pairs: &[(&str, (&str, bool))]| -> HashMap<String, (String, bool)> {
+            pairs
+                .iter()
+                .map(|(k, (p, s))| (k.to_string(), (p.to_string(), *s)))
+                .collect()
+        };
+        let old = map(&[("x", ("alice", true)), ("y", ("bob", false))]);
+        // Alice stops sharing and Carol's camera takes mid x in the same offer.
+        let new = map(&[("x", ("carol", false)), ("y", ("bob", false))]);
+        assert_eq!(reused_ids(&old, &new), vec!["x".to_string()]);
+        // The same participant's camera turned into a screen share on the same mid counts too.
+        let shared = map(&[("x", ("alice", false))]);
+        let now_screen = map(&[("x", ("alice", true))]);
+        assert_eq!(reused_ids(&shared, &now_screen), vec!["x".to_string()]);
+        // Unchanged, new and gone ids are not "reused".
+        let more = map(&[
+            ("x", ("alice", true)),
+            ("y", ("bob", false)),
+            ("z", ("dan", false)),
+        ]);
+        assert!(reused_ids(&old, &more).is_empty());
+        assert!(reused_ids(&more, &old).is_empty());
     }
 }

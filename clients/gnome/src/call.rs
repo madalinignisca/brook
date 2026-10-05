@@ -348,6 +348,21 @@ impl CallView {
         }
     }
 
+    /// The pin was made for the stream that had this id, which now belongs to another: drop it.
+    pub fn release_pin_for(&self, mid: &str) {
+        let released = {
+            let mut pinned = self.layout.pinned.borrow_mut();
+            let hit = pinned.as_deref() == Some(mid);
+            if hit {
+                *pinned = None;
+            }
+            hit
+        };
+        if released {
+            self.layout.relayout();
+        }
+    }
+
     /// A stream's tile changed kind in a new offer (a camera's id reused for a screen, or back):
     /// it takes its place by what it is now.
     pub fn set_tile_screen(&self, mid: &str, screen: bool) {
@@ -1034,6 +1049,11 @@ pub fn open_call(
                                 )
                             })
                             .collect();
+                        // A mid the server handed to another stream within this offer: a pin
+                        // made for the old one must not carry over to the new one.
+                        for mid in crate::call_stage::reused_ids(&mids.borrow(), &video) {
+                            view.release_pin_for(&mid);
+                        }
                         *mids.borrow_mut() = video;
                         // Tiles for mids no longer in the offer are gone.
                         for mid in view.tile_mids() {
