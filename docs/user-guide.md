@@ -130,11 +130,13 @@ device stay readable to anyone who can sign in to that computer.
   Messages that mention you are marked, and the sidebar shows unread and mention counts.
   You see when someone is typing.
 - **Attach files** with the paperclip (**Add files** on GNOME, **Attach files** on the Mac); on
-  GNOME you can also drag them into the window. A file you receive is opened or saved from its row:
-  **Save…** asks where (on GNOME the dialog starts in your Downloads folder), **Open** hands a
-  copy to another app. Images can show a preview where the system can decode them safely (on
-  Linux, see the tarball's `INSTALL.md`). **Keep available offline** pins a file so you can
-  open it without a connection.
+  GNOME you can also drag them into the window. A file you receive is opened or saved from its
+  row: **Save…** asks where (on GNOME the dialog starts in your Downloads folder), **Open**
+  hands a copy to another app. On GNOME an image shows a **Show preview** button (where the
+  system can decode images safely: see the tarball's `INSTALL.md`), and **Show image previews**
+  in the main menu makes small images preview by themselves; nothing is fetched for a preview
+  until you ask, or turn that on. **Keep available offline** pins a file so you can open it
+  without a connection.
 - **Calls** (voice, video, screen share) work on macOS and on GNOME (on Linux, Debian 13 and
   Ubuntu 26.04 are the supported systems).
 
@@ -156,8 +158,8 @@ scripts are transliterated to Latin letters (`Ștefan–raport.pdf` becomes
 or harm a computer (hidden characters, paths, reserved names) is removed. That way a file
 opens the same on Windows, macOS, Linux and phones. The name exactly as it was sent is
 still shown next to the file, so nothing is lost. A file is only saved, to a place you choose, or opened in another app when you ask: the Save
-dialog suggests the plain name (on GNOME it starts in your Downloads folder). Images may show a
-preview by themselves, which fetches them.
+dialog suggests the plain name (on GNOME it starts in your Downloads folder). On the Mac, small
+images may preview by themselves, which fetches them.
 
 ## See also
 
