@@ -53,7 +53,7 @@ and a server contract change in flight (`admin_password` on register).
 ## Not doing
 Deactivate/promote/demote; invite links; forced password change at first sign-in; bulk import; updating `globalRole`
 live (a demotion mid-session leaves the entry and the server refuses); hiding the entry offline; a Copy button or any
-clipboard code; creating the first user of a new server (core sends nothing without a session; the open bootstrap is not this call) (owner may ask; then `org.nspasteboard.ConcealedType` and clear after ~60 s); zeroing memory (Swift/Rust
+clipboard code (owner may ask; then `org.nspasteboard.ConcealedType` and clear after ~60 s); creating the first user of a new server (core sends nothing without a session; the open bootstrap is not this call); zeroing memory (Swift/Rust
 copies are dropped, not wiped; "cleared" means the model and the field no longer hold it, as the existing password
 calls); a local admin check in core (the server decides); showing `Retry-After`; GTK (its own change, same core call).
 
@@ -61,7 +61,7 @@ calls); a local admin check in core (the server decides); showing `Retry-After`;
 - A stolen admin token creating accounts for up to 15 minutes: closed by `admin_password` once the server PR lands;
   until then the server ignores the extra field (nothing breaks, the gap stays).
 - An expired/revoked token gets 403, not 401, on register (`_optional_user` returns None): core cannot tell it from a
-  real refusal and does not refresh; the server should answer 401 for a presented-but-rejected token (server agent's call).
+  real refusal and does not refresh; the server should answer 401 for a presented-but-rejected token (server agent's call). **Gate: no client sheet (Mac or GTK) ships until register answers 401 for a presented-but-rejected token; if the server keeps 403, core adds one SingleFlight refresh-and-retry on `authz.forbidden`, never on `auth.invalid_credentials`.**
 - Role changes mid-sheet: the server reads the role from the database, so a demotion is refused at once.
 - A timeout after the server created the account: a retry says 409; the model remembers a no-answer try for that handle.
 - Two admins adding the same handle at once: the loser gets a server 500 (unique-constraint race); shown as "unexpected".
