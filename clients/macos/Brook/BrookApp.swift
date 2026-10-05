@@ -24,6 +24,13 @@ struct BrookApp: App {
     @State private var calls = CallCenter()
 
     init() {
+        // Staged files don't outlive the app, so a sole instance's earlier copies are all stale; a
+        // second instance leaves them alone (the first may still hold a staged draft).
+        // Judged by process id, not by a count: whether this process is listed yet at this point is not
+        // something to rely on.
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .filter { $0.processIdentifier != getpid() }
+        if others.isEmpty { DropImport.sweep(olderThan: 0) }
         let store = SessionStore(persistence: .live())
         _store = State(initialValue: store)
         _form = State(initialValue: LoginForm(store: store))
