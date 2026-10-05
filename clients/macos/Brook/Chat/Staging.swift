@@ -137,24 +137,31 @@ enum DropImport {
         let types = provider.registeredTypeIdentifiers.compactMap { UTType($0) }
         if types.contains(where: { $0.conforms(to: .folder) }) { return .refused(.notAFile) }
         let suggested = provider.suggestedName
-        // The file's own type (not a URL: asking for "any item" of a provider that only offers
-        // a file URL would hand over the URL's text as if it were the file).
-        if let own = types.first(where: { ($0.conforms(to: .data) || $0.conforms(to: .content)) && !$0.conforms(to: .url) }) {
-            return await withCheckedContinuation { c in
-                _ = provider.loadInPlaceFileRepresentation(forTypeIdentifier: own.identifier) { url, _, error in
-                    guard let url, error == nil else {
+        // A file URL names the file itself, so it comes first: another representation beside it
+        // (plain text, a link's text) may be something else entirely, and loading "any item" of
+        // a provider that offers only a URL would hand over the URL's text as the file.
+        var failure = Outcome.refused(.unreadable(safeName(suggested)))
+        if types.contains(where: { $0.conforms(to: .fileURL) }) {
+            let viaURL: Outcome = await withCheckedContinuation { c in
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    let url = (item as? URL) ?? (item as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
+                    guard let url, url.isFileURL else {
                         return c.resume(returning: .refused(.unreadable(safeName(suggested))))
                     }
                     c.resume(returning: take(url, suggested: suggested, limit: limit, root: root))
                 }
             }
+            // Only an unreadable URL falls back to the provider's own copy of the file; a folder
+            // or a file too large is final.
+            guard case .refused(.unreadable) = viaURL else { return viaURL }
+            failure = viaURL
         }
-        // Only a file URL on offer: read the URL (the load carries the drop's access to it).
-        guard types.contains(where: { $0.conforms(to: .fileURL) }) else { return .refused(.unreadable(safeName(suggested))) }
+        // The file's own type, in place (not a URL type).
+        guard let own = types.first(where: { ($0.conforms(to: .data) || $0.conforms(to: .content)) && !$0.conforms(to: .url) })
+        else { return failure }
         return await withCheckedContinuation { c in
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                let url = (item as? URL) ?? (item as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
-                guard let url, url.isFileURL else { return c.resume(returning: .refused(.unreadable(safeName(suggested)))) }
+            _ = provider.loadInPlaceFileRepresentation(forTypeIdentifier: own.identifier) { url, _, error in
+                guard let url, error == nil else { return c.resume(returning: failure) }
                 c.resume(returning: take(url, suggested: suggested, limit: limit, root: root))
             }
         }

@@ -115,6 +115,39 @@ import XCTest
         XCTAssertEqual(url.lastPathComponent, "only-url.png")
     }
 
+    /// Finder may offer a file's URL beside a text that is not the file: the URL decides.
+    func testAFileURLBeatsATextRepresentationBesideIt() async throws {
+        let src = try source("real.png", bytes: 41)
+        let p = NSItemProvider()
+        p.suggestedName = "real"
+        p.registerDataRepresentation(forTypeIdentifier: UTType.plainText.identifier, visibility: .all) { done in
+            done(Data("not the file".utf8), nil)
+            return nil
+        }
+        p.registerDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier, visibility: .all) { done in
+            done(src.dataRepresentation, nil)
+            return nil
+        }
+        guard case let .copied(url, _, _) = await DropImport.copy(p, root: root) else { return XCTFail("expected a copy") }
+        XCTAssertEqual(try Data(contentsOf: url), try Data(contentsOf: src))
+    }
+
+    func testAnUnreadableFileURLFallsBackToTheProvidersOwnFile() async throws {
+        let src = try source("fallback.png", bytes: 21)
+        let p = NSItemProvider()
+        p.suggestedName = "fallback"
+        p.registerDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier, visibility: .all) { done in
+            done(URL(fileURLWithPath: "/nonexistent/fallback.png").dataRepresentation, nil)
+            return nil
+        }
+        p.registerFileRepresentation(forTypeIdentifier: UTType.png.identifier, fileOptions: [], visibility: .all) { done in
+            done(src, false, nil)
+            return nil
+        }
+        guard case let .copied(url, _, _) = await DropImport.copy(p, root: root) else { return XCTFail("expected a copy") }
+        XCTAssertEqual(try Data(contentsOf: url), try Data(contentsOf: src))
+    }
+
     func testAProviderWithNothingFileLikeIsRefused() async {
         let p = NSItemProvider()
         p.registerDataRepresentation(forTypeIdentifier: UTType.url.identifier, visibility: .all) { done in
