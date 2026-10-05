@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from app import calls
 from app.routers import ws as wsmod
 
 AUTH = "/api/v1/auth"
@@ -138,3 +139,68 @@ async def test_post_reply_work_never_raises_into_the_command(
     await asyncio.sleep(0.05)
     assert "background call task failed" in caplog.text
     assert not mgr._tasks  # done and released
+
+
+# What a client may relay to Janus as an ICE candidate (PROTOCOL.md §3.3): a string, a
+# string media id and a small integer; null or {"completed": true} is end-of-candidates.
+NESTED = [[[[1]]]]
+
+
+def test_a_well_formed_candidate_is_relayed_with_only_its_three_fields() -> None:
+    got = calls._client_candidate(
+        {
+            "candidate": "candidate:1 1 udp 1 10.0.0.1 9 typ host",
+            "sdpMid": "0",
+            "sdpMLineIndex": 0,
+            "extra": {"anything": "else"},
+        }
+    )
+    assert got == {
+        "candidate": "candidate:1 1 udp 1 10.0.0.1 9 typ host",
+        "sdpMid": "0",
+        "sdpMLineIndex": 0,
+    }
+    assert calls._client_candidate({"candidate": "c"}) == {"candidate": "c"}
+
+
+@pytest.mark.parametrize("end", [None, {"completed": True}, {"completed": True, "x": 1}])
+def test_end_of_candidates_is_none(end: object) -> None:
+    assert calls._client_candidate(end) is None
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "a string, not an object",
+        7,
+        [],
+        {},  # no candidate text
+        {"candidate": None},
+        {"candidate": 5},
+        {"candidate": NESTED},
+        {"candidate": "x" * 5000},
+        {"candidate": "c", "sdpMid": NESTED},
+        {"candidate": "c", "sdpMid": 5},
+        {"candidate": "c", "sdpMid": "m" * 5000},
+        {"candidate": "c", "sdpMLineIndex": "0"},
+        {"candidate": "c", "sdpMLineIndex": True},  # a bool is an int in Python
+        {"candidate": "c", "sdpMLineIndex": 1.5},
+        {"candidate": "c", "sdpMLineIndex": -1},
+        {"candidate": "c", "sdpMLineIndex": 70000},
+        {"candidate": "c", "sdpMLineIndex": NESTED},
+    ],
+)
+def test_a_malformed_candidate_is_refused(bad: object) -> None:
+    with pytest.raises(ValueError):
+        calls._client_candidate(bad)
+
+
+def test_token_rejects_is_exactly_the_agreed_exceptions_and_never_a_cancellation() -> None:
+    import jwt
+
+    from app.security import TOKEN_REJECTS
+
+    # The three token handlers deny on these and nothing else: a new member is a decision.
+    assert set(TOKEN_REJECTS) == {jwt.PyJWTError, KeyError, ValueError, TypeError, RecursionError}
+    # Catching a cancellation or an interrupt there would swallow a shutdown.
+    assert all(issubclass(e, Exception) for e in TOKEN_REJECTS)

@@ -69,6 +69,48 @@ def test_bad_first_frame_closes_1008_auth_failed(sync_client: TestClient, first:
         _expect_close(ws, "auth_failed")
 
 
+# Nested JSON raises RecursionError, which is not a ValueError: a ~40 KB frame (inside the
+# 64 KiB WebSocket frame) does it on Python 3.12, which production and CI run. It used to
+# escape the frame parse and drop the socket with a traceback, before the rate limiter.
+# On Python 3.14 the limit is far higher (about 100k levels): these payloads no longer raise
+# there, so the tests below only discriminate on 3.12 and 3.13, which is what CI runs.
+NESTED = "[" * 20_000 + "]" * 20_000
+
+
+def test_a_nested_first_frame_is_auth_failed_not_a_crash(sync_client: TestClient) -> None:
+    with sync_client.websocket_connect("/ws") as ws:
+        ws.send_text(NESTED)
+        _expect_close(ws, "auth_failed")
+
+
+def test_a_token_with_a_nested_header_is_auth_failed(sync_client: TestClient) -> None:
+    import base64
+
+    def b64(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    # The JWS header is parsed before the signature is checked. 12k levels is ~32 KB.
+    header = b64(b"[" * 12_000 + b"]" * 12_000)
+    token = f"{header}.{b64(b'{}')}.{b64(b'sig')}"
+    with sync_client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "auth", "data": {"access_token": token}})
+        _expect_close(ws, "auth_failed")
+
+
+def test_a_nested_frame_after_auth_is_an_invalid_frame_and_the_socket_lives(
+    sync_client: TestClient,
+) -> None:
+    tok = _token(sync_client)
+    with sync_client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "auth", "data": {"access_token": tok}})
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_text(NESTED)
+        err = ws.receive_json()
+        assert (err["type"], err["data"]["code"]) == ("error", "invalid")
+        ws.send_json({"type": "ping", "id": "p1", "data": {}})  # still answering
+        assert ws.receive_json()["type"] == "pong"
+
+
 def test_non_access_jwt_is_rejected(sync_client: TestClient) -> None:
     """A signed JWT of another type (e.g. the planned totp_pending) must not open
     a socket, or a half-finished 2FA login would get realtime access."""

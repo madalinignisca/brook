@@ -8,6 +8,7 @@ its pong, so a missing event fails an assert instead of hanging CI.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -107,7 +108,9 @@ def _publish_live(tc: TestClient, fake: FakeJanus, ws: Any, call_id: str, pid: s
     tc.portal.call(fake.fire, _participant(call_id, pid).pub_hid, {"janus": "webrtcup"})
 
 
-def test_full_call_flow(sync_client: TestClient, fake: FakeJanus) -> None:
+def test_full_call_flow(
+    sync_client: TestClient, fake: FakeJanus, caplog: pytest.LogCaptureFixture
+) -> None:
     a, b, _c, ch = _setup(sync_client)
     with _ws(sync_client, a) as wa, _ws(sync_client, b) as wb:
         ja = cmd(wa, "call.join", {"channel_id": ch})["data"]
@@ -181,6 +184,36 @@ def test_full_call_flow(sync_client: TestClient, fake: FakeJanus) -> None:
         trickles = [r for n, r in fake.requests if n == "trickle"]
         assert trickles[-2]["handle"] == _participant(call_id, pb).pub_hid
         assert trickles[-1] == {"handle": _participant(call_id, pb).sub_hid, "candidate": None}
+
+        # a malformed candidate (here a nested sdpMid) is dropped, never relayed to Janus,
+        # and a well-formed one still is, with only the three fields the contract defines
+        seen = len(trickles)
+        caplog.set_level(logging.DEBUG, logger="app.calls")
+        wb.send_json(
+            {
+                "type": "call.ice",
+                "data": {
+                    "call_id": call_id,
+                    "pc": "publish",
+                    "candidate": {"candidate": "c", "sdpMid": [[[[1]]]], "extra": 1},
+                },
+            }
+        )
+        wb.send_json(
+            {
+                "type": "call.ice",
+                "data": {
+                    "call_id": call_id,
+                    "pc": "publish",
+                    "candidate": {**cand, "extra": {"x": 1}},
+                },
+            }
+        )
+        assert collect(wb, wait=0.1) == [], "call.ice has no reply, a refused one included"
+        refused = [r for r in caplog.records if "malformed ICE candidate" in r.getMessage()]
+        assert [r.levelno for r in refused] == [logging.WARNING], "one visible warning"
+        later = [r for n, r in fake.requests if n == "trickle"][seen:]
+        assert [t["candidate"] for t in later] == [cand], "only the well-formed one, cleaned"
 
         # Janus-side trickle reaches the client as call.ice
         sync_client.portal.call(

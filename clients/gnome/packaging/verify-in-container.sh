@@ -20,10 +20,11 @@ case "$ID" in
     apt-get install -y -qq --no-install-recommends \
       libgtk-4-1 libadwaita-1-0 \
       gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-      gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice gstreamer1.0-gtk4 \
+      gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice \
       gstreamer1.0-pipewire gstreamer1.0-tools libssl3t64 liblcms2-2 libseccomp2 \
       libfontconfig1 glycin-loaders bubblewrap \
       adwaita-icon-theme fonts-dejavu-core xvfb xauth dbus >/dev/null
+    apt-get install -y -qq --no-install-recommends gstreamer1.0-gtk4 >/dev/null
     ;;
   alpine)
     apk add -q --no-cache \
@@ -100,4 +101,10 @@ echo "ok (still running after ${elapsed}s)"
 if grep -E 'panicked at|-CRITICAL' "$work/out.log"; then
   echo "FAIL: the app logged a panic or critical" >&2; exit 1
 fi
+# The documented removal must take the app away again (INSTALL.md: ./install.sh --uninstall).
+(cd "$work"/brook-gnome-*/ && ./install.sh --uninstall)
+[ ! -e "$bin" ] || { echo "FAIL: --uninstall left $bin behind" >&2; exit 1; }
+# A launcher left pointing at a deleted binary is the failure users would see.
+desktop="${XDG_DATA_HOME:-$HOME/.local/share}/applications/dev.brook.Brook.desktop"
+[ ! -e "$desktop" ] || { echo "FAIL: --uninstall left $desktop behind" >&2; exit 1; }
 echo "PASS $PRETTY_NAME"

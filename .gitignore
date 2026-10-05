@@ -46,6 +46,7 @@ bindings/apple/swift/BrookCore/.swiftpm/
 # macOS client: generated project and build output
 clients/macos/Brook.xcodeproj/
 clients/macos/build/
+clients/macos/build.noindex/
 clients/macos/Brook/Info.plist
 clients/macos/Brook/Brook.entitlements
 clients/macos/BrookImageDecoder/Info.plist

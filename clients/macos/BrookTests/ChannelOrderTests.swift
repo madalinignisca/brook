@@ -223,6 +223,46 @@ final class ChannelOrderTests: XCTestCase {
         XCTAssertEqual(ids(model), ["c1", "c2", "c3"], "a channel with no row re-sorted the list")
     }
 
+    // ---- A read that outlives the session never brings the erased ranks back ----
+
+    private func gatedModelWithStaleRank() async -> (ChannelsModel, Task<Void, Never>, Gate) {
+        defaults.set(["gone": 1], forKey: "ChannelOpenedRanks.me") // a rank the network list will prune
+        let client = FakeRealtime(channels: three)
+        let gate = Gate()
+        client.listGate = gate
+        let model = model(client)
+        let read = Task { await model.start() }
+        for _ in 0 ..< 300 where client.order.withLock({ $0 }).filter({ $0 == "list" }).isEmpty {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return (model, read, gate)
+    }
+
+    func testAReadFinishingAfterTheEraseDoesNotSaveTheRanksAgain() async {
+        let (_, read, gate) = await gatedModelWithStaleRank()
+        ChannelsModel.eraseRanks(for: "me", defaults: defaults)
+        gate.open()
+        await read.value
+        XCTAssertNil(defaults.object(forKey: "ChannelOpenedRanks.me"), "a late read recreated the erased ranks")
+    }
+
+    func testAStoppedModelSavesNothing() async {
+        let (model, read, gate) = await gatedModelWithStaleRank()
+        model.stop()
+        gate.open()
+        await read.value
+        model.openChannel = "c1"
+        XCTAssertEqual(defaults.dictionary(forKey: "ChannelOpenedRanks.me") as? [String: Int], ["gone": 1],
+                       "a stopped model wrote its ranks")
+    }
+
+    func testANewSessionForTheUserSavesAgainAfterAnErase() async {
+        ChannelsModel.eraseRanks(for: "me", defaults: defaults)
+        let (_, model) = await started()
+        model.openChannel = "c2"
+        XCTAssertNotNil(defaults.object(forKey: "ChannelOpenedRanks.me"), "the erase blocked the next sign-in's ranks")
+    }
+
     func testAnEmptyOfflineListKeepsTheSavedRanks() async {
         let (client, first) = await started()
         first.openChannel = "c1"
