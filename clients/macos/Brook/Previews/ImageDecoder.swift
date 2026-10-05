@@ -31,6 +31,10 @@ actor ImageDecoder {
     private var running = 0
     private var waiting: [Waiting] = []
     private var disabled = false
+    /// `disabled`, readable from any thread: a row checks before it fetches an image for a
+    /// decoder that is off.
+    nonisolated let offFlag = Flag()
+    nonisolated var isOff: Bool { offFlag.value }
     /// Requests in a row that got no answer at all. One can be a broker killed under memory
     /// pressure (it relaunches); several mean the service can't be reached.
     private var unreachable = 0
@@ -83,6 +87,7 @@ actor ImageDecoder {
     private func disableOnce(_ why: String) {
         guard !disabled else { return }
         disabled = true
+        offFlag.set(true)
         log.info("image previews are off: \(why, privacy: .public)")
     }
 

@@ -34,4 +34,15 @@ final class SettingsTests: XCTestCase {
         Settings(defaults: defaults, environment: [:]).saveLastGoodServer("https://ok.example")
         XCTAssertEqual(defaults.string(forKey: Settings.lastServerKey), "https://ok.example")
     }
+
+    /// Off unless chosen: the owner's decision, one constant for the reader and every view.
+    func testImagePreviewsAreOffUntilChosen() {
+        XCTAssertFalse(Settings.showImagePreviewsDefault)
+        XCTAssertEqual(Settings(defaults: defaults, environment: [:]).showImagePreviews, Settings.showImagePreviewsDefault)
+        defaults.set(true, forKey: Settings.showImagePreviewsKey)
+        XCTAssertTrue(Settings(defaults: defaults, environment: [:]).showImagePreviews)
+        defaults.set(false, forKey: Settings.showImagePreviewsKey)
+        XCTAssertFalse(Settings(defaults: defaults, environment: [:]).showImagePreviews)
+        XCTAssertEqual(Settings.showImagePreviewsKey, "ShowImagePreviews")
+    }
 }

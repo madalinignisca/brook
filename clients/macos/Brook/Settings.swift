@@ -12,6 +12,11 @@ struct Settings {
     /// The Settings window's "Show usernames": people read as `@handle` instead of their display
     /// name. Off by default.
     static let showUsernamesKey = "ShowUsernames"
+    /// The Settings window's "Show image previews": small images in conversations show by
+    /// themselves. Per device.
+    static let showImagePreviewsKey = "ShowImagePreviews"
+    /// Off: an absent value means off, here and in every `@AppStorage` initial value.
+    static let showImagePreviewsDefault = false
     static let fallbackServer = "https://localhost"
 
     let defaults: UserDefaults
@@ -32,6 +37,10 @@ struct Settings {
     }
 
     var showUsernames: Bool { defaults.bool(forKey: Self.showUsernamesKey) }
+
+    var showImagePreviews: Bool {
+        defaults.object(forKey: Self.showImagePreviewsKey) as? Bool ?? Self.showImagePreviewsDefault
+    }
 
     /// The server of the last successful sign-in, if any (the launch restore's server).
     var lastGoodServer: String? { defaults.string(forKey: Self.lastServerKey) }

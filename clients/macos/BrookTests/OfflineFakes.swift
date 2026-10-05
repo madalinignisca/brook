@@ -129,6 +129,7 @@ extension FakeChat: OfflineClient {
     func previewFile(transferId: UInt64, fileId: String) async throws -> FfiImagePreview {
         try need()
         record("preview")
+        if let previewGate { await previewGate.wait() }
         return try previewResult.get()
     }
 

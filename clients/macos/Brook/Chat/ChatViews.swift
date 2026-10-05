@@ -260,6 +260,8 @@ struct AttachmentRow: View {
     /// Open, keep offline and the preview (with local data; else nil: Save only).
     @State private var row: FileRowModel?
     let makeRow: (FfiFileInfo) -> FileRowModel?
+    /// Settings' "Show image previews"; every row follows it at once (the key is shared).
+    @AppStorage(Settings.showImagePreviewsKey) private var showPreviews = Settings.showImagePreviewsDefault
 
     init(file: FfiFileInfo, saves: SaveModel, makeRow: @escaping (FfiFileInfo) -> FileRowModel? = { _ in nil }) {
         self.file = file
@@ -280,7 +282,12 @@ struct AttachmentRow: View {
             guard let row else { return }
             row.onScreen = true
             await row.reloadKeep()
+            // A row that was off screen during a change catches up before it decides.
+            await row.previewSetting(showPreviews)
             await row.startPreview()
+        }
+        .onChange(of: showPreviews) { _, on in
+            Task { await row?.previewSetting(on) }
         }
         .onDisappear { row?.onScreen = false }
     }
