@@ -21,6 +21,7 @@ struct SignedInView: View {
     @State private var selection: String?
     @State private var changingPassword = false
     @State private var resettingPassword = false
+    @State private var addingUser = false
     /// The open channel's conversation (made when the selection changes, never in `body`).
     @State private var timeline: TimelineModel?
     @State private var pending: PendingModel?
@@ -249,6 +250,9 @@ struct SignedInView: View {
                 Menu {
                     Button("Edit Profile…") { editingProfile = true }
                     Button("Change Password…") { changingPassword = true }
+                    if AddUserMenu.isVisible(globalRole: user.globalRole) {
+                        Button("Add User…") { addingUser = true }
+                    }
                     if user.globalRole == "admin" {
                         Button("Reset a User's Password…") { resettingPassword = true }
                     }
@@ -312,6 +316,11 @@ struct SignedInView: View {
                 }
                 .padding(8)
                 .background(.orange.opacity(0.15))
+            }
+        }
+        .sheet(isPresented: $addingUser) {
+            if let account = client as? any AccountClient {
+                AddUserSheet(client: account)
             }
         }
         .sheet(isPresented: $resettingPassword) {

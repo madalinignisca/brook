@@ -14,6 +14,7 @@ protocol AccountClient: AnyObject, Sendable {
     func totpDisable(password: String, factor: FfiSecondFactor) async throws
     func totpRegenerateRecoveryCodes(password: String, factor: FfiSecondFactor) async throws -> [String]
     func adminResetTotp(userId: String, adminPassword: String) async throws
+    func createUser(handle: String, displayName: String, password: String, adminPassword: String) async throws -> FfiUserSummary
 }
 
 extension FfiBrookClient: AccountClient {}
@@ -205,5 +206,165 @@ final class AdminResetModel {
         adminPassword = ""
         new = ""
         confirm = ""
+    }
+}
+
+/// The server's limits for a new account's handle and display name, mirrored only to answer early.
+enum NewUserPolicy {
+    static let handleRange = 2 ... 64
+    static let nameRange = 1 ... 64
+
+    /// The handle as it is sent (trimmed, no leading `@`; case kept) and the name as sent (trimmed).
+    static func sent(handle: String, displayName: String) -> (handle: String, displayName: String) {
+        (Handle.clean(handle), displayName.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Why this handle/name can't be sent, or nil.
+    static func problem(handle: String, displayName: String) -> String? {
+        let (handle, name) = sent(handle: handle, displayName: displayName)
+        // ASCII only, spelled out: `\w` and character classes would admit other scripts.
+        let allowed = handle.unicodeScalars.allSatisfy {
+            ("A" ... "Z").contains($0) || ("a" ... "z").contains($0) || ("0" ... "9").contains($0)
+                || $0 == "_" || $0 == "." || $0 == "-"
+        }
+        if !handleRange.contains(handle.unicodeScalars.count) || !allowed {
+            return "A handle is 2 to 64 letters, digits, dots, dashes or underscores."
+        }
+        // Code points, as the server counts.
+        if !nameRange.contains(name.unicodeScalars.count) {
+            return "A display name is 1 to 64 characters."
+        }
+        return nil
+    }
+}
+
+/// A random password a person can read out or retype: no 0 O 1 l I o.
+enum PasswordGenerator {
+    static let alphabet = Array("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789")
+    static let length = 16
+
+    /// `Int.random(in:using:)` draws uniformly (it rejects, it does not take a modulo), so no
+    /// character is likelier than another.
+    static func make<G: RandomNumberGenerator>(using generator: inout G) -> String {
+        String((0 ..< length).map { _ in alphabet[Int.random(in: 0 ..< alphabet.count, using: &generator)] })
+    }
+
+    static func make() -> String {
+        var system = SystemRandomNumberGenerator()
+        return make(using: &system)
+    }
+}
+
+/// Whether the Account menu offers Add User… (the server decides; this only hides the entry).
+enum AddUserMenu {
+    static func isVisible(globalRole: String) -> Bool { globalRole == "admin" }
+}
+
+/// Add User sheet (admins): a new member's handle, name and first password; the admin's own
+/// password is asked again.
+@MainActor
+@Observable
+final class AddUserModel {
+    var handle = ""
+    var displayName = ""
+    /// Editing it after `generate()` hides the generated text and empties Confirm.
+    var password = "" {
+        didSet {
+            if let shown = generated, !PasswordPolicy.same(shown, password) {
+                generated = nil
+                confirm = ""
+            }
+        }
+    }
+    var confirm = ""
+    var adminPassword = ""
+    /// The generated password, shown once while the Password field still holds it.
+    private(set) var generated: String?
+    private(set) var busy = false
+    private(set) var error: String?
+    private(set) var done: String?
+    /// The handle of the latest try that got no usable answer: it may have been created.
+    private var lastNoAnswerHandle: String?
+
+    static let taken = "That handle is taken. Handles are case-sensitive, and a disabled account keeps its handle."
+    static let probablyCreated =
+        "Your previous try got no answer and probably created it, with the password you entered."
+    static let notAllowed =
+        "Not allowed: your account may no longer be an admin, or your sign-in expired. Try again."
+    static let limits =
+        "The server refused it: a handle is 2 to 64 letters, digits, dots, dashes or underscores; a name 1 to 64 characters; a password 8 to 256."
+    static let noAnswer =
+        "No clear answer came back, so the account may have been created. Try again; if it says the handle is taken, it was."
+
+    private let client: any AccountClient
+    private let generator: () -> String
+
+    init(client: any AccountClient, generator: @escaping () -> String = { PasswordGenerator.make() }) {
+        self.client = client
+        self.generator = generator
+    }
+
+    /// Why it can't be sent yet, or nil (shown as the user types; the button stays disabled).
+    var problem: String? {
+        if let problem = NewUserPolicy.problem(handle: handle, displayName: displayName) { return problem }
+        if let problem = PasswordPolicy.problem(new: password, confirm: confirm) { return problem }
+        if adminPassword.isEmpty { return "Enter your own password." }
+        return nil
+    }
+
+    func generate() {
+        let fresh = generator()
+        password = fresh // may hide an older generated text; set below
+        confirm = fresh
+        generated = fresh
+    }
+
+    func submit() async {
+        guard problem == nil, !busy else { return }
+        let (handle, name) = NewUserPolicy.sent(handle: handle, displayName: displayName)
+        busy = true
+        error = nil
+        defer { busy = false }
+        do {
+            _ = try await client.createUser(
+                handle: handle, displayName: name, password: password, adminPassword: adminPassword)
+            clear()
+            lastNoAnswerHandle = nil
+            done = "\(handle) was added. Give them the password; they can change it under Change Password."
+        } catch {
+            // Fields stay: a typo can be fixed without retyping everything.
+            self.error = text(for: error, handle: handle)
+        }
+    }
+
+    private func text(for error: Error, handle: String) -> String {
+        switch error as? LoginError {
+        case let .Api(code, _)?:
+            switch code {
+            case "conflict":
+                return lastNoAnswerHandle == handle ? Self.probablyCreated : Self.taken
+            case "auth.invalid_credentials": return AdminResetModel.wrongAdmin
+            case "authz.forbidden": return Self.notAllowed
+            case "validation": return Self.limits
+            case "auth.rate_limited": return AccountMessage.tooManyAttempts
+            case "http_5xx":
+                lastNoAnswerHandle = handle
+                return Self.noAnswer
+            default: return AccountMessage.unexpected
+            }
+        case .Network?, .Timeout?, .Disconnected?, .UnexpectedResponse?:
+            lastNoAnswerHandle = handle
+            return Self.noAnswer
+        case .NotAuthenticated?: return AccountMessage.signedOut
+        default: return AccountMessage.unexpected
+        }
+    }
+
+    /// When the sheet closes (and after success): nothing keeps the passwords.
+    func clear() {
+        password = ""
+        confirm = ""
+        adminPassword = ""
+        generated = nil
     }
 }
