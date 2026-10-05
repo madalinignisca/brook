@@ -142,6 +142,46 @@ final class TimelineModelTests: XCTestCase {
         XCTAssertEqual(t.messages.first?.deleted, true, "a late copy brought it back")
     }
 
+    /// A new conversation: its first messages land while the newest page is still loading, so the
+    /// older-page loader (shown above the first message) asks while a load is running. That ask
+    /// must wait for the running load, not give up: nothing asks again, and the spinner stayed
+    /// for good instead of becoming "the start of the conversation".
+    func testAnOlderPageAskedWhileTheHeadLoadsWaitsAndEndsAtTheStart() async {
+        let chat = FakeChat()
+        chat.pages = [[msg("m5", "hey")], []]
+        let gate = Gate()
+        chat.historyGate = gate
+        let t = TimelineModel(channelId: "c", client: chat)
+        let loading = Task { await t.load() }
+        for _ in 0 ..< 40 { await Task.yield(); try? await Task.sleep(for: .milliseconds(5)) }
+        t.merge([msg("m4", "first")]) // a live message: the loader appears above it
+        XCTAssertTrue(t.loading, "the head is still loading")
+        let older = Task { await t.loadOlder() }
+        for _ in 0 ..< 10 { await Task.yield(); try? await Task.sleep(for: .milliseconds(5)) }
+        gate.open()
+        await loading.value
+        await older.value
+        XCTAssertTrue(t.atStart, "the loader would spin for good")
+        XCTAssertEqual(chat.historyCalls.withLock { $0 }, 2, "the head, then one older page")
+    }
+
+    /// A failed older page is shown as a failure to retry, not a spinner nothing will end.
+    func testAFailedOlderPageIsRetryable() async {
+        let chat = FakeChat()
+        chat.pages = [[msg("m5", "x")]]
+        let t = TimelineModel(channelId: "c", client: chat)
+        await t.load()
+        chat.historyFailure = LoginError.Network(message: "offline")
+        await t.loadOlder()
+        XCTAssertTrue(t.olderFailed)
+        XCTAssertFalse(t.atStart)
+        chat.historyFailure = nil
+        chat.pages = [[]]
+        await t.loadOlder() // Retry
+        XCTAssertFalse(t.olderFailed)
+        XCTAssertTrue(t.atStart)
+    }
+
     /// An empty older page means the start of the channel; no more pages are asked for.
     func testAnEmptyOlderPageIsTheStart() async {
         let chat = FakeChat()

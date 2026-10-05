@@ -31,6 +31,8 @@ final class TimelineModel {
     private(set) var loading = false
     /// No older page: the start of the channel is on screen.
     private(set) var atStart = false
+    /// The last older page failed: the view offers a retry instead of a spinner.
+    private(set) var olderFailed = false
     /// The network's error. Hidden (`visibleError`) while offline with cached messages shown.
     private(set) var error: String?
     /// Set from the cache's state feed: the last sync couldn't reach the server.
@@ -153,7 +155,12 @@ final class TimelineModel {
     /// The page before the oldest shown (scrolled to the top): the cache's, loading it when
     /// the cache can't vouch for it; the network's when there's no local data.
     func loadOlder() async {
+        // A load already running (the newest page of a new conversation, an older page): wait for it
+        // and then decide. Giving up here left the loader spinning for good, since it asks once, when
+        // it appears.
+        while loading, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(25)) }
         guard !atStart, !loading, let oldest = messages.first else { return }
+        olderFailed = false
         loading = true // one older page at a time
         let fromCache = await readCache(before: oldest.id, loadIfIncomplete: true)
         loading = false
@@ -211,6 +218,7 @@ final class TimelineModel {
             error = nil
         } catch {
             self.error = "Couldn't load messages."
+            if before != nil { olderFailed = true }
         }
     }
 

@@ -45,8 +45,13 @@ struct ChatView: View {
                             Text("This is the start of the conversation.")
                                 .font(.caption).foregroundStyle(.secondary)
                         } else if !timeline.messages.isEmpty {
-                            ProgressView().controlSize(.small)
-                                .onAppear { Task { await timeline.loadOlder() } }
+                            if timeline.olderFailed {
+                                Button("Couldn't load older messages. Retry") { Task { await timeline.loadOlder() } }
+                                    .buttonStyle(.link).font(.caption)
+                            } else {
+                                ProgressView().controlSize(.small)
+                                    .onAppear { Task { await timeline.loadOlder() } }
+                            }
                         }
                         ForEach(timeline.messages, id: \.id) { message in
                             MessageRow(message: message, author: timeline.authorName(message),
