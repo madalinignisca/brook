@@ -7,6 +7,7 @@
 | Method & path | Purpose |
 |---|---|
 | `GET  /auth/methods` | which methods this deployment enabled (local/oidc/ldap) |
+| `POST /auth/register` | `{handle, display_name, password, admin_password?}` → `201 UserOut` (a `member`). The **first** account bootstraps as `admin` (open; `admin_password` ignored). After that only a global admin may call it, and must re-enter their own password in `admin_password`, so a stolen access token alone can't mint accounts. Checks run in this order: `401 auth.invalid_token` (a token was sent but is expired/revoked: refresh, then retry) · `403 authz.forbidden` (no token, or not an admin) · `422 validation.error` (`admin_password` missing) · `403 auth.invalid_credentials` (wrong `admin_password`; counts against the rate limit) · `409 conflict` (handle taken, disabled accounts included; handles are case-sensitive) · `422` for a bad body. `handle` 2–64 of `[A-Za-z0-9_.-]`, `display_name` 1–64 after trimming (`422 profile.invalid` for refused characters, as for `PATCH /auth/me`), `password` 8–256. `429 auth.rate_limited` + `Retry-After` |
 | `POST /auth/login` | `{handle, password, supports_totp}` → `{access_token, refresh_token}`, or for a TOTP user `200 {totp_required, totp_token, expires_in}`; see §1.2 |
 | `POST /auth/totp` | `{totp_token, code}` or `{totp_token, recovery_code}` → tokens (`+ recovery_codes_left` with a recovery code) |
 | `POST /auth/totp/enroll` · `/activate` · `/disable` · `/recovery-codes` | set up, confirm, turn off, regenerate codes; see §1.2 |

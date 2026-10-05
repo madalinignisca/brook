@@ -31,7 +31,7 @@ async def _pair(client: httpx.AsyncClient, handle: str, password: str = PW) -> d
 
 async def _setup(client: httpx.AsyncClient) -> tuple[dict[str, str], dict[str, str]]:
     """alice (admin) with two devices: returns (phone, laptop) token pairs."""
-    body = {"handle": "alice", "display_name": "Alice", "password": PW}
+    body = {"handle": "alice", "display_name": "Alice", "password": PW, "admin_password": PW}
     await client.post(f"{AUTH}/register", json=body)
     return await _pair(client, "alice"), await _pair(client, "alice")
 
@@ -83,7 +83,7 @@ async def test_unchecked_keeps_other_devices_signed_in(client: httpx.AsyncClient
 
 async def test_admin_reset_cuts_the_target_off_immediately(client: httpx.AsyncClient) -> None:
     admin, _ = await _setup(client)
-    body = {"handle": "bob", "display_name": "Bob", "password": PW}
+    body = {"handle": "bob", "display_name": "Bob", "password": PW, "admin_password": PW}
     await client.post(f"{AUTH}/register", json=body, headers=_h(admin["access_token"]))
     bob = await _pair(client, "bob")
     bob_id = (await client.get(f"{AUTH}/me", headers=_h(bob["access_token"]))).json()["id"]
@@ -128,7 +128,7 @@ def test_tokens_without_iat_ms_round_down() -> None:
 
 def test_open_sockets_of_other_devices_are_closed(sync_client: TestClient) -> None:
     http = sync_client
-    body = {"handle": "alice", "display_name": "Alice", "password": PW}
+    body = {"handle": "alice", "display_name": "Alice", "password": PW, "admin_password": PW}
     assert http.post(f"{AUTH}/register", json=body).status_code == 201
     phone = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
     laptop = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
@@ -165,7 +165,7 @@ def test_open_sockets_of_other_devices_are_closed(sync_client: TestClient) -> No
 
 def test_unchecked_leaves_other_sockets_open(sync_client: TestClient) -> None:
     http = sync_client
-    body = {"handle": "alice", "display_name": "Alice", "password": PW}
+    body = {"handle": "alice", "display_name": "Alice", "password": PW, "admin_password": PW}
     assert http.post(f"{AUTH}/register", json=body).status_code == 201
     phone = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
     laptop = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
@@ -202,7 +202,7 @@ async def test_register_refuses_a_revoked_admin_token(client: httpx.AsyncClient)
     assert r.status_code == 200
     body = {"handle": "mallory", "display_name": "Mallory", "password": "mallory-pass"}
     created = await client.post(f"{AUTH}/register", json=body, headers=_h(stolen["access_token"]))
-    assert created.status_code == 403
+    assert created.status_code == 401
     login = await client.post(
         f"{AUTH}/login", json={"handle": "mallory", "password": "mallory-pass"}
     )
@@ -213,7 +213,7 @@ def test_reauth_with_a_revoked_token_is_session_revoked(sync_client: TestClient)
     """The on-socket `auth` frame path: a revoked token closes `session_revoked`
     (not `auth_failed`, which would count against the owner's IP)."""
     http = sync_client
-    body = {"handle": "alice", "display_name": "Alice", "password": PW}
+    body = {"handle": "alice", "display_name": "Alice", "password": PW, "admin_password": PW}
     assert http.post(f"{AUTH}/register", json=body).status_code == 201
     old = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
     r = http.post(
@@ -239,7 +239,7 @@ def test_a_socket_registering_after_the_sweep_is_closed(
     from app.routers import ws as ws_module
 
     http = sync_client
-    body = {"handle": "alice", "display_name": "Alice", "password": PW}
+    body = {"handle": "alice", "display_name": "Alice", "password": PW, "admin_password": PW}
     assert http.post(f"{AUTH}/register", json=body).status_code == 201
     pair = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
     user_id = http.get(f"{AUTH}/me", headers=_h(pair["access_token"])).json()["id"]

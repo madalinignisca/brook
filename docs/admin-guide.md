@@ -71,7 +71,8 @@ After that, registration is closed to anonymous users — only an admin may crea
 further accounts (a proper admin/user-management UI is **planned**). For now an
 admin creates a user by sending the same `register` request with an
 `Authorization: Bearer <admin-access-token>` header (get a token via
-`POST /api/v1/auth/login`).
+`POST /api/v1/auth/login`) and their own password as `"admin_password"` in the
+body, so a stolen token alone can't create accounts.
 
 ## Day-to-day operations
 

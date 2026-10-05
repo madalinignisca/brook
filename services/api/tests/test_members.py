@@ -29,7 +29,7 @@ def _h(token: str) -> dict[str, str]:
 async def _user(
     client: httpx.AsyncClient, handle: str, admin: dict[str, str] | None = None
 ) -> tuple[dict[str, str], str]:
-    body = {"handle": handle, "display_name": handle.title(), "password": PW}
+    body = {"handle": handle, "display_name": handle.title(), "password": PW, "admin_password": PW}
     await client.post(f"{AUTH}/register", json=body, headers=admin or {})
     r = await client.post(f"{AUTH}/login", json={"handle": handle, "password": PW})
     h = _h(r.json()["access_token"])
@@ -184,7 +184,12 @@ def test_removal_is_live_for_both_sides(sync_client: TestClient) -> None:
     http = sync_client
 
     def user(handle: str, admin: dict[str, str] | None = None) -> tuple[dict[str, str], str]:
-        body = {"handle": handle, "display_name": handle.title(), "password": PW}
+        body = {
+            "handle": handle,
+            "display_name": handle.title(),
+            "password": PW,
+            "admin_password": PW,
+        }
         http.post(f"{AUTH}/register", json=body, headers=admin or {})
         tok = http.post(f"{AUTH}/login", json={"handle": handle, "password": PW}).json()
         h = _h(tok["access_token"])
@@ -299,7 +304,12 @@ async def test_a_name_must_show_something(client: httpx.AsyncClient) -> None:
 
 async def test_registration_cleans_the_name_too(client: httpx.AsyncClient) -> None:
     ha, _ = await _user(client, "alice")
-    body = {"handle": "mallory", "display_name": "evil" + chr(0x202E) + "gnp", "password": PW}
+    body = {
+        "handle": "mallory",
+        "display_name": "evil" + chr(0x202E) + "gnp",
+        "password": PW,
+        "admin_password": PW,
+    }
     r = await client.post(f"{AUTH}/register", json=body, headers=ha)
     assert r.status_code == 422 and r.json()["error"]["code"] == "profile.invalid"
 

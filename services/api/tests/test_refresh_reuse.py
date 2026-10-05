@@ -28,7 +28,7 @@ async def _login(client: httpx.AsyncClient) -> str:
 
 
 async def _alice(client: httpx.AsyncClient) -> None:
-    body = {"handle": "alice", "display_name": "Alice", "password": PW}
+    body = {"handle": "alice", "display_name": "Alice", "password": PW, "admin_password": PW}
     assert (await client.post(f"{AUTH}/register", json=body)).status_code == 201
 
 
