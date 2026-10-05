@@ -3,9 +3,10 @@
 Using the Brook desktop client. To run a server, see the
 [Administrator Guide](admin-guide.md).
 
-> **Status: Phase 0.** What works today: **connecting to a server and signing
-> in**. Chat, channels, file transfer, calls, and bots are **planned** (see
-> [ROADMAP.md](ROADMAP.md)); this guide grows as they ship.
+> **Status: beta.** What works today: signing in (with a second factor if you turned
+> one on), channels and direct messages, files, working offline, and calls on the GNOME
+> client. Bots are **planned** (see [ROADMAP.md](ROADMAP.md)); this guide grows as they
+> ship.
 
 ## What is Brook?
 
@@ -85,23 +86,57 @@ open clients/macos/build.noindex/Build/Products/Debug/Brook.app
 
 ## Signing in
 
-1. Launch Brook — you'll see the **login** screen.
+1. Launch Brook: you'll see the **login** screen.
 2. Enter your **handle** and **password**, and click **Log in** (or press Enter).
-3. On success the app switches to your home view. A wrong handle/password shows
-   an inline error; fix it and try again.
+3. If you turned on a second factor, enter the **code from your authenticator app**, or
+   choose **Use a recovery code instead**. You can turn it on, get new recovery codes or
+   turn it off in your account settings.
+4. On success the app shows your conversations. A wrong handle or password shows an inline
+   error; fix it and try again.
 
-If the app can't reach the server at all, it shows an error window explaining why
-(check the address with your admin).
+If the app can't reach the server, the login screen says why (check the address with your
+admin).
 
-## Available now vs. planned
+### Staying signed in
 
-| Feature | Status |
-|---|---|
-| Sign in to a server | ✅ Available (Phase 0) |
-| 1:1 and channel chat | ⏳ Planned (Phase 1) |
-| File transfer | ⏳ Planned (Phase 2) |
-| Bots / slash commands | ⏳ Planned (Phase 3) |
-| Voice/video calls + screen share | ⏳ Planned (Phase 4) |
+Brook keeps you signed in between launches through your desktop's keyring (GNOME Keyring,
+KWallet or the macOS Keychain), and never asks for the keyring's password itself. With no
+keyring, or a locked one, you sign in each time, and the offline features below are off.
+
+### Signing out
+
+**Sign Out** ends this device's sign-in. **Remove this device's data** (on by default) also
+deletes the messages and files Brook saved on this computer, and any messages you had not
+sent yet. Tick it off to keep them for your next sign-in. If Brook can't remove the data
+(say the keyring is locked), it tells you on the login screen. To cut off a device you have
+lost, change your password with **Sign out of other devices** on; messages already saved on that
+device stay readable to anyone who can sign in to that computer.
+
+## Conversations
+
+- **Channels and people** are listed in the sidebar, each section ordered by what you used
+  last. **Show usernames** (in the main menu) names people by `@handle` instead of by name,
+  everywhere.
+- Send messages, **reply**, **edit** and **delete** your own, add **reactions**, and search.
+  Messages that mention you are marked, and the sidebar shows unread and mention counts.
+  You see when someone is typing.
+- Scroll up to load older messages.
+- **Attach files** with the paperclip or by dragging them into the window. A file you
+  receive is opened or saved from its row: **Save** asks where (starting in your Downloads
+  folder), **Open** hands a copy to another app. Images show a preview where the system can
+  decode them safely (see the install notes). **Keep available offline** pins a file so you
+  can open it without a connection.
+- **Calls** (voice, video, screen share) work in the GNOME client on a glibc distribution.
+
+## Working offline
+
+With the keyring available, Brook saves your conversations on this computer, encrypted with
+a key only your keyring holds. Without a connection you can still read them and open pinned
+files. A banner appears once you have been offline for a few seconds. Messages you write
+meanwhile wait in an outbox and go out when the connection returns; each shows as pending,
+with **Retry** and **Delete** if one fails. Known limit: Brook has to start with a connection
+to sign you in, so this works only once it has started online; starting it offline shows the
+login screen.
 
 ## Why do my file names look different?
 
@@ -110,8 +145,8 @@ scripts are transliterated to Latin letters (`Ștefan–raport.pdf` becomes
 `Stefan-raport.pdf`, `日本語.txt` becomes `RiBenYu.txt`), and anything that could confuse
 or harm a computer (hidden characters, paths, reserved names) is removed. That way a file
 opens the same on Windows, macOS, Linux and phones. The name exactly as it was sent is
-still shown next to the file, so nothing is lost. Files you receive are always saved to
-your Downloads folder and never opened automatically.
+still shown next to the file, so nothing is lost. A file is only saved or opened when you ask:
+the Save dialog suggests the plain name, starting in your Downloads folder.
 
 ## See also
 
