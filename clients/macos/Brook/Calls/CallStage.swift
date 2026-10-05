@@ -18,6 +18,13 @@ enum CallStage {
         return Split(stage: chosen, strip: tiles.filter { $0.id != chosen.id })
     }
 
+    /// The pin to keep after the tiles changed: one whose tile is gone is dropped for good, so it
+    /// cannot come back when the same id appears again (the same person shares their screen again).
+    static func pruned(_ pinned: String?, tiles: [CallModel.Tile]) -> String? {
+        guard let pinned, tiles.contains(where: { $0.id == pinned }) else { return nil }
+        return pinned
+    }
+
     /// A click on a tile: on the stage it releases the pin (back to the automatic choice), anywhere
     /// else it pins that tile.
     static func toggled(_ pinned: String?, clicked id: String, onStage: String?) -> String? {

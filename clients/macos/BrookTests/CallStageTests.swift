@@ -23,6 +23,8 @@ final class CallStageTests: XCTestCase {
     func testAPinBeatsTheScreenAndPinsAnyTile() {
         let tiles = [tile("a"), tile("p2.screen", screen: true), tile("b")]
         XCTAssertEqual(CallStage.split(tiles, pinned: "b").stage?.id, "b")
+        XCTAssertEqual(CallStage.split(tiles, pinned: "b").strip.map(\.id), ["a", "p2.screen"],
+                       "the screen is still shown, in the strip")
         XCTAssertEqual(CallStage.split([tile("a"), tile("b")], pinned: "a").stage?.id, "a", "a pin works with no screen")
     }
 
@@ -30,6 +32,18 @@ final class CallStageTests: XCTestCase {
         let tiles = [tile("a"), tile("p2.screen", screen: true)]
         XCTAssertEqual(CallStage.split(tiles, pinned: "gone").stage?.id, "p2.screen", "falls back to the screen")
         XCTAssertNil(CallStage.split([tile("a")], pinned: "gone").stage, "and to the grid")
+    }
+
+    /// The stored pin is dropped when its tile goes, so it cannot return with the same id later.
+    func testAPinIsDroppedForGoodWhenItsTileLeaves() {
+        let withScreen = [tile("a"), tile("p2.screen", screen: true)]
+        XCTAssertEqual(CallStage.pruned("p2.screen", tiles: withScreen), "p2.screen", "kept while the tile is there")
+        let gone = CallStage.pruned("p2.screen", tiles: [tile("a"), tile("p3.screen", screen: true)])
+        XCTAssertNil(gone, "dropped when the tile is gone")
+        // The same person shares again: the old pin must not displace the other share.
+        let again = [tile("a"), tile("p3.screen", screen: true), tile("p2.screen", screen: true)]
+        XCTAssertEqual(CallStage.split(again, pinned: gone).stage?.id, "p3.screen")
+        XCTAssertNil(CallStage.pruned(nil, tiles: again))
     }
 
     func testClickingPinsAndClickingTheStageReleases() {

@@ -41,7 +41,8 @@ struct TileView: View {
         ZStack(alignment: .bottomLeading) {
             Rectangle().fill(.black)
             if tile.video, tile.track != nil {
-                VideoTile(track: tile.track)
+                // The video view would take the click, and a tile is clicked to put it on the stage.
+                VideoTile(track: tile.track).allowsHitTesting(false)
             } else {
                 Image(systemName: "person.crop.circle.fill")
                     .font(.system(size: 48))
@@ -58,8 +59,8 @@ struct TileView: View {
             .padding(8)
         }
         .aspectRatio(16 / 9, contentMode: .fit)
-        .frame(maxWidth: fills ? .infinity : nil, maxHeight: fills ? .infinity : nil)
         .clipShape(RoundedRectangle(cornerRadius: 10))
+        .frame(maxWidth: fills ? .infinity : nil, maxHeight: fills ? .infinity : nil)
         // The tile is always black: its icon and name chip use dark-scheme colours in light mode too.
         .environment(\.colorScheme, .dark)
         .accessibilityElement(children: .combine)
@@ -78,10 +79,23 @@ struct CallView: View {
     /// the equal grid when nothing is on the stage.
     @ViewBuilder
     private var tilesArea: some View {
+        tilesLayout
+            .onChange(of: call.tiles.map(\.id)) { _, _ in pinned = CallStage.pruned(pinned, tiles: call.tiles) }
+    }
+
+    @ViewBuilder
+    private var tilesLayout: some View {
         let split = CallStage.split(call.tiles, pinned: pinned)
         if let stage = split.stage {
             VStack(spacing: 10) {
+                // A fresh view for each tile on the stage: a renderer moved to another track would keep
+                // drawing the old picture until a new frame arrives (a still screen sends none).
                 TileView(tile: stage, fills: true)
+                    .id(stage.id)
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityAction(named: pinned == stage.id ? "Release" : "Keep on stage") {
+                        pinned = CallStage.toggled(pinned, clicked: stage.id, onStage: stage.id)
+                    }
                     .onTapGesture {
                         pinned = CallStage.toggled(pinned, clicked: stage.id, onStage: stage.id)
                     }
@@ -92,6 +106,10 @@ struct CallView: View {
                             ForEach(split.strip) { tile in
                                 TileView(tile: tile)
                                     .frame(width: 160)
+                                    .accessibilityAddTraits(.isButton)
+                                    .accessibilityAction(named: "Put on stage") {
+                                        pinned = CallStage.toggled(pinned, clicked: tile.id, onStage: stage.id)
+                                    }
                                     .onTapGesture {
                                         pinned = CallStage.toggled(pinned, clicked: tile.id, onStage: stage.id)
                                     }
@@ -107,7 +125,12 @@ struct CallView: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 10)], spacing: 10) {
                     ForEach(split.strip) { tile in
                         TileView(tile: tile)
+                            .accessibilityAddTraits(.isButton)
+                            .accessibilityAction(named: "Put on stage") {
+                                pinned = CallStage.toggled(pinned, clicked: tile.id, onStage: nil)
+                            }
                             .onTapGesture { pinned = CallStage.toggled(pinned, clicked: tile.id, onStage: nil) }
+                            .help("Click to put this on the stage")
                     }
                 }
             }
