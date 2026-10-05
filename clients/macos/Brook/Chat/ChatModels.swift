@@ -31,8 +31,16 @@ final class TimelineModel {
     private(set) var loading = false
     /// No older page: the start of the channel is on screen.
     private(set) var atStart = false
-    /// The last older page failed: the view offers a retry instead of a spinner.
+    /// The last older page failed: the view offers a retry instead of a spinner. It stays until
+    /// tapped (a returning connection reloads the head, not this): a chosen simplicity, since a
+    /// spinner that retried by itself is what looped.
     private(set) var olderFailed = false
+    /// An older page is being asked for: another ask (the Retry button's new spinner appearing, say)
+    /// joins it instead of waiting to start one more.
+    private var olderInFlight = false
+    /// The newest page failed to load: an older page is not asked for behind it (it would end at an
+    /// empty "start of the conversation" over history that never loaded).
+    private(set) var headFailed = false
     /// The network's error. Hidden (`visibleError`) while offline with cached messages shown.
     private(set) var error: String?
     /// Set from the cache's state feed: the last sync couldn't reach the server.
@@ -155,13 +163,18 @@ final class TimelineModel {
     /// The page before the oldest shown (scrolled to the top): the cache's, loading it when
     /// the cache can't vouch for it; the network's when there's no local data.
     func loadOlder() async {
-        // A load already running (the newest page of a new conversation, an older page): wait for it
-        // and then decide. Giving up here left the loader spinning for good, since it asks once, when
-        // it appears.
-        while loading, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(25)) }
-        guard !atStart, !loading, let oldest = messages.first else { return }
+        // A load already running (the newest page of a new conversation): wait for it and then
+        // decide. Giving up here left the loader spinning for good, since it asks once, when it
+        // appears. Only the newest page's load is waited for: asks for older pages join each other.
+        // (`loading` covers the network fetches; a cached head's own load, in `readCache`, is not
+        // waited for: an older read then runs beside it and still ends at the start or a page.)
+        while loading, !olderInFlight, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(25)) }
+        guard !Task.isCancelled, !olderInFlight, !atStart, !headFailed, !loading,
+              let oldest = messages.first else { return }
+        olderInFlight = true
+        defer { olderInFlight = false }
         olderFailed = false
-        loading = true // one older page at a time
+        loading = true // one page at a time
         let fromCache = await readCache(before: oldest.id, loadIfIncomplete: true)
         loading = false
         if fromCache { return }
@@ -214,11 +227,12 @@ final class TimelineModel {
         do {
             let page = try await client.channelHistory(channelId: channelId, before: before)
             if page.isEmpty, before != nil { atStart = true }
+            if before == nil { headFailed = false }
             merge(page)
             error = nil
         } catch {
             self.error = "Couldn't load messages."
-            if before != nil { olderFailed = true }
+            if before != nil { olderFailed = true } else { headFailed = true }
         }
     }
 
