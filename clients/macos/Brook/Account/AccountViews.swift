@@ -88,3 +88,56 @@ struct AdminResetSheet: View {
         .onDisappear { model.clear() }
     }
 }
+
+struct AddUserSheet: View {
+    @State private var model: AddUserModel
+    @Environment(\.dismiss) private var dismiss
+
+    init(client: any AccountClient) {
+        _model = State(initialValue: AddUserModel(client: client))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Add User").font(.title2)
+            if let done = model.done {
+                Text(done)
+                HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
+            } else {
+                Form {
+                    // No content types: nothing here should be offered to AutoFill as a login.
+                    TextField("Handle", text: $model.handle)
+                        .autocorrectionDisabled()
+                    TextField("Display name", text: $model.displayName)
+                    SecureField("Password", text: $model.password)
+                    SecureField("Confirm password", text: $model.confirm)
+                    Button("Generate") { model.generate() }
+                    if let generated = model.generated {
+                        // Shown once, until the Password field is edited or the sheet closes.
+                        Text(generated)
+                            .font(.system(.body, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                    SecureField("Your password", text: $model.adminPassword)
+                }
+                Text("The new account is a member. Give them the password; they can change it under Change Password.")
+                    .font(.callout).foregroundStyle(.secondary)
+                if let error = model.error {
+                    Text(error).foregroundStyle(.red)
+                } else if let problem = model.problem {
+                    Text(problem).font(.callout).foregroundStyle(.secondary)
+                }
+                HStack {
+                    Spacer()
+                    Button("Cancel", role: .cancel) { dismiss() }
+                    Button("Add User") { Task { await model.submit() } }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(model.problem != nil || model.busy)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+        .onDisappear { model.clear() }  // nothing keeps the passwords once the sheet is gone
+    }
+}
