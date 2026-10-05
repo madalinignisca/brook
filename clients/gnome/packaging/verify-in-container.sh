@@ -62,9 +62,8 @@ done
 [ "$missing" = 0 ] || exit 1
 
 echo "== 3. starts and stays up"
-# Software rendering: there is no GPU in a container. timeout reports the deadline with 124
-. That code can also come from an early
-# death, so the elapsed time has to show the deadline really passed.
+# Software rendering: there is no GPU in a container. timeout reports the deadline with 124.
+# That code can also come from an early death, so the elapsed time has to show the deadline really passed.
 export GSK_RENDERER=cairo
 start="$(date +%s)"
 set +e
