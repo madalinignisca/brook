@@ -46,9 +46,10 @@ final class Broker: NSObject, NSXPCListenerDelegate {
         let data = NSSet(array: [NSData.self]) as! Set<AnyHashable>
         interface.setClasses(data, for: #selector(ImageDecoding.decode(_:kind:reply:)), argumentIndex: 0, ofReply: false)
         interface.setClasses(data, for: #selector(ImageDecoding.decode(_:kind:reply:)), argumentIndex: 3, ofReply: true)
-        // Per connection, before resume: the listener-wide setter crashes in libxpc on the
-        // service listener (a null dereference at launch on macOS 27.0.1, so no preview ever
-        // appeared in a Release build), and this one needs no listener at all.
+        // Per connection, before resume. The listener-wide setter is documented to work only on
+        // anonymous and mach-service listeners; on the service listener it asserts or crashes
+        // (a null dereference at launch on macOS 27.0.1, so no preview ever appeared in a
+        // Release build). Do not move it back to the listener, and not after resume().
         if let requirement { c.setCodeSigningRequirement(requirement) }
         let session = Session()
         c.exportedInterface = interface
