@@ -90,22 +90,45 @@ pub fn engine_config_from_env() -> Result<EngineConfig, String> {
 #[derive(Clone)]
 pub struct CallView {
     root: gtk::Widget,
-    grid: gtk::FlowBox,
-    grid_stack: gtk::Stack,
-    self_view: gtk::Picture,
     status: adw::Banner,
     mic_button: gtk::ToggleButton,
     camera_button: gtk::ToggleButton,
     share_button: gtk::ToggleButton,
     hangup_button: gtk::Button,
-    tiles: Rc<RefCell<HashMap<String, Tile>>>,
+    layout: Rc<Layout>,
+}
+
+/// The id of your own camera's tile.
+const SELF_TILE: &str = "local:self";
+
+/// Where the tiles are put: the equal grid (no stage), or the stage with a strip beside it
+/// (#268, see call_stage.rs). The tiles are re-parented between them by `relayout`.
+struct Layout {
+    stack: gtk::Stack,
+    grid: gtk::FlowBox,
+    stage_frame: gtk::AspectFrame,
+    strip: gtk::Box,
+    tiles: RefCell<HashMap<String, Tile>>,
+    /// Tile ids in the order they were added, screens first.
+    order: RefCell<Vec<String>>,
+    /// The tile the user pinned to the stage, if any.
+    pinned: RefCell<Option<String>>,
+    /// What `relayout` put on the stage.
+    on_stage: RefCell<Option<String>>,
+    /// The strip tiles' height now, so a window resize can restyle them.
+    strip_height: std::cell::Cell<i32>,
+    /// The strip's slots as `relayout` made them, for a resize to restyle without rebuilding.
+    strip_slots: RefCell<Vec<gtk::ScrolledWindow>>,
+    /// The camera is off: your own tile is dimmed, also when it appears after the toggle.
+    camera_off: std::cell::Cell<bool>,
 }
 
 #[derive(Clone)]
 struct Tile {
-    child: gtk::FlowBoxChild,
+    overlay: gtk::Overlay,
     picture: gtk::Picture,
     label: gtk::Label,
+    screen: bool,
 }
 
 impl CallView {
@@ -130,26 +153,39 @@ impl CallView {
             .title("Waiting for others")
             .description("Their video appears here when they join.")
             .build();
+        // The stage: one tile as large as the window allows, 16:9 kept, with the others in a strip
+        // of about a fifth of the height below it.
+        let stage_frame = gtk::AspectFrame::builder()
+            .ratio(16.0 / 9.0)
+            .obey_child(false)
+            .hexpand(true)
+            .vexpand(true)
+            .halign(gtk::Align::Fill)
+            .valign(gtk::Align::Fill)
+            .margin_top(6)
+            .build();
+        let strip = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .halign(gtk::Align::Center)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+        // A call with many people must not make the window wider than the screen: the strip scrolls.
+        let strip_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Automatic)
+            .vscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .child(&strip)
+            .build();
+        let stage = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        stage.append(&stage_frame);
+        stage.append(&strip_scroll);
         let grid_stack = gtk::Stack::new();
         grid_stack.add_named(&empty, Some("empty"));
         grid_stack.add_named(&grid, Some("grid"));
+        grid_stack.add_named(&stage, Some("stage"));
         grid_stack.set_vexpand(true);
-
-        // Self-view: small, bottom-right over the grid.
-        let self_view = gtk::Picture::builder()
-            .content_fit(gtk::ContentFit::Cover)
-            .width_request(200)
-            .height_request(112)
-            .halign(gtk::Align::End)
-            .valign(gtk::Align::End)
-            .margin_end(12)
-            .margin_bottom(12)
-            .build();
-        self_view.add_css_class("card");
-        self_view.set_overflow(gtk::Overflow::Hidden);
-        let overlay = gtk::Overlay::new();
-        overlay.set_child(Some(&grid_stack));
-        overlay.add_overlay(&self_view);
 
         let mic_button = control_toggle("microphone-sensitivity-high-symbolic", "Mute microphone");
         let camera_button = control_toggle("camera-web-symbolic", "Turn camera off");
@@ -181,20 +217,44 @@ impl CallView {
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
         toolbar.add_top_bar(&status);
-        toolbar.set_content(Some(&overlay));
+        toolbar.set_content(Some(&grid_stack));
         toolbar.add_bottom_bar(&controls);
 
+        let layout = Rc::new(Layout {
+            stack: grid_stack,
+            grid,
+            stage_frame,
+            strip,
+            tiles: RefCell::default(),
+            order: RefCell::default(),
+            pinned: RefCell::default(),
+            on_stage: RefCell::default(),
+            strip_height: std::cell::Cell::new(0),
+            strip_slots: RefCell::default(),
+            camera_off: std::cell::Cell::new(false),
+        });
+        // The strip is about a fifth of the window's height: follow the window as it is resized.
+        stage.add_tick_callback({
+            let layout = Rc::downgrade(&layout);
+            move |stage, _| {
+                if let Some(layout) = layout.upgrade() {
+                    let wanted = crate::call_stage::strip_height(stage.height());
+                    if wanted != layout.strip_height.get() {
+                        layout.strip_height.set(wanted);
+                        layout.restyle_strip();
+                    }
+                }
+                glib::ControlFlow::Continue
+            }
+        });
         let view = Self {
             root: toolbar.upcast(),
-            grid,
-            grid_stack,
-            self_view,
             status,
             mic_button,
             camera_button,
             share_button,
             hangup_button,
-            tiles: Rc::default(),
+            layout,
         };
         // Sharing is shown as an accent-coloured toggle.
         view.share_button.connect_toggled(|b| {
@@ -220,7 +280,7 @@ impl CallView {
             b.set_icon_name(icon);
             b.set_tooltip_text(Some(tip));
         });
-        let self_view = view.self_view.clone();
+        let layout = Rc::downgrade(&view.layout);
         view.camera_button.connect_toggled(move |b| {
             let (icon, tip) = if b.is_active() {
                 ("camera-disabled-symbolic", "Turn camera on")
@@ -229,7 +289,13 @@ impl CallView {
             };
             b.set_icon_name(icon);
             b.set_tooltip_text(Some(tip));
-            self_view.set_opacity(if b.is_active() { 0.3 } else { 1.0 });
+            if let Some(layout) = layout.upgrade() {
+                layout.camera_off.set(b.is_active());
+                if let Some(tile) = layout.tiles.borrow().get(SELF_TILE) {
+                    tile.picture
+                        .set_opacity(if b.is_active() { 0.3 } else { 1.0 });
+                }
+            }
         });
         view
     }
@@ -241,29 +307,25 @@ impl CallView {
 
     /// Show the local camera in the self-view.
     pub fn set_self_view(&self, sink: &gst::Element) {
-        self.self_view.set_paintable(paintable_of(sink).as_ref());
+        let tile = self.layout.ensure_tile(SELF_TILE, false);
+        tile.picture.set_content_fit(gtk::ContentFit::Cover);
+        tile.picture.set_paintable(paintable_of(sink).as_ref());
+        tile.label.set_text("You");
+        tile.picture.set_opacity(if self.layout.camera_off.get() {
+            0.3
+        } else {
+            1.0
+        });
+        self.layout.relayout();
     }
 
     /// Add (or re-bind) the video tile for a remote stream. A shared screen
     /// gets a large tile at the front of the grid.
     pub fn set_remote_video(&self, mid: &str, sink: &gst::Element, name: &str, screen: bool) {
-        let paintable = paintable_of(sink);
-        let mut tiles = self.tiles.borrow_mut();
-        let tile = tiles.entry(mid.to_string()).or_insert_with(|| {
-            let tile = new_tile();
-            if screen {
-                self.grid.prepend(&tile.child);
-            } else {
-                self.grid.append(&tile.child);
-            }
-            tile
-        });
-        let (w, h) = if screen { (640, 360) } else { (320, 180) };
-        tile.picture.set_size_request(w, h);
-        tile.picture.set_paintable(paintable.as_ref());
+        let tile = self.layout.ensure_tile(mid, screen);
+        tile.picture.set_paintable(paintable_of(sink).as_ref());
         tile.label.set_text(name);
-        drop(tiles);
-        self.refresh_empty();
+        self.layout.relayout();
     }
 
     /// Called with the desired state when the user toggles screen sharing.
@@ -281,17 +343,39 @@ impl CallView {
 
     /// Rename a tile (e.g. once the roster maps its mid to a participant).
     pub fn set_tile_name(&self, mid: &str, name: &str) {
-        if let Some(tile) = self.tiles.borrow().get(mid) {
+        if let Some(tile) = self.layout.tiles.borrow().get(mid) {
             tile.label.set_text(name);
+        }
+    }
+
+    /// The pin was made for the stream that had this id, which now belongs to another: drop it.
+    pub fn release_pin_for(&self, mid: &str) {
+        let released = {
+            let mut pinned = self.layout.pinned.borrow_mut();
+            let hit = pinned.as_deref() == Some(mid);
+            if hit {
+                *pinned = None;
+            }
+            hit
+        };
+        if released {
+            self.layout.relayout();
+        }
+    }
+
+    /// A stream's tile changed kind in a new offer (a camera's id reused for a screen, or back):
+    /// it takes its place by what it is now.
+    pub fn set_tile_screen(&self, mid: &str, screen: bool) {
+        let known = self.layout.tiles.borrow().get(mid).map(|t| t.screen);
+        if known.is_some_and(|k| k != screen) {
+            self.layout.ensure_tile(mid, screen);
+            self.layout.relayout();
         }
     }
 
     /// Remove a remote stream's tile (it left the latest subscribe offer).
     pub fn remove_tile(&self, mid: &str) {
-        if let Some(tile) = self.tiles.borrow_mut().remove(mid) {
-            self.grid.remove(&tile.child);
-        }
-        self.refresh_empty();
+        self.layout.remove_tile(mid);
     }
 
     /// Show a status line (connecting, reconnecting, errors); empty hides it.
@@ -333,16 +417,14 @@ impl CallView {
 
     /// Mids that currently have a tile.
     fn tile_mids(&self) -> Vec<String> {
-        self.tiles.borrow().keys().cloned().collect()
-    }
-
-    fn refresh_empty(&self) {
-        let name = if self.tiles.borrow().is_empty() {
-            "empty"
-        } else {
-            "grid"
-        };
-        self.grid_stack.set_visible_child_name(name);
+        // Remote streams only: your own camera's tile is not in any subscribe offer.
+        self.layout
+            .tiles
+            .borrow()
+            .keys()
+            .filter(|id| id.as_str() != SELF_TILE)
+            .cloned()
+            .collect()
     }
 }
 
@@ -356,11 +438,9 @@ fn control_toggle(icon: &str, tooltip: &str) -> gtk::ToggleButton {
     b
 }
 
-fn new_tile() -> Tile {
+fn new_tile(screen: bool) -> Tile {
     let picture = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Contain)
-        .width_request(320)
-        .height_request(180)
         .build();
     let label = gtk::Label::builder()
         .halign(gtk::Align::Start)
@@ -375,12 +455,205 @@ fn new_tile() -> Tile {
     overlay.add_overlay(&label);
     overlay.add_css_class("card");
     overlay.set_overflow(gtk::Overflow::Hidden);
-    let child = gtk::FlowBoxChild::new();
-    child.set_child(Some(&overlay));
     Tile {
-        child,
+        overlay,
         picture,
         label,
+        screen,
+    }
+}
+
+impl Layout {
+    /// The tile for `id`, made (and put in order, remote screens first) when it is new.
+    fn ensure_tile(self: &Rc<Self>, id: &str, screen: bool) -> Tile {
+        let known = self.tiles.borrow().get(id).cloned();
+        if let Some(mut tile) = known {
+            // The SFU reuses a stream id across re-offers: a camera's id can come back as a screen
+            // (or the reverse) without it ever leaving the offer. The tile follows what it is now.
+            if tile.screen != screen && id != SELF_TILE {
+                tile.screen = screen;
+                self.tiles.borrow_mut().insert(id.to_string(), tile.clone());
+                self.reorder(id, screen);
+            }
+            return tile;
+        }
+        let tile = new_tile(screen);
+        // A click on any tile puts it on the stage; a click on the pinned stage releases it.
+        let click = gtk::GestureClick::new();
+        click.connect_released({
+            let (layout, id) = (Rc::downgrade(self), id.to_string());
+            move |_, n_press, _, _| {
+                // The first press only: a double click would pin and release at once.
+                if n_press != 1 {
+                    return;
+                }
+                if let Some(layout) = layout.upgrade() {
+                    layout.click(&id);
+                }
+            }
+        });
+        tile.overlay.add_controller(click);
+        self.tiles.borrow_mut().insert(id.to_string(), tile.clone());
+        self.reorder(id, screen);
+        tile
+    }
+
+    /// Put `id` where its kind goes in the order (screens first, in the order they appeared).
+    fn reorder(&self, id: &str, screen: bool) {
+        let tiles = self.tiles.borrow();
+        let mut order = self.order.borrow_mut();
+        order.retain(|o| o != id);
+        let refs: Vec<crate::call_stage::TileRef> = order
+            .iter()
+            .filter_map(|o| {
+                tiles.get(o).map(|t| crate::call_stage::TileRef {
+                    id: o.clone(),
+                    screen: t.screen && o != SELF_TILE,
+                })
+            })
+            .collect();
+        let at = crate::call_stage::insert_at(&refs, screen);
+        let at = at.min(order.len());
+        order.insert(at, id.to_string());
+    }
+
+    fn remove_tile(&self, id: &str) {
+        let removed = self.tiles.borrow_mut().remove(id);
+        if let Some(tile) = removed {
+            detach(&tile.overlay);
+        }
+        self.order.borrow_mut().retain(|o| o != id);
+        // A pin for whoever just left goes with them, for good.
+        let remaining: Vec<crate::call_stage::TileRef> = self
+            .order
+            .borrow()
+            .iter()
+            .map(|o| crate::call_stage::TileRef {
+                id: o.clone(),
+                screen: false,
+            })
+            .collect();
+        let kept = crate::call_stage::pruned(self.pinned.borrow().as_deref(), &remaining);
+        *self.pinned.borrow_mut() = kept;
+        self.relayout();
+    }
+
+    fn click(&self, id: &str) {
+        let next = crate::call_stage::toggled(
+            self.pinned.borrow().as_deref(),
+            id,
+            self.on_stage.borrow().as_deref(),
+        );
+        *self.pinned.borrow_mut() = next;
+        self.relayout();
+    }
+
+    /// Put every tile where the rule says: on the stage with the rest in the strip, or, with no
+    /// stage, in the equal grid.
+    fn relayout(&self) {
+        let order = self.order.borrow().clone();
+        let tiles = self.tiles.borrow();
+        let refs: Vec<crate::call_stage::TileRef> = order
+            .iter()
+            .filter_map(|id| {
+                tiles.get(id).map(|t| crate::call_stage::TileRef {
+                    id: id.clone(),
+                    screen: t.screen && id != SELF_TILE,
+                })
+            })
+            .collect();
+        for tile in tiles.values() {
+            detach(&tile.overlay);
+        }
+        while let Some(child) = self.grid.first_child() {
+            self.grid.remove(&child);
+        }
+        while let Some(child) = self.strip.first_child() {
+            self.strip.remove(&child);
+        }
+        self.strip_slots.borrow_mut().clear();
+        let split = crate::call_stage::split(&refs, self.pinned.borrow().as_deref());
+        *self.on_stage.borrow_mut() = split.stage.clone();
+        match &split.stage {
+            None => {
+                for id in &order {
+                    let Some(tile) = tiles.get(id) else { continue };
+                    let (w, h) = if tile.screen { (640, 360) } else { (320, 180) };
+                    tile.picture.set_size_request(w, h);
+                    tile.overlay.set_hexpand(false);
+                    tile.overlay.set_vexpand(false);
+                    let slot = gtk::FlowBoxChild::new();
+                    slot.set_child(Some(&tile.overlay));
+                    self.grid.append(&slot);
+                }
+                self.stack
+                    .set_visible_child_name(if order.is_empty() { "empty" } else { "grid" });
+            }
+            Some(stage) => {
+                if let Some(tile) = tiles.get(stage) {
+                    tile.picture.set_size_request(1, 1);
+                    tile.overlay.set_hexpand(true);
+                    tile.overlay.set_vexpand(true);
+                    self.stage_frame.set_child(Some(&tile.overlay));
+                }
+                for id in &split.strip {
+                    if let Some(tile) = tiles.get(id) {
+                        tile.overlay.set_hexpand(false);
+                        tile.overlay.set_vexpand(false);
+                        // A fixed-size slot: a picture's natural size is its video's, which
+                        // would swallow the stage; a scrolled window with no scrolling and
+                        // `propagate_natural_*` off caps it at the strip's size.
+                        let height = self
+                            .strip_height
+                            .get()
+                            .max(crate::call_stage::strip_height(0));
+                        let slot = gtk::ScrolledWindow::builder()
+                            .hscrollbar_policy(gtk::PolicyType::Never)
+                            .vscrollbar_policy(gtk::PolicyType::Never)
+                            .min_content_width(height * 16 / 9)
+                            .min_content_height(height)
+                            .propagate_natural_width(false)
+                            .propagate_natural_height(false)
+                            .build();
+                        tile.picture.set_size_request(1, 1);
+                        slot.set_child(Some(&tile.overlay));
+                        self.strip.append(&slot);
+                        self.strip_slots.borrow_mut().push(slot);
+                    }
+                }
+                self.stack.set_visible_child_name("stage");
+            }
+        }
+    }
+}
+
+impl Layout {
+    /// The strip's slots follow the window's height without being rebuilt.
+    fn restyle_strip(&self) {
+        let height = self
+            .strip_height
+            .get()
+            .max(crate::call_stage::strip_height(0));
+        for slot in self.strip_slots.borrow().iter() {
+            slot.set_min_content_width(height * 16 / 9);
+            slot.set_min_content_height(height);
+        }
+    }
+}
+
+/// Take a tile's widget out of whichever container holds it (the grid's slot, the stage or the
+/// strip), so it can be put in another.
+fn detach(widget: &gtk::Overlay) {
+    let Some(parent) = widget.parent() else {
+        return;
+    };
+    if let Some(slot) = parent.downcast_ref::<gtk::FlowBoxChild>() {
+        slot.set_child(None::<&gtk::Widget>);
+    } else if let Some(frame) = parent.downcast_ref::<gtk::AspectFrame>() {
+        frame.set_child(None::<&gtk::Widget>);
+    } else if let Some(viewport) = parent.downcast_ref::<gtk::Viewport>() {
+        // A scrolled window wraps a child that isn't scrollable in a viewport of its own.
+        viewport.set_child(None::<&gtk::Widget>);
     }
 }
 
@@ -776,6 +1049,11 @@ pub fn open_call(
                                 )
                             })
                             .collect();
+                        // A mid the server handed to another stream within this offer: a pin
+                        // made for the old one must not carry over to the new one.
+                        for mid in crate::call_stage::reused_ids(&mids.borrow(), &video) {
+                            view.release_pin_for(&mid);
+                        }
                         *mids.borrow_mut() = video;
                         // Tiles for mids no longer in the offer are gone.
                         for mid in view.tile_mids() {
@@ -783,6 +1061,8 @@ pub fn open_call(
                                 view.remove_tile(&mid);
                             } else {
                                 view.set_tile_name(&mid, &name_of(&mid));
+                                let screen = mids.borrow().get(&mid).is_some_and(|(_, s)| *s);
+                                view.set_tile_screen(&mid, screen);
                             }
                         }
                     }
