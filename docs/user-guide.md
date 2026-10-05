@@ -90,7 +90,7 @@ open clients/macos/build.noindex/Build/Products/Debug/Brook.app
 2. Enter your **handle** and **password**, and click **Log in** (or press Enter).
 3. If you turned on a second factor, enter the **code from your authenticator app**, or
    choose **Use a recovery code instead**. You can turn it on, get new recovery codes or
-   turn it off in your account settings.
+   turn it off under **Two-Factor Sign-In…** in the main menu.
 4. On success the app shows your conversations. A wrong handle or password shows an inline
    error; fix it and try again.
 
@@ -101,31 +101,30 @@ admin).
 
 Brook keeps you signed in between launches through your desktop's keyring (GNOME Keyring,
 KWallet or the macOS Keychain), and never asks for the keyring's password itself. With no
-keyring, or a locked one, you sign in each time, and the offline features below are off.
+keyring, or a locked one, you sign in each time, and everything that needs saved data is off:
+the offline cache, sending and opening files, and keeping files offline.
 
 ### Signing out
 
 **Sign Out** ends this device's sign-in. **Remove this device's data** (on by default) also
 deletes the messages and files Brook saved on this computer, and any messages you had not
-sent yet. Tick it off to keep them for your next sign-in. If Brook can't remove the data
-(say the keyring is locked), it tells you on the login screen. To cut off a device you have
+sent yet. Tick it off to keep them for your next sign-in. To cut off a device you have
 lost, change your password with **Sign out of other devices** on; messages already saved on that
 device stay readable to anyone who can sign in to that computer.
 
 ## Conversations
 
-- **Channels and people** are listed in the sidebar, each section ordered by what you used
-  last. **Show usernames** (in the main menu) names people by `@handle` instead of by name,
-  everywhere.
+- **Channels and people** are listed in the sidebar, channels first, each section with the
+  newest message first (then the one you opened last, then by name). **Show usernames** names
+  people by `@handle` instead of by name: in the main menu on GNOME, in Settings on the Mac.
 - Send messages, **reply**, **edit** and **delete** your own, add **reactions**, and search.
   Messages that mention you are marked, and the sidebar shows unread and mention counts.
   You see when someone is typing.
-- Scroll up to load older messages.
-- **Attach files** with the paperclip or by dragging them into the window. A file you
-  receive is opened or saved from its row: **Save** asks where (starting in your Downloads
-  folder), **Open** hands a copy to another app. Images show a preview where the system can
-  decode them safely (see the install notes). **Keep available offline** pins a file so you
-  can open it without a connection.
+- **Attach files** with the paperclip (**Add files**) or by dragging them into the window. A
+  file you receive is opened or saved from its row: **Save…** asks where (starting in your
+  Downloads folder), **Open** hands a copy to another app. Images can show a preview where the
+  system can decode them safely (see the install notes). **Keep available offline** pins a file
+  so you can open it without a connection.
 - **Calls** (voice, video, screen share) work in the GNOME client on a glibc distribution.
 
 ## Working offline
