@@ -597,7 +597,7 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
                         let (client, file_id) = (client.clone(), file_id.clone());
                         async move { client.file_state(&file_id).await }
                     });
-                    let (start, show) = (start.clone(), show.downgrade());
+                    let (start, show, gate) = (start.clone(), show.downgrade(), gate.clone());
                     glib::spawn_future_local(async move {
                         let result = cached.await;
                         if !wanted.is_current() {
@@ -610,7 +610,7 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
                             )) => start(),
                             _ => {
                                 if let Some(show) = show.upgrade() {
-                                    show.set_visible(true);
+                                    show.set_visible(!gate.is_asked());
                                 }
                             }
                         }
