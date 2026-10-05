@@ -30,7 +30,7 @@ struct BrookApp: App {
     }
 
     var body: some Scene {
-        Window("Brook", id: "main") {
+        Window(AppTitle.main, id: "main") {
             Group {
                 switch store.phase {
                 case let .signedIn(user):

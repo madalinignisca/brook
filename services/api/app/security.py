@@ -73,6 +73,19 @@ def issued_at_ms(payload: dict[str, Any]) -> int:
     return int(payload["iat"]) * 1000
 
 
+# Everything that means "this token is not acceptable", for the ``except`` around a decode:
+# the library's own errors, the lookups and conversions on the claims, and RecursionError
+# (a JWS header nested past the recursion limit raised it from inside pyjwt <= 2.13, and
+# it is not a ValueError). One tuple, so a new call site cannot forget one of them.
+TOKEN_REJECTS: tuple[type[Exception], ...] = (
+    jwt.PyJWTError,
+    KeyError,
+    ValueError,
+    TypeError,
+    RecursionError,
+)
+
+
 def decode_access_token(settings: Settings, token: str) -> dict[str, Any]:
     """Decode and validate an access JWT.
 

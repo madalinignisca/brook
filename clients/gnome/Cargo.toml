@@ -34,3 +34,5 @@ glycin-gio = { package = "gio", version = "0.22" }
 serde_json = { workspace = true }
 # Scans the rendered QR code back in tests.
 rqrr = "0.11"
+# Scratch dirs for the live keyring tests, removed even when an assertion fails.
+tempfile = "3"
