@@ -99,7 +99,7 @@ pub struct CallView {
 }
 
 /// The id of your own camera's tile.
-const SELF_TILE: &str = "self";
+const SELF_TILE: &str = "local:self";
 
 /// Where the tiles are put: the equal grid (no stage), or the stage with a strip beside it
 /// (#268, see call_stage.rs). The tiles are re-parented between them by `relayout`.
@@ -345,6 +345,16 @@ impl CallView {
     pub fn set_tile_name(&self, mid: &str, name: &str) {
         if let Some(tile) = self.layout.tiles.borrow().get(mid) {
             tile.label.set_text(name);
+        }
+    }
+
+    /// A stream's tile changed kind in a new offer (a camera's id reused for a screen, or back):
+    /// it takes its place by what it is now.
+    pub fn set_tile_screen(&self, mid: &str, screen: bool) {
+        let known = self.layout.tiles.borrow().get(mid).map(|t| t.screen);
+        if known.is_some_and(|k| k != screen) {
+            self.layout.ensure_tile(mid, screen);
+            self.layout.relayout();
         }
     }
 
@@ -1031,6 +1041,8 @@ pub fn open_call(
                                 view.remove_tile(&mid);
                             } else {
                                 view.set_tile_name(&mid, &name_of(&mid));
+                                let screen = mids.borrow().get(&mid).is_some_and(|(_, s)| *s);
+                                view.set_tile_screen(&mid, screen);
                             }
                         }
                     }
