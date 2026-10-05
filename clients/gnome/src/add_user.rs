@@ -504,9 +504,11 @@ pub fn add_user_dialog(
                         admin.set_text("");
                     }
                     if !closed.get() {
+                        // The button's state first: revalidate() hides the error label whenever the
+                        // local checks pass, so the outcome is shown after it, not before.
+                        revalidate();
                         error.set_text(&text);
                         error.set_visible(true);
-                        revalidate();
                     } else {
                         // Not "not added" when it may have been.
                         let title = if left_uncertain(&err) {
