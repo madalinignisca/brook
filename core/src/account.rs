@@ -593,10 +593,6 @@ pub(crate) async fn account_error(resp: Response) -> Error {
     account_error_with(resp, false).await
 }
 
-/// `account_error`, but a 422 keeps the server's own code (`profile.invalid` for characters a
-/// name cannot hold, `validation.error` for a malformed body) so a client can word them apart,
-/// with a fixed message: the body is never read for text. A code that is not a short identifier
-/// is `validation`.
 /// A short identifier of lowercase letters, digits, dots and underscores: what the server's codes are.
 fn is_plain_code(code: &str) -> bool {
     (1..=48).contains(&code.len())
@@ -605,6 +601,10 @@ fn is_plain_code(code: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_')
 }
 
+/// `account_error`, but a 422 keeps the server's own code (`profile.invalid` for characters a
+/// name cannot hold, `validation.error` for a malformed body) so a client can word them apart,
+/// with a fixed message: the body is never read for text. A code that is not a short identifier
+/// is `validation`.
 pub(crate) async fn account_error_keeping_422(resp: Response) -> Error {
     account_error_with(resp, true).await
 }

@@ -883,6 +883,8 @@ async fn create_user_errors_keep_their_stable_codes() {
         (RegisterMode::ValidationError, "validation.error"),
         // A code that is not a short identifier is not passed on.
         (RegisterMode::OddCode, "validation"),
+        (RegisterMode::LongCode, "validation"),
+        (RegisterMode::EmptyCode, "validation"),
     ] {
         server.set_register_mode(mode);
         let err = admin
@@ -904,6 +906,22 @@ async fn create_user_errors_keep_their_stable_codes() {
         }
         secret_free(&err, &[NEW_PW, ADMIN_PW]);
     }
+}
+
+/// The limit is 48 characters: exactly 48 is kept as the server sent it.
+#[tokio::test]
+async fn create_user_keeps_a_422_code_of_exactly_the_longest_length() {
+    let server = strict().await;
+    let admin = signed_in(&server, "admin").await;
+    server.set_register_mode(RegisterMode::MaxCode);
+    let err = admin
+        .create_user("carol", "Carol C", NEW_PW, ADMIN_PW)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Api { code, .. } if *code == "a".repeat(48)),
+        "{err:?}"
+    );
 }
 
 /// A 403 is a refusal, not an expired token: no refresh, one request.
