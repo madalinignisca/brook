@@ -87,6 +87,10 @@ pub enum RegisterMode {
     ValidationError,
     /// 422 whose code is not a plain identifier.
     OddCode,
+    /// 422 with a 49-character code (one over the limit), and with an empty code, and with 48.
+    LongCode,
+    EmptyCode,
+    MaxCode,
     /// 429 `auth.rate_limited`.
     RateLimited,
     /// 201 whose body is not a user (`{}`).
@@ -695,6 +699,9 @@ async fn register(
             &format!("bad body, admin {}", body["admin_password"]),
         ),
         RegisterMode::OddCode => error(422, "Not A Code! <b>", "x"),
+        RegisterMode::LongCode => error(422, &"a".repeat(49), "x"),
+        RegisterMode::EmptyCode => error(422, "", "x"),
+        RegisterMode::MaxCode => error(422, &"a".repeat(48), "x"),
         RegisterMode::RateLimited => {
             let mut r = error(429, "auth.rate_limited", "slow down");
             r.headers_mut().insert("retry-after", "30".parse().unwrap());
