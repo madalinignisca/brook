@@ -275,7 +275,10 @@ mod tests {
     #[test]
     fn the_bottom_has_a_little_slack() {
         assert!(near_bottom(950.0, 100.0, 1000.0));
-        assert!(near_bottom(860.0, 100.0, 1000.0), "40 px short is still the bottom");
+        assert!(
+            near_bottom(860.0, 100.0, 1000.0),
+            "40 px short is still the bottom"
+        );
         assert!(!near_bottom(840.0, 100.0, 1000.0), "60 px short is not");
         assert!(!near_bottom(500.0, 100.0, 1000.0));
     }
@@ -292,5 +295,16 @@ mod tests {
         assert!(p.paged_back());
         p.reset();
         assert!(!p.paged_back());
+    }
+
+    #[test]
+    fn a_new_channel_does_not_inherit_the_last_ones_backoff() {
+        let mut p = ready_pager();
+        let (g, _) = p.begin(Some("m5".into()), t0()).unwrap();
+        p.failed(g, t0());
+        p.reset();
+        let g = p.generation();
+        p.ready(g);
+        assert!(p.begin(Some("n1".into()), t0()).is_some());
     }
 }

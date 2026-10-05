@@ -1206,7 +1206,20 @@ fn load_older(chat: &Rc<Chat>) {
         // for some later, unrelated growth.
         if !fresh.is_empty() {
             let adj = chat.message_scroll.vadjustment();
-            chat.scroll_anchor.set(Some((adj.upper(), adj.value())));
+            let anchor = (adj.upper(), adj.value());
+            chat.scroll_anchor.set(Some(anchor));
+            // Laid out within a moment; an anchor still set after that is obsolete (nothing
+            // grew), and a later resize must not apply it.
+            glib::timeout_add_local_once(Duration::from_millis(500), {
+                let chat = Rc::downgrade(&chat);
+                move || {
+                    if let Some(chat) = chat.upgrade() {
+                        if chat.scroll_anchor.get() == Some(anchor) {
+                            chat.scroll_anchor.set(None);
+                        }
+                    }
+                }
+            });
             chat.paging.set(true);
             for message in fresh {
                 append_message(&chat, message);
