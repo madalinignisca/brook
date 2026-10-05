@@ -53,7 +53,7 @@ and a server contract change in flight (`admin_password` on register).
 ## Not doing
 Deactivate/promote/demote; invite links; forced password change at first sign-in; bulk import; updating `globalRole`
 live (a demotion mid-session leaves the entry and the server refuses); hiding the entry offline; a Copy button or any
-clipboard code (owner may ask; then `org.nspasteboard.ConcealedType` and clear after ~60 s); zeroing memory (Swift/Rust
+clipboard code; creating the first user of a new server (core sends nothing without a session; the open bootstrap is not this call) (owner may ask; then `org.nspasteboard.ConcealedType` and clear after ~60 s); zeroing memory (Swift/Rust
 copies are dropped, not wiped; "cleared" means the model and the field no longer hold it, as the existing password
 calls); a local admin check in core (the server decides); showing `Retry-After`; GTK (its own change, same core call).
 
