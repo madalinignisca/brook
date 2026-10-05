@@ -545,7 +545,10 @@ final class FileRowModelTests: XCTestCase {
         let small = await started(chat, previews: false, decoded: decoded)
         let large = await started(chat, size: FileRowModel.autoMaxBytes + 1, previews: false, decoded: decoded)
         let away = await started(chat, previews: false, decoded: decoded, expensive: true)
-        let shown = await started(chat, previews: true, decoded: decoded)
+        // A preview the user asked for while previews were off: it must stay when they are turned on.
+        let shown = await started(chat, previews: false, decoded: decoded)
+        await shown.showPreview()
+        guard case .shown = shown.preview else { return XCTFail("the clicked preview did not show") }
         XCTAssertEqual(previewCalls(chat), 1)
         for m in [small, large, away] {
             guard case .offer = m.preview else { return XCTFail("not a button before") }
@@ -554,9 +557,9 @@ final class FileRowModelTests: XCTestCase {
         guard case .shown = small.preview else { return XCTFail("a small image stayed a button") }
         guard case .offer = large.preview else { return XCTFail("a large image was fetched by turning on") }
         guard case .offer = away.preview else { return XCTFail("fetched on an expensive connection") }
-        await shown.previewSetting(true) // unchanged
+        await shown.previewSetting(true) // off to on, with a preview already shown
         guard case .shown = shown.preview else { return XCTFail("a shown row changed") }
-        XCTAssertEqual(previewCalls(chat), 2, "only the small one was fetched")
+        XCTAssertEqual(previewCalls(chat), 2, "only the small one was fetched, the shown one not again")
     }
 
     func testTheSettingNeverPinsUnpinsOpensOrDeletes() async {
