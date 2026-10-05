@@ -14,10 +14,21 @@ final class FileRowModelTests: XCTestCase {
     }
 
     private final class Opened: @unchecked Sendable { var urls: [URL] = []; var result = true }
-    private final class Decoded: @unchecked Sendable { var calls = 0; var image: CGImage?; var aliveSeen: Bool? }
+    private final class Decoded: @unchecked Sendable {
+        var calls = 0; var image: CGImage?; var aliveSeen: Bool?
+        /// Held until opened: the decode finishes when the test says.
+        var gate: Gate?
+    }
 
+    /// A row on its own defaults suite, never the real ones (the test host is Brook.app).
+    /// `previews`: the stored setting, nil for none stored (the default).
     private func model(_ chat: FakeChat, file: FfiFileInfo? = nil, exists: Bool = true, expensive: Bool = false,
-                       opened: Opened = Opened(), decoded: Decoded = Decoded()) -> FileRowModel {
+                       opened: Opened = Opened(), decoded: Decoded = Decoded(),
+                       previews: Bool? = true, decoderOff: Flag = Flag()) -> FileRowModel {
+        let suite = "brook.tests.filerow.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        if let previews { defaults.set(previews, forKey: Settings.showImagePreviewsKey) }
         let m = FileRowModel(file: file ?? info(), client: chat,
                              opener: { opened.urls.append($0); return opened.result },
                              exists: { _ in exists }, expensive: { expensive },
@@ -25,8 +36,10 @@ final class FileRowModelTests: XCTestCase {
                                  decoded.calls += 1
                                  // As the decoder's queue does: from another thread.
                                  decoded.aliveSeen = await Task.detached { alive() }.value
+                                 await decoded.gate?.wait()
                                  return decoded.image
-                             })
+                             },
+                             defaults: defaults, decoderOff: { decoderOff.value })
         m.onScreen = true
         return m
     }
@@ -248,5 +261,224 @@ final class FileRowModelTests: XCTestCase {
         await m.showPreview() // an off-screen row asks for nothing
         XCTAssertEqual(decoded.calls, 1)
         XCTAssertFalse(chat.cacheCalls.withLock { $0 }.filter { $0 == "preview" }.count > 1)
+    }
+
+    // ---- The decisions, over every input ----
+
+    func testCanPreviewNeedsADeclaredImageSmallEnoughLocalDataAndALiveDecoder() {
+        let ok = (type: "image/png", size: UInt64(1000))
+        func can(_ type: String = ok.type, size: UInt64 = ok.size, local: Bool = true, off: Bool = false) -> Bool {
+            FileRowModel.canPreview(type: type, size: size, hasLocalData: local, decoderOff: off)
+        }
+        XCTAssertTrue(can())
+        for type in ["image/png", "image/jpeg", "image/gif", "image/webp", "IMAGE/PNG; x=y"] { XCTAssertTrue(can(type), type) }
+        for type in ["application/pdf", "image/svg+xml", "text/plain", ""] { XCTAssertFalse(can(type), type) }
+        XCTAssertTrue(can(size: previewMaxBytes()))
+        XCTAssertFalse(can(size: previewMaxBytes() + 1))
+        XCTAssertFalse(can(local: false))
+        XCTAssertFalse(can(off: true))
+    }
+
+    func testShouldAutoPreviewIsTheSettingAndCanPreviewAndSmallAndNotExpensiveUnlessHere() {
+        let small = FileRowModel.autoMaxBytes
+        // setting, size, type, local, decoderOff, expensive, here -> expected
+        func auto(setting: Bool = true, size: UInt64 = small, type: String = "image/png", local: Bool = true,
+                  off: Bool = false, expensive: Bool = false, here: Bool = false) -> Bool {
+            FileRowModel.shouldAutoPreview(setting: setting, size: size, type: type, hasLocalData: local,
+                                           decoderOff: off, expensive: expensive, here: here)
+        }
+        XCTAssertTrue(auto())
+        XCTAssertFalse(auto(setting: false))
+        XCTAssertFalse(auto(setting: false, here: true))
+        XCTAssertFalse(auto(size: small + 1))
+        XCTAssertFalse(auto(type: "application/pdf"))
+        XCTAssertFalse(auto(local: false))
+        XCTAssertFalse(auto(off: true))
+        XCTAssertFalse(auto(expensive: true))
+        XCTAssertTrue(auto(expensive: true, here: true))
+        XCTAssertTrue(auto(here: true))
+    }
+
+    // ---- The "Show image previews" setting ----
+
+    private func started(_ chat: FakeChat, _ type: String = "image/png", size: UInt64 = 1000, previews: Bool? = true,
+                         decoded: Decoded = Decoded(), decoderOff: Flag = Flag(), expensive: Bool = false) async -> FileRowModel {
+        let m = model(chat, file: info(type, size: size), expensive: expensive, decoded: decoded,
+                      previews: previews, decoderOff: decoderOff)
+        await m.reloadKeep()
+        await m.startPreview()
+        return m
+    }
+
+    private func previewCalls(_ chat: FakeChat) -> Int { chat.cacheCalls.withLock { $0 }.filter { $0 == "preview" }.count }
+
+    func testWithTheSettingOffNothingIsFetchedOrDecodedUntilShowPreviewIsClicked() async {
+        let decoded = Decoded()
+        decoded.image = Self.image
+        let chat = local()
+        chat.previewResult = .success(imageBytes())
+        chat.states = [.notCached, .notCached, .cached] // reloadKeep reads one; a second read would take another
+        let m = await started(chat, previews: false, decoded: decoded)
+        guard case .offer = m.preview else { return XCTFail("no button with the setting off") }
+        XCTAssertEqual(previewCalls(chat), 0)
+        XCTAssertEqual(decoded.calls, 0)
+        XCTAssertEqual(chat.states.count, 2, "the cache was asked about a preview that wasn't wanted")
+        await m.showPreview()
+        guard case .shown = m.preview else { return XCTFail("the click didn't show it") }
+        XCTAssertEqual(previewCalls(chat), 1)
+        XCTAssertEqual(decoded.calls, 1)
+    }
+
+    func testAbsentSettingMeansOffAndAStoredOneIsReadWithoutBeingToldAnything() async {
+        let decoded = Decoded()
+        decoded.image = Self.image
+        let chat = local()
+        chat.previewResult = .success(imageBytes())
+        let absent = await started(chat, previews: nil, decoded: decoded)
+        guard case .offer = absent.preview else { return XCTFail("previews on by default") }
+        let on = await started(chat, previews: true, decoded: decoded)
+        guard case .shown = on.preview else { return XCTFail("a stored on was ignored") }
+        let off = await started(chat, previews: false, decoded: decoded)
+        guard case .offer = off.preview else { return XCTFail("a stored off was ignored") }
+    }
+
+    func testWithTheSettingOnTheRuleIsAsBefore() async {
+        let decoded = Decoded()
+        decoded.image = Self.image
+        let chat = local()
+        chat.previewResult = .success(imageBytes())
+        chat.states = [.notCached]
+        let large = await started(chat, size: FileRowModel.autoMaxBytes + 1, decoded: decoded)
+        guard case .offer = large.preview else { return XCTFail("a large image fetched by itself") }
+        let atLimit = await started(chat, size: FileRowModel.autoMaxBytes, decoded: decoded)
+        guard case .shown = atLimit.preview else { return XCTFail("4 MiB didn't preview") }
+        let away = await started(chat, decoded: decoded, expensive: true)
+        guard case .offer = away.preview else { return XCTFail("fetched on an expensive connection") }
+        chat.states = [.cached]
+        let here = await started(chat, decoded: decoded, expensive: true)
+        guard case .shown = here.preview else { return XCTFail("a cached image didn't preview") }
+    }
+
+    func testNoButtonWhereAPreviewCannotWork() async {
+        for setting in [false, true] {
+            let chat = local()
+            chat.previewResult = .success(imageBytes())
+            let decoded = Decoded()
+            for (type, size) in [("application/pdf", UInt64(1000)), ("image/svg+xml", 1000), ("image/png", previewMaxBytes() + 1)] {
+                let m = await started(chat, type, size: size, previews: setting, decoded: decoded)
+                guard case .none = m.preview else { return XCTFail("\(type) \(size) offered, setting \(setting)") }
+            }
+            let dead = Flag()
+            dead.set(true)
+            let off = await started(chat, previews: setting, decoded: decoded, decoderOff: dead)
+            guard case .none = off.preview else { return XCTFail("a dead decoder offered, setting \(setting)") }
+            let noData = model(FakeChat(), file: info("image/png"), previews: setting)
+            await noData.reloadKeep()
+            await noData.startPreview()
+            guard case .none = noData.preview else { return XCTFail("no local data offered, setting \(setting)") }
+            XCTAssertEqual(previewCalls(chat), 0)
+            XCTAssertEqual(decoded.calls, 0)
+        }
+    }
+
+    func testADecoderThatDiesAfterTheButtonWasOfferedFetchesNothing() async {
+        let chat = local()
+        chat.previewResult = .success(imageBytes())
+        let dead = Flag()
+        let decoded = Decoded()
+        let m = await started(chat, previews: false, decoded: decoded, decoderOff: dead)
+        guard case .offer = m.preview else { return XCTFail("no button") }
+        dead.set(true)
+        await m.showPreview()
+        guard case .none = m.preview else { return XCTFail("the button stayed for a dead decoder") }
+        XCTAssertEqual(previewCalls(chat), 0)
+    }
+
+    func testTurningOffPutsEveryShownRowBackToAButtonAtOnceAndFetchesNothing() async {
+        let decoded = Decoded()
+        decoded.image = Self.image
+        let chat = local()
+        chat.previewResult = .success(imageBytes())
+        let m = await started(chat, decoded: decoded)
+        guard case .shown = m.preview else { return XCTFail("not shown to begin with") }
+        await m.previewSetting(false)
+        guard case .offer = m.preview else { return XCTFail("a shown row stayed shown") }
+        XCTAssertEqual(previewCalls(chat), 1, "turning off fetched again")
+        await m.previewSetting(false) // unchanged: nothing
+        guard case .offer = m.preview else { return XCTFail("a repeat changed the row") }
+    }
+
+    func testAnImageThatArrivesAfterTurningOffIsDropped() async {
+        // Held in the decoder.
+        let decoded = Decoded()
+        decoded.image = Self.image
+        let gate = Gate()
+        decoded.gate = gate
+        let chat = local()
+        chat.previewResult = .success(imageBytes())
+        let m = model(chat, file: info("image/png"), decoded: decoded)
+        await m.reloadKeep()
+        let loading = Task { await m.startPreview() }
+        for _ in 0 ..< 40 { await Task.yield(); try? await Task.sleep(for: .milliseconds(5)) }
+        guard case .loading = m.preview else { return XCTFail("not decoding yet") }
+        await m.previewSetting(false)
+        guard case .offer = m.preview else { return XCTFail("a loading row stayed loading") }
+        gate.open()
+        await loading.value
+        guard case .offer = m.preview else { return XCTFail("a late image was shown after turning off") }
+
+        // Held in the fetch.
+        let fetchGate = Gate()
+        let chat2 = local()
+        chat2.previewResult = .success(imageBytes())
+        chat2.previewGate = fetchGate
+        let decoded2 = Decoded()
+        decoded2.image = Self.image
+        let n = model(chat2, file: info("image/png"), decoded: decoded2)
+        await n.reloadKeep()
+        let fetching = Task { await n.startPreview() }
+        for _ in 0 ..< 40 { await Task.yield(); try? await Task.sleep(for: .milliseconds(5)) }
+        await n.previewSetting(false)
+        fetchGate.open()
+        await fetching.value
+        guard case .offer = n.preview else { return XCTFail("a late fetch changed the row after turning off") }
+        XCTAssertEqual(decoded2.calls, 0, "a fetch that arrived after turning off was decoded")
+    }
+
+    func testTurningOnDecidesEveryButtonAsOnOpeningAndLeavesShownRowsAlone() async {
+        let decoded = Decoded()
+        decoded.image = Self.image
+        let chat = local()
+        chat.previewResult = .success(imageBytes())
+        chat.states = [.notCached]
+        let small = await started(chat, previews: false, decoded: decoded)
+        let large = await started(chat, size: FileRowModel.autoMaxBytes + 1, previews: false, decoded: decoded)
+        let away = await started(chat, previews: false, decoded: decoded, expensive: true)
+        let shown = await started(chat, previews: true, decoded: decoded)
+        XCTAssertEqual(previewCalls(chat), 1)
+        for m in [small, large, away] {
+            guard case .offer = m.preview else { return XCTFail("not a button before") }
+            await m.previewSetting(true)
+        }
+        guard case .shown = small.preview else { return XCTFail("a small image stayed a button") }
+        guard case .offer = large.preview else { return XCTFail("a large image was fetched by turning on") }
+        guard case .offer = away.preview else { return XCTFail("fetched on an expensive connection") }
+        await shown.previewSetting(true) // unchanged
+        guard case .shown = shown.preview else { return XCTFail("a shown row changed") }
+        XCTAssertEqual(previewCalls(chat), 2, "only the small one was fetched")
+    }
+
+    func testTheSettingNeverPinsUnpinsOpensOrDeletes() async {
+        let chat = local()
+        chat.previewResult = .success(imageBytes())
+        let decoded = Decoded()
+        decoded.image = Self.image
+        let m = await started(chat, previews: false, decoded: decoded)
+        await m.previewSetting(true)
+        await m.previewSetting(false)
+        await m.showPreview()
+        XCTAssertTrue(chat.pins.withLock { $0 }.isEmpty)
+        XCTAssertFalse(chat.cacheCalls.withLock { $0 }.contains("open"))
+        XCTAssertEqual(m.keep, .off)
     }
 }
