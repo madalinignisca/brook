@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import httpx
+import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models import Reaction
 
 API = "/api/v1"
 
@@ -386,6 +390,34 @@ async def test_reactions_toggle_and_aggregate(client: httpx.AsyncClient) -> None
     hist = await client.get(f"{API}/channels/{cid}/messages", headers=_auth(bob))
     msg = next(m for m in hist.json() if m["id"] == mid)
     assert msg["reactions"] == [{"emoji": "👍", "count": 1, "me": True}]
+
+
+async def test_a_toggle_that_loses_the_insert_race_becomes_the_removal(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two overlapping adds by one user both read "no reaction yet"; the second waits on the
+    # counter lock and then hits the primary key. That used to be a 500. Simulated by making
+    # the first read of the reaction a stale None although the row exists.
+    alice, bob = await _two_users(client)
+    cid, mid = await _dm_with_message(client, alice, bob)
+    url = f"{API}/channels/{cid}/messages/{mid}/reactions"
+    r = await client.post(url, json={"emoji": "👍"}, headers=_auth(alice))
+    assert r.json() == [{"emoji": "👍", "count": 1, "me": True}]
+
+    real_get = AsyncSession.get
+    stale = {"left": 1}
+
+    async def stale_get(self, entity, ident, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if entity is Reaction and stale["left"]:
+            stale["left"] -= 1
+            return None
+        return await real_get(self, entity, ident, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "get", stale_get)
+    r = await client.post(url, json={"emoji": "👍"}, headers=_auth(alice))
+    assert r.status_code == 200, "the insert conflict is retried, not a 500"
+    assert r.json() == [], "two toggles in sequence: the add, then the removal"
+    assert stale["left"] == 0, "the stale read was really used"
 
 
 async def test_reaction_requires_membership(client: httpx.AsyncClient) -> None:
