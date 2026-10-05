@@ -4460,8 +4460,13 @@ fn wipe_other_accounts(chat: &Rc<Chat>) {
             let client = chat.client.clone();
             async move { client.other_local_users().await }
         });
-        let Ok(Ok(others)) = lookup.await else {
-            return;
+        let others = match lookup.await {
+            Ok(Ok(others)) => others,
+            Ok(Err(err)) => {
+                tracing::warn!(%err, "could not look up other accounts' saved data");
+                return;
+            }
+            Err(_) => return,
         };
         // Every other account's sidebar order goes, on this thread (every writer of that file
         // is here) and before the wipe, which stops at the first error. Orphaned ones too,
@@ -4480,26 +4485,54 @@ fn wipe_other_accounts(chat: &Rc<Chat>) {
             let client = chat.client.clone();
             async move { client.wipe_other_local_users().await }
         });
-        let alert = match wipe.await {
-            Ok(Ok(())) => {
+        let result = match wipe.await {
+            Ok(result) => result,
+            Err(_) => return,
+        };
+        // A sign-out (or a torn-down view) while the wipe ran: nothing to say, and no window
+        // to say it on.
+        if chat.ended.get() || chat.offline_banner.root().is_none() {
+            return;
+        }
+        let alert = match wipe_outcome(&result) {
+            WipeOutcome::Removed => {
                 let unsent: Vec<Option<u64>> = others.iter().map(|o| o.unsent).collect();
                 adw::AlertDialog::new(
                     Some("Saved Data Removed"),
                     Some(&others_removed_text(&unsent)),
                 )
             }
-            // Said, not swallowed (#249): the next start tries again.
-            _ => adw::AlertDialog::new(
+            // Said, not swallowed (#249).
+            WipeOutcome::Failed => adw::AlertDialog::new(
                 Some("Saved Data Not Removed"),
                 Some(
                     "Another account's saved messages couldn't be removed from this device. \
                      Brook tries again the next time it starts.",
                 ),
             ),
+            WipeOutcome::Nothing => return,
         };
         alert.add_response("ok", "OK");
         alert.present(Some(&chat.message_list));
     });
+}
+
+/// What the other-account wipe's result calls for: the notice that it removed the data, one
+/// that it failed (core's `local.store`: the erase ran and failed), or nothing (the stores were
+/// not open, `local.unavailable`, or another error: not a failed erase worth an alert).
+#[derive(Debug, PartialEq)]
+enum WipeOutcome {
+    Removed,
+    Failed,
+    Nothing,
+}
+
+fn wipe_outcome(result: &Result<(), brook_core::Error>) -> WipeOutcome {
+    match result {
+        Ok(()) => WipeOutcome::Removed,
+        Err(brook_core::Error::Api { code, .. }) if code == "local.store" => WipeOutcome::Failed,
+        Err(_) => WipeOutcome::Nothing,
+    }
 }
 
 /// The notice after another account's saved data was removed: with its unsent messages when
@@ -4599,21 +4632,20 @@ fn lost_device_help(admin: bool) -> String {
 /// `known`: this user's stores answered a cached call, so `unsent` is a real count (it's 0
 /// while they're closed, which isn't the same as none).
 fn sign_out_body(unsent: u64, known: bool, remove: bool) -> String {
-    let mut text = if remove && !known {
-        // Nothing of this device's saved data is open this session, so a removal can't be
-        // promised (#249).
-        String::from(
-            "Brook can't open this device's saved data right now (is your keyring locked?), so \
-             it may not be removed.",
-        )
-    } else if remove {
+    if remove && !known {
+        // This session has not opened the saved data (local data is off, or the keyring was
+        // locked): a removal can't be promised, and nothing unsent is touched either (#249).
+        return String::from(
+            "Brook can't open this device's saved data in this session, so it may not be able to \
+             remove it.",
+        );
+    }
+    let mut text = if remove {
         String::from("Saved messages and files are removed from this device.")
     } else {
         String::from("Saved messages stay on this device for your next sign-in.")
     };
-    if remove && !known {
-        text.push_str(" Unsent messages on this device may be deleted.");
-    } else if remove && unsent > 0 {
+    if remove && unsent > 0 {
         let what = if unsent == 1 {
             "1 message hasn't"
         } else {
@@ -4754,10 +4786,12 @@ mod offline_tests {
             "kept messages aren't lost"
         );
         // Stores not known to be open: a 0 isn't "none".
-        assert!(sign_out_body(0, false, true).contains("may be deleted"));
-        // Data that is not open can't be promised removed.
-        assert!(sign_out_body(0, false, true).contains("may not be removed"));
-        assert!(!sign_out_body(0, false, true).contains("are removed from this device"));
+        // Data that is not open can't be promised removed, and nothing unsent is touched.
+        let closed = sign_out_body(0, false, true);
+        assert!(closed.contains("may not be able to remove"), "{closed}");
+        assert!(!closed.contains("are removed from this device"), "{closed}");
+        assert!(!closed.contains("deleted"), "{closed}");
+        assert!(!sign_out_body(5, false, true).contains("deleted"));
         assert!(!sign_out_body(0, false, false).contains("deleted"));
     }
 
@@ -5671,5 +5705,23 @@ mod offline_banner_tests {
         assert_eq!(b.on_state(true, false), BannerAction::Start(1));
         b.stop();
         assert!(!b.on_fire(1));
+    }
+
+    #[test]
+    fn only_a_failed_erase_is_worth_an_alert_about_other_accounts() {
+        use super::{wipe_outcome, WipeOutcome};
+        let api = |code: &str| {
+            Err(brook_core::Error::Api {
+                code: code.into(),
+                message: String::new(),
+            })
+        };
+        assert_eq!(wipe_outcome(&Ok(())), WipeOutcome::Removed);
+        assert_eq!(wipe_outcome(&api("local.store")), WipeOutcome::Failed);
+        assert_eq!(
+            wipe_outcome(&api("local.unavailable")),
+            WipeOutcome::Nothing
+        );
+        assert_eq!(wipe_outcome(&api("something.else")), WipeOutcome::Nothing);
     }
 }

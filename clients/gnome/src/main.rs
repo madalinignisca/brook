@@ -361,44 +361,34 @@ fn back_to_password(ui: &LoginUi, message: &str) {
     login_button.set_sensitive(true);
 }
 
-/// Shown while a sign-out erases this device's data (sign-in waits for it).
-const ERASING: &str = "Removing this device's data…";
-/// Shown while a sign-out that keeps the data closes it (sign-in waits for that too).
 /// What to tell the user after a sign-out that left something behind, or `None` when it
 /// left nothing: the stored sign-in that couldn't be forgotten (`session_forgotten` false), and
 /// the saved data that "Remove this device's data" could not remove (`erase`: core's error from
-/// `sign_out_and_forget`; `local.not_open` means this session never opened that data, so
-/// nothing was erased; `local.store` means the erase ran and failed, and the next launch
-/// finishes it).
+/// `sign_out_and_forget`; `local.not_open`: this session never opened that data, so nothing was
+/// erased, and core can't say whose data it is or why; `local.store`: the erase ran and
+/// failed, and the next launch finishes it).
 fn sign_out_notice(session_forgotten: bool, erase: Option<&brook_core::Error>) -> Option<String> {
-    let session =
-        (!session_forgotten).then_some("Brook couldn't forget this sign-in on this computer.");
+    let session = (!session_forgotten).then_some("forget this sign-in on this computer");
     let data = erase.map(|err| match err {
         brook_core::Error::Api { code, .. } if code == "local.not_open" => {
-            "Your saved messages were not removed from this device: Brook couldn't open them \
-             (is your keyring locked?). Unlock it, sign in and sign out again to remove them."
+            "check this device's saved data (nothing was removed; sign in and sign out again to \
+             retry)"
         }
         brook_core::Error::Api { code, .. } if code == "local.store" => {
-            "Removing this device's saved data failed. Brook finishes it the next time it starts."
+            "finish removing this device's saved data (it tries again the next time it starts)"
         }
-        _ => "Removing this device's saved data failed.",
+        _ => "remove this device's saved data",
     });
     match (session, data) {
         (None, None) => None,
-        (Some(a), None) | (None, Some(a)) => Some(format!("Signed out, but {}", lower(a))),
-        (Some(a), Some(b)) => Some(format!("Signed out, but {} {b}", lower(a))),
+        (Some(a), None) | (None, Some(a)) => Some(format!("Signed out, but Brook couldn't {a}.")),
+        (Some(a), Some(b)) => Some(format!("Signed out, but Brook couldn't {a}, or {b}.")),
     }
 }
 
-/// The text with its first letter in lower case, to follow "Signed out, but ".
-fn lower(text: &str) -> String {
-    let mut chars = text.chars();
-    chars
-        .next()
-        .map(|c| c.to_lowercase().chain(chars).collect())
-        .unwrap_or_default()
-}
-
+/// Shown while a sign-out erases this device's data (sign-in waits for it).
+const ERASING: &str = "Removing this device's data…";
+/// Shown while a sign-out that keeps the data closes it (sign-in waits for that too).
 const CLOSING: &str = "Signing out…";
 
 /// Build a core client for `server`. Plain http is only allowed for loopback,
@@ -413,8 +403,13 @@ fn new_client(
     let client = Arc::new(BrookClient::new(config)?);
     // Only with a keyring that answered at launch: otherwise every sign-in would try
     // (and fence) a store that isn't there. Sign-out fences live in the data dir.
+    let data_dir = glib::user_data_dir().join("brook");
+    if !keyring.usable.get() {
+        // Not opened (no usable keyring), but where an earlier session left its data is
+        // known, so "Remove this device's data" can say it could not check it (#249).
+        client.note_local_data_dir(&data_dir);
+    }
     if keyring.usable.get() {
-        let data_dir = glib::user_data_dir().join("brook");
         client.enable_persistence(keyring.slot.clone(), data_dir.clone());
         // The offline cache and outbox (#62), keyed in the same keyring. The signed-in
         // user's stores open on sign-in; until then (or if the key store is locked)
@@ -613,7 +608,7 @@ fn watch_auth_state(
                                     // plainly: a sign-out that left something behind is not a
                                     // clean one.
                                     let notice = sign_out_notice(
-                                        !matches!(forgot, Ok(false)),
+                                        matches!(forgot, Ok(true)),
                                         erase_failed.as_ref(),
                                     );
                                     if let (Some(text), false) = (notice, stale) {
@@ -666,16 +661,24 @@ mod sign_out_notice_tests {
 
     #[test]
     fn a_sign_in_that_could_not_be_forgotten_is_said() {
-        let text = sign_out_notice(false, None).unwrap();
-        assert!(text.starts_with("Signed out, but brook"), "{text}");
-        assert!(text.contains("forget this sign-in"), "{text}");
+        assert_eq!(
+            sign_out_notice(false, None).as_deref(),
+            Some("Signed out, but Brook couldn't forget this sign-in on this computer.")
+        );
     }
 
     #[test]
-    fn saved_data_that_was_not_opened_is_not_called_removed() {
+    fn saved_data_that_was_not_checked_says_nothing_was_removed() {
         let text = sign_out_notice(true, Some(&api("local.not_open"))).unwrap();
-        assert!(text.contains("were not removed"), "{text}");
-        assert!(text.contains("keyring"), "{text}");
+        assert!(
+            text.starts_with("Signed out, but Brook couldn't check"),
+            "{text}"
+        );
+        assert!(text.contains("nothing was removed"), "{text}");
+        assert!(
+            !text.contains("keyring"),
+            "core can't say it is the keyring: {text}"
+        );
     }
 
     #[test]
@@ -687,12 +690,13 @@ mod sign_out_notice_tests {
     #[test]
     fn any_other_erase_failure_is_still_reported() {
         let text = sign_out_notice(true, Some(&Error::UnexpectedResponse)).unwrap();
-        assert!(text.contains("failed"), "{text}");
+        assert!(text.contains("couldn't remove"), "{text}");
     }
 
     #[test]
     fn both_failures_are_both_said() {
         let text = sign_out_notice(false, Some(&api("local.store"))).unwrap();
         assert!(text.contains("forget this sign-in") && text.contains("next time it starts"));
+        assert!(text.starts_with("Signed out, but Brook couldn't"), "{text}");
     }
 }
