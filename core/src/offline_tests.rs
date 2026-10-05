@@ -650,6 +650,35 @@ mod client {
         );
     }
 
+    /// Noting a second data directory must not make the first one's stores disappear from the
+    /// check: both are remembered, so data in either is reported.
+    #[tokio::test]
+    async fn every_noted_data_dir_counts_not_just_the_last() {
+        let server = TestServer::start().await;
+        let (with_data, empty) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let slot = Arc::new(InMemoryKeySlot::default());
+        let first = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        assert!(
+            first
+                .enable_local_data(slot as Arc<dyn KeySlot>, with_data.path().to_path_buf())
+                .await
+        );
+        first.login("alice", "pw").await.unwrap();
+        assert!(active(&first).await);
+        first.close_local_data().await;
+        drop(first);
+
+        let c = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        c.note_local_data_dir(with_data.path());
+        c.note_local_data_dir(empty.path());
+        c.login("alice", "pw").await.unwrap();
+        let err = c.sign_out_and_forget().await.unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Api { code, .. } if code == "local.not_open"),
+            "data in the first noted dir was lost to the second: {err:?}"
+        );
+    }
+
     /// The index file outlives every erase (it is made by the first open and holds no
     /// messages), so "an index exists" must not count as stored data: after an erase that
     /// worked, or on a device where nobody ever stored anything, a later launch with a locked

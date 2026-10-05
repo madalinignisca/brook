@@ -118,11 +118,17 @@ impl BrookClient {
     /// to say so when an earlier session's stores are there: call this with the same
     /// `data_dir` and `sign_out_and_forget` reports `local.not_open` instead of `Ok`.
     /// `enable_local_data` does this itself; calling both is harmless.
+    /// Every directory noted is remembered (not just the last): data in one of them is data
+    /// "Remove this device's data" has to account for, whatever was noted after.
     pub fn note_local_data_dir(&self, data_dir: &Path) {
-        *self
-            .local_root
+        let root = data_dir.join("stores");
+        let mut roots = self
+            .local_roots
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(data_dir.join("stores"));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
     }
 
     /// Turn on the offline cache and outbox, keyed in `slot` (the platform's secure store,
@@ -275,15 +281,22 @@ impl BrookClient {
     /// (anything but "not there"), assume data exists: "erased" would be a claim nothing
     /// supports.
     async fn stores_on_disk(&self) -> bool {
-        let root = self
-            .local_root
+        let roots = self
+            .local_roots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let Some(root) = root else {
-            return false;
-        };
-        let mut entries = match tokio::fs::read_dir(&root).await {
+        for root in roots {
+            if Self::has_stores(&root).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether `root` holds a store directory (or can't be read, which counts as data).
+    async fn has_stores(root: &Path) -> bool {
+        let mut entries = match tokio::fs::read_dir(root).await {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
             Err(_) => return true,
