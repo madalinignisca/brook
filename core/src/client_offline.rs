@@ -112,6 +112,19 @@ impl BrookClient {
         self.base.as_str().trim_end_matches('/').to_string()
     }
 
+    /// Tell the client where this device's local data lives, without opening it. An app that
+    /// does not call [`BrookClient::enable_local_data`] this session (the key store was
+    /// probed as locked or absent, so it never tries) still needs "Remove this device's data"
+    /// to say so when an earlier session's stores are there: call this with the same
+    /// `data_dir` and `sign_out_and_forget` reports `local.not_open` instead of `Ok`.
+    /// `enable_local_data` does this itself; calling both is harmless.
+    pub fn note_local_data_dir(&self, data_dir: &Path) {
+        *self
+            .local_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(data_dir.join("stores"));
+    }
+
     /// Turn on the offline cache and outbox, keyed in `slot` (the platform's secure store,
     /// the same one `enable_persistence` uses), stored under `data_dir`. From then on the
     /// signed-in user's stores open on sign-in. Returns whether local data is on: false while
@@ -123,10 +136,7 @@ impl BrookClient {
         }
         // Before the open can fail: a locked key store leaves local data off, but what an
         // earlier session stored is still on disk, and a later erase has to know to say so.
-        *self
-            .local_root
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(data_dir.join("stores"));
+        self.note_local_data_dir(&data_dir);
         let Ok(Some(local)) = LocalData::open(&data_dir.join("stores"), slot).await else {
             return false;
         };

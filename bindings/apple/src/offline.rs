@@ -642,6 +642,14 @@ impl FfiBrookClient {
             .unwrap_or(false)
     }
 
+    /// Tell the client where local data lives without opening it: call this (with the same
+    /// `data_dir`) when you do not call `enable_local_data` this session, so that "Remove this
+    /// device's data" can report `local.not_open` for stores an earlier session left.
+    pub fn note_local_data_dir(&self, data_dir: String) {
+        self.inner
+            .note_local_data_dir(std::path::Path::new(&data_dir));
+    }
+
     /// Change notices from the cache and outbox (see [`CacheEventListener`]).
     pub fn subscribe_cache_events(
         &self,

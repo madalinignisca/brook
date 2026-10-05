@@ -615,6 +615,41 @@ mod client {
         locked_first_launch.sign_out_and_forget().await.unwrap();
     }
 
+    /// An app that never calls `enable_local_data` this session (it probed the key store as
+    /// locked and did not try) must still be able to say that an earlier session's data was
+    /// not erased: it tells the client where the data is with `note_local_data_dir`.
+    #[tokio::test]
+    async fn an_app_that_never_enabled_local_data_can_still_report_unerased_stores() {
+        let server = TestServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let slot = Arc::new(InMemoryKeySlot::default());
+        let first = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        assert!(
+            first
+                .enable_local_data(slot as Arc<dyn KeySlot>, dir.path().to_path_buf())
+                .await
+        );
+        first.login("alice", "pw").await.unwrap();
+        assert!(active(&first).await);
+        first.close_local_data().await;
+        drop(first);
+
+        // Without the note, core cannot know where to look: Ok, as before.
+        let unaware = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        unaware.login("alice", "pw").await.unwrap();
+        unaware.sign_out_and_forget().await.unwrap();
+
+        // With it, the unopened store is reported.
+        let c = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
+        c.note_local_data_dir(dir.path());
+        c.login("alice", "pw").await.unwrap();
+        let err = c.sign_out_and_forget().await.unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Api { code, .. } if code == "local.not_open"),
+            "stores an earlier session left, reported as {err:?}, or as success"
+        );
+    }
+
     /// The index file outlives every erase (it is made by the first open and holds no
     /// messages), so "an index exists" must not count as stored data: after an erase that
     /// worked, or on a device where nobody ever stored anything, a later launch with a locked
