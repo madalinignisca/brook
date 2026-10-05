@@ -34,12 +34,15 @@ struct VideoTile: NSViewRepresentable {
 
 struct TileView: View {
     let tile: CallModel.Tile
+    /// On the stage: as large as the window allows (16:9 kept), not a fixed-width cell.
+    var fills = false
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             Rectangle().fill(.black)
             if tile.video, tile.track != nil {
-                VideoTile(track: tile.track)
+                // The video view would take the click, and a tile is clicked to put it on the stage.
+                VideoTile(track: tile.track).allowsHitTesting(false)
             } else {
                 Image(systemName: "person.crop.circle.fill")
                     .font(.system(size: 48))
@@ -57,6 +60,7 @@ struct TileView: View {
         }
         .aspectRatio(16 / 9, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 10))
+        .frame(maxWidth: fills ? .infinity : nil, maxHeight: fills ? .infinity : nil)
         // The tile is always black: its icon and name chip use dark-scheme colours in light mode too.
         .environment(\.colorScheme, .dark)
         .accessibilityElement(children: .combine)
@@ -68,6 +72,70 @@ struct CallView: View {
     let call: CallModel
     var pickScreen: () async -> VideoCapture? = { nil }
     let leave: () async -> Void
+    /// The tile the user put on the stage; nil leaves the choice to `CallStage` (a shared screen).
+    @State private var pinned: String?
+
+    /// A stage (a shared screen, or the tile the user chose) with the rest in a strip below it, or
+    /// the equal grid when nothing is on the stage.
+    @ViewBuilder
+    private var tilesArea: some View {
+        tilesLayout
+            .onChange(of: call.tiles.map(\.id)) { _, _ in pinned = CallStage.pruned(pinned, tiles: call.tiles) }
+    }
+
+    @ViewBuilder
+    private var tilesLayout: some View {
+        let split = CallStage.split(call.tiles, pinned: pinned)
+        if let stage = split.stage {
+            VStack(spacing: 10) {
+                // A fresh view for each tile on the stage: a renderer moved to another track would keep
+                // drawing the old picture until a new frame arrives (a still screen sends none).
+                TileView(tile: stage, fills: true)
+                    .id(stage.id)
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityAction(named: pinned == stage.id ? "Release" : "Keep on stage") {
+                        pinned = CallStage.toggled(pinned, clicked: stage.id, onStage: stage.id)
+                    }
+                    .onTapGesture {
+                        pinned = CallStage.toggled(pinned, clicked: stage.id, onStage: stage.id)
+                    }
+                    .help(pinned == stage.id ? "Click to release" : "Click to keep this on the stage")
+                if !split.strip.isEmpty {
+                    ScrollView(.horizontal) {
+                        HStack(spacing: 8) {
+                            ForEach(split.strip) { tile in
+                                TileView(tile: tile)
+                                    .frame(width: 160)
+                                    .accessibilityAddTraits(.isButton)
+                                    .accessibilityAction(named: "Put on stage") {
+                                        pinned = CallStage.toggled(pinned, clicked: tile.id, onStage: stage.id)
+                                    }
+                                    .onTapGesture {
+                                        pinned = CallStage.toggled(pinned, clicked: tile.id, onStage: stage.id)
+                                    }
+                                    .help("Click to put this on the stage")
+                            }
+                        }
+                    }
+                    .frame(height: 100)
+                }
+            }
+        } else {
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 10)], spacing: 10) {
+                    ForEach(split.strip) { tile in
+                        TileView(tile: tile)
+                            .accessibilityAddTraits(.isButton)
+                            .accessibilityAction(named: "Put on stage") {
+                                pinned = CallStage.toggled(pinned, clicked: tile.id, onStage: nil)
+                            }
+                            .onTapGesture { pinned = CallStage.toggled(pinned, clicked: tile.id, onStage: nil) }
+                            .help("Click to put this on the stage")
+                    }
+                }
+            }
+        }
+    }
 
     var body: some View {
         VStack(spacing: 12) {
@@ -90,11 +158,7 @@ struct CallView: View {
             if let error = call.shareError {
                 Text(error).font(.callout).foregroundStyle(.red)
             }
-            ScrollView {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 10)], spacing: 10) {
-                    ForEach(call.tiles) { TileView(tile: $0) }
-                }
-            }
+            tilesArea
             HStack(spacing: 16) {
                 Button {
                     Task { await call.toggleMic() }
