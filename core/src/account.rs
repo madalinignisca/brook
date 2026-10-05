@@ -534,6 +534,45 @@ impl BrookClient {
         Ok(resp)
     }
 
+    /// Admin: add a user (always a `member`). The admin re-enters their own password, as for a
+    /// reset. Errors by code: `conflict` (handle taken), `authz.forbidden` (not an admin),
+    /// `auth.invalid_credentials` (the admin password is wrong), `validation` (a limit; nothing
+    /// of the body is carried), `auth.rate_limited`. A 201 that does not parse is
+    /// `UnexpectedResponse`: the account may exist.
+    pub async fn create_user(
+        &self,
+        handle: &str,
+        display_name: &str,
+        password: &str,
+        admin_password: &str,
+    ) -> Result<UserSummary> {
+        let epoch = self.session.snapshot().await.0.epoch;
+        let url = self.base.join("api/v1/auth/register")?;
+        // Never logged or formatted: both passwords are in here.
+        let body = json!({
+            "handle": handle,
+            "display_name": display_name,
+            "password": password,
+            "admin_password": admin_password,
+        });
+        let (resp, _) = self
+            .ctx()
+            .send(epoch, OnExpired::SingleFlight, |access| {
+                self.http.post(url.clone()).bearer_auth(access).json(&body)
+            })
+            .await?;
+        if !resp.status().is_success() {
+            return Err(match account_error(resp).await {
+                Error::Api { code, .. } if code == "validation" => Error::Api {
+                    code,
+                    message: "the handle, display name or password was refused".into(),
+                },
+                other => other,
+            });
+        }
+        resp.json().await.map_err(|_| Error::UnexpectedResponse)
+    }
+
     /// Admin: every user, by handle.
     pub async fn list_users(&self) -> Result<Vec<UserSummary>> {
         let epoch = self.session.snapshot().await.0.epoch;

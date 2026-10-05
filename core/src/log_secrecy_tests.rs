@@ -12,7 +12,7 @@ use serde_json::json;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
-use crate::test_support::TestServer;
+use crate::test_support::{RegisterMode, TestServer};
 
 /// The filter clients install: everything at trace, dependencies that log frames capped.
 pub(crate) const CLIENT_FILTER: &str = "trace,tungstenite=info,tokio_tungstenite=info";
@@ -139,4 +139,52 @@ async fn without_the_dependency_cap_tokens_do_leak() {
         .iter()
         .any(|s| encodings(s).iter().any(|e| logs.contains(e.as_str())));
     assert!(leaked, "no leak without the cap: the capture does not see dependency logs, so the other test proves nothing");
+}
+
+/// Neither password of an added user reaches a log line at trace level, on success or on any
+/// failure (a 422 echoes them back; a 401 sends the request twice).
+#[tokio::test]
+async fn create_user_never_logs_either_password() {
+    const NEW_PW: &str = "NEWUSER-SECRET-91bd";
+    const ADMIN_PW: &str = "ADMIN-SECRET-4c2e";
+    LOG_BRIDGE.call_once(|| {
+        let _ = tracing_log::LogTracer::init();
+    });
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("trace"))
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let server = TestServer::start().await;
+    let client = server.client();
+    client.login("admin", "pw").await.unwrap();
+    client
+        .create_user("carol", "Carol C", NEW_PW, ADMIN_PW)
+        .await
+        .unwrap();
+    server.expire_next(1);
+    client
+        .create_user("dave", "Dave D", NEW_PW, ADMIN_PW)
+        .await
+        .unwrap();
+    for mode in [
+        RegisterMode::Echo422,
+        RegisterMode::Conflict,
+        RegisterMode::WrongAdmin,
+        RegisterMode::BadBody,
+    ] {
+        server.set_register_mode(mode);
+        let _ = client.create_user("erin", "Erin E", NEW_PW, ADMIN_PW).await;
+    }
+
+    let logs = String::from_utf8_lossy(&capture.0.lock().unwrap().clone()).into_owned();
+    assert!(!logs.is_empty(), "capture saw nothing");
+    for secret in [NEW_PW, ADMIN_PW] {
+        for enc in encodings(secret) {
+            assert!(!logs.contains(&enc), "`{secret}` leaked as `{enc}`");
+        }
+    }
 }

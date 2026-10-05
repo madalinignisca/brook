@@ -138,6 +138,24 @@ impl FfiBrookClient {
         Ok(users.into_iter().map(Into::into).collect())
     }
 
+    /// Admin: add a user (always a member), re-entering the admin's own password.
+    pub async fn create_user(
+        &self,
+        handle: String,
+        display_name: String,
+        password: String,
+        admin_password: String,
+    ) -> Result<FfiUserSummary, LoginError> {
+        let inner = Arc::clone(&self.inner);
+        let user = run(async move {
+            inner
+                .create_user(&handle, &display_name, &password, &admin_password)
+                .await
+        })
+        .await?;
+        Ok(user.into())
+    }
+
     /// Realtime events the Apple UI uses (`Ready`, `ChannelCall`, the message events); others
     /// are skipped. Missed events arrive as one `Resync`. Cancel (or drop) the subscription
     /// to stop.
@@ -724,6 +742,51 @@ mod tests {
         // and what comes back carries them.
         assert_eq!(made.topic.as_deref(), Some("all hands"));
         assert!(made.is_public);
+    }
+
+    /// Each argument reaches its own JSON key (four strings: a swap would still compile), and
+    /// the answer comes back as the summary.
+    #[tokio::test]
+    async fn create_user_sends_each_argument_under_its_own_key() {
+        let server = mock_login_ok().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/register"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                format!("Bearer {ACCESS}").as_str(),
+            ))
+            .and(wiremock::matchers::body_json(json!({
+                "handle": "carol", "display_name": "Carol C",
+                "password": "new-pw-sentinel", "admin_password": "admin-pw-sentinel",
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "u2", "handle": "carol", "display_name": "Carol C", "global_role": "member"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = FfiBrookClient::new(server.uri(), false).unwrap();
+        client.login("alice".into(), "pw".into()).await.unwrap();
+
+        let made = client
+            .create_user(
+                "carol".into(),
+                "Carol C".into(),
+                "new-pw-sentinel".into(),
+                "admin-pw-sentinel".into(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            made,
+            FfiUserSummary {
+                id: "u2".into(),
+                handle: "carol".into(),
+                display_name: "Carol C".into(),
+                global_role: "member".into(),
+            }
+        );
     }
 
     /// Test 3: the server's error code reaches Swift verbatim.
