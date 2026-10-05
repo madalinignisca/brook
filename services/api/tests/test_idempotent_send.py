@@ -14,12 +14,15 @@ PW = "supersecret"
 async def _setup(client: httpx.AsyncClient) -> tuple[dict[str, str], dict[str, str], str]:
     """alice (admin) and bob, both in a channel; returns their bearer headers + channel id."""
     await client.post(
-        f"{AUTH}/register", json={"handle": "alice", "display_name": "A", "password": PW}
+        f"{AUTH}/register",
+        json={"handle": "alice", "display_name": "A", "password": PW, "admin_password": PW},
     )
     a = (await client.post(f"{AUTH}/login", json={"handle": "alice", "password": PW})).json()
     ha = {"Authorization": f"Bearer {a['access_token']}"}
     await client.post(
-        f"{AUTH}/register", json={"handle": "bob", "display_name": "B", "password": PW}, headers=ha
+        f"{AUTH}/register",
+        json={"handle": "bob", "display_name": "B", "password": PW, "admin_password": PW},
+        headers=ha,
     )
     b = (await client.post(f"{AUTH}/login", json={"handle": "bob", "password": PW})).json()
     hb = {"Authorization": f"Bearer {b['access_token']}"}
@@ -77,7 +80,10 @@ async def test_without_client_id_every_send_is_new(client: httpx.AsyncClient) ->
 
 def test_live_event_echoes_client_id(sync_client: TestClient) -> None:
     http = sync_client
-    http.post(f"{AUTH}/register", json={"handle": "alice", "display_name": "A", "password": PW})
+    http.post(
+        f"{AUTH}/register",
+        json={"handle": "alice", "display_name": "A", "password": PW, "admin_password": PW},
+    )
     a = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
     ha = {"Authorization": f"Bearer {a['access_token']}"}
     ch = http.post(

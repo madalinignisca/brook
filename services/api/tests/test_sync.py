@@ -24,7 +24,7 @@ def _h(token: str) -> dict[str, str]:
 async def _user(
     client: httpx.AsyncClient, handle: str, admin: dict[str, str] | None = None
 ) -> dict[str, str]:
-    body = {"handle": handle, "display_name": handle.title(), "password": PW}
+    body = {"handle": handle, "display_name": handle.title(), "password": PW, "admin_password": PW}
     await client.post(f"{AUTH}/register", json=body, headers=admin or {})
     r = await client.post(f"{AUTH}/login", json={"handle": handle, "password": PW})
     return _h(r.json()["access_token"])
@@ -205,7 +205,10 @@ async def test_archive_is_a_channel_change(client: httpx.AsyncClient) -> None:
 
 def test_live_events_carry_seq(sync_client: TestClient) -> None:
     http = sync_client
-    http.post(f"{AUTH}/register", json={"handle": "alice", "display_name": "A", "password": PW})
+    http.post(
+        f"{AUTH}/register",
+        json={"handle": "alice", "display_name": "A", "password": PW, "admin_password": PW},
+    )
     a = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
     ha = _h(a["access_token"])
     ch = http.post("/api/v1/channels", json={"kind": "channel", "name": "g"}, headers=ha).json()
@@ -338,11 +341,16 @@ async def test_non_ascii_digit_cursor_is_a_reset(client: httpx.AsyncClient) -> N
 
 def test_reaction_and_channel_events_carry_a_fresh_seq(sync_client: TestClient) -> None:
     http = sync_client
-    http.post(f"{AUTH}/register", json={"handle": "alice", "display_name": "A", "password": PW})
+    http.post(
+        f"{AUTH}/register",
+        json={"handle": "alice", "display_name": "A", "password": PW, "admin_password": PW},
+    )
     a = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
     ha = _h(a["access_token"])
     http.post(
-        f"{AUTH}/register", json={"handle": "bob", "display_name": "B", "password": PW}, headers=ha
+        f"{AUTH}/register",
+        json={"handle": "bob", "display_name": "B", "password": PW, "admin_password": PW},
+        headers=ha,
     )
     ch = http.post("/api/v1/channels", json={"kind": "channel", "name": "g"}, headers=ha).json()
     with http.websocket_connect("/ws") as ws:
@@ -374,11 +382,14 @@ def test_being_added_to_a_channel_hints_a_sync(
 
     monkeypatch.setattr(sync_module, "HINTS_ENABLED", True)
     http = sync_client
-    http.post(f"{AUTH}/register", json={"handle": "alice", "display_name": "A", "password": PW})
+    http.post(
+        f"{AUTH}/register",
+        json={"handle": "alice", "display_name": "A", "password": PW, "admin_password": PW},
+    )
     a = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
     ha = _h(a["access_token"])
     for handle in ("bob", "carol"):
-        body = {"handle": handle, "display_name": handle, "password": PW}
+        body = {"handle": handle, "display_name": handle, "password": PW, "admin_password": PW}
         http.post(f"{AUTH}/register", json=body, headers=ha)
     b = http.post(f"{AUTH}/login", json={"handle": "bob", "password": PW}).json()
     c = http.post(f"{AUTH}/login", json={"handle": "carol", "password": PW}).json()
@@ -429,11 +440,16 @@ def test_a_message_hints_only_the_senders_other_devices(
 
     monkeypatch.setattr(sync_module, "HINTS_ENABLED", True)
     http = sync_client
-    http.post(f"{AUTH}/register", json={"handle": "alice", "display_name": "A", "password": PW})
+    http.post(
+        f"{AUTH}/register",
+        json={"handle": "alice", "display_name": "A", "password": PW, "admin_password": PW},
+    )
     a = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
     ha = _h(a["access_token"])
     http.post(
-        f"{AUTH}/register", json={"handle": "bob", "display_name": "B", "password": PW}, headers=ha
+        f"{AUTH}/register",
+        json={"handle": "bob", "display_name": "B", "password": PW, "admin_password": PW},
+        headers=ha,
     )
     b1 = http.post(f"{AUTH}/login", json={"handle": "bob", "password": PW}).json()
     b2 = http.post(f"{AUTH}/login", json={"handle": "bob", "password": PW}).json()

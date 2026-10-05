@@ -60,7 +60,7 @@ async def _login(
 
 async def _setup(client: httpx.AsyncClient) -> dict[str, str]:
     """alice (admin) signed in; returns her pair."""
-    body = {"handle": "alice", "display_name": "Alice", "password": PW}
+    body = {"handle": "alice", "display_name": "Alice", "password": PW, "admin_password": PW}
     assert (await client.post(f"{AUTH}/register", json=body)).status_code == 201
     return dict((await _login(client)).json())
 
@@ -172,7 +172,7 @@ def test_pending_token_is_refused_on_the_websocket(sync_client: TestClient) -> N
     from app.security import create_totp_pending_token
 
     http = sync_client
-    body = {"handle": "alice", "display_name": "Alice", "password": PW}
+    body = {"handle": "alice", "display_name": "Alice", "password": PW, "admin_password": PW}
     assert http.post(f"{AUTH}/register", json=body).status_code == 201
     pair = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
     uid = uuid.UUID(http.get(f"{AUTH}/me", headers=_h(pair["access_token"])).json()["id"])
@@ -423,7 +423,7 @@ async def test_password_stage_alone_earns_no_trust(client: httpx.AsyncClient, cl
 
 async def test_admin_totp_reset(client: httpx.AsyncClient, clock: Clock) -> None:
     admin = await _setup(client)
-    body = {"handle": "bob", "display_name": "Bob", "password": PW}
+    body = {"handle": "bob", "display_name": "Bob", "password": PW, "admin_password": PW}
     await client.post(f"{AUTH}/register", json=body, headers=_h(admin["access_token"]))
     bob = dict((await _login(client, "bob")).json())
     _secret, bob_on = await _enable(client, bob, clock)
@@ -454,7 +454,7 @@ async def test_admin_cannot_reset_another_admins_totp(
     from app.models import User
 
     admin = await _setup(client)
-    body = {"handle": "carol", "display_name": "Carol", "password": PW}
+    body = {"handle": "carol", "display_name": "Carol", "password": PW, "admin_password": PW}
     await client.post(f"{AUTH}/register", json=body, headers=_h(admin["access_token"]))
     async with db.get_sessionmaker()() as s:
         await s.execute(update(User).where(User.handle == "carol").values(global_role="admin"))
@@ -653,7 +653,7 @@ async def test_a_recovery_code_only_works_for_its_owner(
 ) -> None:
     admin = await _setup(client)
     _s1, alice_on = await _enable(client, admin, clock)
-    body = {"handle": "bob", "display_name": "Bob", "password": PW}
+    body = {"handle": "bob", "display_name": "Bob", "password": PW, "admin_password": PW}
     await client.post(f"{AUTH}/register", json=body, headers=_h(alice_on["access_token"]))
     bob = dict((await _login(client, "bob")).json())
     await _enable(client, bob, clock)

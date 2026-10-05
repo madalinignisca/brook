@@ -35,11 +35,14 @@ async def _login(client: httpx.AsyncClient, handle: str) -> dict[str, str]:
 async def _setup(client: httpx.AsyncClient) -> tuple[dict[str, str], dict[str, str], str]:
     """alice (admin) and bob in one channel."""
     await client.post(
-        f"{AUTH}/register", json={"handle": "alice", "display_name": "A", "password": PW}
+        f"{AUTH}/register",
+        json={"handle": "alice", "display_name": "A", "password": PW, "admin_password": PW},
     )
     ha = await _login(client, "alice")
     await client.post(
-        f"{AUTH}/register", json={"handle": "bob", "display_name": "B", "password": PW}, headers=ha
+        f"{AUTH}/register",
+        json={"handle": "bob", "display_name": "B", "password": PW, "admin_password": PW},
+        headers=ha,
     )
     hb = await _login(client, "bob")
     ch = (
@@ -287,7 +290,9 @@ async def test_download_headers_and_range(client: httpx.AsyncClient) -> None:
 async def test_download_authorisation(client: httpx.AsyncClient) -> None:
     ha, _hb, ch = await _setup(client)
     await client.post(
-        f"{AUTH}/register", json={"handle": "eve", "display_name": "E", "password": PW}, headers=ha
+        f"{AUTH}/register",
+        json={"handle": "eve", "display_name": "E", "password": PW, "admin_password": PW},
+        headers=ha,
     )
     he = await _login(client, "eve")
     f = await _upload(client, ha, ch, b"secret")
@@ -504,7 +509,9 @@ async def test_file_delete_authorisation(client: httpx.AsyncClient) -> None:
     gets 404."""
     ha, hb, ch = await _setup(client)  # alice created the channel: its owner
     await client.post(
-        f"{AUTH}/register", json={"handle": "eve", "display_name": "E", "password": PW}, headers=ha
+        f"{AUTH}/register",
+        json={"handle": "eve", "display_name": "E", "password": PW, "admin_password": PW},
+        headers=ha,
     )
     he = await _login(client, "eve")
     alices = await _upload(client, ha, ch, b"a")
@@ -590,7 +597,10 @@ def test_deleting_an_attached_file_updates_its_message_live(sync_client: TestCli
     """Members online see the file go at once (message.update with the shorter list and a
     higher seq), not only at their next /sync."""
     http = sync_client
-    http.post(f"{AUTH}/register", json={"handle": "alice", "display_name": "A", "password": PW})
+    http.post(
+        f"{AUTH}/register",
+        json={"handle": "alice", "display_name": "A", "password": PW, "admin_password": PW},
+    )
     a = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
     ha = {"Authorization": f"Bearer {a['access_token']}"}
     ch = http.post("/api/v1/channels", json={"kind": "channel", "name": "g"}, headers=ha).json()
@@ -635,11 +645,16 @@ def test_message_update_carries_each_members_own_reactions(sync_client: TestClie
     """Caches store a message.update's row whole, so its reactions' `me` must be the
     recipient's, not the actor's: bob reacted, alice edits, and only bob's frame says so."""
     http = sync_client
-    http.post(f"{AUTH}/register", json={"handle": "alice", "display_name": "A", "password": PW})
+    http.post(
+        f"{AUTH}/register",
+        json={"handle": "alice", "display_name": "A", "password": PW, "admin_password": PW},
+    )
     a = http.post(f"{AUTH}/login", json={"handle": "alice", "password": PW}).json()
     ha = {"Authorization": f"Bearer {a['access_token']}"}
     http.post(
-        f"{AUTH}/register", json={"handle": "bob", "display_name": "B", "password": PW}, headers=ha
+        f"{AUTH}/register",
+        json={"handle": "bob", "display_name": "B", "password": PW, "admin_password": PW},
+        headers=ha,
     )
     b = http.post(f"{AUTH}/login", json={"handle": "bob", "password": PW}).json()
     hb = {"Authorization": f"Bearer {b['access_token']}"}

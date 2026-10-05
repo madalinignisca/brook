@@ -14,6 +14,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import func, select, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings, get_settings
@@ -56,11 +57,35 @@ async def _optional_user(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_optional_bearer)],
     session: Annotated[AsyncSession, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_settings)],
-) -> User | None:
-    """Resolve the caller if a valid token is present; else ``None``."""
+) -> tuple[User | None, bool]:
+    """``(caller, token_was_sent)``. ``caller`` is ``None`` without a token or when the
+    token is refused (expired, revoked, user disabled); the route tells the two apart
+    through the flag, because refused must be a 401 (clients refresh on 401 only, and a
+    403 left an admin whose token had expired staring at "not allowed") while the
+    bootstrap, which needs no token, must ignore a stale one."""
     if credentials is None:
-        return None
-    return await user_from_access_token(session, settings, credentials.credentials)
+        return None, False
+    return await user_from_access_token(session, settings, credentials.credentials), True
+
+
+def confirm_admin_password(
+    admin: User, admin_password: str, ip: str, limiter: AuthLimiter, *, paid: bool = False
+) -> None:
+    """Re-authenticate an admin for an action a stolen access token must not do alone
+    (resetting another user, creating an account; encryption spec §7.6). Rate limited
+    per IP and admin, since it is a password-guessing surface too. ``paid``: the request
+    already took an attempt token (register enforces before it knows who calls)."""
+    enforce(limiter, ip, admin.handle, consume=not paid)
+    if admin.password_hash is None or not verify_password(admin.password_hash, admin_password):
+        limiter.failure(ip, admin.handle)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "auth.invalid_credentials", "message": "Admin password is wrong"},
+        )
+    # Resets the IP's streak but must not make it *trusted* for this handle: trust
+    # exempts an IP from the TOTP code budget, and a password re-check is not a
+    # completed login (same rule as totp.py's _reauth_password).
+    limiter.success(ip)
 
 
 async def lock_user(session: AsyncSession, user_id: uuid.UUID) -> User | None:
@@ -116,24 +141,40 @@ async def register(
     body: RegisterIn,
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
-    caller: Annotated[User | None, Depends(_optional_user)],
+    who: Annotated[tuple[User | None, bool], Depends(_optional_user)],
     limiter: Annotated[AuthLimiter, Depends(get_limiter)],
 ) -> User:
     """Create a user.
 
-    The **first** user bootstraps as global ``admin`` (open). Once any user
-    exists, only an authenticated admin may create further accounts.
+    The **first** user bootstraps as global ``admin`` (open, ``admin_password`` ignored).
+    Once any user exists, only an authenticated admin may create further accounts, and
+    they re-enter their password (``admin_password``): a stolen access token alone must
+    not mint accounts that outlive it. Order: role (403), password (403/422), handle (409).
     """
     ip = client_ip(request.client.host if request.client else None)
     enforce(limiter, ip)
     count = await session.scalar(select(func.count()).select_from(User))
     is_first = (count or 0) == 0
-    if not is_first and (caller is None or caller.global_role != "admin"):
-        limiter.failure(ip)  # an unauthenticated attempt on a closed endpoint
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"code": "authz.forbidden", "message": "Admin role required to add users"},
-        )
+    caller, token_sent = who
+    if not is_first:
+        if caller is None and token_sent:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"code": "auth.invalid_token", "message": "Invalid or expired token"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if caller is None or caller.global_role != "admin":
+            limiter.failure(ip)  # an unauthenticated attempt on a closed endpoint
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "authz.forbidden", "message": "Admin role required to add users"},
+            )
+        if body.admin_password is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "validation.error", "message": "admin_password is required"},
+            )
+        confirm_admin_password(caller, body.admin_password, ip, limiter, paid=True)
 
     exists = await session.scalar(select(User).where(User.handle == body.handle))
     if exists is not None:
@@ -142,7 +183,8 @@ async def register(
             detail={"code": "conflict", "message": "Handle already taken"},
         )
 
-    limiter.success(ip)
+    if is_first:
+        limiter.success(ip)
     user = User(
         handle=body.handle,
         display_name=_clean_profile_text(body.display_name, "display_name", 1, 64),
@@ -150,7 +192,16 @@ async def register(
         global_role="admin" if is_first else "member",
     )
     session.add(user)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Two registers of one handle both passed the check above; the unique column
+        # decided. The loser is a conflict, not a 500.
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "conflict", "message": "Handle already taken"},
+        ) from None
     await session.refresh(user)
     return user
 
