@@ -82,7 +82,10 @@ def confirm_admin_password(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "auth.invalid_credentials", "message": "Admin password is wrong"},
         )
-    limiter.success(ip, admin.handle)
+    # Resets the IP's streak but must not make it *trusted* for this handle: trust
+    # exempts an IP from the TOTP code budget, and a password re-check is not a
+    # completed login (same rule as totp.py's _reauth_password).
+    limiter.success(ip)
 
 
 async def lock_user(session: AsyncSession, user_id: uuid.UUID) -> User | None:

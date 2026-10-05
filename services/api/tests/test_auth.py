@@ -282,3 +282,44 @@ async def test_register_losing_a_handle_race_is_409(
     assert r.status_code == 409
     assert r.json()["error"]["code"] == "conflict"
     assert await _count_users("bob") == 1
+
+
+def test_admin_reauth_does_not_make_the_ip_trusted() -> None:
+    """Trust exempts an IP from the TOTP code budget; a password re-check is not a login."""
+    from app.ratelimit import AuthLimiter
+    from app.routers.auth import confirm_admin_password
+    from app.security import hash_password
+
+    admin = User(handle="alice", display_name="A", password_hash=hash_password("supersecret"))
+    limiter = AuthLimiter()
+    confirm_admin_password(admin, "supersecret", "203.0.113.9", limiter)
+    assert limiter.code_check("alice", "203.0.113.9") is None  # nothing spent yet
+    for _ in range(limiter.config.code_budget):
+        limiter.code_failure("alice")
+    assert limiter.code_check("alice", "203.0.113.9") is not None, "the IP was trusted"
+
+
+async def test_register_costs_one_attempt_token_and_a_wrong_password_one_failure(
+    client: httpx.AsyncClient,
+) -> None:
+    from app import ratelimit
+
+    admin = await _admin_headers(client)
+    lim = ratelimit.get_limiter()
+    ip = "127.0.0.1"
+
+    def tokens() -> float:
+        return lim._ips.get(ip).tokens  # noqa: SLF001
+
+    before = tokens()
+    assert (await _register(client, "bob", headers=admin)).status_code == 201
+    spent = before - tokens()
+    assert 0.5 < spent < 1.5, spent  # one, not two (refill is negligible in a test)
+
+    failures = len(lim._ips.get(ip).recent)  # noqa: SLF001
+    body = {"handle": "eve", "display_name": "E", "password": "supersecret"}
+    r = await client.post(
+        f"{API}/register", json={**body, "admin_password": "nope-nope"}, headers=admin
+    )
+    assert r.status_code == 403
+    assert len(lim._ips.get(ip).recent) == failures + 1  # noqa: SLF001
