@@ -727,6 +727,8 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                         *chat.current.borrow_mut() = None;
                         chat.message_rows.borrow_mut().clear();
                         chat.reaction_order.borrow_mut().clear();
+                        chat.pager.borrow_mut().reset();
+                        chat.scroll_anchor.set(None);
                         while let Some(row) = chat.message_list.row_at_index(0) {
                             chat.message_list.remove(&row);
                         }
@@ -1131,6 +1133,9 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
             for message in &messages {
                 append_message(&chat, message);
             }
+            // Drawn from the cache: older pages can be asked for without waiting for the
+            // network (a slow one would otherwise hold paging up).
+            chat.pager.borrow_mut().ready(generation);
         }
         // Then the network, as before (duplicates replace their cached row).
         let handle = chat.runtime.spawn({
@@ -1151,6 +1156,7 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
         if is_current(&chat) {
             render_pending(&chat);
             chat.pager.borrow_mut().ready(generation);
+            fill_view(&chat);
         }
     });
 }
@@ -1162,7 +1168,11 @@ fn load_older(chat: &Rc<Chat>) {
         return;
     };
     let oldest = crate::history::oldest(chat.message_rows.borrow().keys());
-    let Some((generation, before)) = chat.pager.borrow_mut().begin(oldest) else {
+    let Some((generation, before)) = chat
+        .pager
+        .borrow_mut()
+        .begin(oldest, std::time::Instant::now())
+    else {
         return;
     };
     let chat = chat.clone();
@@ -1173,30 +1183,54 @@ fn load_older(chat: &Rc<Chat>) {
             async move { older_page(&client, &channel_id, &before).await }
         });
         let Ok(Ok((messages, vouched))) = page.await else {
-            chat.pager.borrow_mut().failed(generation);
+            chat.pager
+                .borrow_mut()
+                .failed(generation, std::time::Instant::now());
             return;
         };
-        if !chat
-            .pager
-            .borrow_mut()
-            .done(generation, messages.is_empty(), vouched)
+        // The channel may have been left or deleted meanwhile (the generation covers a switch).
+        if chat.current.borrow().as_deref() != Some(channel_id.as_str())
+            || !chat
+                .pager
+                .borrow_mut()
+                .done(generation, messages.is_empty(), vouched)
         {
             return;
         }
-        let adj = chat.message_scroll.vadjustment();
-        chat.scroll_anchor.set(Some((adj.upper(), adj.value())));
-        chat.paging.set(true);
-        for message in &messages {
-            if !chat.message_rows.borrow().contains_key(&message.id) {
+        let fresh = crate::history::fresh(
+            &messages,
+            |m| m.id.as_str(),
+            |id| chat.message_rows.borrow().contains_key(id),
+        );
+        // Only rows that go in move the layout: anchoring for none would leave the anchor set
+        // for some later, unrelated growth.
+        if !fresh.is_empty() {
+            let adj = chat.message_scroll.vadjustment();
+            chat.scroll_anchor.set(Some((adj.upper(), adj.value())));
+            chat.paging.set(true);
+            for message in fresh {
                 append_message(&chat, message);
             }
+            chat.paging.set(false);
         }
-        chat.paging.set(false);
+        fill_view(&chat);
+    });
+}
+
+/// A list that doesn't fill the window can't be scrolled, so no edge signal would ever ask for
+/// older messages: ask for the next page until it does, or the start of the channel is reached.
+fn fill_view(chat: &Rc<Chat>) {
+    let chat = chat.clone();
+    glib::idle_add_local_once(move || {
+        let adj = chat.message_scroll.vadjustment();
+        if adj.upper() <= adj.page_size() {
+            load_older(&chat);
+        }
     });
 }
 
 /// The page before `before`: from the cache when it can vouch for it (loading it into the
-/// cache when it can't), else from the network. `true` when what came back is certain to be
+/// cache first when it can't), else from the network. `true` when what came back is certain to be
 /// all there is before `before` (so an empty page is the start of the channel).
 async fn older_page(
     client: &BrookClient,
@@ -1210,10 +1244,12 @@ async fn older_page(
                 page = again;
             }
         }
-        // The cache answered for this page; one it still can't vouch for, and that is empty,
-        // is left to the network rather than stalling the paging.
-        if !(page.needs_network && page.messages.is_empty()) {
-            return Ok((page.messages, !page.needs_network));
+        // A page the cache vouches for is final. One it can't (and core's `load_older` pages
+        // below its own boundary, not below `before`) may leave a gap above `before`: the
+        // network decides, and if it can't be reached nothing is drawn, so the next attempt
+        // starts from the same message and no row is left stranded past a gap.
+        if !page.needs_network {
+            return Ok((page.messages, true));
         }
     }
     let messages = client.channel_history(channel_id, Some(before)).await?;
@@ -1764,7 +1800,11 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
     // Scroll to bottom after layout settles (not while older rows are added above the view).
     if !chat.paging.get() {
         let adj = chat.message_scroll.vadjustment();
-        glib::idle_add_local_once(move || adj.set_value(adj.upper()));
+        let own = chat.me.borrow().as_deref() == Some(message.author_id.as_str());
+        let at_bottom = crate::history::near_bottom(adj.value(), adj.page_size(), adj.upper());
+        if crate::history::follows_bottom(own, chat.pager.borrow().paged_back(), at_bottom) {
+            glib::idle_add_local_once(move || adj.set_value(adj.upper()));
+        }
     }
 }
 
