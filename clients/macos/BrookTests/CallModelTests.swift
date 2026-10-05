@@ -593,6 +593,7 @@ extension FakeRealtime {
     func loadHead(channelId: String, limit: UInt32) async throws { throw unused }
     func loadOlder(channelId: String, limit: UInt32) async throws { throw unused }
     func markRead(channelId: String, messageId: String?) async throws { throw unused }
+    func noteLocalDataDir(dataDir: String) {}
     func removeMember(channelId: String, userId: String) async throws { throw unused }
     func leaveChannel(channelId: String) async throws { throw unused }
     func sendTyping(channelId: String) async throws { throw unused }
