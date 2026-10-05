@@ -114,7 +114,9 @@ pub fn left_uncertain(err: &Error) -> bool {
     match err {
         Error::Timeout | Error::UnexpectedResponse => true,
         Error::Http(e) => !e.is_connect(),
-        Error::Api { code, .. } => code.starts_with("http_5"),
+        // A bare 5xx from something in front of the server, or the server's own 500: either can
+        // follow a committed insert.
+        Error::Api { code, .. } => code.starts_with("http_5") || code == "internal_error",
         _ => false,
     }
 }
@@ -145,6 +147,25 @@ pub fn error_text(err: &Error, same_handle_uncertain: bool) -> String {
         Error::NotAuthenticated => "You were signed out. Sign in again and retry.".into(),
         // Only a failed connect proves nothing was sent.
         _ => "Couldn't reach the server. The user was not added.".into(),
+    }
+}
+
+/// The handles whose last attempt got no clear answer, one by one: a lost answer for bob says
+/// nothing about alice.
+#[derive(Default)]
+pub struct Uncertain(HashSet<String>);
+
+impl Uncertain {
+    pub fn note(&mut self, handle: &str) {
+        self.0.insert(handle.to_string());
+    }
+
+    pub fn knows(&self, handle: &str) -> bool {
+        self.0.contains(handle)
+    }
+
+    pub fn clear(&mut self, handle: &str) {
+        self.0.remove(handle);
     }
 }
 
@@ -183,9 +204,13 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
     let in_flight = Rc::new(Cell::new(false));
     // Handles whose last attempt got no clear answer (per handle: a lost answer for one says
     // nothing about another).
-    let uncertain: Rc<RefCell<HashSet<String>>> = Rc::default();
+    let uncertain: Rc<RefCell<Uncertain>> = Rc::default();
     // The window the sheet sits over, so the outcome still shows if the sheet is closed mid-request.
-    let origin = parent.upcast_ref::<gtk::Widget>().downgrade();
+    // The window itself (not a widget in it: sign-out removes the chat page and what is in it).
+    let origin = parent.root().map_or_else(
+        || parent.upcast_ref::<gtk::Widget>().downgrade(),
+        |r| r.upcast::<gtk::Widget>().downgrade(),
+    );
     let generate = gtk::Button::builder()
         .icon_name("view-refresh-symbolic")
         .tooltip_text("Generate a password")
@@ -364,22 +389,23 @@ pub fn add_user_dialog(parent: &impl IsA<gtk::Widget>, client: Arc<BrookClient>,
                     password.set_text("");
                     confirm.set_text("");
                     admin.set_text("");
-                    let Some(dialog) = dialog_weak.upgrade() else {
-                        return;
-                    };
-                    let parent = dialog.parent();
-                    dialog.close();
+                    uncertain.borrow_mut().clear(&new_handle);
+                    if let Some(dialog) = dialog_weak.upgrade() {
+                        dialog.close();
+                    }
+                    // Said on the window the sheet sat over, even if the sheet was closed while
+                    // the request was out: the account exists and the admin must be told.
                     let done =
                         adw::AlertDialog::new(Some("User Added"), Some(&added_text(&new_handle)));
                     done.add_response("ok", "OK");
-                    done.present(parent.as_ref());
+                    done.present(origin.upgrade().as_ref());
                 }
                 Err(err) => {
                     tracing::warn!(%err, "adding a user failed");
-                    let same = uncertain.borrow().contains(&new_handle);
+                    let same = uncertain.borrow().knows(&new_handle);
                     let text = error_text(&err, same);
                     if left_uncertain(&err) {
-                        uncertain.borrow_mut().insert(new_handle.clone());
+                        uncertain.borrow_mut().note(&new_handle);
                     }
                     // The sheet may be gone (closed mid-request): then the outcome is shown on
                     // the window it sat over instead.
@@ -568,6 +594,34 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_answer_for_one_handle_does_not_colour_another() {
+        let taken = Error::Api {
+            code: "conflict".into(),
+            message: String::new(),
+        };
+        let mut uncertain = Uncertain::default();
+        // A timeout on bob...
+        assert!(left_uncertain(&Error::Timeout));
+        uncertain.note("bob");
+        // ...then "taken" for alice is just taken; for bob it probably went through.
+        assert!(error_text(&taken, uncertain.knows("alice")).contains("case-sensitive"));
+        assert!(error_text(&taken, uncertain.knows("bob")).contains("probably created it"));
+        // A success for bob forgets it.
+        uncertain.clear("bob");
+        assert!(!uncertain.knows("bob"));
+    }
+
+    #[test]
+    fn a_server_error_may_have_followed_the_insert() {
+        let api = |code: &str| Error::Api {
+            code: code.into(),
+            message: String::new(),
+        };
+        assert!(left_uncertain(&api("internal_error")));
+        assert_eq!(error_text(&api("internal_error"), false), UNCERTAIN);
+    }
+
+    #[test]
     fn a_bare_gateway_failure_may_have_created_the_account() {
         let api = |code: &str| Error::Api {
             code: code.into(),
@@ -599,6 +653,7 @@ mod tests {
             api("auth.rate_limited"),
             api("validation"),
             api("http_504"),
+            api("internal_error"),
             api("something.new"),
         ] {
             assert_eq!(

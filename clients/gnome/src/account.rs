@@ -196,6 +196,15 @@ pub fn change_password_dialog(
     }
 
     close_on_logout(&dialog, &client);
+    // What was typed is wiped when the dialog goes away, whether it was used or not.
+    dialog.connect_closed({
+        let (current, new, confirm) = (current.clone(), new.clone(), confirm.clone());
+        move |_| {
+            current.set_text("");
+            new.set_text("");
+            confirm.set_text("");
+        }
+    });
     let dialog_weak = dialog.downgrade();
     change.connect_clicked(move |button| {
         if check(&current.text(), &new.text(), &confirm.text()).is_err() {
