@@ -129,10 +129,10 @@ pub struct BrookClient {
     /// the per-user data: a loss can be found before that exists, and its numbers must
     /// never restart.
     pub(crate) losses: Arc<std::sync::Mutex<crate::offline::Losses>>,
-    /// Where `enable_local_data` put the stores (`<data_dir>/stores`), kept even when they
-    /// could not be opened: "Remove this device's data" must tell "nothing is stored here"
+    /// Every place `enable_local_data` or `note_local_data_dir` was pointed at
+    /// (`<data_dir>/stores`), kept even when they could not be opened: "Remove this device's data" must tell "nothing is stored here"
     /// from "something is stored that this session never opened" (client_offline.rs).
-    pub(crate) local_root: std::sync::Mutex<Option<std::path::PathBuf>>,
+    pub(crate) local_roots: std::sync::Mutex<Vec<std::path::PathBuf>>,
 }
 
 impl Drop for BrookClient {
@@ -181,7 +181,7 @@ impl BrookClient {
             cache_events: broadcast::channel(512).0,
             cache_state: watch::channel(crate::cache::CacheState::default()).0,
             losses: Arc::default(),
-            local_root: std::sync::Mutex::new(None),
+            local_roots: std::sync::Mutex::new(Vec::new()),
         })
     }
 
