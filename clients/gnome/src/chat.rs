@@ -4480,15 +4480,25 @@ fn wipe_other_accounts(chat: &Rc<Chat>) {
             let client = chat.client.clone();
             async move { client.wipe_other_local_users().await }
         });
-        if let Ok(Ok(())) = wipe.await {
-            let unsent: Vec<Option<u64>> = others.iter().map(|o| o.unsent).collect();
-            let alert = adw::AlertDialog::new(
-                Some("Saved Data Removed"),
-                Some(&others_removed_text(&unsent)),
-            );
-            alert.add_response("ok", "OK");
-            alert.present(Some(&chat.message_list));
-        }
+        let alert = match wipe.await {
+            Ok(Ok(())) => {
+                let unsent: Vec<Option<u64>> = others.iter().map(|o| o.unsent).collect();
+                adw::AlertDialog::new(
+                    Some("Saved Data Removed"),
+                    Some(&others_removed_text(&unsent)),
+                )
+            }
+            // Said, not swallowed (#249): the next start tries again.
+            _ => adw::AlertDialog::new(
+                Some("Saved Data Not Removed"),
+                Some(
+                    "Another account's saved messages couldn't be removed from this device. \
+                     Brook tries again the next time it starts.",
+                ),
+            ),
+        };
+        alert.add_response("ok", "OK");
+        alert.present(Some(&chat.message_list));
     });
 }
 
@@ -4589,7 +4599,14 @@ fn lost_device_help(admin: bool) -> String {
 /// `known`: this user's stores answered a cached call, so `unsent` is a real count (it's 0
 /// while they're closed, which isn't the same as none).
 fn sign_out_body(unsent: u64, known: bool, remove: bool) -> String {
-    let mut text = if remove {
+    let mut text = if remove && !known {
+        // Nothing of this device's saved data is open this session, so a removal can't be
+        // promised (#249).
+        String::from(
+            "Brook can't open this device's saved data right now (is your keyring locked?), so \
+             it may not be removed.",
+        )
+    } else if remove {
         String::from("Saved messages and files are removed from this device.")
     } else {
         String::from("Saved messages stay on this device for your next sign-in.")
@@ -4738,6 +4755,9 @@ mod offline_tests {
         );
         // Stores not known to be open: a 0 isn't "none".
         assert!(sign_out_body(0, false, true).contains("may be deleted"));
+        // Data that is not open can't be promised removed.
+        assert!(sign_out_body(0, false, true).contains("may not be removed"));
+        assert!(!sign_out_body(0, false, true).contains("are removed from this device"));
         assert!(!sign_out_body(0, false, false).contains("deleted"));
     }
 
