@@ -231,7 +231,7 @@ Messages are tagged envelopes:
   [SECURITY.md](SECURITY.md) §7 fires). **Authorization = channel membership**,
   checked by `api` on every call command; a member removed from the channel is
   removed from its call (`call.ended {reason: "removed"}`). One user may join the
-  same call from several devices; each device is its own participant, and one socket holds at most one participant per call. An archived channel is read-only: `call.join` gets `bad_state`.
+  same call from several devices; each device is its own participant, and one socket holds at most one participant per call. An archived channel is read-only for talking, not for managing: sending a message answers `403 authz.forbidden` ("This channel is archived"), `call.join` gets `bad_state`, and it can no longer be self-joined; but an owner or admin can still rename it, un-archive it (`PATCH {archived: false}`), add members to it or delete it.
 - **Two PeerConnections per participant**, both terminated by the SFU:
   - **publish** — `sendonly`: the participant's mic, camera, and later screen.
     The **client offers**, the server answers. The client may **renegotiate** the
