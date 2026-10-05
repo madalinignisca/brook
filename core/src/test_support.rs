@@ -81,6 +81,12 @@ pub enum RegisterMode {
     WrongAdmin,
     /// 422 whose body echoes the submitted passwords, as FastAPI's validation errors do.
     Echo422,
+    /// 422 `profile.invalid` (invisible characters in the display name), its message echoing a password.
+    ProfileInvalid,
+    /// 422 `validation.error` (a malformed body), its message echoing a password.
+    ValidationError,
+    /// 422 whose code is not a plain identifier.
+    OddCode,
     /// 429 `auth.rate_limited`.
     RateLimited,
     /// 201 whose body is not a user (`{}`).
@@ -678,6 +684,17 @@ async fn register(
                 "input": body["password"], "ctx": { "admin": body["admin_password"] } }] })),
         )
             .into_response(),
+        RegisterMode::ProfileInvalid => error(
+            422,
+            "profile.invalid",
+            &format!("bad name, password {}", body["password"]),
+        ),
+        RegisterMode::ValidationError => error(
+            422,
+            "validation.error",
+            &format!("bad body, admin {}", body["admin_password"]),
+        ),
+        RegisterMode::OddCode => error(422, "Not A Code! <b>", "x"),
         RegisterMode::RateLimited => {
             let mut r = error(429, "auth.rate_limited", "slow down");
             r.headers_mut().insert("retry-after", "30".parse().unwrap());

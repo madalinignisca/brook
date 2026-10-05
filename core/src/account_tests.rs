@@ -877,6 +877,12 @@ async fn create_user_errors_keep_their_stable_codes() {
         (RegisterMode::WrongAdmin, "auth.invalid_credentials"),
         (RegisterMode::RateLimited, "auth.rate_limited"),
         (RegisterMode::Echo422, "validation"),
+        // The server's own 422 code is kept so a client can word them apart; the message is
+        // fixed (the echoing server messages never reach it).
+        (RegisterMode::ProfileInvalid, "profile.invalid"),
+        (RegisterMode::ValidationError, "validation.error"),
+        // A code that is not a short identifier is not passed on.
+        (RegisterMode::OddCode, "validation"),
     ] {
         server.set_register_mode(mode);
         let err = admin
@@ -887,6 +893,15 @@ async fn create_user_errors_keep_their_stable_codes() {
             matches!(&err, Error::Api { code: c, .. } if c == code),
             "{mode:?}: {err:?}"
         );
+        if code.starts_with("validation") || code == "profile.invalid" {
+            let Error::Api { message, .. } = &err else {
+                unreachable!()
+            };
+            assert_eq!(
+                message, "the handle, display name or password was refused",
+                "{mode:?}"
+            );
+        }
         secret_free(&err, &[NEW_PW, ADMIN_PW]);
     }
 }
