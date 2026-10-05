@@ -163,8 +163,50 @@ struct MessageWidgets {
     author_fallback: String,
     /// Hidden once the message is a tombstone: actions, quote, files, reactions.
     extras: Vec<gtk::Widget>,
-    /// The quoted message's id, its author and the quote line, if this is a reply.
-    quote: Option<(String, String, gtk::Label)>,
+    /// The quoted message and the quote line, if this is a reply.
+    quote: Option<QuoteView>,
+}
+
+/// A reply's quote line and what it is drawn from, so it can be drawn again when "Show
+/// usernames" changes or its target is deleted.
+#[derive(Clone)]
+struct QuoteView {
+    id: String,
+    author_name: String,
+    author_handle: String,
+    body: String,
+    files: u32,
+    deleted: Rc<Cell<bool>>,
+    label: gtk::Label,
+}
+
+impl QuoteView {
+    fn line(&self, show_usernames: bool) -> String {
+        quote_line(
+            (&self.author_name, &self.author_handle),
+            (&self.body, self.files, self.deleted.get()),
+            show_usernames,
+        )
+    }
+}
+
+/// A search result's line: the channel, the author named by the preference, and the text.
+fn search_line(channel: &str, (name, handle): (&str, &str), body: &str, show: bool) -> String {
+    format!("{channel} · {}: {body}", author_text(name, handle, show))
+}
+
+/// The quote line above a reply: its author named by the preference, then the excerpt.
+fn quote_line(
+    (name, handle): (&str, &str),
+    (body, files, deleted): (&str, u32, bool),
+    show_usernames: bool,
+) -> String {
+    quote_text(
+        &author_text(name, handle, show_usernames),
+        body,
+        deleted,
+        files,
+    )
 }
 
 /// Build the chat view. `is_admin` controls whether channel creation is offered.
@@ -707,7 +749,16 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     let me = chat.me.borrow().clone().unwrap_or_default();
                     let is_current = chat.current.borrow().as_deref() == Some(channel_id.as_str());
                     if is_current && user_id != me {
-                        show_typing(&chat, &user_id, &display_name);
+                        // The event carries no handle: take it from a message on screen.
+                        let handle = chat
+                            .message_rows
+                            .borrow()
+                            .values()
+                            .find(|w| w.author_id == user_id)
+                            .map(|w| w.author_handle.clone())
+                            .unwrap_or_default();
+                        let name = author_text(&display_name, &handle, chat.show_usernames.get());
+                        show_typing(&chat, &user_id, &name);
                     }
                 }
                 Ok(ServerEvent::ChannelUpdate(_)) => {
@@ -1545,25 +1596,24 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
     // Quoted-reply preview above the body, if this message is a reply.
     let mut quote_widgets = None;
     if let Some(reply) = &message.reply_to {
-        let who = reply
-            .author_display_name
-            .clone()
-            .or_else(|| reply.author_handle.clone())
-            .unwrap_or_else(|| "Unknown".to_string());
         let quote = gtk::Label::builder()
-            .label(quote_text(
-                &who,
-                &reply.body,
-                reply.deleted,
-                reply.attachments,
-            ))
             .xalign(0.0)
             .wrap(true)
             .css_classes(["caption", "dim-label"])
             .build();
+        let view = QuoteView {
+            id: reply.id.clone(),
+            author_name: reply.author_display_name.clone().unwrap_or_default(),
+            author_handle: reply.author_handle.clone().unwrap_or_default(),
+            body: reply.body.clone(),
+            files: reply.attachments,
+            deleted: Rc::new(Cell::new(reply.deleted)),
+            label: quote.clone(),
+        };
+        quote.set_label(&view.line(chat.show_usernames.get()));
         row.append(&quote);
-        extras.push(quote.clone().upcast());
-        quote_widgets = Some((reply.id.clone(), who, quote));
+        extras.push(quote.upcast());
+        quote_widgets = Some(view);
     }
     // A file sent without a caption has no text line (the server allows an empty body
     // when files are attached).
@@ -1876,14 +1926,15 @@ fn message_actions_button(chat: &Rc<Chat>, message: &Message, is_own: bool) -> g
         let chat = chat.clone();
         let popover = popover.clone();
         let message_id = message.id.clone();
-        let label = message
-            .author_display_name
-            .clone()
-            .or_else(|| message.author_handle.clone())
-            .unwrap_or_else(|| "message".to_string());
+        let (name, handle) = (
+            message.author_display_name.clone().unwrap_or_default(),
+            message.author_handle.clone().unwrap_or_default(),
+        );
         move |_| {
             popover.popdown();
-            set_reply(&chat, Some((message_id.clone(), label.clone())));
+            // Named by the preference as it is now, not as it was when the row was drawn.
+            let label = author_text(&name, &handle, chat.show_usernames.get());
+            set_reply(&chat, Some((message_id.clone(), label)));
         }
     });
 
@@ -3758,13 +3809,16 @@ fn run_search(
                 .find(|c| c.id == message.channel_id)
                 .map(|c| c.title(&me))
                 .unwrap_or_else(|| "channel".to_string());
-            let author = message
-                .author_display_name
-                .clone()
-                .or_else(|| message.author_handle.clone())
-                .unwrap_or_else(|| "?".to_string());
             let button = gtk::Button::builder()
-                .label(format!("{channel_name} · {author}: {}", message.body))
+                .label(search_line(
+                    &channel_name,
+                    (
+                        message.author_display_name.as_deref().unwrap_or_default(),
+                        message.author_handle.as_deref().unwrap_or_default(),
+                    ),
+                    &message.body,
+                    chat.show_usernames.get(),
+                ))
                 .has_frame(false)
                 .build();
             if let Some(label) = button.child().and_downcast::<gtk::Label>() {
@@ -4171,6 +4225,11 @@ fn relabel_authors(chat: &Rc<Chat>) {
             &widgets.author_handle,
             chat.show_usernames.get(),
         ));
+        if let Some(quote) = &widgets.quote {
+            quote
+                .label
+                .set_label(&quote.line(chat.show_usernames.get()));
+        }
     }
 }
 
@@ -4940,9 +4999,19 @@ fn show_deleted(widgets: &MessageWidgets) {
 /// gets `message.delete`; the next history or sync read carries the server's flag).
 fn mark_quotes_deleted(chat: &Rc<Chat>, target: &str) {
     for widgets in chat.message_rows.borrow().values() {
-        if let Some((id, who, label)) = &widgets.quote {
-            if id == target {
-                label.set_label(&quote_text(who, "", true, 0));
+        if let Some(quote) = &widgets.quote {
+            if quote.id == target {
+                quote.deleted.set(true);
+                quote.label.set_label(&quote_text(
+                    &author_text(
+                        &quote.author_name,
+                        &quote.author_handle,
+                        chat.show_usernames.get(),
+                    ),
+                    "",
+                    true,
+                    0,
+                ));
             }
         }
     }
@@ -5651,5 +5720,42 @@ mod offline_banner_tests {
         assert_eq!(b.on_state(true, false), BannerAction::Start(1));
         b.stop();
         assert!(!b.on_fire(1));
+    }
+}
+
+#[cfg(test)]
+mod name_surface_tests {
+    use super::{quote_line, search_line};
+
+    #[test]
+    fn a_quote_names_its_author_by_the_preference() {
+        let quote = |show| quote_line(("Ann Lee", "ann"), ("hello", 0, false), show);
+        assert_eq!(quote(false), "\u{21b3} Ann Lee: hello");
+        assert_eq!(quote(true), "\u{21b3} @ann: hello");
+        // A tombstone keeps the name rule too.
+        assert_eq!(
+            quote_line(("Ann Lee", "ann"), ("hello", 0, true), true),
+            "\u{21b3} @ann: a deleted message"
+        );
+    }
+
+    #[test]
+    fn a_quote_with_no_name_falls_back_to_the_handle() {
+        assert_eq!(
+            quote_line(("", "ann"), ("hi", 0, false), false),
+            "\u{21b3} @ann: hi"
+        );
+    }
+
+    #[test]
+    fn a_search_result_names_its_author_by_the_preference() {
+        assert_eq!(
+            search_line("#general", ("Ann Lee", "ann"), "found it", false),
+            "#general · Ann Lee: found it"
+        );
+        assert_eq!(
+            search_line("#general", ("Ann Lee", "ann"), "found it", true),
+            "#general · @ann: found it"
+        );
     }
 }
