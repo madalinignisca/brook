@@ -11,7 +11,7 @@
 //! temporary sibling, which a Flatpak's document portal wouldn't allow); a failed or
 //! cancelled save leaves nothing behind.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -21,6 +21,8 @@ use adw::prelude::*;
 use brook_core::{BrookClient, FileCacheState, FileInfo, FileSink, TransferId, TransferState};
 use gtk::{gdk, gio, glib};
 use tokio::runtime::Handle;
+
+use crate::preview_gate::Gate;
 
 /// An icon for the declared type. Only cosmetic: the type is the uploader's claim.
 pub fn icon_for(content_type: &str) -> &'static str {
@@ -455,10 +457,13 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
             });
         });
     });
-    // An inline preview under a declared image (previews spec §1, §3).
+    // An inline preview under a declared image (previews spec §1, §3), by "Show image
+    // previews" (#259): off unless the user turned it on, then only the "Show preview" button.
     if !previewable_type(&p_file.content_type) || p_file.size > brook_core::PREVIEW_MAX_BYTES {
         return row.upcast();
     }
+    // Only an image row needs to know whether glycin can decode here (once per run).
+    ensure_probe(&p_runtime);
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -492,14 +497,22 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
         }
     });
     picture.add_controller(click);
+    // What this row's preview is asked for through: the setting turning off cancels it, and every
+    // step (the queued job, the fetch, the decode, the draw) checks it (see preview_gate.rs).
+    let gate: Rc<Gate> = Rc::default();
     let start: Rc<dyn Fn()> = Rc::new({
         let (client, runtime, file_id) = (p_client.clone(), p_runtime.clone(), p_file.id.clone());
         let (picture, show) = (picture.downgrade(), show.downgrade());
+        let gate = gate.clone();
         move || {
+            // One preview per ask: a click and the setting turning on don't fetch twice.
+            let Some(token) = gate.begin() else {
+                return;
+            };
             if let Some(show) = show.upgrade() {
                 show.set_visible(false);
             }
-            let alive = picture.clone();
+            let (alive, queued) = (picture.clone(), token.clone());
             let (client, runtime, file_id, picture) = (
                 client.clone(),
                 runtime.clone(),
@@ -508,21 +521,32 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
             );
             crate::preview::QUEUE.with(|q| {
                 q.push(crate::preview::Job {
-                    alive: Box::new(move || alive.upgrade().is_some()),
+                    alive: Box::new(move || alive.upgrade().is_some() && queued.is_current()),
                     run: Box::new(move |done| {
+                        let (fetching, drawing) = (token.clone(), token);
                         let decoded = runtime.spawn(async move {
+                            // A job admitted just before the setting went off: no fetch at all.
+                            if !fetching.is_current() {
+                                return None;
+                            }
                             let bytes = client
                                 .preview_file(TransferId::new(), &file_id)
                                 .await
                                 .ok()?
                                 .bytes;
+                            // Turned off while it was being fetched: no decode.
+                            if !fetching.is_current() {
+                                return None;
+                            }
                             crate::preview::decode(bytes).await
                         });
                         glib::spawn_future_local(async move {
                             if let (Ok(Some(px)), Some(picture)) =
                                 (decoded.await, picture.upgrade())
                             {
-                                show_pixels(&picture, px);
+                                if drawing.is_current() {
+                                    show_pixels(&picture, px);
+                                }
                             }
                             done();
                         });
@@ -535,34 +559,206 @@ pub fn attachment_row(file: &FileInfo, client: Arc<BrookClient>, runtime: Handle
         let start = start.clone();
         move |_| start()
     });
-    // Small ones by themselves, unless the connection is metered and it isn't cached yet.
-    if p_file.size <= crate::preview::AUTO_MAX_BYTES {
-        let metered = gio::NetworkMonitor::default().is_network_metered();
-        if !metered {
-            start();
-        } else {
-            let cached = p_runtime.spawn({
-                let (client, file_id) = (p_client.clone(), p_file.id.clone());
-                async move { client.file_state(&file_id).await }
-            });
-            let (start, show) = (start.clone(), show.downgrade());
-            glib::spawn_future_local(async move {
-                match cached.await {
-                    Ok(Ok(
-                        FileCacheState::Cached | FileCacheState::Pinned { cached: true, .. },
-                    )) => start(),
-                    _ => {
-                        if let Some(show) = show.upgrade() {
-                            show.set_visible(true);
-                        }
-                    }
+    // What the row shows follows the setting, now and whenever it changes (and when the probe
+    // answers).
+    let apply: Rc<dyn Fn()> = Rc::new({
+        let (picture, show, start) = (picture.downgrade(), show.downgrade(), start.clone());
+        let (content_type, size) = (p_file.content_type.clone(), p_file.size);
+        let gate = gate.clone();
+        let (client, runtime, file_id) = (p_client.clone(), p_runtime.clone(), p_file.id.clone());
+        move || {
+            let (Some(picture), Some(show)) = (picture.upgrade(), show.upgrade()) else {
+                return;
+            };
+            match row_plan(&content_type, size) {
+                PreviewPlan::Plain => {
+                    gate.cancel();
+                    clear_picture(&picture);
+                    show.set_visible(false);
                 }
-            });
+                // With the setting off, whatever was asked for goes (drawn, queued, fetching);
+                // with it on (a larger image, which keeps its button), a preview the user asked
+                // for stays.
+                PreviewPlan::Button => {
+                    if !show_image_previews() {
+                        gate.cancel();
+                        clear_picture(&picture);
+                    }
+                    show.set_visible(!gate.is_asked());
+                }
+                PreviewPlan::Auto => {
+                    if gate.is_asked() {
+                        return; // drawn, or on its way
+                    }
+                    // Unless the connection is metered and it isn't cached yet.
+                    if !gio::NetworkMonitor::default().is_network_metered() {
+                        start();
+                        return;
+                    }
+                    // Taken before the lookup: turned off meanwhile, nothing starts.
+                    let wanted = gate.token();
+                    let cached = runtime.spawn({
+                        let (client, file_id) = (client.clone(), file_id.clone());
+                        async move { client.file_state(&file_id).await }
+                    });
+                    let (start, show, gate) = (start.clone(), show.downgrade(), gate.clone());
+                    glib::spawn_future_local(async move {
+                        let result = cached.await;
+                        if !wanted.is_current() {
+                            return;
+                        }
+                        match result {
+                            Ok(Ok(
+                                FileCacheState::Cached
+                                | FileCacheState::Pinned { cached: true, .. },
+                            )) => start(),
+                            _ => {
+                                if let Some(show) = show.upgrade() {
+                                    show.set_visible(!gate.is_asked());
+                                }
+                            }
+                        }
+                    });
+                }
+            }
         }
-    } else {
-        show.set_visible(true);
-    }
+    });
+    apply();
+    register_listener(&apply);
+    // The row keeps its own listener alive: it lives as long as the row's button does.
+    show.connect_destroy({
+        let keep = apply.clone();
+        move |_| drop(keep.clone())
+    });
     outer.upcast()
+}
+
+/// What an attachment row shows for a declared image.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PreviewPlan {
+    /// Nothing to preview (not an image, too large to try, or glycin can't decode here).
+    Plain,
+    /// The plain row with a "Show preview" button: nothing is fetched until it is clicked.
+    Button,
+    /// Preview by itself.
+    Auto,
+}
+
+/// Whether a small declared image previews by itself: only with "Show image previews" on.
+pub fn should_auto_preview(setting: bool, size: u64, content_type: &str) -> bool {
+    setting && previewable_type(content_type) && size <= crate::preview::AUTO_MAX_BYTES
+}
+
+/// The plan for one attachment: the one decision every surface that draws an attachment shares.
+pub fn preview_plan(
+    setting: bool,
+    content_type: &str,
+    size: u64,
+    availability: crate::preview::Availability,
+) -> PreviewPlan {
+    if !previewable_type(content_type)
+        || size > brook_core::PREVIEW_MAX_BYTES
+        || availability != crate::preview::Availability::Yes
+    {
+        PreviewPlan::Plain
+    } else if should_auto_preview(setting, size, content_type) {
+        PreviewPlan::Auto
+    } else {
+        PreviewPlan::Button
+    }
+}
+
+/// The plan for a row now: the one thing a row's `apply` calls, so a row that ignored the
+/// setting or the probe would fail a test of this.
+fn row_plan(content_type: &str, size: u64) -> PreviewPlan {
+    preview_plan(
+        show_image_previews(),
+        content_type,
+        size,
+        crate::preview::availability(),
+    )
+}
+
+fn clear_picture(picture: &gtk::Picture) {
+    picture.set_visible(false);
+    picture.set_paintable(None::<&gdk::Paintable>);
+}
+
+thread_local! {
+    static SETTING: Cell<Option<bool>> = const { Cell::new(None) };
+    static LISTENERS: RefCell<Vec<Weak<dyn Fn()>>> = const { RefCell::new(Vec::new()) };
+    static PROBING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// "Show image previews", read once and kept (changed through [`set_show_image_previews`]).
+pub fn show_image_previews() -> bool {
+    SETTING.with(|s| match s.get() {
+        Some(v) => v,
+        None => {
+            let v = crate::prefs::show_image_previews();
+            s.set(Some(v));
+            v
+        }
+    })
+}
+
+/// Change the setting: saved, and every attachment row on screen follows at once.
+pub fn set_show_image_previews(on: bool) {
+    SETTING.with(|s| s.set(Some(on)));
+    crate::prefs::save_show_image_previews(on);
+    notify_listeners();
+}
+
+fn register_listener(apply: &Rc<dyn Fn()>) {
+    LISTENERS.with(|l| {
+        let mut l = l.borrow_mut();
+        l.retain(|w| w.upgrade().is_some());
+        l.push(Rc::downgrade(apply));
+    });
+}
+
+fn notify_listeners() {
+    let live: Vec<Rc<dyn Fn()>> = LISTENERS.with(|l| {
+        let mut l = l.borrow_mut();
+        l.retain(|w| w.upgrade().is_some());
+        l.iter().filter_map(Weak::upgrade).collect()
+    });
+    for apply in live {
+        apply();
+    }
+}
+
+/// Learn once whether glycin can decode here, by decoding the 1x1 PNG Brook ships in the
+/// sandbox. Rows drawn before it answers are plain; a "yes" gives them their button or preview.
+fn ensure_probe(runtime: &Handle) {
+    if PROBING.with(|p| p.replace(true)) {
+        return;
+    }
+    // A slow first start of the sandbox can time out once: only a second failure says no.
+    let probe = runtime.spawn(async {
+        for attempt in 0..2 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            if crate::preview::decode(crate::preview::PROBE_PNG.to_vec())
+                .await
+                .is_some()
+            {
+                return true;
+            }
+        }
+        false
+    });
+    glib::spawn_future_local(async move {
+        let ok = probe.await.unwrap_or(false);
+        crate::preview::set_availability(if ok {
+            crate::preview::Availability::Yes
+        } else {
+            crate::preview::Availability::No
+        });
+        // Rows drawn before the answer are plain until it says yes, then get their plan.
+        notify_listeners();
+    });
 }
 
 /// A declared image type a preview may be tried for (the sniff in core still decides).
@@ -841,5 +1037,105 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+}
+
+#[cfg(test)]
+mod preview_setting_tests {
+    use super::{preview_plan, should_auto_preview, PreviewPlan};
+    use crate::preview::Availability::{No, Unknown, Yes};
+
+    const SMALL: u64 = 100 * 1024;
+    const LARGE: u64 = 5 * 1024 * 1024; // over what previews by themselves, under the cap
+
+    #[test]
+    fn with_the_setting_off_nothing_previews_by_itself() {
+        assert!(!should_auto_preview(false, SMALL, "image/png"));
+        assert_eq!(
+            preview_plan(false, "image/png", SMALL, Yes),
+            PreviewPlan::Button
+        );
+    }
+
+    #[test]
+    fn with_it_on_a_small_image_previews_and_a_large_one_gets_the_button() {
+        assert!(should_auto_preview(true, SMALL, "image/jpeg"));
+        assert_eq!(
+            preview_plan(true, "image/jpeg", SMALL, Yes),
+            PreviewPlan::Auto
+        );
+        assert_eq!(
+            preview_plan(true, "image/jpeg", LARGE, Yes),
+            PreviewPlan::Button
+        );
+    }
+
+    #[test]
+    fn turning_the_setting_changes_the_plan() {
+        // The test a surface that ignores the setting would fail.
+        assert_ne!(
+            preview_plan(true, "image/png", SMALL, Yes),
+            preview_plan(false, "image/png", SMALL, Yes)
+        );
+    }
+
+    #[test]
+    fn what_is_not_a_previewable_image_is_never_offered_a_preview() {
+        for setting in [true, false] {
+            assert_eq!(
+                preview_plan(setting, "application/pdf", SMALL, Yes),
+                PreviewPlan::Plain
+            );
+            assert_eq!(
+                preview_plan(setting, "image/svg+xml", SMALL, Yes),
+                PreviewPlan::Plain
+            );
+        }
+        assert!(!should_auto_preview(true, SMALL, "application/pdf"));
+    }
+
+    #[test]
+    fn an_image_over_the_cap_is_plain_whatever_the_setting() {
+        let over = brook_core::PREVIEW_MAX_BYTES + 1;
+        assert_eq!(
+            preview_plan(true, "image/png", over, Yes),
+            PreviewPlan::Plain
+        );
+        assert_eq!(
+            preview_plan(false, "image/png", over, Yes),
+            PreviewPlan::Plain
+        );
+    }
+
+    #[test]
+    fn no_button_where_glycin_cannot_decode() {
+        for setting in [true, false] {
+            assert_eq!(
+                preview_plan(setting, "image/png", SMALL, No),
+                PreviewPlan::Plain
+            );
+        }
+        // Until the probe has answered, no button: it is offered only where it can work.
+        for setting in [true, false] {
+            assert_eq!(
+                preview_plan(setting, "image/png", SMALL, Unknown),
+                PreviewPlan::Plain
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_follows_the_setting_and_the_probe() {
+        use super::{row_plan, SETTING};
+        crate::preview::set_availability(Yes);
+        SETTING.with(|s| s.set(Some(false)));
+        assert_eq!(row_plan("image/png", SMALL), PreviewPlan::Button);
+        SETTING.with(|s| s.set(Some(true)));
+        assert_eq!(row_plan("image/png", SMALL), PreviewPlan::Auto);
+        crate::preview::set_availability(No);
+        assert_eq!(row_plan("image/png", SMALL), PreviewPlan::Plain);
+        crate::preview::set_availability(Unknown);
+        assert_eq!(row_plan("image/png", SMALL), PreviewPlan::Plain);
+        SETTING.with(|s| s.set(None));
     }
 }
