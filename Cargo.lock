@@ -437,6 +437,7 @@ dependencies = [
  "oo7",
  "pulldown-cmark",
  "qrcode",
+ "reqwest",
  "rqrr",
  "serde_json",
  "tempfile",

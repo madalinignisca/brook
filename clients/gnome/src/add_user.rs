@@ -144,18 +144,31 @@ pub fn error_text(err: &Error, same_handle_uncertain: bool) -> String {
             "conflict" => "That handle is taken. Handles are case-sensitive, and a disabled \
                            account keeps its handle."
                 .into(),
-            "authz.forbidden" => "Not allowed: your account may no longer be an admin, or your \
-                                  sign-in expired. Try again."
-                .into(),
+            // With a rejected token answered 401 (core refreshes and retries), a 403 only means the
+            // account is not an admin.
+            "authz.forbidden" => "Not allowed: your account is not an admin.".into(),
             "auth.invalid_credentials" => "Your own password is wrong.".into(),
             "auth.rate_limited" => "Too many attempts. Try again later.".into(),
-            "validation" | "validation.error" => "The server refused these details.".into(),
+            // The form checks every limit, so the 422 an admin actually meets is a display name the
+            // server refuses (invisible or control characters).
+            "validation" | "validation.error" | "profile.invalid" => "The server refused the \
+                                                                     display name or the other \
+                                                                     details. Check the name for \
+                                                                     invisible or unusual \
+                                                                     characters."
+                .into(),
             _ => "The server refused to add the user.".into(),
         },
         Error::NotAuthenticated => "You were signed out. Sign in again and retry.".into(),
         // Only a failed connect proves nothing was sent.
         _ => "Couldn't reach the server. The user was not added.".into(),
     }
+}
+
+/// Whether the generated password is still what the field holds (exactly), so that showing it
+/// is still right.
+pub fn still_shown(generated: &str, field: &str) -> bool {
+    !generated.is_empty() && generated == field
 }
 
 /// The handles whose last attempt got no clear answer, one by one: a lost answer for bob says
@@ -175,6 +188,11 @@ impl Uncertain {
     pub fn clear(&mut self, handle: &str) {
         self.0.remove(handle);
     }
+}
+
+/// The admin's own password was refused: the field is emptied so a typo is not resent as it is.
+pub fn is_wrong_admin_password(err: &Error) -> bool {
+    matches!(err, Error::Api { code, .. } if code == "auth.invalid_credentials")
 }
 
 /// What the request carries, built from the form as it was checked: the display name trimmed,
@@ -335,11 +353,15 @@ pub fn add_user_dialog(
     }
     // A generated password fills both fields, so the admin can read it (the eye on the row) and
     // pass it on.
+    // The generated password as shown: the label stays only while the field holds exactly it.
+    let generated_value: Rc<RefCell<String>> = Rc::default();
     generate.connect_clicked({
         let (password, confirm) = (password.clone(), confirm.clone());
-        let generated_label = generated_label.clone();
+        let (generated_label, generated_value) = (generated_label.clone(), generated_value.clone());
         move |_| {
             let mut generated = generate_password();
+            // Remembered before the fields change, so their change handlers see it.
+            *generated_value.borrow_mut() = generated.clone();
             password.set_text(&generated);
             confirm.set_text(&generated);
             // Shown until the sheet is used or closed, so it can be copied and handed on.
@@ -348,15 +370,21 @@ pub fn add_user_dialog(
             generated.zeroize();
         }
     });
-    // Typing a password of one's own replaces the generated one: it is not shown any more.
+    // Any edit that makes the field differ from the generated password takes the label away and
+    // empties Confirm (which still holds the generated one).
     password.connect_changed({
-        let generated_label = generated_label.clone();
+        let (generated_label, generated_value, confirm) = (
+            generated_label.clone(),
+            generated_value.clone(),
+            confirm.clone(),
+        );
         move |row| {
-            let shown = generated_label.text();
-            let typed = row.text();
-            if generated_label.is_visible() && !shown.ends_with(typed.as_str()) {
+            if generated_label.is_visible() && !still_shown(&generated_value.borrow(), &row.text())
+            {
                 generated_label.set_visible(false);
                 generated_label.set_text("");
+                generated_value.borrow_mut().zeroize();
+                confirm.set_text("");
             }
         }
     });
@@ -472,6 +500,9 @@ pub fn add_user_dialog(
                     }
                     // The sheet may be gone (closed mid-request): then the outcome is shown on
                     // the window it sat over instead.
+                    if is_wrong_admin_password(&err) {
+                        admin.set_text("");
+                    }
                     if !closed.get() {
                         error.set_text(&text);
                         error.set_visible(true);
@@ -618,10 +649,10 @@ mod tests {
             message: String::new(),
         };
         assert!(error_text(&api("conflict"), false).contains("is taken"));
-        assert!(error_text(&api("authz.forbidden"), false).contains("sign-in expired"));
+        assert!(error_text(&api("authz.forbidden"), false).contains("not an admin"));
         assert!(error_text(&api("auth.rate_limited"), false).contains("Too many"));
-        assert!(error_text(&api("validation"), false).contains("refused these details"));
-        assert!(error_text(&api("validation.error"), false).contains("refused these details"));
+        assert!(error_text(&api("validation"), false).contains("display name"));
+        assert!(error_text(&api("validation.error"), false).contains("display name"));
         assert_eq!(
             error_text(&api("auth.invalid_credentials"), false),
             "Your own password is wrong."
@@ -763,5 +794,100 @@ mod tests {
         assert!(!left_uncertain(&Error::NotAuthenticated));
         assert!(!left_uncertain(&api("conflict")));
         assert!(!left_uncertain(&api("auth.invalid_credentials")));
+    }
+
+    #[test]
+    fn the_generated_password_is_shown_only_while_the_field_holds_exactly_it() {
+        assert!(still_shown("abc123XYZ", "abc123XYZ"));
+        assert!(!still_shown("abc123XYZ", ""), "cleared");
+        assert!(!still_shown("abc123XYZ", "123XYZ"), "the start deleted");
+        assert!(!still_shown("abc123XYZ", "abc123XYZ!"), "extended");
+        assert!(!still_shown("", ""), "nothing generated");
+    }
+
+    #[test]
+    fn only_a_wrong_admin_password_empties_that_field() {
+        let api = |code: &str| Error::Api {
+            code: code.into(),
+            message: String::new(),
+        };
+        assert!(is_wrong_admin_password(&api("auth.invalid_credentials")));
+        assert!(!is_wrong_admin_password(&api("conflict")));
+        assert!(!is_wrong_admin_password(&Error::Timeout));
+    }
+
+    #[test]
+    fn a_422_points_at_the_display_name() {
+        let api = |code: &str| Error::Api {
+            code: code.into(),
+            message: String::new(),
+        };
+        for code in ["validation", "validation.error", "profile.invalid"] {
+            assert!(
+                error_text(&api(code), false).contains("display name"),
+                "{code}"
+            );
+        }
+    }
+
+    /// A request that stalls past the client's timeout is not a "no": the server may have
+    /// committed the account (a real `reqwest::Error`, not a constructed variant).
+    #[test]
+    fn a_real_request_timeout_may_have_created_the_account() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        // Accepts the connection and never answers.
+        let _stall = std::thread::spawn(move || {
+            let held = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            drop(held);
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(async {
+                reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_millis(150))
+                    .build()
+                    .unwrap()
+                    .post(&url)
+                    .send()
+                    .await
+            })
+            .unwrap_err();
+        assert!(err.is_timeout() && !err.is_connect());
+        let err = Error::Http(err);
+        assert!(left_uncertain(&err));
+        assert_eq!(error_text(&err, false), UNCERTAIN);
+    }
+
+    /// A refused connection proves nothing was sent: the one "not added" a transport error can say.
+    #[test]
+    fn a_refused_connection_is_a_definite_no() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(async {
+                reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(2))
+                    .build()
+                    .unwrap()
+                    .post(format!("http://127.0.0.1:{port}"))
+                    .send()
+                    .await
+            })
+            .unwrap_err();
+        assert!(err.is_connect());
+        let err = Error::Http(err);
+        assert!(!left_uncertain(&err));
+        assert!(error_text(&err, false).contains("was not added"));
     }
 }
