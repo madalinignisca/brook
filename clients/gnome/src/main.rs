@@ -13,6 +13,7 @@ mod account;
 mod attachments;
 mod call;
 mod chat;
+mod history;
 mod keyring;
 mod outgoing;
 mod prefs;
@@ -361,6 +362,31 @@ fn back_to_password(ui: &LoginUi, message: &str) {
     login_button.set_sensitive(true);
 }
 
+/// What to tell the user after a sign-out that left something behind, or `None` when it
+/// left nothing: the stored sign-in that couldn't be forgotten (`session_forgotten` false), and
+/// the saved data that "Remove this device's data" could not remove (`erase`: core's error from
+/// `sign_out_and_forget`; `local.not_open`: this session never opened that data, so nothing was
+/// erased, and core can't say whose data it is or why; `local.store`: the erase ran and
+/// failed, and the next launch finishes it).
+fn sign_out_notice(session_forgotten: bool, erase: Option<&brook_core::Error>) -> Option<String> {
+    let session = (!session_forgotten).then_some("forget this sign-in on this computer");
+    let data = erase.map(|err| match err {
+        brook_core::Error::Api { code, .. } if code == "local.not_open" => {
+            "check this device's saved data (nothing was removed; if your keyring was locked, \
+             unlock it and restart Brook, then sign in and sign out to try again)"
+        }
+        brook_core::Error::Api { code, .. } if code == "local.store" => {
+            "finish removing this device's saved data (it tries again the next time it starts)"
+        }
+        _ => "remove this device's saved data",
+    });
+    match (session, data) {
+        (None, None) => None,
+        (Some(a), None) | (None, Some(a)) => Some(format!("Signed out, but Brook couldn't {a}.")),
+        (Some(a), Some(b)) => Some(format!("Signed out, but Brook couldn't {a}, or {b}.")),
+    }
+}
+
 /// Shown while a sign-out erases this device's data (sign-in waits for it).
 const ERASING: &str = "Removing this device's data…";
 /// Shown while a sign-out that keeps the data closes it (sign-in waits for that too).
@@ -378,8 +404,13 @@ fn new_client(
     let client = Arc::new(BrookClient::new(config)?);
     // Only with a keyring that answered at launch: otherwise every sign-in would try
     // (and fence) a store that isn't there. Sign-out fences live in the data dir.
+    let data_dir = glib::user_data_dir().join("brook");
+    if !keyring.usable.get() {
+        // Not opened (no usable keyring), but where an earlier session left its data is
+        // known, so "Remove this device's data" can say it could not check it (#249).
+        client.note_local_data_dir(&data_dir);
+    }
     if keyring.usable.get() {
-        let data_dir = glib::user_data_dir().join("brook");
         client.enable_persistence(keyring.slot.clone(), data_dir.clone());
         // The offline cache and outbox (#62), keyed in the same keyring. The signed-in
         // user's stores open on sign-in; until then (or if the key store is locked)
@@ -524,9 +555,11 @@ fn watch_auth_state(
                                 // "Remove this device's data" erases this user's
                                 // cache and outbox first, even with no network.
                                 let done = runtime.spawn(async move {
+                                    let mut erase_failed = None;
                                     if remove_data {
                                         if let Err(err) = client.sign_out_and_forget().await {
                                             tracing::warn!(%err, "erasing local data failed");
+                                            erase_failed = Some(err);
                                         }
                                     } else {
                                         client.logout().await;
@@ -534,7 +567,7 @@ fn watch_auth_state(
                                     // Either way, this client's stores and index are closed
                                     // before the next sign-in opens the same directory.
                                     client.close_local_data().await;
-                                    client.sign_out_complete()
+                                    (client.sign_out_complete(), erase_failed)
                                 });
                                 let error_label = error_label.clone();
                                 let (closing, login_button) =
@@ -544,7 +577,10 @@ fn watch_auth_state(
                                     // Both the keyring delete and its fallback failed:
                                     // the stored sign-in may still be usable here.
                                     // Only while no newer sign-in has completed.
-                                    let forgot = done.await;
+                                    let (forgot, erase_failed) = match done.await {
+                                        Ok((complete, erase)) => (Ok(complete), erase),
+                                        Err(err) => (Err(err), None),
+                                    };
                                     // Its local data is closed for good: the next sign-in
                                     // gets a new client (which opens it again), even to the
                                     // same server.
@@ -569,12 +605,16 @@ fn watch_auth_state(
                                         }
                                     }
                                     let stale = signins.get() != at_sign_out;
-                                    if let (Ok(false), false) = (forgot, stale) {
+                                    // What didn't go (the saved session, the saved data), said
+                                    // plainly: a sign-out that left something behind is not a
+                                    // clean one.
+                                    let notice = sign_out_notice(
+                                        matches!(forgot, Ok(true)),
+                                        erase_failed.as_ref(),
+                                    );
+                                    if let (Some(text), false) = (notice, stale) {
                                         if let Some(label) = error_label.upgrade() {
-                                            label.set_text(
-                                                "Signed out, but Brook couldn't forget this \
-                                                 sign-in on this computer.",
-                                            );
+                                            label.set_text(&text);
                                         }
                                     }
                                 });
@@ -601,4 +641,62 @@ fn watch_auth_state(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod sign_out_notice_tests {
+    use super::sign_out_notice;
+    use brook_core::Error;
+
+    fn api(code: &str) -> Error {
+        Error::Api {
+            code: code.into(),
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_clean_sign_out_says_nothing() {
+        assert_eq!(sign_out_notice(true, None), None);
+    }
+
+    #[test]
+    fn a_sign_in_that_could_not_be_forgotten_is_said() {
+        assert_eq!(
+            sign_out_notice(false, None).as_deref(),
+            Some("Signed out, but Brook couldn't forget this sign-in on this computer.")
+        );
+    }
+
+    #[test]
+    fn saved_data_that_was_not_checked_says_nothing_was_removed() {
+        let text = sign_out_notice(true, Some(&api("local.not_open"))).unwrap();
+        assert!(
+            text.starts_with("Signed out, but Brook couldn't check"),
+            "{text}"
+        );
+        assert!(text.contains("nothing was removed"), "{text}");
+        // The launch probe is the only thing that sets the keyring usable: signing in again
+        // without a restart would loop, so the advice includes the restart.
+        assert!(text.contains("restart Brook"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_erase_says_the_next_launch_finishes_it() {
+        let text = sign_out_notice(true, Some(&api("local.store"))).unwrap();
+        assert!(text.contains("next time it starts"), "{text}");
+    }
+
+    #[test]
+    fn any_other_erase_failure_is_still_reported() {
+        let text = sign_out_notice(true, Some(&Error::UnexpectedResponse)).unwrap();
+        assert!(text.contains("couldn't remove"), "{text}");
+    }
+
+    #[test]
+    fn both_failures_are_both_said() {
+        let text = sign_out_notice(false, Some(&api("local.store"))).unwrap();
+        assert!(text.contains("forget this sign-in") && text.contains("next time it starts"));
+        assert!(text.starts_with("Signed out, but Brook couldn't"), "{text}");
+    }
 }
