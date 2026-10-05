@@ -29,10 +29,11 @@ Brook keeps you signed in between launches through your desktop's keyring
 (GNOME Keyring or KWallet), and never asks for the keyring's password itself. With
 no keyring, or a locked one, you sign in each time.
 
-Image attachments show a preview, decoded only inside a sandbox by glycin. That needs
-glycin's loaders (2.0 or newer) and bubblewrap: `glycin-loaders bubblewrap`. Without
-them (the loaders of Debian 13 are too old), images show as plain
-attachments with Open and Save, and nothing is decoded outside the sandbox.
+Image previews are off until you ask: an image attachment shows a **Show preview** button,
+and **Show image previews** in the main menu makes small images preview by themselves. A preview
+is decoded only inside a sandbox by glycin, which needs glycin's loaders (2.0 or newer) and
+bubblewrap: `glycin-loaders bubblewrap`. Without them (the loaders of Debian 13 are too old),
+images show as plain attachments with Open and Save, and nothing is decoded outside the sandbox.
 
 Calls use H.264 (x264 or openh264, whichever is installed) and fall back to VP8.
 `BROOK_HW_ENCODE=1 brook-gnome` tries GPU H.264 encoding (Intel/AMD, needs the

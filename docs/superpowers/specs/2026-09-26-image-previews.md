@@ -12,10 +12,14 @@
   `image/webp`) are offered a preview at all, automatically or by "Show preview".
   `preview_file` fetches before it sniffs, so any other attachment would be downloaded just
   to find out. The declared type only chooses which files to try; the sniff still decides.
-- **Small images (≤ 4 MiB) preview by themselves** when the row is shown: fetched into the
-  encrypted cache if they aren't there yet.
-- **Larger ones** (up to 16 MiB) get a "Show preview" button: nothing is downloaded until the
-  user asks.
+- **"Show image previews" is a per-device setting, off by default** (owner decision, #259; an
+  absent value is off), applied at once to every row on screen. **Off:** nothing is fetched or
+  decoded unless the user clicks "Show preview" on that file (previews drawn, queued or in
+  flight when it is turned off are dropped). **On:** small images (≤ 4 MiB) preview by
+  themselves when the row is shown, fetched into the encrypted cache if they aren't there yet.
+- **Larger ones** (up to 16 MiB), and every image with the setting off, get a "Show preview"
+  button: nothing is downloaded until the user asks. Where the decoder can't work (its loaders
+  are too old: Debian 13), no button is offered.
 - **Anything else**, including images over 16 MiB, huge dimensions, or a decoder that isn't
   available, keeps the plain file row. There's never a fallback decoder.
 - GIF and animated WebP show their first frame only.
@@ -70,7 +74,7 @@ are tested with a table, including headers that lie.
   just scrolled into view). A request whose row has gone is dropped before it starts.
 - **A timeout:** each decode (load plus the one frame) gets 10 s, then its `gio::Cancellable`
   is cancelled and there's no preview.
-- **Metered networks:** automatic previews (4 MiB or less) only fetch when
+- **Metered networks:** automatic previews (setting on, 4 MiB or less) only fetch when
   `gio::NetworkMonitor` says the connection isn't metered. A file already in the cache still
   previews. "Show preview" always works.
 - Decoding runs on the Tokio runtime, off the GTK loop. A row that scrolls away drops its
