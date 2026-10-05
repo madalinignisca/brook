@@ -54,6 +54,9 @@ final class CallStageTests: XCTestCase {
         XCTAssertEqual(CallStage.arrivalOrder(previous: ["p2"], current: ["p2", "p9", "p4"]), ["p2", "p4", "p9"],
                        "several in one update are ordered by id")
         XCTAssertEqual(CallStage.arrivalOrder(previous: ["p3"], current: ["p3", "p2"]).first, "p3", "the first stays first")
+        // p3 stops (an update without it), then shares again: it goes after the share still running.
+        let stopped = CallStage.arrivalOrder(previous: ["p3", "p2"], current: ["p2"])
+        XCTAssertEqual(CallStage.arrivalOrder(previous: stopped, current: ["p2", "p3"]), ["p2", "p3"])
     }
 
     func testClickingPinsAndClickingTheStageReleases() {
