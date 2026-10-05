@@ -37,12 +37,19 @@ func peerRequirement() -> String? {
 }
 
 final class Broker: NSObject, NSXPCListenerDelegate {
+    private let requirement: String?
+    init(requirement: String?) { self.requirement = requirement }
+
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection c: NSXPCConnection) -> Bool {
         let interface = NSXPCInterface(with: ImageDecoding.self)
         // Plain values only, both ways: Data and numbers.
         let data = NSSet(array: [NSData.self]) as! Set<AnyHashable>
         interface.setClasses(data, for: #selector(ImageDecoding.decode(_:kind:reply:)), argumentIndex: 0, ofReply: false)
         interface.setClasses(data, for: #selector(ImageDecoding.decode(_:kind:reply:)), argumentIndex: 3, ofReply: true)
+        // Per connection, before resume: the listener-wide setter crashes in libxpc on the
+        // service listener (a null dereference at launch on macOS 27.0.1, so no preview ever
+        // appeared in a Release build), and this one needs no listener at all.
+        if let requirement { c.setCodeSigningRequirement(requirement) }
         let session = Session()
         c.exportedInterface = interface
         c.exportedObject = session
@@ -126,8 +133,7 @@ if let items = try? FileManager.default.contentsOfDirectory(at: tmp, includingPr
     for item in items { try? FileManager.default.removeItem(at: item) }
 }
 let requirement = peerRequirement()
-let broker = Broker()
+let broker = Broker(requirement: requirement)
 let listener = NSXPCListener.service()
-if let requirement { listener.setConnectionCodeSigningRequirement(requirement) }
 listener.delegate = broker
 listener.resume()
