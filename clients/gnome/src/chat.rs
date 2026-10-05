@@ -68,6 +68,8 @@ struct Chat {
     /// The reply banner shown above the composer while replying.
     reply_bar: gtk::Revealer,
     reply_label: gtk::Label,
+    /// Name and handle of who the open reply answers, to name them by the preference.
+    reply_author: Rc<RefCell<(String, String)>>,
     /// Channel settings menu (members, leave, and for owners and admins rename/archive/delete).
     channel_settings: gtk::MenuButton,
     /// What only an owner or an admin of the open channel is offered (see `show_management`).
@@ -163,8 +165,50 @@ struct MessageWidgets {
     author_fallback: String,
     /// Hidden once the message is a tombstone: actions, quote, files, reactions.
     extras: Vec<gtk::Widget>,
-    /// The quoted message's id, its author and the quote line, if this is a reply.
-    quote: Option<(String, String, gtk::Label)>,
+    /// The quoted message and the quote line, if this is a reply.
+    quote: Option<QuoteView>,
+}
+
+/// A reply's quote line and what it is drawn from, so it can be drawn again when "Show
+/// usernames" changes or its target is deleted.
+#[derive(Clone)]
+struct QuoteView {
+    id: String,
+    author_name: String,
+    author_handle: String,
+    body: String,
+    files: u32,
+    deleted: Rc<Cell<bool>>,
+    label: gtk::Label,
+}
+
+impl QuoteView {
+    fn line(&self, show_usernames: bool) -> String {
+        quote_line(
+            (&self.author_name, &self.author_handle),
+            (&self.body, self.files, self.deleted.get()),
+            show_usernames,
+        )
+    }
+}
+
+/// A search result's line: the channel, the author named by the preference, and the text.
+fn search_line(channel: &str, (name, handle): (&str, &str), body: &str, show: bool) -> String {
+    format!("{channel} · {}: {body}", author_text(name, handle, show))
+}
+
+/// The quote line above a reply: its author named by the preference, then the excerpt.
+fn quote_line(
+    (name, handle): (&str, &str),
+    (body, files, deleted): (&str, u32, bool),
+    show_usernames: bool,
+) -> String {
+    quote_text(
+        &author_text(name, handle, show_usernames),
+        body,
+        deleted,
+        files,
+    )
 }
 
 /// Build the chat view. `is_admin` controls whether channel creation is offered.
@@ -282,6 +326,7 @@ pub fn build(
         replying_to: Rc::new(RefCell::new(None)),
         reply_bar: reply_bar.clone(),
         reply_label: reply_label.clone(),
+        reply_author: Rc::default(),
         channel_settings: channel_settings.clone(),
         manage: Rc::default(),
         typing_label: typing_label.clone(),
@@ -707,7 +752,11 @@ fn spawn_event_loop(chat: &Rc<Chat>) {
                     let me = chat.me.borrow().clone().unwrap_or_default();
                     let is_current = chat.current.borrow().as_deref() == Some(channel_id.as_str());
                     if is_current && user_id != me {
-                        show_typing(&chat, &user_id, &display_name);
+                        // The event carries no handle: it comes from the channel's members.
+                        let handle = member_handle(&chat, &channel_id, &user_id);
+                        chat.typing.borrow_mut().set_handle(&user_id, &handle);
+                        let name = display_name.clone();
+                        show_typing(&chat, &user_id, &name);
                     }
                 }
                 Ok(ServerEvent::ChannelUpdate(_)) => {
@@ -989,6 +1038,25 @@ fn refresh_call_button(chat: &Rc<Chat>) {
     }
 }
 
+/// A member's handle, from the channel's member list (empty when they aren't in it).
+fn member_handle(chat: &Rc<Chat>, channel_id: &str, user_id: &str) -> String {
+    chat.channels
+        .borrow()
+        .iter()
+        .find(|c| c.id == channel_id)
+        .map(|c| handle_of(&c.members, user_id))
+        .unwrap_or_default()
+}
+
+/// The handle of `user_id` among `members`, or empty.
+fn handle_of(members: &[brook_core::ChannelMember], user_id: &str) -> String {
+    members
+        .iter()
+        .find(|m| m.id == user_id)
+        .map(|m| m.handle.clone())
+        .unwrap_or_default()
+}
+
 /// Start or join the open channel's call in its own window (one at a time).
 fn open_call(chat: &Rc<Chat>, button: &gtk::Button) {
     if let Some(window) = chat.call_window.borrow().as_ref().and_then(|w| w.upgrade()) {
@@ -1004,8 +1072,20 @@ fn open_call(chat: &Rc<Chat>, button: &gtk::Button) {
         parent.as_ref(),
         chat.client.clone(),
         chat.runtime.clone(),
-        channel_id,
+        channel_id.clone(),
         &title,
+        {
+            // Tile names follow the preference as it is when a tile is drawn, with the handle
+            // from the channel's members.
+            let chat = Rc::downgrade(chat);
+            Rc::new(move |user_id: &str, display_name: &str| {
+                let Some(chat) = chat.upgrade() else {
+                    return display_name.to_string();
+                };
+                let handle = member_handle(&chat, &channel_id, user_id);
+                author_text(display_name, &handle, chat.show_usernames.get())
+            })
+        },
     );
     *chat.call_window.borrow_mut() = Some(window.downgrade());
 }
@@ -1127,13 +1207,8 @@ fn send_current(chat: &Rc<Chat>) {
     }
     chat.composer.set_text("");
     let reply_to = chat.replying_to.borrow().clone();
-    // "Replying to …", kept to restore the reply if the send fails.
-    let reply_label = chat
-        .reply_label
-        .label()
-        .strip_prefix("Replying to ")
-        .map(str::to_string)
-        .unwrap_or_default();
+    // Who it answers, kept to restore the reply if the send fails.
+    let reply_author = chat.reply_author.borrow().clone();
     set_reply(chat, None);
     let client_id = draft_id(
         &mut chat.text_draft.borrow_mut(),
@@ -1188,7 +1263,7 @@ fn send_current(chat: &Rc<Chat>) {
                     chat.composer.set_text(&body);
                     chat.composer.set_position(-1);
                     if let Some(id) = reply_to {
-                        set_reply(&chat, Some((id, reply_label)));
+                        set_reply(&chat, Some((id, reply_author.0, reply_author.1)));
                     }
                 }
                 show_send_error(&chat, &send_error_text(&err));
@@ -1545,25 +1620,24 @@ fn append_message(chat: &Rc<Chat>, message: &Message) {
     // Quoted-reply preview above the body, if this message is a reply.
     let mut quote_widgets = None;
     if let Some(reply) = &message.reply_to {
-        let who = reply
-            .author_display_name
-            .clone()
-            .or_else(|| reply.author_handle.clone())
-            .unwrap_or_else(|| "Unknown".to_string());
         let quote = gtk::Label::builder()
-            .label(quote_text(
-                &who,
-                &reply.body,
-                reply.deleted,
-                reply.attachments,
-            ))
             .xalign(0.0)
             .wrap(true)
             .css_classes(["caption", "dim-label"])
             .build();
+        let view = QuoteView {
+            id: reply.id.clone(),
+            author_name: reply.author_display_name.clone().unwrap_or_default(),
+            author_handle: reply.author_handle.clone().unwrap_or_default(),
+            body: reply.body.clone(),
+            files: reply.attachments,
+            deleted: Rc::new(Cell::new(reply.deleted)),
+            label: quote.clone(),
+        };
+        quote.set_label(&view.line(chat.show_usernames.get()));
         row.append(&quote);
-        extras.push(quote.clone().upcast());
-        quote_widgets = Some((reply.id.clone(), who, quote));
+        extras.push(quote.upcast());
+        quote_widgets = Some(view);
     }
     // A file sent without a caption has no text line (the server allows an empty body
     // when files are attached).
@@ -1876,14 +1950,16 @@ fn message_actions_button(chat: &Rc<Chat>, message: &Message, is_own: bool) -> g
         let chat = chat.clone();
         let popover = popover.clone();
         let message_id = message.id.clone();
-        let label = message
-            .author_display_name
-            .clone()
-            .or_else(|| message.author_handle.clone())
-            .unwrap_or_else(|| "message".to_string());
+        let (name, handle) = (
+            message.author_display_name.clone().unwrap_or_default(),
+            message.author_handle.clone().unwrap_or_default(),
+        );
         move |_| {
             popover.popdown();
-            set_reply(&chat, Some((message_id.clone(), label.clone())));
+            set_reply(
+                &chat,
+                Some((message_id.clone(), name.clone(), handle.clone())),
+            );
         }
     });
 
@@ -2081,6 +2157,11 @@ fn main_menu_popover(chat: &Rc<Chat>) -> gtk::Popover {
             // Relabel the rows where they are: this never sorts.
             redraw_sidebar(&chat);
             relabel_authors(&chat);
+            relabel_reply(&chat);
+            chat.typing
+                .borrow_mut()
+                .set_show_usernames(check.is_active());
+            render_typing(&chat);
             let current = chat.current.borrow().clone();
             if let Some(current) = current {
                 apply_channel_chrome(&chat, &current);
@@ -2615,7 +2696,7 @@ fn ask_about_ownership(chat: &Rc<Chat>) {
     let by = members
         .iter()
         .find(|m| m.id == offered_by)
-        .map(|m| format!("{} (@{})", m.display_name, m.handle))
+        .map(|m| author_text(&m.display_name, &m.handle, chat.show_usernames.get()))
         .unwrap_or_else(|| "An owner".into());
     let dialog = adw::AlertDialog::new(
         Some("Become an Owner?"),
@@ -3194,11 +3275,12 @@ fn notify(id: &str, summary: &str, body: &str) {
 }
 
 /// Enter (`Some`) or leave (`None`) reply mode; toggles the banner above composer.
-fn set_reply(chat: &Rc<Chat>, target: Option<(String, String)>) {
+fn set_reply(chat: &Rc<Chat>, target: Option<(String, String, String)>) {
     match target {
-        Some((id, label)) => {
+        Some((id, name, handle)) => {
             *chat.replying_to.borrow_mut() = Some(id);
-            chat.reply_label.set_label(&format!("Replying to {label}"));
+            *chat.reply_author.borrow_mut() = (name, handle);
+            relabel_reply(chat);
             chat.reply_bar.set_reveal_child(true);
             chat.composer.grab_focus();
         }
@@ -3207,6 +3289,18 @@ fn set_reply(chat: &Rc<Chat>, target: Option<(String, String)>) {
             chat.reply_bar.set_reveal_child(false);
         }
     }
+}
+
+/// The reply banner, naming who it answers by the preference as it is now.
+fn relabel_reply(chat: &Rc<Chat>) {
+    let (name, handle) = chat.reply_author.borrow().clone();
+    chat.reply_label
+        .set_label(&reply_banner((&name, &handle), chat.show_usernames.get()));
+}
+
+/// "Replying to Ann" / "Replying to @ann".
+fn reply_banner((name, handle): (&str, &str), show_usernames: bool) -> String {
+    format!("Replying to {}", author_text(name, handle, show_usernames))
 }
 
 /// Tell the server we're typing in the current channel, throttled to ~once / 3s.
@@ -3315,6 +3409,9 @@ fn line_shown(hold: &ErrorHold, typing: &TypingState, now: Instant) -> LineShown
 struct TypingState {
     seen: Vec<(String, String, Instant)>,
     last_message: HashMap<String, Instant>,
+    /// Their handles (from the channel's members), to name them by "Show usernames".
+    handles: HashMap<String, String>,
+    show_usernames: bool,
 }
 
 impl TypingState {
@@ -3333,6 +3430,16 @@ impl TypingState {
             Some(entry) => (entry.1, entry.2) = (name.to_string(), at),
             None => self.seen.push((user_id.to_string(), name.to_string(), at)),
         }
+    }
+
+    /// Their handle, for naming them by the preference when the line is drawn.
+    fn set_handle(&mut self, user_id: &str, handle: &str) {
+        self.handles.insert(user_id.to_string(), handle.to_string());
+    }
+
+    /// The "Show usernames" preference, as the line is drawn.
+    fn set_show_usernames(&mut self, show: bool) {
+        self.show_usernames = show;
     }
 
     /// A message from them: they're done.
@@ -3354,7 +3461,13 @@ impl TypingState {
     /// "Ann is typing…", "Ann and Bob are typing…", "Several people are typing…"; none when
     /// nobody is.
     fn line(&self, now: Instant) -> Option<String> {
-        let mut names: Vec<&str> = self.live(now).map(|(_, n, _)| n.as_str()).collect();
+        let mut names: Vec<String> = self
+            .live(now)
+            .map(|(id, name, _)| {
+                let handle = self.handles.get(id).map_or("", String::as_str);
+                author_text(name, handle, self.show_usernames)
+            })
+            .collect();
         names.sort_unstable();
         match names.as_slice() {
             [] => None,
@@ -3374,7 +3487,11 @@ impl TypingState {
 
 /// Note that `user_id` is typing, and redraw the line.
 fn show_typing(chat: &Rc<Chat>, user_id: &str, name: &str) {
-    chat.typing.borrow_mut().note(user_id, name, Instant::now());
+    {
+        let mut typing = chat.typing.borrow_mut();
+        typing.set_show_usernames(chat.show_usernames.get());
+        typing.note(user_id, name, Instant::now());
+    }
     render_typing(chat);
 }
 
@@ -3756,15 +3873,18 @@ fn run_search(
                 .borrow()
                 .iter()
                 .find(|c| c.id == message.channel_id)
-                .map(|c| c.title(&me))
+                .map(|c| crate::sidebar::label(c, &me, chat.show_usernames.get()))
                 .unwrap_or_else(|| "channel".to_string());
-            let author = message
-                .author_display_name
-                .clone()
-                .or_else(|| message.author_handle.clone())
-                .unwrap_or_else(|| "?".to_string());
             let button = gtk::Button::builder()
-                .label(format!("{channel_name} · {author}: {}", message.body))
+                .label(search_line(
+                    &channel_name,
+                    (
+                        message.author_display_name.as_deref().unwrap_or_default(),
+                        message.author_handle.as_deref().unwrap_or_default(),
+                    ),
+                    &message.body,
+                    chat.show_usernames.get(),
+                ))
                 .has_frame(false)
                 .build();
             if let Some(label) = button.child().and_downcast::<gtk::Label>() {
@@ -4171,6 +4291,11 @@ fn relabel_authors(chat: &Rc<Chat>) {
             &widgets.author_handle,
             chat.show_usernames.get(),
         ));
+        if let Some(quote) = &widgets.quote {
+            quote
+                .label
+                .set_label(&quote.line(chat.show_usernames.get()));
+        }
     }
 }
 
@@ -4940,9 +5065,19 @@ fn show_deleted(widgets: &MessageWidgets) {
 /// gets `message.delete`; the next history or sync read carries the server's flag).
 fn mark_quotes_deleted(chat: &Rc<Chat>, target: &str) {
     for widgets in chat.message_rows.borrow().values() {
-        if let Some((id, who, label)) = &widgets.quote {
-            if id == target {
-                label.set_label(&quote_text(who, "", true, 0));
+        if let Some(quote) = &widgets.quote {
+            if quote.id == target {
+                quote.deleted.set(true);
+                quote.label.set_label(&quote_text(
+                    &author_text(
+                        &quote.author_name,
+                        &quote.author_handle,
+                        chat.show_usernames.get(),
+                    ),
+                    "",
+                    true,
+                    0,
+                ));
             }
         }
     }
@@ -5651,5 +5786,84 @@ mod offline_banner_tests {
         assert_eq!(b.on_state(true, false), BannerAction::Start(1));
         b.stop();
         assert!(!b.on_fire(1));
+    }
+}
+
+#[cfg(test)]
+mod name_surface_tests {
+    use super::{quote_line, search_line};
+
+    #[test]
+    fn a_quote_names_its_author_by_the_preference() {
+        let quote = |show| quote_line(("Ann Lee", "ann"), ("hello", 0, false), show);
+        assert_eq!(quote(false), "\u{21b3} Ann Lee: hello");
+        assert_eq!(quote(true), "\u{21b3} @ann: hello");
+        // A tombstone keeps the name rule too.
+        assert_eq!(
+            quote_line(("Ann Lee", "ann"), ("hello", 0, true), true),
+            "\u{21b3} @ann: a deleted message"
+        );
+    }
+
+    #[test]
+    fn a_quote_with_no_name_falls_back_to_the_handle() {
+        assert_eq!(
+            quote_line(("", "ann"), ("hi", 0, false), false),
+            "\u{21b3} @ann: hi"
+        );
+    }
+
+    #[test]
+    fn a_search_result_names_its_author_by_the_preference() {
+        assert_eq!(
+            search_line("#general", ("Ann Lee", "ann"), "found it", false),
+            "#general · Ann Lee: found it"
+        );
+        assert_eq!(
+            search_line("#general", ("Ann Lee", "ann"), "found it", true),
+            "#general · @ann: found it"
+        );
+    }
+
+    #[test]
+    fn the_reply_banner_names_who_it_answers_by_the_preference() {
+        assert_eq!(
+            super::reply_banner(("Ann Lee", "ann"), false),
+            "Replying to Ann Lee"
+        );
+        assert_eq!(
+            super::reply_banner(("Ann Lee", "ann"), true),
+            "Replying to @ann"
+        );
+    }
+
+    #[test]
+    fn a_typing_line_follows_the_preference_when_it_is_drawn() {
+        use super::{Instant, TypingState};
+        let mut state = TypingState::default();
+        let t0 = Instant::now();
+        state.set_handle("a", "ann");
+        state.note("a", "Ann Lee", t0);
+        assert_eq!(state.line(t0).as_deref(), Some("Ann Lee is typing\u{2026}"));
+        state.set_show_usernames(true);
+        assert_eq!(state.line(t0).as_deref(), Some("@ann is typing\u{2026}"));
+        // With no handle known, the name is all there is.
+        state.note("b", "Bob", t0);
+        state.set_handle("a", "");
+        assert_eq!(
+            state.line(t0).as_deref(),
+            Some("Ann Lee and Bob are typing\u{2026}")
+        );
+    }
+
+    #[test]
+    fn a_handle_comes_from_the_channels_members() {
+        let members: Vec<brook_core::ChannelMember> = serde_json::from_value(serde_json::json!([
+            {"id": "u1", "handle": "ann", "display_name": "Ann Lee"},
+            {"id": "u2", "handle": "bob", "display_name": "Bob"}
+        ]))
+        .unwrap();
+        assert_eq!(super::handle_of(&members, "u2"), "bob");
+        assert_eq!(super::handle_of(&members, "nobody"), "");
     }
 }
