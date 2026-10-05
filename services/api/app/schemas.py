@@ -12,7 +12,10 @@ class RegisterIn(BaseModel):
     """Registration payload."""
 
     handle: str = Field(min_length=2, max_length=64, pattern=r"^[a-zA-Z0-9_.-]+$")
-    display_name: str = Field(min_length=1, max_length=64)
+    # Only a bound on the raw input: the real rule (1-64 after trimming, visible, no control
+    # characters) lives in _clean_profile_text, so a name padded with spaces is judged
+    # by what it trims to, as in PATCH /auth/me.
+    display_name: str = Field(min_length=1, max_length=256)
     password: str = Field(min_length=8, max_length=256)
     # The admin's own password, required once the first account exists (not checked
     # here: the bootstrap has no admin, so the route decides).

@@ -245,17 +245,27 @@ async def test_bootstrap_ignores_a_stale_token(client: httpx.AsyncClient) -> Non
 
 
 async def test_register_display_name_limit_is_one_rule(client: httpx.AsyncClient) -> None:
+    """The name is judged once, after trimming (1-64, as PATCH /auth/me): a name padded
+    with spaces that trims to 64 passes, 65 visible characters is profile.invalid."""
     admin = await _admin_headers(client)
     base = {"password": "supersecret", "admin_password": "supersecret"}
-    ok = await client.post(
-        f"{API}/register", json={**base, "handle": "n64", "display_name": "n" * 64}, headers=admin
+    padded = await client.post(
+        f"{API}/register",
+        json={**base, "handle": "n64", "display_name": "  " + "n" * 64 + "  "},
+        headers=admin,
     )
-    assert ok.status_code == 201
+    assert padded.status_code == 201
+    assert padded.json()["display_name"] == "n" * 64
     long_ = await client.post(
         f"{API}/register", json={**base, "handle": "n65", "display_name": "n" * 65}, headers=admin
     )
     assert long_.status_code == 422
-    assert long_.json()["error"]["code"] == "validation.error"
+    assert long_.json()["error"]["code"] == "profile.invalid"
+    huge = await client.post(
+        f"{API}/register", json={**base, "handle": "n300", "display_name": "n" * 300}, headers=admin
+    )
+    assert huge.status_code == 422
+    assert huge.json()["error"]["code"] == "validation.error"
 
 
 async def test_register_losing_a_handle_race_is_409(
