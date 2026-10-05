@@ -169,7 +169,7 @@ final class TimelineModel {
         // (`loading` covers the network fetches; a cached head's own load, in `readCache`, is not
         // waited for: an older read then runs beside it and still ends at the start or a page.)
         while loading, !olderInFlight, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(25)) }
-        guard !Task.isCancelled, !olderInFlight, !atStart, !headFailed, !loading,
+        guard !Task.isCancelled, !olderInFlight, !atStart, !loading,
               let oldest = messages.first else { return }
         olderInFlight = true
         defer { olderInFlight = false }
@@ -178,8 +178,19 @@ final class TimelineModel {
         let fromCache = await readCache(before: oldest.id, loadIfIncomplete: true)
         loading = false
         if fromCache { return }
+        // Cached history is paged whatever the network does, but behind a newest page that failed the
+        // network is not asked for older ones (an empty answer would read as the start of the
+        // conversation): the Retry button instead, so no spinner is left that nothing will end.
+        if headFailed {
+            olderFailed = true
+            return
+        }
         await fetch(before: oldest.id)
     }
+
+    /// The loader above the first message: shown while an older page can be asked for. Behind a failed
+    /// newest page only cached history can be, so without any it stays hidden (the error shows).
+    var offersOlder: Bool { !atStart && !messages.isEmpty && (!headFailed || fromCache) }
 
     /// Re-read the cached head (the cache changed for this channel, or was reset).
     func refill() async {
@@ -227,7 +238,9 @@ final class TimelineModel {
         do {
             let page = try await client.channelHistory(channelId: channelId, before: before)
             if page.isEmpty, before != nil { atStart = true }
-            if before == nil { headFailed = false }
+            // The newest page is back: an older page is asked for again, and a Retry left from the time
+            // it was held back is not shown.
+            if before == nil { headFailed = false; olderFailed = false }
             merge(page)
             error = nil
         } catch {

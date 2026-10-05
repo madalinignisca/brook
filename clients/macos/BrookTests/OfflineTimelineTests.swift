@@ -50,6 +50,50 @@ final class OfflineTimelineTests: XCTestCase {
         XCTAssertTrue(t.atStart)
     }
 
+    /// Offline with this Mac's cache: the newest page's network fetch fails, and the cached history is
+    /// still paged (and ends at the start); only the network fallback is held back, with a Retry.
+    func testCachedHistoryStillPagesBehindAFailedHead() async {
+        let chat = FakeChat()
+        chat.local = true
+        chat.historyFailure = LoginError.Network(message: "offline")
+        chat.cachePages = [cachedPage([msg("m5", "newest")])]
+        let t = TimelineModel(channelId: "c", client: chat)
+        await t.load()
+        XCTAssertTrue(t.headFailed)
+        XCTAssertTrue(t.offersOlder, "cached history can still be paged")
+        chat.cachePages = [cachedPage([msg("m3", "a"), msg("m4", "b")])]
+        await t.loadOlder()
+        XCTAssertEqual(t.messages.map(\.id), ["m3", "m4", "m5"])
+        chat.cachePages = [cachedPage([])]
+        await t.loadOlder()
+        XCTAssertTrue(t.atStart, "an empty complete cached page is the start, offline too")
+        XCTAssertFalse(t.olderFailed)
+    }
+
+    /// Behind a failed head the cache cannot answer: the network is not asked, the Retry shows.
+    func testWhenTheCacheCannotAnswerBehindAFailedHeadTheRetryShows() async {
+        let chat = FakeChat()
+        chat.local = true
+        chat.historyFailure = LoginError.Network(message: "offline")
+        chat.cachePages = [cachedPage([msg("m5", "newest")])]
+        let t = TimelineModel(channelId: "c", client: chat)
+        await t.load()
+        let before = chat.historyCalls.withLock { $0 }
+        chat.cachePages = [cachedPage([], needsNetwork: true)]
+        chat.loadFails = true
+        await t.loadOlder()
+        XCTAssertTrue(t.olderFailed)
+        XCTAssertEqual(chat.historyCalls.withLock { $0 }, before, "the network was asked behind a failed head")
+        XCTAssertFalse(t.atStart)
+        // The head comes back: the Retry is not left over (the loader asks again by itself).
+        chat.historyFailure = nil
+        chat.pages = [[msg("m6", "newer")]]
+        t.apply(.ready)
+        await settle("no retry on ready") { t.error == nil && !t.loading }
+        XCTAssertFalse(t.headFailed)
+        XCTAssertFalse(t.olderFailed, "a Retry left over from behind the failed head")
+    }
+
     func testAFailedLoadOfAnIncompletePageFallsBackToTheNetwork() async {
         let chat = FakeChat()
         chat.local = true
@@ -161,6 +205,8 @@ final class OfflineTimelineTests: XCTestCase {
         chat.pages = [[msg("m1", "back")]]
         t.apply(.ready)
         await settle("no retry on ready") { t.error == nil && !t.loading }
+        XCTAssertFalse(t.headFailed, "a loader hidden for good behind a head that recovered")
+        XCTAssertFalse(t.olderFailed, "a Retry left over from behind the failed head")
         XCTAssertEqual(t.messages.map(\.id), ["m1"])
         XCTAssertEqual(chat.historyCalls.withLock { $0 }, 2)
     }

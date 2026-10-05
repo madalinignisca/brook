@@ -223,12 +223,11 @@ final class TimelineModelTests: XCTestCase {
         await loading.value
         await older.value
         XCTAssertTrue(t.headFailed)
-        XCTAssertFalse(t.olderFailed, "a failed head is not a failed older page")
         XCTAssertFalse(t.atStart)
         XCTAssertEqual(chat.historyCalls.withLock { $0 }, 1, "only the failed head was asked for")
     }
 
-    /// A caller cancelled while it waited (the view went) must not start a request afterwards.
+    /// A caller cancelled while it waited must not start a request afterwards.
     func testACancelledOlderAskStartsNothing() async {
         let chat = FakeChat()
         chat.pages = [[msg("m5", "x")]]

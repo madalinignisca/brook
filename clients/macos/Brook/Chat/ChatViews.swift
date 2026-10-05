@@ -44,7 +44,7 @@ struct ChatView: View {
                         if timeline.atStart {
                             Text("This is the start of the conversation.")
                                 .font(.caption).foregroundStyle(.secondary)
-                        } else if !timeline.messages.isEmpty, !timeline.headFailed {
+                        } else if timeline.offersOlder {
                             if timeline.olderFailed {
                                 Button("Couldn't load older messages. Retry") { Task { await timeline.loadOlder() } }
                                     .buttonStyle(.link).font(.caption)
