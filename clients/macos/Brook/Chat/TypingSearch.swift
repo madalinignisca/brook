@@ -31,9 +31,10 @@ struct TypingState {
     }
 
     /// "Ann is typing…", "Ann and Bob are typing…", "Several people are typing…"; nil when nobody.
-    func line(now: Date) -> String? {
-        let names = seen.values.filter { now.timeIntervalSince($0.at) < Self.lifetime }
-            .map(\.name).sorted()
+    /// `label` says how each (user id, name as sent) reads, so a toggle relabels at once.
+    func line(now: Date, label: (_ userId: String, _ name: String) -> String) -> String? {
+        let names = seen.filter { now.timeIntervalSince($0.value.at) < Self.lifetime }
+            .map { label($0.key, $0.value.name) }.sorted()
         switch names.count {
         case 0: return nil
         case 1: return "\(names[0]) is typing…"
@@ -80,15 +81,22 @@ extension FfiBrookClient: SearchClient {}
 struct SearchHit: Identifiable, Equatable {
     let id: String
     let channelId: String
-    let author: String
+    /// Kept as sent, never a finished label: the list relabels when drawn.
+    let authorName: String?
+    let authorHandle: String?
     let excerpt: String
 
     init(_ message: FfiMessage) {
         id = message.id
         channelId = message.channelId
-        author = message.authorDisplayName ?? message.authorHandle ?? "Someone"
+        authorName = message.authorDisplayName // raw name: stored with its handle
+        authorHandle = message.authorHandle
         let flat = message.body.split(whereSeparator: \.isWhitespace).joined(separator: " ")
         excerpt = String(flat.prefix(100))
+    }
+
+    func author(showUsernames: Bool) -> String {
+        PersonName.label(authorName, handle: authorHandle, showUsernames: showUsernames)
     }
 }
 

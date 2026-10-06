@@ -79,7 +79,7 @@ final class OfferActionsTests: XCTestCase {
 @MainActor
 final class OfferAnswerTests: XCTestCase {
     private func model(_ client: FakeMembership) -> OfferAnswerModel {
-        OfferAnswerModel(channelId: "c1", title: "general", offerer: "Ann", client: client)
+        OfferAnswerModel(channelId: "c1", title: "general", offeredBy: member("own", "Ann", "owner"), client: client)
     }
 
     func testAcceptAndDeclineCallOnceAndClose() async {
@@ -120,10 +120,24 @@ final class OfferAnswerTests: XCTestCase {
         XCTAssertTrue(m.canDefer)
     }
 
-    func testTheOfferersNameOrSomeone() {
+    func testOffererFollowsShowUsernames() {
         let members = [member("own", "Owner Ann", "owner")]
-        XCTAssertEqual(OfferAnswerModel.offererName(offer(to: "me", by: "own"), members: members), "Owner Ann")
-        XCTAssertEqual(OfferAnswerModel.offererName(offer(to: "me", by: "gone"), members: members), "Someone")
+        let by = offer(to: "me", by: "own")
+        XCTAssertEqual(OfferAnswerModel.offererName(by, members: members, showUsernames: false), "Owner Ann")
+        XCTAssertEqual(OfferAnswerModel.offererName(by, members: members, showUsernames: true), "@own")
+        for on in [false, true] {
+            XCTAssertEqual(OfferAnswerModel.offererName(offer(to: "me", by: "gone"), members: members, showUsernames: on),
+                           "Someone")
+        }
+    }
+
+    /// The sheet reads the model's member, so a toggle while it is open relabels it.
+    func testTheModelLabelsItsOffererByPreference() {
+        let m = model(FakeMembership())
+        XCTAssertEqual(m.offerer(showUsernames: false), "Ann")
+        XCTAssertEqual(m.offerer(showUsernames: true), "@own")
+        let gone = OfferAnswerModel(channelId: "c1", title: "general", offeredBy: nil, client: FakeMembership())
+        XCTAssertEqual(gone.offerer(showUsernames: true), "Someone")
     }
 }
 

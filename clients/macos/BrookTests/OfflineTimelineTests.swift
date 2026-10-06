@@ -178,15 +178,46 @@ final class OfflineTimelineTests: XCTestCase {
         XCTAssertEqual(b.messages.first?.body, "newer")
     }
 
-    func testARenameReachesCachedRows() async {
+    private func authored(_ name: String?, _ handle: String?) -> FfiMessage {
+        var m = msg("m1", "hi")
+        (m.authorDisplayName, m.authorHandle) = (name, handle)
+        return m
+    }
+
+    func testAuthorNameFollowsShowUsernames() async {
         let chat = FakeChat()
         chat.local = true
-        chat.users = [FfiMember(id: "u", handle: "u", displayName: "Robert", role: nil)]
+        chat.users = [FfiMember(id: "u", handle: "bob", displayName: "Robert", role: nil)]
         let t = TimelineModel(channelId: "c", client: chat)
-        t.merge([msg("m1", "hi")]) // stored as "U"
-        XCTAssertEqual(t.authorName(t.messages[0]), "U")
+        t.merge([authored("Bob", "bob")]) // stored as "Bob" / "bob"
+        XCTAssertEqual(t.authorName(t.messages[0], showUsernames: false), "Bob")
+        XCTAssertEqual(t.authorName(t.messages[0], showUsernames: true), "@bob")
+        // A `Users` notice renames him: the cached row follows, the handle stays.
         await t.refreshAuthors(["u"])
-        XCTAssertEqual(t.authorName(t.messages[0]), "Robert")
+        XCTAssertEqual(t.authorName(t.messages[0], showUsernames: false), "Robert")
+        XCTAssertEqual(t.authorName(t.messages[0], showUsernames: true), "@bob")
+    }
+
+    func testAuthorNameWithoutAHandleOrAName() {
+        let t = TimelineModel(channelId: "c", client: FakeChat())
+        t.merge([authored("Bot", nil)])
+        XCTAssertEqual(t.authorName(t.messages[0], showUsernames: true), "Bot")
+        XCTAssertEqual(t.authorName(t.messages[0], showUsernames: false), "Bot")
+        let gone = TimelineModel(channelId: "c", client: FakeChat())
+        gone.merge([authored(nil, nil)])
+        XCTAssertEqual(gone.authorName(gone.messages[0], showUsernames: true), "Someone")
+        XCTAssertEqual(gone.authorName(gone.messages[0], showUsernames: false), "Someone")
+    }
+
+    /// The refreshed handle replaces the message's own, not only the name.
+    func testARefreshReplacesTheHandleToo() async {
+        let chat = FakeChat()
+        chat.local = true
+        chat.users = [FfiMember(id: "u", handle: "bobby", displayName: "Bob", role: nil)]
+        let t = TimelineModel(channelId: "c", client: chat)
+        t.merge([authored("Bob", "bob")])
+        await t.refreshAuthors(["u"])
+        XCTAssertEqual(t.authorName(t.messages[0], showUsernames: true), "@bobby")
     }
 
     func testTheNetworkErrorHidesWhileOfflineWithCachedMessages() async {

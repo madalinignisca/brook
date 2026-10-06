@@ -35,15 +35,40 @@ struct MembersView: View {
     @State var model: MembersModel
     @State private var confirming: FfiMember?
     @State private var offering: FfiMember?
+    @Environment(\.showUsernames) private var showUsernames
+
+    /// A row's two lines: the label (and "(you)"), then the form not shown, if any.
+    static func lines(_ m: FfiMember, me: String, showUsernames: Bool) -> (primary: String, secondary: String?) {
+        let label = PersonName.label(m.displayName, handle: m.handle, showUsernames: showUsernames) // raw name: input to the label
+        let other = PersonName.other(m.displayName, handle: m.handle, showUsernames: showUsernames) // raw name: input to the label
+        return (m.id == me ? "\(label) (you)" : label, other)
+    }
+
+    static func offerTitle(_ m: FfiMember?, title: String, showUsernames: Bool) -> String {
+        "Offer \(label(m, showUsernames: showUsernames)) ownership of \(title)?"
+    }
+
+    static func removeTitle(_ m: FfiMember?, title: String, showUsernames: Bool) -> String {
+        "Remove \(label(m, showUsernames: showUsernames)) from \(title)?"
+    }
+
+    /// Empty while no member is picked (the dialog is closed then).
+    private static func label(_ m: FfiMember?, showUsernames: Bool) -> String {
+        guard let m else { return "" }
+        return PersonName.label(m.displayName, handle: m.handle, showUsernames: showUsernames) // raw name: input to the label
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Members of \(title)").font(.headline)
-            List(powers.rows, id: \.id) { m in
+            List(powers.rows(showUsernames: showUsernames), id: \.id) { m in
                 HStack {
+                    let lines = Self.lines(m, me: powers.me, showUsernames: showUsernames)
                     VStack(alignment: .leading) {
-                        Text(m.id == powers.me ? "\(m.displayName) (you)" : m.displayName)
-                        Text("@\(m.handle)").font(.caption).foregroundStyle(.secondary)
+                        Text(lines.primary)
+                        if let second = lines.secondary {
+                            Text(second).font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                     Spacer()
                     if m.role == "owner" { Text("Owner").font(.caption).foregroundStyle(.secondary) }
@@ -69,7 +94,7 @@ struct MembersView: View {
         .padding(12)
         .frame(width: 320, height: 320)
         .confirmationDialog(
-            "Offer \(offering?.displayName ?? "") ownership of \(title)?",
+            Self.offerTitle(offering, title: title, showUsernames: showUsernames),
             isPresented: Binding(get: { offering != nil }, set: { if !$0 { offering = nil } })
         ) {
             Button("Offer Ownership") {
@@ -79,7 +104,7 @@ struct MembersView: View {
             Text("They'll be asked when they next open it.")
         }
         .confirmationDialog(
-            "Remove \(confirming?.displayName ?? "") from \(title)?",
+            Self.removeTitle(confirming, title: title, showUsernames: showUsernames),
             isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })
         ) {
             Button("Remove", role: .destructive) {
@@ -93,11 +118,12 @@ struct MembersView: View {
 struct OfferAnswerSheet: View {
     let model: OfferAnswerModel
     let later: () -> Void
+    @Environment(\.showUsernames) private var showUsernames
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Become an owner of \(model.title)?").font(.title2)
-            Text("\(model.offerer) offered you ownership of \(model.title). Owners can rename, archive and delete it, and remove members.")
+            Text("\(model.offerer(showUsernames: showUsernames)) offered you ownership of \(model.title). Owners can rename, archive and delete it, and remove members.")
                 .fixedSize(horizontal: false, vertical: true)
             if let error = model.error { Text(error).foregroundStyle(.red) }
             HStack {

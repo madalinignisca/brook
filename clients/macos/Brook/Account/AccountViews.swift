@@ -45,6 +45,7 @@ struct ChangePasswordSheet: View {
 struct AdminResetSheet: View {
     @State private var model: AdminResetModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.showUsernames) private var showUsernames
 
     init(client: any AccountClient, selfId: String) {
         _model = State(initialValue: AdminResetModel(client: client, selfId: selfId))
@@ -61,7 +62,8 @@ struct AdminResetSheet: View {
                     Picker("User", selection: $model.selectedId) {
                         Text("Choose…").tag(String?.none)
                         ForEach(model.users, id: \.id) { user in
-                            Text("\(user.displayName) (\(user.handle))").tag(Optional(user.id))
+                            Text(PersonName.both(user.displayName, handle: user.handle, showUsernames: showUsernames)) // raw name: input to the label
+                                .tag(Optional(user.id))
                         }
                     }
                     SecureField("New password", text: $model.new)
@@ -76,7 +78,7 @@ struct AdminResetSheet: View {
                 HStack {
                     Spacer()
                     Button("Cancel", role: .cancel) { dismiss() }
-                    Button("Reset Password") { Task { await model.submit() } }
+                    Button("Reset Password") { Task { await model.submit(showUsernames: showUsernames) } }
                         .keyboardShortcut(.defaultAction)
                         .disabled(model.problem != nil || model.busy)
                 }
@@ -108,7 +110,7 @@ struct AddUserSheet: View {
                     // No content types: nothing here should be offered to AutoFill as a login.
                     TextField("Handle", text: $model.handle)
                         .autocorrectionDisabled()
-                    TextField("Display name", text: $model.displayName)
+                    TextField("Display name", text: $model.displayName) // raw name: the name being typed for a new account
                     SecureField("Password", text: $model.password)
                     SecureField("Confirm password", text: $model.confirm)
                     Button("Generate") { model.generate() }

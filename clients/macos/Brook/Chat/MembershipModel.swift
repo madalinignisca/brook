@@ -68,11 +68,19 @@ struct ChannelPowers {
         myRole == "owner" && members.filter { $0.role == "owner" }.count == 1
     }
 
-    /// You first, then by name. Names aren't unique, so the list shows handles too.
-    var rows: [FfiMember] {
-        members.sorted { a, b in
+    /// You first, then by the label shown (so a toggle reorders), then by id. Names aren't
+    /// unique, so the list shows the other form too.
+    func rows(showUsernames: Bool) -> [FfiMember] {
+        func label(_ m: FfiMember) -> String {
+            PersonName.label(m.displayName, handle: m.handle, showUsernames: showUsernames) // raw name: input to the label
+        }
+        return members.sorted { a, b in
             if (a.id == me) != (b.id == me) { return a.id == me }
-            return a.displayName.localizedCaseInsensitiveCompare(b.displayName) == .orderedAscending
+            switch label(a).localizedCaseInsensitiveCompare(label(b)) {
+            case .orderedAscending: return true
+            case .orderedDescending: return false
+            case .orderedSame: return a.id < b.id
+            }
         }
     }
 }
@@ -213,7 +221,8 @@ final class OfferAnswerModel {
 
     let channelId: String
     let title: String
-    let offerer: String
+    /// Kept as the member, not a finished name, so a toggle while the sheet is open relabels it.
+    let offeredBy: FfiMember?
     private(set) var busy = false
     private(set) var error: String?
     /// Answered (or the offer is gone): the sheet closes.
@@ -223,13 +232,25 @@ final class OfferAnswerModel {
 
     private let client: any MembershipClient
 
-    init(channelId: String, title: String, offerer: String, client: any MembershipClient) {
-        (self.channelId, self.title, self.offerer, self.client) = (channelId, title, offerer, client)
+    init(channelId: String, title: String, offeredBy: FfiMember?, client: any MembershipClient) {
+        (self.channelId, self.title, self.offeredBy, self.client) = (channelId, title, offeredBy, client)
     }
 
     /// Who offered, as the channel lists them; "Someone" once they're gone from it.
-    static func offererName(_ offer: FfiOwnerOffer, members: [FfiMember]) -> String {
-        members.first { $0.id == offer.offeredBy }?.displayName ?? "Someone"
+    func offerer(showUsernames: Bool) -> String { Self.label(offeredBy, showUsernames: showUsernames) }
+
+    /// The member who made the offer, if still here: what the sheet is built with.
+    static func offerer(of offer: FfiOwnerOffer, in members: [FfiMember]) -> FfiMember? {
+        members.first { $0.id == offer.offeredBy }
+    }
+
+    static func offererName(_ offer: FfiOwnerOffer, members: [FfiMember], showUsernames: Bool) -> String {
+        label(offerer(of: offer, in: members), showUsernames: showUsernames)
+    }
+
+    private static func label(_ member: FfiMember?, showUsernames: Bool) -> String {
+        guard let member else { return PersonName.unknown }
+        return PersonName.label(member.displayName, handle: member.handle, showUsernames: showUsernames) // raw name: input to the label
     }
 
     func accept() async { await answer { _ = try await $0.acceptOwnership(channelId: self.channelId) } }

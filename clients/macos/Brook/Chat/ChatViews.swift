@@ -16,6 +16,7 @@ struct ChatView: View {
     /// An archived channel is read-only.
     let archived: Bool
     private let client: any ChatClient
+    @Environment(\.showUsernames) private var showUsernames
 
     init(channelId: String, me: String, client: any ChatClient, timeline: TimelineModel,
          pending: PendingModel? = nil, feed: CacheFeed? = nil, archived: Bool = false) {
@@ -54,7 +55,7 @@ struct ChatView: View {
                             }
                         }
                         ForEach(timeline.messages, id: \.id) { message in
-                            MessageRow(message: message, author: timeline.authorName(message),
+                            MessageRow(message: message, author: timeline.authorName(message, showUsernames: showUsernames),
                                        mine: message.authorId == me, me: me, saves: saves, composer: composer,
                                        onReact: { emoji in Task { await timeline.toggleReaction(message, emoji: emoji) } },
                                        makeRow: makeRow)
@@ -77,7 +78,7 @@ struct ChatView: View {
             }
             // Re-evaluated every second, so "typing…" expires by itself.
             TimelineView(.periodic(from: .now, by: 1)) { context in
-                if let line = timeline.typing.line(now: context.date) {
+                if let line = timeline.typingLine(now: context.date, showUsernames: showUsernames) {
                     Text(line).font(.callout).foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
                 }
@@ -382,11 +383,22 @@ struct AttachmentRow: View {
 
 struct ComposerView: View {
     @Bindable var composer: ComposerModel
+    @Environment(\.showUsernames) private var showUsernames
+
+    /// "Replying to <who>"; a message whose author has neither a name nor a handle is "a message".
+    static func replyBanner(_ m: FfiMessage, showUsernames: Bool) -> String {
+        let blank = [m.authorDisplayName, m.authorHandle].allSatisfy { // raw name: tested for blankness only
+            ($0 ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if blank { return "Replying to a message" }
+        return "Replying to " + PersonName.label(
+            m.authorDisplayName, handle: m.authorHandle, showUsernames: showUsernames) // raw name: input to the label
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             if let reply = composer.replyingTo {
-                banner("Replying to \(reply.authorDisplayName ?? "a message")")
+                banner(Self.replyBanner(reply, showUsernames: showUsernames))
             } else if composer.editing != nil {
                 banner("Editing your message")
             }

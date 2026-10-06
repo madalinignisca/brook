@@ -185,14 +185,17 @@ final class AdminResetModel {
         return PasswordPolicy.problem(new: new, confirm: confirm)
     }
 
-    func submit() async {
+    /// `showUsernames` words the done text; it isn't relabelled if the setting changes after.
+    func submit(showUsernames: Bool) async {
         guard problem == nil, !busy, let id = selectedId else { return }
         busy = true
         error = nil
         defer { busy = false }
         do {
             try await client.adminResetPassword(userId: id, adminPassword: adminPassword, new: new)
-            let who = users.first { $0.id == id }?.displayName ?? "The user"
+            let who = users.first { $0.id == id }.map {
+                PersonName.label($0.displayName, handle: $0.handle, showUsernames: showUsernames) // raw name: input to the label
+            } ?? "The user"
             clear()
             done = "\(who)'s password is set. They're signed out everywhere."
         } catch {

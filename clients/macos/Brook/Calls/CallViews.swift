@@ -74,18 +74,20 @@ struct CallView: View {
     let leave: () async -> Void
     /// The tile the user put on the stage; nil leaves the choice to `CallStage` (a shared screen).
     @State private var pinned: String?
+    @Environment(\.showUsernames) private var showUsernames
 
     /// A stage (a shared screen, or the tile the user chose) with the rest in a strip below it, or
     /// the equal grid when nothing is on the stage.
     @ViewBuilder
     private var tilesArea: some View {
+        let tiles = call.tiles(showUsernames: showUsernames)
         tilesLayout
-            .onChange(of: call.tiles.map(\.id)) { _, _ in pinned = CallStage.pruned(pinned, tiles: call.tiles) }
+            .onChange(of: tiles.map(\.id)) { _, _ in pinned = CallStage.pruned(pinned, tiles: tiles) }
     }
 
     @ViewBuilder
     private var tilesLayout: some View {
-        let split = CallStage.split(call.tiles, pinned: pinned)
+        let split = CallStage.split(call.tiles(showUsernames: showUsernames), pinned: pinned)
         if let stage = split.stage {
             VStack(spacing: 10) {
                 // A fresh view for each tile on the stage: a renderer moved to another track would keep
@@ -250,6 +252,8 @@ struct CallWindow: View {
         .onChange(of: center.call?.isEnded ?? false) { _, ended in
             if ended { picker?.cancel() }
         }
+        // Outermost: this window is its own scene, so SignedInView's environment never reaches it.
+        .modifier(FollowsShowUsernames())
     }
 }
 

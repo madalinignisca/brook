@@ -165,6 +165,7 @@ struct SecondFactorSheet: View {
 struct AdminTotpResetSheet: View {
     @State private var model: AdminTotpResetModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.showUsernames) private var showUsernames
 
     init(client: any AccountClient, selfId: String) {
         _model = State(initialValue: AdminTotpResetModel(client: client, selfId: selfId))
@@ -182,7 +183,10 @@ struct AdminTotpResetSheet: View {
                 Form {
                     Picker("User", selection: $model.selectedId) {
                         Text("Choose…").tag(String?.none)
-                        ForEach(model.users, id: \.id) { Text($0.displayName).tag(Optional($0.id)) }
+                        ForEach(model.users, id: \.id) { user in
+                            Text(PersonName.both(user.displayName, handle: user.handle, showUsernames: showUsernames)) // raw name: input to the label
+                                .tag(Optional(user.id))
+                        }
                     }
                     SecureField("Your own password", text: $model.adminPassword)
                 }
@@ -190,7 +194,7 @@ struct AdminTotpResetSheet: View {
                 HStack {
                     Spacer()
                     Button("Cancel", role: .cancel) { dismiss() }
-                    Button("Reset") { Task { await model.submit() } }
+                    Button("Reset") { Task { await model.submit(showUsernames: showUsernames) } }
                         .keyboardShortcut(.defaultAction)
                         .disabled(model.problem != nil || model.busy)
                 }

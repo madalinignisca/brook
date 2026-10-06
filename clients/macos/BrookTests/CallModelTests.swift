@@ -266,13 +266,13 @@ final class CallModelTests: XCTestCase {
         let other = FfiParticipant(participantId: "p2", userId: "u2", displayName: "Linux", audio: false, video: true)
         // core's roster excludes self: the self tile comes from local state.
         call.apply(FfiCallState(status: .connected, callId: "k1", selfParticipant: "p1", participants: [other]))
-        XCTAssertEqual(call.tiles.map { (t: CallModel.Tile) in t.name }, ["You", "Linux"])
-        XCTAssertTrue(call.tiles[0].isSelf)
-        XCTAssertTrue(call.tiles[0].audio)
-        XCTAssertFalse(call.tiles[1].audio)
+        XCTAssertEqual(call.tiles(showUsernames: false).map { (t: CallModel.Tile) in t.name }, ["You", "Linux"])
+        XCTAssertTrue(call.tiles(showUsernames: false)[0].isSelf)
+        XCTAssertTrue(call.tiles(showUsernames: false)[0].audio)
+        XCTAssertFalse(call.tiles(showUsernames: false)[1].audio)
         XCTAssertNil(call.banner)
         call.apply(FfiCallState(status: .connected, callId: "k1", selfParticipant: "p1", participants: []))
-        XCTAssertEqual(call.tiles.map { (t: CallModel.Tile) in t.name }, ["You"], "alone: only the self tile")
+        XCTAssertEqual(call.tiles(showUsernames: false).map { (t: CallModel.Tile) in t.name }, ["You"], "alone: only the self tile")
         call.apply(FfiCallState(status: .reconnecting, callId: "k1", selfParticipant: "p1", participants: [other]))
         XCTAssertEqual(call.banner, "Reconnecting…")
         call.apply(FfiCallState(status: .ended(reason: .removed), callId: "k1", selfParticipant: "p1", participants: []))
@@ -381,7 +381,7 @@ final class CallReviewFixTests: XCTestCase {
         let client = FakeRealtime(channels: [])
         client.joinGate = Gate()
         let center = CallCenter(auth: GrantedNothing(), makeEngine: { _ in FakeMedia() })
-        let joining = Task { await center.join(channelId: "c1", name: "general", client: client) }
+        let joining = Task { await center.join(channelId: "c1", name: "general", handles: [:], client: client) }
         await Task.yield() // join() registers its task; the join's work has not started yet
         await center.endAll()
         client.joinGate?.open()
@@ -395,7 +395,7 @@ final class CallReviewFixTests: XCTestCase {
         let client = FakeRealtime(channels: [])
         client.joinGate = Gate()
         let center = CallCenter(auth: GrantedNothing(), makeEngine: { _ in FakeMedia() })
-        let joining = Task { await center.join(channelId: "c1", name: "general", client: client) }
+        let joining = Task { await center.join(channelId: "c1", name: "general", handles: [:], client: client) }
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertTrue(center.joining)
         let ended = Task { await center.endAll() }
@@ -413,7 +413,7 @@ final class CallReviewFixTests: XCTestCase {
         var replies = 0
         let quit = QuitCoordinator(timeout: .seconds(5), reply: { _ in replies += 1 })
         let center = CallCenter(auth: GrantedNothing(), quit: quit, makeEngine: { _ in FakeMedia() })
-        let joining = Task { await center.join(channelId: "c1", name: "general", client: client) }
+        let joining = Task { await center.join(channelId: "c1", name: "general", handles: [:], client: client) }
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(quit.shouldTerminate(), .terminateLater, "quit mid-join skipped the handshake")
         client.joinGate?.open()
@@ -539,11 +539,39 @@ final class ScreenShareModelTests: XCTestCase {
             RemoteTrack(mid: "2", participantId: "p2", kind: .video, source: .screen, track: scr),
         ])
         await drainMain()
-        let tiles = call.tiles
+        let tiles = call.tiles(showUsernames: false)
         XCTAssertEqual(tiles.map(\.name), ["Linux's screen", "You", "Linux"])
         XCTAssertTrue(tiles[0].isScreen)
         XCTAssertTrue(tiles[0].track === scr)
         XCTAssertTrue(tiles[2].track === cam)
+    }
+
+    /// Linux is "@linux" with the handle known (from the channel's members at join time), "Linux"
+    /// without; "You" never changes, and a shared screen follows its sharer.
+    private func sharing(handles: [String: String]) async -> CallModel {
+        let media = FakeMedia()
+        let call = CallModel(channelName: "c", plan: full, handle: FakeHandle(), media: media, handles: handles)
+        await call.start()
+        let linux = FfiParticipant(participantId: "p2", userId: "u2", displayName: "Linux", audio: true, video: true)
+        call.apply(FfiCallState(status: .connected, callId: "k1", selfParticipant: "p1", participants: [linux]))
+        let factory = RTCPeerConnectionFactory()
+        let scr = factory.videoTrack(with: factory.videoSource(), trackId: "scr")
+        media.remoteTracks.withLock { $0 }?([
+            RemoteTrack(mid: "2", participantId: "p2", kind: .video, source: .screen, track: scr),
+        ])
+        await drainMain()
+        return call
+    }
+
+    func testTilesFollowShowUsernames() async {
+        let call = await sharing(handles: ["u2": "linux"])
+        XCTAssertEqual(call.tiles(showUsernames: false).map(\.name), ["Linux's screen", "You", "Linux"])
+        XCTAssertEqual(call.tiles(showUsernames: true).map(\.name), ["@linux's screen", "You", "@linux"])
+    }
+
+    func testTileWithoutHandleShowsName() async {
+        let call = await sharing(handles: [:])
+        XCTAssertEqual(call.tiles(showUsernames: true).map(\.name), ["Linux's screen", "You", "Linux"])
     }
 
     /// Two people share: the screen that arrived first stays first (and so on the stage), even when
@@ -568,7 +596,7 @@ final class ScreenShareModelTests: XCTestCase {
             RemoteTrack(mid: "2", participantId: "p2", kind: .video, source: .screen, track: b),
         ])
         await drainMain()
-        XCTAssertEqual(call.tiles.filter(\.isScreen).map(\.name), ["Late's screen", "Early's screen"])
+        XCTAssertEqual(call.tiles(showUsernames: false).filter(\.isScreen).map(\.name), ["Late's screen", "Early's screen"])
     }
 }
 

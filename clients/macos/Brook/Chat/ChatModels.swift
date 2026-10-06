@@ -48,9 +48,9 @@ final class TimelineModel {
         // The connection is back: a head load that failed is tried again.
         didSet { if oldValue, !offline { retryFailedHead() } }
     }
-    /// Current names for authors (a `Users` notice): cached rows keep the name they were
-    /// stored with.
-    private(set) var authorNames: [String: String] = [:]
+    /// Current (name, handle) of authors (a `Users` notice): cached rows keep what they were
+    /// stored with. Never a finished label, so Show usernames relabels without a reload.
+    private(set) var authors: [String: (name: String, handle: String)] = [:]
 
     /// Ids deleted, including ones not shown yet: every later copy stays a tombstone.
     private var deleted: Set<String> = []
@@ -102,12 +102,18 @@ final class TimelineModel {
         }
     }
 
-    init(channelId: String, client: any ChatClient, me: String = "", now: @escaping () -> Date = Date.init,
+    /// The open channel's members (a data source, not the flag): a typing notice carries only a
+    /// name, and the handle comes from here.
+    private let members: @MainActor () -> [FfiMember]
+
+    init(channelId: String, client: any ChatClient, me: String = "",
+         members: @escaping @MainActor () -> [FfiMember] = { [] }, now: @escaping () -> Date = Date.init,
          errorLifetime: Duration = .seconds(5),
          isActive: @escaping @MainActor () -> Bool = { AppActivity.isActive }) {
         self.channelId = channelId
         self.client = client
         self.me = me
+        self.members = members
         self.now = now
         self.errorLifetime = errorLifetime
         self.isActive = isActive
@@ -145,9 +151,25 @@ final class TimelineModel {
     /// What the view shows: no network error while offline with cached messages on screen.
     var visibleError: String? { offline && fromCache ? nil : error }
 
+    /// "Ann is typing…" and so on. The handle comes from the channel's members, then from a
+    /// refreshed author, then from a message of theirs here; with none the name shows.
+    func typingLine(now: Date, showUsernames: Bool) -> String? {
+        let members = members()
+        return typing.line(now: now) { userId, name in
+            let handle = members.first { $0.id == userId }?.handle
+                ?? authors[userId]?.handle
+                ?? messages.last { $0.authorId == userId }?.authorHandle
+            return PersonName.label(name, handle: handle, showUsernames: showUsernames)
+        }
+    }
+
     /// The name to show for a message's author.
-    func authorName(_ message: FfiMessage) -> String {
-        authorNames[message.authorId] ?? message.authorDisplayName ?? message.authorHandle ?? "Someone"
+    func authorName(_ message: FfiMessage, showUsernames: Bool) -> String {
+        if let a = authors[message.authorId] {
+            return PersonName.label(a.name, handle: a.handle, showUsernames: showUsernames)
+        }
+        return PersonName.label(
+            message.authorDisplayName, handle: message.authorHandle, showUsernames: showUsernames) // raw name: input to the label
     }
 
     /// The cached head first (and, when the cache can't vouch for it, a load and a re-read),
@@ -205,7 +227,7 @@ final class TimelineModel {
     /// Current names for these authors, from the cache.
     func refreshAuthors(_ ids: [String]) async {
         guard let users = try? await cache?.cachedUsers(ids: ids) else { return }
-        for u in users { authorNames[u.id] = u.displayName }
+        for u in users { authors[u.id] = (u.displayName, u.handle) } // raw name: stored with its handle
     }
 
     /// One cached page, merged: true if the cache answered (so the network isn't needed for
