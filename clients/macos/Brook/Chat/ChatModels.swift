@@ -31,6 +31,16 @@ final class TimelineModel {
     private(set) var loading = false
     /// No older page: the start of the channel is on screen.
     private(set) var atStart = false
+    /// The last older page failed: the view offers a retry instead of a spinner. It stays until
+    /// tapped, or until the newest page loads again (then the loader asks by itself): a spinner that
+    /// retried on every change is what looped.
+    private(set) var olderFailed = false
+    /// An older page is being asked for: another ask (the Retry button's new spinner appearing, say)
+    /// joins it instead of waiting to start one more.
+    private var olderInFlight = false
+    /// The newest page failed to load: the network is not asked for an older page behind it (it would
+    /// end at an empty "start of the conversation" over history that never loaded); cached pages are.
+    private(set) var headFailed = false
     /// The network's error. Hidden (`visibleError`) while offline with cached messages shown.
     private(set) var error: String?
     /// Set from the cache's state feed: the last sync couldn't reach the server.
@@ -153,13 +163,39 @@ final class TimelineModel {
     /// The page before the oldest shown (scrolled to the top): the cache's, loading it when
     /// the cache can't vouch for it; the network's when there's no local data.
     func loadOlder() async {
-        guard !atStart, !loading, let oldest = messages.first else { return }
-        loading = true // one older page at a time
+        // A load already running (the newest page of a new conversation): wait for it and then
+        // decide. Giving up here left the loader spinning for good, since it asks once, when it
+        // appears. Only the newest page's load is waited for: asks for older pages join each other.
+        // (`loading` covers the network fetches; a cached head's own load, in `readCache`, is not
+        // waited for: an older read then runs beside it and still ends at the start or a page.)
+        while loading || headDrain != nil, !olderInFlight, !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        guard !Task.isCancelled, !olderInFlight, !atStart, !loading,
+              let oldest = messages.first else { return }
+        olderInFlight = true
+        defer { olderInFlight = false }
+        olderFailed = false
+        loading = true // one page at a time
         let fromCache = await readCache(before: oldest.id, loadIfIncomplete: true)
         loading = false
         if fromCache { return }
+        // A newest-page fetch may have started meanwhile (a returning connection, a resync): its
+        // outcome decides whether an older page may be asked for, so it is waited for.
+        if let drain = headDrain { await drain.value }
+        // Cached history is paged whatever the network does, but behind a newest page that failed the
+        // network is not asked for older ones (an empty answer would read as the start of the
+        // conversation): the Retry button instead, so no spinner is left that nothing will end.
+        if headFailed {
+            olderFailed = true
+            return
+        }
         await fetch(before: oldest.id)
     }
+
+    /// The loader above the first message: shown while an older page can be asked for. Behind a failed
+    /// newest page only cached history can be, so without any it stays hidden (the error shows).
+    var offersOlder: Bool { !atStart && !messages.isEmpty && (!headFailed || fromCache) }
 
     /// Re-read the cached head (the cache changed for this channel, or was reset).
     func refill() async {
@@ -207,10 +243,14 @@ final class TimelineModel {
         do {
             let page = try await client.channelHistory(channelId: channelId, before: before)
             if page.isEmpty, before != nil { atStart = true }
+            // The newest page is back: an older page is asked for again, and a Retry left from the time
+            // it was held back is not shown.
+            if before == nil { headFailed = false; olderFailed = false }
             merge(page)
             error = nil
         } catch {
             self.error = "Couldn't load messages."
+            if before != nil { olderFailed = true } else { headFailed = true }
         }
     }
 

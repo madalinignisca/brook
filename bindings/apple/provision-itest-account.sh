@@ -2,7 +2,7 @@
 # Create the integration-test account on a Brook server and write bindings/apple/.itest.env.
 #
 # Run it yourself, as the server's admin. Your admin password is read without echo and
-# used for one login; the test account's password is generated here and written only to
+# used to log in and to confirm the new account (the server asks for it again); the test account's password is generated here and written only to
 # .itest.env (mode 600). Neither is printed, logged, or passed on the command line.
 #
 #   bindings/apple/provision-itest-account.sh [server]            # default: the shared LAN test server
@@ -55,15 +55,16 @@ fi
 
 token="$(check "$(json handle password | post "$API/auth/login")" 200 "admin login" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+export admin_password="$password"  # re-entered for the registration below (server #265)
 unset password
 
 export handle="$HANDLE" display_name="Mac integration tests"
 export password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
-check "$(json handle display_name password | post "$API/auth/register" "$token")" 201 "creating $HANDLE" >/dev/null
+check "$(json handle display_name password admin_password | post "$API/auth/register" "$token")" 201 "creating $HANDLE" >/dev/null
 
 insecure=""; [[ "$SERVER" == http://* ]] && insecure="BROOK_TEST_ALLOW_INSECURE_HTTP=1"
 ( umask 077
   printf 'BROOK_TEST_SERVER=%s\nBROOK_TEST_HANDLE=%s\nBROOK_TEST_PASSWORD=%s\n%s\n' \
     "$SERVER" "$HANDLE" "$password" "$insecure" > "$ENV_FILE" )
-unset password token
+unset password admin_password token
 echo "created '$HANDLE' and wrote $ENV_FILE (mode $(stat -f '%Lp' "$ENV_FILE")). Now run: bindings/apple/itest.sh"

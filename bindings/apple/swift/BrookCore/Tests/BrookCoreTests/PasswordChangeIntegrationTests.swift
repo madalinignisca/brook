@@ -113,7 +113,8 @@ final class PasswordChangeIntegrationTests: XCTestCase {
         let handle = "pc-" + UUID().uuidString.prefix(8).lowercased()
         let (status, body) = try await send(
             cfg, "POST", "auth/register", bearer: adminToken,
-            json: ["handle": handle, "display_name": "Throwaway \(handle)", "password": oldPassword])
+            json: ["handle": handle, "display_name": "Throwaway \(handle)", "password": oldPassword,
+                   "admin_password": cfg.adminPassword])
         XCTAssertEqual(status, 201, "register \(handle)")
         return (handle, try XCTUnwrap(body["id"] as? String))
     }

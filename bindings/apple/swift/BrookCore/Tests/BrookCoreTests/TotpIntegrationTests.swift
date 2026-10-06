@@ -115,7 +115,8 @@ final class TotpIntegrationTests: XCTestCase {
         let handle = "tf-" + UUID().uuidString.prefix(8).lowercased()
         let (status, body) = try await send(
             cfg, "POST", "auth/register", bearer: admin["access_token"] as? String,
-            json: ["handle": handle, "display_name": "Throwaway \(handle)", "password": password])
+            json: ["handle": handle, "display_name": "Throwaway \(handle)", "password": password,
+                   "admin_password": cfg.adminPassword])
         XCTAssertEqual(status, 201, "register \(handle)")
         return (handle, try XCTUnwrap(body["id"] as? String))
     }

@@ -12,6 +12,7 @@
 mod account;
 mod attachments;
 mod call;
+mod call_stage;
 mod chat;
 mod history;
 mod keyring;

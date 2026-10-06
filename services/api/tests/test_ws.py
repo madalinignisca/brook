@@ -33,7 +33,12 @@ def test_ws_delivers_message_new(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             headers = {"Authorization": f"Bearer {token}"} if token else {}
             r = http.post(
                 "/api/v1/auth/register",
-                json={"handle": handle, "display_name": handle.title(), "password": PW},
+                json={
+                    "handle": handle,
+                    "display_name": handle.title(),
+                    "password": PW,
+                    "admin_password": PW,
+                },
                 headers=headers,
             )
             assert r.status_code == 201, r.text
@@ -144,7 +149,12 @@ def test_ws_channel_update_when_added_to_channel(
             headers = {"Authorization": f"Bearer {token}"} if token else {}
             r = http.post(
                 "/api/v1/auth/register",
-                json={"handle": handle, "display_name": handle.title(), "password": PW},
+                json={
+                    "handle": handle,
+                    "display_name": handle.title(),
+                    "password": PW,
+                    "admin_password": PW,
+                },
                 headers=headers,
             )
             assert r.status_code == 201, r.text

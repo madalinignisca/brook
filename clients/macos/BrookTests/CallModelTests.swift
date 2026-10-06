@@ -545,6 +545,31 @@ final class ScreenShareModelTests: XCTestCase {
         XCTAssertTrue(tiles[0].track === scr)
         XCTAssertTrue(tiles[2].track === cam)
     }
+
+    /// Two people share: the screen that arrived first stays first (and so on the stage), even when
+    /// the second sharer comes earlier in the roster.
+    func testTwoSharedScreensKeepTheirArrivalOrder() async throws {
+        let media = FakeMedia()
+        let call = CallModel(channelName: "c", plan: full, handle: FakeHandle(), media: media)
+        await call.start()
+        let early = FfiParticipant(participantId: "p2", userId: "u2", displayName: "Early", audio: true, video: false)
+        let late = FfiParticipant(participantId: "p3", userId: "u3", displayName: "Late", audio: true, video: false)
+        call.apply(FfiCallState(status: .connected, callId: "k1", selfParticipant: "p1", participants: [early, late]))
+        let factory = RTCPeerConnectionFactory()
+        let a = factory.videoTrack(with: factory.videoSource(), trackId: "a")
+        let b = factory.videoTrack(with: factory.videoSource(), trackId: "b")
+        // p3 starts sharing first, then p2 (earlier in the roster).
+        media.remoteTracks.withLock { $0 }?([
+            RemoteTrack(mid: "1", participantId: "p3", kind: .video, source: .screen, track: a),
+        ])
+        await drainMain()
+        media.remoteTracks.withLock { $0 }?([
+            RemoteTrack(mid: "1", participantId: "p3", kind: .video, source: .screen, track: a),
+            RemoteTrack(mid: "2", participantId: "p2", kind: .video, source: .screen, track: b),
+        ])
+        await drainMain()
+        XCTAssertEqual(call.tiles.filter(\.isScreen).map(\.name), ["Late's screen", "Early's screen"])
+    }
 }
 
 @MainActor

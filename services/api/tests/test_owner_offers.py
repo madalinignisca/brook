@@ -138,7 +138,12 @@ def test_the_recipient_hears_the_offer_live(sync_client: TestClient) -> None:
     http = sync_client
 
     def user(handle: str, admin: dict[str, str] | None = None) -> tuple[dict[str, str], str]:
-        body = {"handle": handle, "display_name": handle.title(), "password": PW}
+        body = {
+            "handle": handle,
+            "display_name": handle.title(),
+            "password": PW,
+            "admin_password": PW,
+        }
         http.post(f"{AUTH}/register", json=body, headers=admin or {})
         tok = http.post(f"{AUTH}/login", json={"handle": handle, "password": PW}).json()
         h = _h(tok["access_token"])

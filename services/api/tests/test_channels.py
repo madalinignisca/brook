@@ -15,7 +15,12 @@ API = "/api/v1"
 
 
 async def _register(client: httpx.AsyncClient, handle: str, **kw: object) -> httpx.Response:
-    body = {"handle": handle, "display_name": handle.title(), "password": "supersecret"}
+    body = {
+        "handle": handle,
+        "display_name": handle.title(),
+        "password": "supersecret",
+        "admin_password": "supersecret",
+    }
     return await client.post(f"{API}/auth/register", json=body, **kw)  # type: ignore[arg-type]
 
 

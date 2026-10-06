@@ -11,7 +11,7 @@ PW = "supersecret"
 
 
 async def _register(client: httpx.AsyncClient, handle: str, **kw: object) -> httpx.Response:
-    body = {"handle": handle, "display_name": handle.title(), "password": PW}
+    body = {"handle": handle, "display_name": handle.title(), "password": PW, "admin_password": PW}
     return await client.post(f"{AUTH}/register", json=body, **kw)  # type: ignore[arg-type]
 
 
@@ -258,7 +258,6 @@ async def test_flooded_ip_is_refused_before_argon2(
 ) -> None:
     from app import ratelimit
     from app.routers import auth as auth_router
-    from app.routers import users as users_router
 
     alice, bob = await _admin_and_member(client)
     bob_id = (await client.get(f"{AUTH}/me", headers=_bearer(bob))).json()["id"]
@@ -270,7 +269,6 @@ async def test_flooded_ip_is_refused_before_argon2(
         raise AssertionError("Argon2 ran for a flooded IP")
 
     monkeypatch.setattr(auth_router, "verify_password", _no_argon2)
-    monkeypatch.setattr(users_router, "verify_password", _no_argon2)
     change = await client.post(
         f"{AUTH}/password",
         json={"current_password": PW, "new_password": "brand-new-pass"},

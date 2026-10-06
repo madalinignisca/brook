@@ -41,7 +41,12 @@ def fake_janus(sync_client: TestClient) -> Iterator[None]:
 
 def _login(tc: TestClient, handle: str, admin: str | None = None) -> str:
     hdr = {"Authorization": f"Bearer {admin}"} if admin else {}
-    body = {"handle": handle, "display_name": handle.title(), "password": "supersecret"}
+    body = {
+        "handle": handle,
+        "display_name": handle.title(),
+        "password": "supersecret",
+        "admin_password": "supersecret",
+    }
     assert tc.post(f"{AUTH}/register", json=body, headers=hdr).status_code == 201
     r = tc.post(f"{AUTH}/login", json={"handle": handle, "password": "supersecret"})
     return str(r.json()["access_token"])
