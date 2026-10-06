@@ -1,6 +1,7 @@
 import AppKit
 import BrookCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// A channel's conversation: its messages, and the box to write in.
 struct ChatView: View {
@@ -482,6 +483,7 @@ struct ComposerView: View {
                     .lineLimit(1 ... 6)
                     .textFieldStyle(.roundedBorder)
                     .focused($inputFocused)
+                    .onPasteCommand(of: [.fileURL, .image]) { providers in paste(providers) }
                     .onSubmit { Task { await composer.send() } }
                 Button(composer.editing == nil ? "Send" : "Save") {
                     Task { await composer.send() }
@@ -496,6 +498,16 @@ struct ComposerView: View {
         .onAppear { inputFocused = true }
         .onChange(of: composer.replyingTo?.id) { _, id in if id != nil { inputFocused = true } }
         .onChange(of: composer.editing?.id) { _, id in if id != nil { inputFocused = true } }
+    }
+
+    /// Cmd+V with files or an image on the clipboard: they join the message. Anything else is the
+    /// field's own paste (as plain text).
+    private func paste(_ providers: [NSItemProvider]) {
+        let types = providers.flatMap { $0.registeredTypeIdentifiers }.compactMap { UTType($0) }
+        switch PasteImport.decide(types, canAttach: composer.canAttach) {
+        case .stage: Task { await composer.attach(dropped: providers) }
+        case .text: NSApp.sendAction(#selector(NSTextView.pasteAsPlainText(_:)), to: nil, from: nil)
+        }
     }
 
     /// Files only, several at once.
