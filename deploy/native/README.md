@@ -55,7 +55,8 @@ loopback and cannot see a Caddy → api failure (e.g. an SELinux denial; EPEL's
 Caddy ships no policy today, so it runs unconfined, but verify rather than trust).
 
 Further accounts: log in as admin and `POST /api/v1/auth/register` with the
-admin's bearer token (registration is admin-only once a user exists).
+admin's bearer token and `"admin_password"` (their own password) in the body
+(registration is admin-only once a user exists).
 
 Then the firewall (optional second layer; the cloud security list already
 filters). Read `firewall.sh` first — it has a 5-minute dead-man switch:

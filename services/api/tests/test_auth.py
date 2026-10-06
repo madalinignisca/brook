@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 import httpx
+import pytest
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app import db
+from app.models import User
 
 API = "/api/v1/auth"
 
 
 async def _register(client: httpx.AsyncClient, handle: str, **kw: str) -> httpx.Response:
-    body = {"handle": handle, "display_name": handle.title(), "password": "supersecret"}
+    # admin_password is ignored by the bootstrap and required for every later account.
+    body = {
+        "handle": handle,
+        "display_name": handle.title(),
+        "password": "supersecret",
+        "admin_password": "supersecret",
+    }
     return await client.post(f"{API}/register", json=body, **kw)
 
 
@@ -153,3 +165,171 @@ async def test_an_undecodable_token_is_refused_never_a_server_error(
     token = f"{header}.{_b64(b'{}')}.{_b64(b'sig')}"
     resp = await client.get("/api/v1/channels", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 401
+
+
+async def _admin_headers(client: httpx.AsyncClient) -> dict[str, str]:
+    await _register(client, "alice")  # first = admin, password "supersecret"
+    login = await client.post(f"{API}/login", json={"handle": "alice", "password": "supersecret"})
+    return {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+
+async def _count_users(handle: str) -> int:
+    async with db.get_sessionmaker()() as s:
+        n = await s.scalar(select(func.count()).select_from(User).where(User.handle == handle))
+    return int(n or 0)
+
+
+async def test_register_needs_the_admin_password(client: httpx.AsyncClient) -> None:
+    """A stolen admin access token alone must not mint accounts (encryption spec §7.6):
+    without the admin's password nothing is created."""
+    admin = await _admin_headers(client)
+    body = {"handle": "mallory", "display_name": "M", "password": "mallory-pass"}
+
+    missing = await client.post(f"{API}/register", json=body, headers=admin)
+    assert missing.status_code == 422
+    assert missing.json()["error"]["code"] == "validation.error"
+
+    wrong = await client.post(
+        f"{API}/register", json={**body, "admin_password": "not-it-at-all"}, headers=admin
+    )
+    assert wrong.status_code == 403
+    assert wrong.json()["error"]["code"] == "auth.invalid_credentials"
+    assert await _count_users("mallory") == 0
+
+    ok = await client.post(
+        f"{API}/register", json={**body, "admin_password": "supersecret"}, headers=admin
+    )
+    assert ok.status_code == 201
+
+
+async def test_register_checks_role_then_password_then_handle(client: httpx.AsyncClient) -> None:
+    admin = await _admin_headers(client)
+    assert (await _register(client, "bob", headers=admin)).status_code == 201
+    login = await client.post(f"{API}/login", json={"handle": "bob", "password": "supersecret"})
+    member = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    # A member is refused on role before their password is looked at.
+    bad = {"handle": "carol", "display_name": "C", "password": "supersecret"}
+    r = await client.post(
+        f"{API}/register", json={**bad, "admin_password": "supersecret"}, headers=member
+    )
+    assert r.status_code == 403 and r.json()["error"]["code"] == "authz.forbidden"
+
+    # A taken handle with a wrong admin password is a 403, not a 409: handles of
+    # existing accounts are not probed by someone who cannot prove they are the admin.
+    taken = {**bad, "handle": "bob", "admin_password": "wrong-password"}
+    r = await client.post(f"{API}/register", json=taken, headers=admin)
+    assert r.status_code == 403 and r.json()["error"]["code"] == "auth.invalid_credentials"
+    # ...and with the right one it is the conflict.
+    r = await client.post(
+        f"{API}/register", json={**taken, "admin_password": "supersecret"}, headers=admin
+    )
+    assert r.status_code == 409
+
+
+async def test_register_with_a_refused_token_is_401_not_403(client: httpx.AsyncClient) -> None:
+    """Clients refresh on 401 only: an expired token must not read as "not allowed"."""
+    await _register(client, "alice")
+    r = await _register(client, "bob", headers={"Authorization": "Bearer not-a-real-token"})
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "auth.invalid_token"
+    assert await _count_users("bob") == 0
+
+
+async def test_bootstrap_ignores_a_stale_token(client: httpx.AsyncClient) -> None:
+    """A client that kept a token from a wiped server must still be able to set up the
+    first account: there is nobody to refresh against."""
+    r = await _register(client, "alice", headers={"Authorization": "Bearer stale-token"})
+    assert r.status_code == 201
+    assert r.json()["global_role"] == "admin"
+
+
+async def test_register_display_name_limit_is_one_rule(client: httpx.AsyncClient) -> None:
+    """The name is judged once, after trimming (1-64, as PATCH /auth/me): a name padded
+    with spaces that trims to 64 passes, 65 visible characters is profile.invalid."""
+    admin = await _admin_headers(client)
+    base = {"password": "supersecret", "admin_password": "supersecret"}
+    padded = await client.post(
+        f"{API}/register",
+        json={**base, "handle": "n64", "display_name": "  " + "n" * 64 + "  "},
+        headers=admin,
+    )
+    assert padded.status_code == 201
+    assert padded.json()["display_name"] == "n" * 64
+    long_ = await client.post(
+        f"{API}/register", json={**base, "handle": "n65", "display_name": "n" * 65}, headers=admin
+    )
+    assert long_.status_code == 422
+    assert long_.json()["error"]["code"] == "profile.invalid"
+    huge = await client.post(
+        f"{API}/register", json={**base, "handle": "n300", "display_name": "n" * 300}, headers=admin
+    )
+    assert huge.status_code == 422
+    assert huge.json()["error"]["code"] == "validation.error"
+
+
+async def test_register_losing_a_handle_race_is_409(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two registers of one handle both pass the existence check; the unique column
+    picks one. The other must be a 409, not a 500. The rival row is committed by a
+    second session right before this request's own commit, i.e. after its check."""
+    admin = await _admin_headers(client)
+    real_commit = AsyncSession.commit
+    rival_done = False
+
+    async def commit_after_rival(self: AsyncSession) -> None:
+        nonlocal rival_done
+        if not rival_done:
+            rival_done = True
+            async with db.get_sessionmaker()() as other:
+                other.add(User(handle="bob", display_name="Rival", password_hash="x"))
+                await other.commit()
+        await real_commit(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", commit_after_rival)
+    r = await _register(client, "bob", headers=admin)
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "conflict"
+    assert await _count_users("bob") == 1
+
+
+def test_admin_reauth_does_not_make_the_ip_trusted() -> None:
+    """Trust exempts an IP from the TOTP code budget; a password re-check is not a login."""
+    from app.ratelimit import AuthLimiter
+    from app.routers.auth import confirm_admin_password
+    from app.security import hash_password
+
+    admin = User(handle="alice", display_name="A", password_hash=hash_password("supersecret"))
+    limiter = AuthLimiter()
+    confirm_admin_password(admin, "supersecret", "203.0.113.9", limiter)
+    assert limiter.code_check("alice", "203.0.113.9") is None  # nothing spent yet
+    for _ in range(limiter.config.code_budget):
+        limiter.code_failure("alice")
+    assert limiter.code_check("alice", "203.0.113.9") is not None, "the IP was trusted"
+
+
+async def test_register_costs_one_attempt_token_and_a_wrong_password_one_failure(
+    client: httpx.AsyncClient,
+) -> None:
+    from app import ratelimit
+
+    admin = await _admin_headers(client)
+    lim = ratelimit.get_limiter()
+    ip = "127.0.0.1"
+
+    def tokens() -> float:
+        return lim._ips.get(ip).tokens  # noqa: SLF001
+
+    before = tokens()
+    assert (await _register(client, "bob", headers=admin)).status_code == 201
+    spent = before - tokens()
+    assert 0.5 < spent < 1.5, spent  # one, not two (refill is negligible in a test)
+
+    failures = len(lim._ips.get(ip).recent)  # noqa: SLF001
+    body = {"handle": "eve", "display_name": "E", "password": "supersecret"}
+    r = await client.post(
+        f"{API}/register", json={**body, "admin_password": "nope-nope"}, headers=admin
+    )
+    assert r.status_code == 403
+    assert len(lim._ips.get(ip).recent) == failures + 1  # noqa: SLF001

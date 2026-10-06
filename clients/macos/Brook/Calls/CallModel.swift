@@ -51,6 +51,8 @@ final class CallModel {
     private var mediaChain: Task<Void, Never>?
     private var remote: [String: RTCVideoTrack] = [:]  // participant id → camera track
     private var remoteScreens: [String: RTCVideoTrack] = [:]  // participant id → screen track
+    /// Who is sharing, in arrival order (`CallStage.arrivalOrder`): the first share stays on the stage.
+    private var screenOrder: [String] = []
     private(set) var sharing = false
     private(set) var sharingBusy = false
     private(set) var shareError: String?
@@ -95,6 +97,7 @@ final class CallModel {
                 MainActor.assumeIsolated {
                     self?.remote = cameras
                     self?.remoteScreens = screens
+                    if let self { self.screenOrder = CallStage.arrivalOrder(previous: self.screenOrder, current: Array(screens.keys)) }
                 }
             }
         }
@@ -133,7 +136,8 @@ final class CallModel {
             video: cameraOn, track: cameraOn ? localVideo : nil)
         let others = state.participants.filter { $0.participantId != state.selfParticipant }
         // Shared screens first: they are what everyone is looking at.
-        let screens = others.compactMap { p -> Tile? in
+        let inArrivalOrder = screenOrder.compactMap { id in others.first { $0.participantId == id } }
+        let screens = inArrivalOrder.compactMap { p -> Tile? in
             guard let track = remoteScreens[p.participantId] else { return nil }
             return Tile(
                 id: p.participantId + ".screen", name: "\(p.displayName)'s screen", isSelf: false,

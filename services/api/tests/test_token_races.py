@@ -37,7 +37,7 @@ SETTLE = 0.5
 
 
 async def _alice(client: httpx.AsyncClient) -> tuple[uuid.UUID, dict[str, str]]:
-    body = {"handle": "alice", "display_name": "Alice", "password": PW}
+    body = {"handle": "alice", "display_name": "Alice", "password": PW, "admin_password": PW}
     await client.post(f"{AUTH}/register", json=body)
     pair = (await client.post(f"{AUTH}/login", json={"handle": "alice", "password": PW})).json()
     me = await client.get(f"{AUTH}/me", headers={"Authorization": f"Bearer {pair['access_token']}"})
@@ -114,7 +114,7 @@ async def test_token_issuing_routes_take_the_user_lock(
 async def test_admin_reset_takes_the_target_lock(client: httpx.AsyncClient) -> None:
     _alice_id, alice = await _alice(client)
     headers = {"Authorization": f"Bearer {alice['access_token']}"}
-    bob = {"handle": "bob", "display_name": "Bob", "password": PW}
+    bob = {"handle": "bob", "display_name": "Bob", "password": PW, "admin_password": PW}
     await client.post(f"{AUTH}/register", json=bob, headers=headers)
     async with db.get_sessionmaker()() as s:
         bob_id = await s.scalar(select(User.id).where(User.handle == "bob"))
@@ -345,7 +345,7 @@ async def test_two_owners_leaving_at_once_leave_one_behind(client: httpx.AsyncCl
     ch = (
         await client.post("/api/v1/channels", json={"kind": "channel", "name": "g"}, headers=ha)
     ).json()["id"]  # alice (admin) is its owner
-    body = {"handle": "bob", "display_name": "Bob", "password": PW}
+    body = {"handle": "bob", "display_name": "Bob", "password": PW, "admin_password": PW}
     await client.post(f"{AUTH}/register", json=body, headers=ha)
     await client.post(f"/api/v1/channels/{ch}/members", json={"handle": "bob"}, headers=ha)
     bob = await client.post(f"{AUTH}/login", json={"handle": "bob", "password": PW})

@@ -47,7 +47,7 @@ def setup() -> tuple[str, dict[str, str]]:
         c.post(
             "/api/v1/auth/register",
             headers=admin_hdr,
-            json={"handle": b, "display_name": "Bob", "password": pw[b]},
+            json={"handle": b, "display_name": "Bob", "password": pw[b], "admin_password": pw[a]},
         ).raise_for_status()
         ch = c.post(
             "/api/v1/channels", headers=admin_hdr, json={"kind": "channel", "name": f"e2e-{tag}"}

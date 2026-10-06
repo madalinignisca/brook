@@ -46,6 +46,19 @@ final class CallStageTests: XCTestCase {
         XCTAssertNil(CallStage.pruned(nil, tiles: again))
     }
 
+    func testSharesKeepTheirArrivalOrderAndANewShareGoesLast() {
+        XCTAssertEqual(CallStage.arrivalOrder(previous: [], current: ["p3"]), ["p3"])
+        XCTAssertEqual(CallStage.arrivalOrder(previous: ["p3"], current: ["p2", "p3"]), ["p3", "p2"],
+                       "p2 is earlier in the roster but arrived second")
+        XCTAssertEqual(CallStage.arrivalOrder(previous: ["p3", "p2"], current: ["p2"]), ["p2"], "p3 stopped sharing")
+        XCTAssertEqual(CallStage.arrivalOrder(previous: ["p2"], current: ["p2", "p9", "p4"]), ["p2", "p4", "p9"],
+                       "several in one update are ordered by id")
+        XCTAssertEqual(CallStage.arrivalOrder(previous: ["p3"], current: ["p3", "p2"]).first, "p3", "the first stays first")
+        // p3 stops (an update without it), then shares again: it goes after the share still running.
+        let stopped = CallStage.arrivalOrder(previous: ["p3", "p2"], current: ["p2"])
+        XCTAssertEqual(CallStage.arrivalOrder(previous: stopped, current: ["p2", "p3"]), ["p2", "p3"])
+    }
+
     func testClickingPinsAndClickingTheStageReleases() {
         XCTAssertEqual(CallStage.toggled(nil, clicked: "b", onStage: "p2.screen"), "b", "a strip tile is pinned")
         XCTAssertNil(CallStage.toggled("b", clicked: "b", onStage: "b"), "the pinned stage releases")

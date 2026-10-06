@@ -17,10 +17,10 @@ from ..db import get_session
 from ..deps import require_admin
 from ..events import record_event
 from ..models import User, utcnow
-from ..ratelimit import AuthLimiter, client_ip, enforce, get_limiter
+from ..ratelimit import AuthLimiter, client_ip, get_limiter
 from ..schemas import AdminPasswordIn, AdminReauthIn, UserOut
-from ..security import hash_password, verify_password
-from .auth import lock_user, sign_out_everywhere
+from ..security import hash_password
+from .auth import confirm_admin_password, lock_user, sign_out_everywhere
 from .totp import remove_totp
 from .ws import revoke_sessions
 
@@ -70,14 +70,7 @@ async def _admin_target(
     admin. Admins manage their own password and TOTP, which re-check them.
     """
     ip = client_ip(request.client.host if request.client else None)
-    enforce(limiter, ip, admin.handle)
-    if admin.password_hash is None or not verify_password(admin.password_hash, admin_password):
-        limiter.failure(ip, admin.handle)
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"code": "auth.invalid_credentials", "message": "Admin password is wrong"},
-        )
-    limiter.success(ip, admin.handle)
+    confirm_admin_password(admin, admin_password, ip, limiter)
     if user_id == admin.id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

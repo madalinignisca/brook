@@ -315,9 +315,13 @@ def get_limiter() -> AuthLimiter:
     )
 
 
-def enforce(limiter: AuthLimiter, ip: str, handle: str | None = None) -> None:
-    """Raise 429 + ``Retry-After`` if ``ip`` (and ``handle``) must wait."""
-    wait = limiter.check(ip, handle)
+def enforce(
+    limiter: AuthLimiter, ip: str, handle: str | None = None, *, consume: bool = True
+) -> None:
+    """Raise 429 + ``Retry-After`` if ``ip`` (and ``handle``) must wait. ``consume=False``
+    re-checks the backoff and slowdowns without taking another attempt token, for a
+    second credential check inside a request that already paid for one."""
+    wait = limiter.check(ip, handle, consume=consume)
     if wait is not None:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
