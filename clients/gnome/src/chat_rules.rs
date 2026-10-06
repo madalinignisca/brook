@@ -66,6 +66,20 @@ pub fn leftovers(root: &Path, existing: &[PathBuf], staged: &[PathBuf]) -> Vec<P
         .collect()
 }
 
+/// The paste folders (`<pid>-<uuid>`) that belong to Brook processes no longer running: theirs
+/// can go at start-up; a running window's stay. A name that isn't one of ours is left alone.
+pub fn dead_paste_dirs(names: &[String], alive: impl Fn(u32) -> bool) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| {
+            name.split_once('-')
+                .and_then(|(pid, _)| pid.parse::<u32>().ok())
+                .is_some_and(|pid| !alive(pid))
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +145,69 @@ mod tests {
         assert!(leftovers(root, &existing, &[a, b]).is_empty());
         // Never anything outside the pasted root, staged or not.
         assert!(!leftovers(root, std::slice::from_ref(&outside), &[]).contains(&outside));
+    }
+
+    #[test]
+    fn only_the_paste_folders_of_dead_runs_go_at_start_up() {
+        let names: Vec<String> = ["100-aaa", "200-bbb", "not-ours", "300"]
+            .map(String::from)
+            .to_vec();
+        let alive = |pid: u32| pid == 200;
+        assert_eq!(dead_paste_dirs(&names, alive), vec!["100-aaa".to_string()]);
+    }
+}
+
+/// What GTK itself does on paste, checked against a real display (Broadway or a desktop):
+/// `GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 cargo test -p brook-gnome paste_on_a_display --
+/// --ignored`. The Mac found its text field swallowed the paste before its own handler saw it;
+/// this proves GtkText's paste signal reaches the handler, can be stopped, and what the
+/// clipboard offers for a picture alone.
+#[cfg(test)]
+mod display_tests {
+    use gtk::prelude::*;
+    use gtk::{gdk, glib};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[test]
+    #[ignore = "needs a display"]
+    fn paste_on_a_display() {
+        gtk::init().expect("a display (GDK_BACKEND=broadway with gtk4-broadwayd running)");
+        let entry = gtk::Entry::new();
+        let text = entry
+            .delegate()
+            .and_downcast::<gtk::Text>()
+            .expect("a GtkEntry edits through a GtkText");
+
+        // A picture alone on the clipboard: offered as a texture, not as text.
+        let png = gdk::MemoryTexture::new(
+            1,
+            1,
+            gdk::MemoryFormat::R8g8b8a8,
+            &glib::Bytes::from_static(&[255, 0, 0, 255]),
+            4,
+        );
+        let clipboard = entry.clipboard();
+        clipboard.set_texture(&png);
+        let formats = clipboard.formats();
+        assert!(formats.contains_type(gdk::Texture::static_type()));
+        assert!(!formats.contains_type(glib::Type::STRING));
+
+        // The paste signal (what Ctrl+V and the menu's Paste emit) reaches a handler that
+        // stops it before the text box's own paste runs.
+        let seen = Rc::new(Cell::new(0));
+        text.connect_paste_clipboard({
+            let seen = seen.clone();
+            move |t| {
+                seen.set(seen.get() + 1);
+                t.stop_signal_emission_by_name("paste-clipboard");
+            }
+        });
+        clipboard.set_text("should not be pasted");
+        text.emit_paste_clipboard();
+        let context = glib::MainContext::default();
+        while context.iteration(false) {}
+        assert_eq!(seen.get(), 1, "the handler saw the paste");
+        assert_eq!(entry.text(), "", "stopping it kept the text box's own paste out");
     }
 }

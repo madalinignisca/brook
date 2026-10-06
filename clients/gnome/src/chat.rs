@@ -54,6 +54,11 @@ struct Chat {
     /// The scroll adjustment's (upper, value) from before older rows were added, so the view
     /// can stay on the same message once they are laid out.
     scroll_anchor: Rc<Cell<Option<(f64, f64)>>>,
+    /// This window's folder for pasted pictures (`pasted/<pid>-<uuid>`), so windows and runs
+    /// never delete each other's (#291).
+    paste_dir: std::path::PathBuf,
+    /// Pasted pictures written but not staged yet: the sweep leaves them alone until they are.
+    pending_pastes: Rc<RefCell<std::collections::HashSet<std::path::PathBuf>>>,
     /// Handles whose last Add User attempt got no clear answer (kept across sheets in this sign-in).
     add_user_uncertain: Rc<RefCell<crate::add_user::Uncertain>>,
     /// The user chose to remove this device's data: a late save mustn't bring their ranks back.
@@ -330,6 +335,12 @@ pub fn build(
         paging: Rc::default(),
         scroll_anchor: Rc::default(),
         add_user_uncertain: Rc::default(),
+        paste_dir: pasted_root().join(format!(
+            "{}-{}",
+            std::process::id(),
+            glib::uuid_string_random()
+        )),
+        pending_pastes: Rc::default(),
         ranks_forgotten: Rc::default(),
         ended: Rc::default(),
         show_usernames: Rc::new(Cell::new(crate::prefs::show_usernames())),
@@ -536,7 +547,12 @@ pub fn build(
         };
         let adj = message_scroll.vadjustment();
         adj.connect_value_changed(update.clone());
-        adj.connect_changed(update);
+        // A new row grows the list before the follow-to-bottom (an idle) catches up: look once
+        // that has run, so a tall new message doesn't flash the button.
+        adj.connect_changed(move |adj| {
+            let (adj, update) = (adj.clone(), update.clone());
+            glib::idle_add_local_once(move || update(&adj));
+        });
     }
     let messages = gtk::Overlay::new();
     messages.set_child(Some(&message_scroll));
@@ -578,7 +594,7 @@ pub fn build(
     });
     // Ctrl+V with copied files, or a picture alone, stages them as files, like a drop (#291);
     // text pastes as before. Pasted pictures left over from an earlier run go first.
-    let _ = std::fs::remove_dir_all(pasted_root());
+    sweep_dead_paste_dirs();
     let composer_text = composer
         .delegate()
         .and_downcast::<gtk::Text>()
@@ -602,7 +618,12 @@ pub fn build(
                 return; // the box's own paste
             }
             entry.stop_signal_emission_by_name("paste-clipboard");
+            // The clipboard answers asynchronously: what was pasted belongs to the conversation
+            // it was pasted in, so a switch meanwhile drops it.
+            let pasted_in = chat.current.borrow().clone();
+            let text_box = entry.clone();
             glib::spawn_future_local(async move {
+                let still_here = |chat: &Rc<Chat>| *chat.current.borrow() == pasted_in;
                 match decision {
                     crate::chat_rules::Paste::Files => {
                         let read = clipboard
@@ -611,14 +632,37 @@ pub fn build(
                                 glib::Priority::DEFAULT,
                             )
                             .await;
-                        match read.ok().and_then(|v| v.get::<gtk::gdk::FileList>().ok()) {
-                            Some(list) => stage_files(&chat, list.files()),
-                            None => show_send_error(&chat, "The copied files couldn't be read."),
+                        let files: Vec<gtk::gio::File> = read
+                            .ok()
+                            .and_then(|v| v.get::<gtk::gdk::FileList>().ok())
+                            .map(|l| l.files())
+                            .unwrap_or_default()
+                            .into_iter()
+                            // Copied web links come as a URI list too: only local files are files.
+                            .filter(|f| f.path().is_some())
+                            .collect();
+                        if !still_here(&chat) {
+                            return;
                         }
+                        if files.is_empty() {
+                            // Links, not files: paste them as the text they are.
+                            if let Ok(Some(text)) = clipboard.read_text_future().await {
+                                let mut at = text_box.position();
+                                text_box.insert_text(&text, &mut at);
+                                text_box.set_position(at);
+                            }
+                            return;
+                        }
+                        stage_files(&chat, files);
                     }
                     crate::chat_rules::Paste::Image => {
                         let texture = clipboard.read_texture_future().await.ok().flatten();
-                        match texture.and_then(|t| write_pasted(&t.save_to_png_bytes())) {
+                        if !still_here(&chat) {
+                            return;
+                        }
+                        let written =
+                            texture.and_then(|t| write_pasted(&chat, &t.save_to_png_bytes()));
+                        match written {
                             Some(path) => stage_files(&chat, vec![gtk::gio::File::for_path(path)]),
                             None => show_send_error(&chat, "The pasted image couldn't be read."),
                         }
@@ -672,6 +716,17 @@ pub fn build(
                     })
                     .as_ref(),
             );
+        }
+    });
+    // Opening a conversation with a click or Enter puts the cursor in its message box (#291).
+    // On activation, not selection: a click focuses the row after selecting it, and arrow keys
+    // select rows as they move, which must keep the keyboard in the sidebar.
+    channel_list.connect_row_activated({
+        let chat = Rc::downgrade(&chat);
+        move |_, _| {
+            if let Some(chat) = chat.upgrade() {
+                focus_composer(&chat);
+            }
         }
     });
     channel_list.connect_row_selected({
@@ -1257,10 +1312,6 @@ fn select_channel(chat: &Rc<Chat>, channel_id: &str) {
     }
     apply_channel_chrome(chat, channel_id);
     ask_about_ownership(chat);
-    // Opening a conversation puts the cursor in its message box (#291).
-    if chat.composer.is_sensitive() {
-        chat.composer.grab_focus();
-    }
 
     // Opening a channel reads it: clear its unread badge locally and tell the
     // server. Compute idx in its own statement so the immutable borrow is dropped
@@ -1550,14 +1601,40 @@ fn add_files(chat: &Rc<Chat>) {
 }
 
 /// Where pasted pictures are written until they are sent or unstaged: this session's runtime
-/// directory, private to the user and gone at log-out.
+/// directory, private to the user and gone at log-out. Each window has a folder of its own in it.
 fn pasted_root() -> std::path::PathBuf {
     glib::user_runtime_dir().join("brook").join("pasted")
 }
 
+/// A folder only the user can read (the runtime directory falls back to the cache directory
+/// when there is none).
+fn private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+/// Remove the paste folders of Brook processes that are gone (a crash, a killed run); those of
+/// running windows stay.
+fn sweep_dead_paste_dirs() {
+    let Ok(dirs) = std::fs::read_dir(pasted_root()) else {
+        return;
+    };
+    let names: Vec<String> = dirs
+        .flatten()
+        .map(|d| d.file_name().to_string_lossy().into_owned())
+        .collect();
+    let alive = |pid: u32| std::path::Path::new(&format!("/proc/{pid}")).exists();
+    for name in crate::chat_rules::dead_paste_dirs(&names, alive) {
+        let _ = std::fs::remove_dir_all(pasted_root().join(name));
+    }
+}
+
 /// Write a pasted picture as a PNG file of its own, named by the time it was pasted, in a folder
 /// of its own (two pastes in one second don't collide). `None` if it can't be written.
-fn write_pasted(png: &glib::Bytes) -> Option<std::path::PathBuf> {
+fn write_pasted(chat: &Rc<Chat>, png: &glib::Bytes) -> Option<std::path::PathBuf> {
     let now = glib::DateTime::now_local().ok()?;
     let name = crate::chat_rules::pasted_name(
         now.year(),
@@ -1567,18 +1644,23 @@ fn write_pasted(png: &glib::Bytes) -> Option<std::path::PathBuf> {
         now.minute() as u32,
         now.second() as u32,
     );
-    let dir = pasted_root().join(glib::uuid_string_random().as_str());
-    std::fs::create_dir_all(&dir).ok()?;
+    private_dir(&pasted_root()).ok()?;
+    let dir = chat.paste_dir.join(glib::uuid_string_random().as_str());
+    private_dir(&dir).ok()?;
     let path = dir.join(name);
-    std::fs::write(&path, png.as_ref()).ok()?;
+    if std::fs::write(&path, png.as_ref()).is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+    // Not staged yet: a sweep meanwhile (another paste, a chip removed) must leave it.
+    chat.pending_pastes.borrow_mut().insert(path.clone());
     Some(path)
 }
 
-/// Delete the pasted pictures no staged file uses any more (unstaged, sent, or refused when
-/// staged), with their folders.
+/// Delete this window's pasted pictures that no staged file uses any more (unstaged, sent, or
+/// refused when staged), with their folders; one still on its way to being staged stays.
 fn sweep_pasted(chat: &Rc<Chat>) {
-    let root = pasted_root();
-    let Ok(dirs) = std::fs::read_dir(&root) else {
+    let Ok(dirs) = std::fs::read_dir(&chat.paste_dir) else {
         return;
     };
     let existing: Vec<std::path::PathBuf> = dirs
@@ -1586,13 +1668,14 @@ fn sweep_pasted(chat: &Rc<Chat>) {
         .filter_map(|d| std::fs::read_dir(d.path()).ok())
         .flat_map(|files| files.flatten().map(|f| f.path()))
         .collect();
-    let staged: Vec<std::path::PathBuf> = chat
+    let mut kept: Vec<std::path::PathBuf> = chat
         .staged
         .borrow()
         .iter()
         .map(|f| f.path.clone())
         .collect();
-    for path in crate::chat_rules::leftovers(&root, &existing, &staged) {
+    kept.extend(chat.pending_pastes.borrow().iter().cloned());
+    for path in crate::chat_rules::leftovers(&chat.paste_dir, &existing, &kept) {
         let _ = std::fs::remove_file(&path);
         if let Some(dir) = path.parent() {
             let _ = std::fs::remove_dir(dir);
@@ -1604,9 +1687,20 @@ fn sweep_pasted(chat: &Rc<Chat>) {
 /// limits as they're added.
 fn stage_files(chat: &Rc<Chat>, files: Vec<gtk::gio::File>) {
     let chat = chat.clone();
+    // Files staged for one conversation never go to another, even when one is opened while
+    // they are being looked at.
+    let staging_in = chat.current.borrow().clone();
     glib::spawn_future_local(async move {
         for file in files {
-            let staged = match crate::outgoing::describe(&file).await {
+            let described = crate::outgoing::describe(&file).await;
+            // Whatever happens to it now, a pasted picture is no longer on its way.
+            if let Some(path) = file.path() {
+                chat.pending_pastes.borrow_mut().remove(&path);
+            }
+            if *chat.current.borrow() != staging_in {
+                continue;
+            }
+            let staged = match described {
                 Ok(staged) => staged,
                 Err(crate::outgoing::NotStaged::NotAFile) => {
                     show_send_error(&chat, "Only files can be sent (not folders or devices).");
@@ -4285,7 +4379,17 @@ fn jump_to_channel(chat: &Rc<Chat>, channel_id: &str) {
     if let Some(idx) = idx {
         if let Some(row) = chat.channel_list.row_at_index(idx as i32) {
             chat.channel_list.select_row(Some(&row));
+            // Opened from search, a notification or a new conversation: the cursor goes to
+            // its message box too.
+            focus_composer(chat);
         }
+    }
+}
+
+/// Put the cursor in the message box, if a conversation that can be written in is open.
+fn focus_composer(chat: &Rc<Chat>) {
+    if chat.composer.is_sensitive() {
+        chat.composer.grab_focus();
     }
 }
 
