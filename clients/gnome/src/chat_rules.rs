@@ -23,13 +23,22 @@ pub struct Offered {
     pub image: bool,
 }
 
-/// What the clipboard offers, from GDK's view of it: the MIME types, and whether GDK can turn it
-/// into a file list (it can from `text/uri-list`), a picture, or a string.
-pub fn offered_from(mimes: &[String], file_list: bool, texture: bool, string: bool) -> Offered {
+/// The clipboard as GDK describes it: its MIME types, and whether GDK can turn it into a file
+/// list (it can from `text/uri-list`), a picture, or a string. Named fields, so the flags can't
+/// be swapped silently at the call site.
+pub struct Formats<'a> {
+    pub mimes: &'a [String],
+    pub file_list: bool,
+    pub texture: bool,
+    pub string: bool,
+}
+
+/// What the clipboard offers, from GDK's view of it.
+pub fn offered_from(f: &Formats) -> Offered {
     Offered {
-        files: file_list,
-        text: string || mimes.iter().any(|m| m.starts_with("text/plain")),
-        image: texture || mimes.iter().any(|m| m.starts_with("image/")),
+        files: f.file_list,
+        text: f.string || f.mimes.iter().any(|m| m.starts_with("text/plain")),
+        image: f.texture || f.mimes.iter().any(|m| m.starts_with("image/")),
     }
 }
 
@@ -119,33 +128,38 @@ mod tests {
     #[test]
     fn files_copied_in_a_file_manager_are_staged() {
         // Nautilus: a URI list, its own type, and the names as text.
-        let o = offered_from(
-            &mimes(&[
+        let o = offered_from(&Formats {
+            mimes: &mimes(&[
                 "x-special/gnome-copied-files",
                 "text/uri-list",
                 "text/plain;charset=utf-8",
             ]),
-            true,
-            false,
-            true,
-        );
+            file_list: true,
+            texture: false,
+            string: true,
+        });
         assert_eq!(paste(o, true), Paste::Files);
     }
 
     #[test]
     fn a_spreadsheet_cell_pastes_as_text() {
-        let o = offered_from(
-            &mimes(&["text/plain", "text/html", "image/png"]),
-            false,
-            true,
-            true,
-        );
+        let o = offered_from(&Formats {
+            mimes: &mimes(&["text/plain", "text/html", "image/png"]),
+            file_list: false,
+            texture: true,
+            string: true,
+        });
         assert_eq!(paste(o, true), Paste::Text);
     }
 
     #[test]
     fn a_screenshot_is_staged_as_a_picture() {
-        let o = offered_from(&mimes(&["image/png"]), false, true, false);
+        let o = offered_from(&Formats {
+            mimes: &mimes(&["image/png"]),
+            file_list: false,
+            texture: true,
+            string: false,
+        });
         assert_eq!(paste(o, true), Paste::Image);
     }
 
@@ -153,7 +167,12 @@ mod tests {
     fn web_links_are_read_as_a_list_then_decided_again_without_files() {
         // GDK offers a file list for any URI list; after reading finds no local file, the paste
         // is decided again with no files: links alone are text, links beside a picture a picture.
-        let links = offered_from(&mimes(&["text/uri-list", "text/plain"]), true, false, true);
+        let links = offered_from(&Formats {
+            mimes: &mimes(&["text/uri-list", "text/plain"]),
+            file_list: true,
+            texture: false,
+            string: true,
+        });
         assert_eq!(paste(links, true), Paste::Files);
         assert_eq!(
             paste(
@@ -165,7 +184,12 @@ mod tests {
             ),
             Paste::Text
         );
-        let with_picture = offered_from(&mimes(&["text/uri-list", "image/png"]), true, true, false);
+        let with_picture = offered_from(&Formats {
+            mimes: &mimes(&["text/uri-list", "image/png"]),
+            file_list: true,
+            texture: true,
+            string: false,
+        });
         assert_eq!(
             paste(
                 Offered {
@@ -230,6 +254,28 @@ mod tests {
             .to_vec();
         let alive = |pid: u32| pid == 200;
         assert_eq!(dead_paste_dirs(&names, alive), vec!["100-aaa".to_string()]);
+    }
+
+    #[test]
+    fn each_sign_of_text_or_a_picture_counts_on_its_own() {
+        let none: Vec<String> = Vec::new();
+        let only = |mimes: &[String], texture: bool, string: bool| {
+            offered_from(&Formats {
+                mimes,
+                file_list: false,
+                texture,
+                string,
+            })
+        };
+        // Text: a string GDK can make, or a text/plain type, each alone.
+        assert!(only(&none, false, true).text);
+        assert!(only(&mimes(&["text/plain;charset=utf-8"]), false, false).text);
+        // A picture: a texture GDK can make, or an image type, each alone.
+        assert!(only(&none, true, false).image);
+        assert!(only(&mimes(&["image/jpeg"]), false, false).image);
+        // Nothing of either.
+        let nothing = only(&mimes(&["text/html"]), false, false);
+        assert!(!nothing.text && !nothing.image && !nothing.files);
     }
 }
 

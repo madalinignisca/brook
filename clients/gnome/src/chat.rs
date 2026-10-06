@@ -595,6 +595,15 @@ pub fn build(
     // Ctrl+V with copied files, or a picture alone, stages them as files, like a drop (#291);
     // text pastes as before. Pasted pictures left over from an earlier run go first.
     sweep_dead_paste_dirs();
+    // The window closed or the account signed out (the conversation view leaves the window
+    // either way): this window's pasted pictures go too. Not tied to the chat being freed, which
+    // the handlers' references to it may keep from ever happening.
+    chat.message_list.connect_unrealize({
+        let dir = chat.paste_dir.clone();
+        move |_| {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    });
     let composer_text = composer
         .delegate()
         .and_downcast::<gtk::Text>()
@@ -606,12 +615,12 @@ pub fn build(
             let clipboard = entry.clipboard();
             let formats = clipboard.formats();
             let mimes: Vec<String> = formats.mime_types().iter().map(|m| m.to_string()).collect();
-            let offered = crate::chat_rules::offered_from(
-                &mimes,
-                formats.contains_type(gtk::gdk::FileList::static_type()),
-                formats.contains_type(gtk::gdk::Texture::static_type()),
-                formats.contains_type(glib::Type::STRING),
-            );
+            let offered = crate::chat_rules::offered_from(&crate::chat_rules::Formats {
+                mimes: &mimes,
+                file_list: formats.contains_type(gtk::gdk::FileList::static_type()),
+                texture: formats.contains_type(gtk::gdk::Texture::static_type()),
+                string: formats.contains_type(glib::Type::STRING),
+            });
             let can_attach = chat.attach_button.is_sensitive();
             let decision = crate::chat_rules::paste(offered, can_attach);
             if decision == crate::chat_rules::Paste::Text {
@@ -4431,13 +4440,6 @@ fn jump_to_channel(chat: &Rc<Chat>, channel_id: &str) {
             // its message box too.
             focus_composer(chat);
         }
-    }
-}
-
-impl Drop for Chat {
-    /// The window closed or the account signed out: this window's pasted pictures go too.
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.paste_dir);
     }
 }
 
