@@ -17,6 +17,9 @@ struct ChatView: View {
     let archived: Bool
     private let client: any ChatClient
     @Environment(\.showUsernames) private var showUsernames
+    /// Scrolled away from the newest message: offers the jump back (#284).
+    @State private var awayFromLatest = false
+    private static let bottomId = "bottom"
 
     init(channelId: String, me: String, client: any ChatClient, timeline: TimelineModel,
          pending: PendingModel? = nil, feed: CacheFeed? = nil, archived: Bool = false) {
@@ -66,12 +69,40 @@ struct ChatView: View {
                                 PendingRow(message: unsent, pending: pending)
                             }
                         }
+                        // Scrolling to the last row itself would leave it flush against the composer;
+                        // scrolling to this spacer keeps the gap (#285).
+                        Color.clear.frame(height: ScrollToLatest.gap).id(Self.bottomId)
                     }
-                    .padding(12)
+                    .padding([.horizontal, .top], 12)
+                }
+                .onScrollGeometryChange(for: Bool.self) { geometry in
+                    ScrollToLatest.isAway(contentHeight: geometry.contentSize.height,
+                                          offset: geometry.contentOffset.y,
+                                          viewportHeight: geometry.containerSize.height)
+                } action: { _, away in
+                    awayFromLatest = away
                 }
                 .onChange(of: timeline.messages.last?.id) { _, newest in
-                    if let newest { proxy.scrollTo(newest, anchor: .bottom) }
+                    if newest != nil { proxy.scrollTo(Self.bottomId, anchor: .bottom) }
                 }
+                .overlay(alignment: .bottomTrailing) {
+                    if awayFromLatest {
+                        Button {
+                            withAnimation { proxy.scrollTo(Self.bottomId, anchor: .bottom) }
+                        } label: {
+                            Image(systemName: "chevron.down").font(.body.weight(.semibold))
+                                .frame(width: 32, height: 32)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .opacity(0.8)
+                        .padding(12)
+                        .help("Jump to the latest message")
+                        .accessibilityLabel("Jump to the latest message")
+                        .transition(.opacity)
+                    }
+                }
+                .animation(.easeInOut(duration: 0.15), value: awayFromLatest)
             }
             if let error = timeline.visibleError {
                 Text(error).foregroundStyle(.red).font(.caption).padding(.horizontal)
@@ -133,6 +164,19 @@ extension ChatView {
         let row = FileRowModel(file: file, client: offline)
         feed?.register(row)
         return row
+    }
+}
+
+/// When the "jump to latest" button shows: the view has been scrolled up by more than a little.
+enum ScrollToLatest {
+    /// Space under the last message, above the composer.
+    static let gap: CGFloat = 12
+    /// Further up than this (points, beyond the gap) counts as away.
+    static let threshold: CGFloat = 80
+
+    static func isAway(contentHeight: CGFloat, offset: CGFloat, viewportHeight: CGFloat) -> Bool {
+        // Content shorter than the view can't be scrolled up.
+        contentHeight - (offset + viewportHeight) > threshold
     }
 }
 
@@ -384,6 +428,7 @@ struct AttachmentRow: View {
 struct ComposerView: View {
     @Bindable var composer: ComposerModel
     @Environment(\.showUsernames) private var showUsernames
+    @FocusState private var inputFocused: Bool
 
     /// "Replying to <who>"; a message whose author has neither a name nor a handle is "a message".
     static func replyBanner(_ m: FfiMessage, showUsernames: Bool) -> String {
@@ -436,6 +481,7 @@ struct ComposerView: View {
                 TextField("Message", text: $composer.text, axis: .vertical)
                     .lineLimit(1 ... 6)
                     .textFieldStyle(.roundedBorder)
+                    .focused($inputFocused)
                     .onSubmit { Task { await composer.send() } }
                 Button(composer.editing == nil ? "Send" : "Save") {
                     Task { await composer.send() }
@@ -445,6 +491,11 @@ struct ComposerView: View {
             }
         }
         .padding(10)
+        // Opening a conversation (the chat view is new per channel), or choosing Reply or Edit, leaves the
+        // cursor in the box (#283). Not on later changes: typing elsewhere is never interrupted.
+        .onAppear { inputFocused = true }
+        .onChange(of: composer.replyingTo?.id) { _, id in if id != nil { inputFocused = true } }
+        .onChange(of: composer.editing?.id) { _, id in if id != nil { inputFocused = true } }
     }
 
     /// Files only, several at once.
