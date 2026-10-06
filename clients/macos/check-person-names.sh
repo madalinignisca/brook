@@ -9,6 +9,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="${1:-$HERE/Brook}"
+[[ -d "$SRC" ]] || { echo "check-person-names: no such directory: $SRC" >&2; exit 2; }
 hits="$(grep -rnE --include='*.swift' '\.displayName|authorDisplayName' "$SRC" \
   | grep -v '/PersonName\.swift:' \
   | grep -vE 'displayName\(' \

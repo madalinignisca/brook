@@ -239,8 +239,13 @@ final class OfferAnswerModel {
     /// Who offered, as the channel lists them; "Someone" once they're gone from it.
     func offerer(showUsernames: Bool) -> String { Self.label(offeredBy, showUsernames: showUsernames) }
 
+    /// The member who made the offer, if still here: what the sheet is built with.
+    static func offerer(of offer: FfiOwnerOffer, in members: [FfiMember]) -> FfiMember? {
+        members.first { $0.id == offer.offeredBy }
+    }
+
     static func offererName(_ offer: FfiOwnerOffer, members: [FfiMember], showUsernames: Bool) -> String {
-        label(members.first { $0.id == offer.offeredBy }, showUsernames: showUsernames)
+        label(offerer(of: offer, in: members), showUsernames: showUsernames)
     }
 
     private static func label(_ member: FfiMember?, showUsernames: Bool) -> String {

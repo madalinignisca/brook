@@ -110,6 +110,18 @@ final class TimelineTypingTests: XCTestCase {
         XCTAssertNil(whoIsTyping(members: []).typingLine(now: t0, showUsernames: true))
     }
 
+    /// Not a member and no message here, but a refreshed author (a `Users` notice): that handle.
+    func testTypingLineUsesARefreshedAuthorsHandle() async {
+        let chat = FakeChat()
+        chat.local = true
+        chat.users = [FfiMember(id: "d", handle: "dave", displayName: "Dave", role: nil)]
+        let t = TimelineModel(channelId: "c", client: chat, me: "me", members: { [] }, now: { t0 })
+        await t.refreshAuthors(["d"])
+        t.apply(.typing(channelId: "c", userId: "d", displayName: "Dave"))
+        XCTAssertEqual(t.typingLine(now: t0, showUsernames: true), "@dave is typing…")
+        XCTAssertEqual(t.typingLine(now: t0, showUsernames: false), "Dave is typing…")
+    }
+
     func testSomeoneElsesTypingShowsAndYourOwnAndOtherChannelsDont() {
         let t = timeline { t0 }
         t.apply(.typing(channelId: "c", userId: "bob", displayName: "Bob"))

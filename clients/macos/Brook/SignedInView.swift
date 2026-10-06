@@ -359,7 +359,7 @@ extension SignedInView {
         answeringFor = key
         answering = OfferAnswerModel(
             channelId: row.id, title: channels.title(row),
-            offeredBy: row.members.first { $0.id == offer.offeredBy }, client: membership)
+            offeredBy: OfferAnswerModel.offerer(of: offer, in: row.members), client: membership)
     }
 
     /// Select a channel just created, joined or opened, once the list has it.
