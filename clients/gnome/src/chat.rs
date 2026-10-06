@@ -1618,7 +1618,14 @@ fn private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 
 /// Remove the paste folders of Brook processes that are gone (a crash, a killed run); those of
 /// running windows stay.
+///
+/// Not under Flatpak: there each instance has its own process namespace, so another running
+/// instance's pid is not in this one's `/proc` and its folder would look dead. The runtime
+/// directory is cleared at log-out anyway.
 fn sweep_dead_paste_dirs() {
+    if crate::preview::in_flatpak() {
+        return;
+    }
     let Ok(dirs) = std::fs::read_dir(pasted_root()) else {
         return;
     };

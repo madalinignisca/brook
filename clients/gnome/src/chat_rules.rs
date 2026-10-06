@@ -208,6 +208,10 @@ mod display_tests {
         let context = glib::MainContext::default();
         while context.iteration(false) {}
         assert_eq!(seen.get(), 1, "the handler saw the paste");
-        assert_eq!(entry.text(), "", "stopping it kept the text box's own paste out");
+        assert_eq!(
+            entry.text(),
+            "",
+            "stopping it kept the text box's own paste out"
+        );
     }
 }
