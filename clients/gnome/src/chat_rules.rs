@@ -16,11 +16,21 @@ pub enum Paste {
 }
 
 /// The clipboard as Ctrl+V sees it: whether it holds a file list, text, or an image.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Offered {
     pub files: bool,
     pub text: bool,
     pub image: bool,
+}
+
+/// What the clipboard offers, from GDK's view of it: the MIME types, and whether GDK can turn it
+/// into a file list (it can from `text/uri-list`), a picture, or a string.
+pub fn offered_from(mimes: &[String], file_list: bool, texture: bool, string: bool) -> Offered {
+    Offered {
+        files: file_list,
+        text: string || mimes.iter().any(|m| m.starts_with("text/plain")),
+        image: texture || mimes.iter().any(|m| m.starts_with("image/")),
+    }
 }
 
 /// The Mac's rule (`PasteImport.decide`): nothing is staged where files can't be attached;
@@ -100,6 +110,72 @@ mod tests {
         assert_eq!(paste(offered(false, true, true), true), Paste::Text);
         assert_eq!(paste(offered(false, true, false), true), Paste::Text);
         assert_eq!(paste(offered(false, false, false), true), Paste::Text);
+    }
+
+    fn mimes(list: &[&str]) -> Vec<String> {
+        list.iter().map(|m| m.to_string()).collect()
+    }
+
+    #[test]
+    fn files_copied_in_a_file_manager_are_staged() {
+        // Nautilus: a URI list, its own type, and the names as text.
+        let o = offered_from(
+            &mimes(&[
+                "x-special/gnome-copied-files",
+                "text/uri-list",
+                "text/plain;charset=utf-8",
+            ]),
+            true,
+            false,
+            true,
+        );
+        assert_eq!(paste(o, true), Paste::Files);
+    }
+
+    #[test]
+    fn a_spreadsheet_cell_pastes_as_text() {
+        let o = offered_from(
+            &mimes(&["text/plain", "text/html", "image/png"]),
+            false,
+            true,
+            true,
+        );
+        assert_eq!(paste(o, true), Paste::Text);
+    }
+
+    #[test]
+    fn a_screenshot_is_staged_as_a_picture() {
+        let o = offered_from(&mimes(&["image/png"]), false, true, false);
+        assert_eq!(paste(o, true), Paste::Image);
+    }
+
+    #[test]
+    fn web_links_are_read_as_a_list_then_decided_again_without_files() {
+        // GDK offers a file list for any URI list; after reading finds no local file, the paste
+        // is decided again with no files: links alone are text, links beside a picture a picture.
+        let links = offered_from(&mimes(&["text/uri-list", "text/plain"]), true, false, true);
+        assert_eq!(paste(links, true), Paste::Files);
+        assert_eq!(
+            paste(
+                Offered {
+                    files: false,
+                    ..links
+                },
+                true
+            ),
+            Paste::Text
+        );
+        let with_picture = offered_from(&mimes(&["text/uri-list", "image/png"]), true, true, false);
+        assert_eq!(
+            paste(
+                Offered {
+                    files: false,
+                    ..with_picture
+                },
+                true
+            ),
+            Paste::Image
+        );
     }
 
     #[test]
