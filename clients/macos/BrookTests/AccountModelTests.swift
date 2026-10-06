@@ -23,6 +23,17 @@ final class FakeAccount: AccountClient, @unchecked Sendable {
     }
     func listUsers() async throws -> [FfiUserSummary] { users }
 
+    /// Per-call results for `createUser`, consumed in order (nil = success); `failure` after.
+    var createScript: [LoginError?] = []
+    /// Records "add:handle|name|password|admin password" so a swap of the two passwords shows.
+    func createUser(handle: String, displayName: String, password: String, adminPassword: String) async throws -> FfiUserSummary {
+        calls.withLock { $0.append("add:\(handle)|\(displayName)|\(password)|\(adminPassword)") }
+        await gate?.wait()
+        let scripted = createScript.isEmpty ? failure : createScript.removeFirst()
+        if let scripted { throw scripted }
+        return FfiUserSummary(id: "new", handle: handle, displayName: displayName, globalRole: "member")
+    }
+
     // TOTP management: each call recorded; `failure` (when set) is thrown by all of them.
     var codes = (1 ... 10).map { String(format: "abcd-%04d", $0) }
     var profile = FfiUser(id: "me", handle: "me", displayName: "Me", globalRole: "member", statusText: nil)

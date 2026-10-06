@@ -88,3 +88,64 @@ struct AdminResetSheet: View {
         .onDisappear { model.clear() }
     }
 }
+
+struct AddUserSheet: View {
+    @State private var model: AddUserModel
+    @Environment(\.dismiss) private var dismiss
+
+    init(client: any AccountClient) {
+        _model = State(initialValue: AddUserModel(client: client))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Add User").font(.title2)
+            if let done = model.done {
+                Text(done)
+                HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
+            } else {
+                Form {
+                    // No content types: nothing here should be offered to AutoFill as a login.
+                    TextField("Handle", text: $model.handle)
+                        .autocorrectionDisabled()
+                    TextField("Display name", text: $model.displayName)
+                    SecureField("Password", text: $model.password)
+                    SecureField("Confirm password", text: $model.confirm)
+                    Button("Generate") { model.generate() }
+                    if let generated = model.generated {
+                        // Shown once, until the Password field is edited or the sheet closes.
+                        Text(generated)
+                            .font(.system(.body, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                    SecureField("Your password", text: $model.adminPassword)
+                }
+                Text("The new account is a member. Give them the password; they can change it under Change Password.")
+                    .font(.callout).foregroundStyle(.secondary)
+                // What is wrong now comes first: after a failure the fields may have been changed to
+                // something invalid, and the old failure would hide why Add User is disabled.
+                if let problem = model.problem {
+                    Text(problem).font(.callout).foregroundStyle(.secondary)
+                } else if let error = model.error {
+                    Text(error).foregroundStyle(.red)
+                }
+                HStack {
+                    Spacer()
+                    // Not while a request is out: closing would clear the sheet's memory of it, and the
+                    // account may still be created.
+                    Button("Cancel", role: .cancel) { dismiss() }
+                        .disabled(model.busy)
+                    Button("Add User") { Task { await model.submit() } }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(model.problem != nil || model.busy)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+        .interactiveDismissDisabled(model.busy)
+        // The model and the fields no longer hold the passwords once the sheet is gone; Swift strings
+        // are not wiped, and an in-flight request keeps the arguments it was started with.
+        .onDisappear { model.clear() }
+    }
+}
