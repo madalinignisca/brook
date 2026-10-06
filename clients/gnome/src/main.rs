@@ -15,6 +15,7 @@ mod attachments;
 mod call;
 mod call_stage;
 mod chat;
+mod chat_rules;
 mod history;
 mod keyring;
 mod outgoing;
