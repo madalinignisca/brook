@@ -23,6 +23,9 @@ qrcode = { version = "0.14", default-features = false }
 # Staying signed in (#58): the session and store keys in the desktop keyring (Secret
 # Service over D-Bus). Same ashpd/zbus majors as gst-media, so no duplicates.
 oo7 = { version = "0.6", default-features = false, features = ["tokio", "native_crypto"] }
+# Add User (#265): a generated first password from OS randomness, wiped after use.
+getrandom = "0.3"
+zeroize = "1"
 # Inline image previews (#66): decoded only in glycin's sandbox (bubblewrap, or
 # flatpak-spawn --sandbox). Pixels are taken raw, so its gtk-rs generation doesn't matter.
 glycin = { version = "3.1", default-features = false, features = ["tokio"] }
@@ -30,6 +33,8 @@ glycin = { version = "3.1", default-features = false, features = ["tokio"] }
 glycin-gio = { package = "gio", version = "0.22" }
 
 [dev-dependencies]
+# Real transport errors (a stalled request, a refused connection) for the Add User tests.
+reqwest = { version = "0.12", default-features = false }
 # Builds core messages in tests the way the server sends them.
 serde_json = { workspace = true }
 # Scans the rendered QR code back in tests.

@@ -427,6 +427,7 @@ version = "0.0.0"
 dependencies = [
  "brook-core",
  "brook-media-gst",
+ "getrandom 0.3.4",
  "gio 0.22.10",
  "glycin",
  "gstreamer",
@@ -436,12 +437,14 @@ dependencies = [
  "oo7",
  "pulldown-cmark",
  "qrcode",
+ "reqwest",
  "rqrr",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

@@ -10,6 +10,7 @@
 //! tasks and signal handlers so nothing keeps the window graph alive (no cycles).
 
 mod account;
+mod add_user;
 mod attachments;
 mod call;
 mod call_stage;

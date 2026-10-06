@@ -54,6 +54,8 @@ struct Chat {
     /// The scroll adjustment's (upper, value) from before older rows were added, so the view
     /// can stay on the same message once they are laid out.
     scroll_anchor: Rc<Cell<Option<(f64, f64)>>>,
+    /// Handles whose last Add User attempt got no clear answer (kept across sheets in this sign-in).
+    add_user_uncertain: Rc<RefCell<crate::add_user::Uncertain>>,
     /// The user chose to remove this device's data: a late save mustn't bring their ranks back.
     ranks_forgotten: Rc<Cell<bool>>,
     /// This session was signed out by the user (either way): nothing it started may erase.
@@ -325,6 +327,7 @@ pub fn build(
         pager: Rc::default(),
         paging: Rc::default(),
         scroll_anchor: Rc::default(),
+        add_user_uncertain: Rc::default(),
         ranks_forgotten: Rc::default(),
         ended: Rc::default(),
         show_usernames: Rc::new(Cell::new(crate::prefs::show_usernames())),
@@ -2350,6 +2353,27 @@ fn main_menu_popover(chat: &Rc<Chat>) -> gtk::Popover {
     });
     menu.append(&show_previews);
     menu.append(&change_password);
+    // Admins only (#265): members never see it.
+    if crate::add_user::offered(*chat.is_admin.borrow()) {
+        let add_user = gtk::Button::builder()
+            .label("Add User…")
+            .has_frame(false)
+            .build();
+        add_user.connect_clicked({
+            let chat = chat.clone();
+            let popover = popover.clone();
+            move |_| {
+                popover.popdown();
+                crate::add_user::add_user_dialog(
+                    &chat.message_list,
+                    chat.client.clone(),
+                    chat.runtime.clone(),
+                    chat.add_user_uncertain.clone(),
+                );
+            }
+        });
+        menu.append(&add_user);
+    }
     menu.append(&two_factor);
     menu.append(&sign_out);
     two_factor.connect_clicked({
