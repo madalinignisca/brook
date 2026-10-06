@@ -49,11 +49,48 @@ private func member(_ id: String, _ name: String, _ role: String? = "member") ->
 
 private func api(_ code: String) -> LoginError { .Api(code: code, message: "") }
 
+@MainActor
 final class ChannelPowersTests: XCTestCase {
     func testYouComeFirstThenByName() {
         let p = ChannelPowers(me: "u3", isAdmin: false,
                               members: [member("u1", "zed"), member("u2", "Anna"), member("u3", "Me")])
-        XCTAssertEqual(p.rows.map(\.id), ["u3", "u2", "u1"])
+        XCTAssertEqual(p.rows(showUsernames: false).map(\.id), ["u3", "u2", "u1"])
+    }
+
+    private func who(_ id: String, _ handle: String, _ name: String) -> FfiMember {
+        FfiMember(id: id, handle: handle, displayName: name, role: "member")
+    }
+
+    func testRowsSortAndSecondLineFollowShowUsernames() {
+        let p = ChannelPowers(me: "me", isAdmin: false,
+                              members: [who("a", "zed", "Ann"), who("b", "amy", "Bob"), who("me", "me", "Me")])
+        func lines(_ on: Bool) -> [String] {
+            p.rows(showUsernames: on).map {
+                let l = MembersView.lines($0, me: "me", showUsernames: on)
+                return "\(l.primary)|\(l.secondary ?? "-")"
+            }
+        }
+        XCTAssertEqual(lines(false), ["Me (you)|@me", "Ann|@zed", "Bob|@amy"])
+        XCTAssertEqual(lines(true), ["@me (you)|Me", "@amy|Bob", "@zed|Ann"])
+        // A blank display name: nothing to show under the handle.
+        let blank = ChannelPowers(me: "me", isAdmin: false, members: [who("me", "me", "Me"), who("x", "xx", " ")])
+        XCTAssertEqual(MembersView.lines(blank.members[1], me: "me", showUsernames: true).secondary, nil)
+        XCTAssertEqual(MembersView.lines(blank.members[1], me: "me", showUsernames: false).primary, "@xx")
+    }
+
+    func testTiesBreakByIdWhenLabelsMatch() {
+        let p = ChannelPowers(me: "me", isAdmin: false,
+                              members: [who("b", "x", "Sam"), who("a", "y", "sam"), who("me", "me", "Me")])
+        XCTAssertEqual(p.rows(showUsernames: false).map(\.id), ["me", "a", "b"])
+    }
+
+    func testConfirmTitlesFollowShowUsernames() {
+        let bob = who("b", "bob", "Bob")
+        XCTAssertEqual(MembersView.offerTitle(bob, title: "#general", showUsernames: false), "Offer Bob ownership of #general?")
+        XCTAssertEqual(MembersView.offerTitle(bob, title: "#general", showUsernames: true), "Offer @bob ownership of #general?")
+        XCTAssertEqual(MembersView.removeTitle(bob, title: "#general", showUsernames: false), "Remove Bob from #general?")
+        XCTAssertEqual(MembersView.removeTitle(bob, title: "#general", showUsernames: true), "Remove @bob from #general?")
+        XCTAssertEqual(MembersView.removeTitle(nil, title: "#general", showUsernames: true), "Remove  from #general?")
     }
 
     func testAnAdminRemovesAnyoneButThemselves() {

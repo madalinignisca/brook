@@ -550,7 +550,7 @@ final class CacheFeedTests: XCTestCase {
 
         feed.handle(.users(ids: ["u"]))
         await settle()
-        XCTAssertEqual(timeline.authorName(timeline.messages[0]), "Robert")
+        XCTAssertEqual(timeline.authorName(timeline.messages[0], showUsernames: false), "Robert")
 
         feed.handle(.removed(ids: ["c"]))
         XCTAssertEqual(channels.channels.map(\.id), ["d"])

@@ -18,6 +18,7 @@ final class NotificationsTests: XCTestCase {
         var m = msg("m1", body, channel: channel, deleted: deleted)
         m.authorId = author
         m.authorDisplayName = "Bo"
+        m.authorHandle = "bo"
         return m
     }
 
@@ -35,16 +36,42 @@ final class NotificationsTests: XCTestCase {
     }
 
     func testWhatItSays() {
-        XCTAssertEqual(NotificationPlanner.body(from("u9", "hello"), me: "me"), "Bo: hello")
+        XCTAssertEqual(NotificationPlanner.body(from("u9", "hello"), me: "me", showUsernames: false), "Bo: hello")
         var byId = from("u9", "look")
         byId.mentions = ["me"]
-        XCTAssertEqual(NotificationPlanner.body(byId, me: "me"), "Bo mentioned you: look")
+        XCTAssertEqual(NotificationPlanner.body(byId, me: "me", showUsernames: false), "Bo mentioned you: look")
         var everyone = from("u9", "all")
         everyone.mentionEveryone = true
-        XCTAssertEqual(NotificationPlanner.body(everyone, me: "me"), "Bo mentioned you: all")
+        XCTAssertEqual(NotificationPlanner.body(everyone, me: "me", showUsernames: false), "Bo mentioned you: all")
         var file = from("u9", "")
         file.attachments = [FfiFileInfo(id: "f", filename: "a", originalName: "a", size: 1, contentType: "x", sha256: nil)]
-        XCTAssertEqual(NotificationPlanner.body(file, me: "me"), "Bo sent a file")
+        XCTAssertEqual(NotificationPlanner.body(file, me: "me", showUsernames: false), "Bo sent a file")
+    }
+
+    func testBodyFollowsShowUsernames() {
+        XCTAssertEqual(NotificationPlanner.body(from("u9", "hello"), me: "me", showUsernames: true), "@bo: hello")
+        var byId = from("u9", "look")
+        byId.mentions = ["me"]
+        XCTAssertEqual(NotificationPlanner.body(byId, me: "me", showUsernames: true), "@bo mentioned you: look")
+        var file = from("u9", "")
+        file.attachments = [FfiFileInfo(id: "f", filename: "a", originalName: "a", size: 1, contentType: "x", sha256: nil)]
+        XCTAssertEqual(NotificationPlanner.body(file, me: "me", showUsernames: true), "@bo sent a file")
+        var gone = from("u9", "hi")
+        (gone.authorDisplayName, gone.authorHandle) = (nil, nil)
+        XCTAssertEqual(NotificationPlanner.body(gone, me: "me", showUsernames: true), "Someone: hi")
+    }
+
+    /// The model's own preference reaches the notification it posts (not a literal).
+    func testPostedBodyUsesModelsPreference() async {
+        let client = FakeRealtime(channels: [channel("c2", "random")])
+        let notifier = FakeNotifier()
+        let model = ChannelsModel(client: client, me: "me", notifier: notifier, isActive: { true }, defaults: isolatedDefaults())
+        await model.start()
+        model.handle(.messageNew(message: from("u9", "hi", channel: "c2")))
+        XCTAssertEqual(notifier.posted.last?.body, "Bo: hi")
+        model.showUsernames = true
+        model.handle(.messageNew(message: from("u9", "again", channel: "c2")))
+        XCTAssertEqual(notifier.posted.last?.body, "@bo: again")
     }
 
     func testALiveMessageRaisesItsChannelsBadgeAndNotifiesOnce() async {

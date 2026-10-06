@@ -121,8 +121,11 @@ struct SignedInView: View {
                             Button {
                                 openWindow(id: "call")
                                 Task {
+                                    // A participant carries a name only: the handles come from here.
+                                    let handles = Dictionary(
+                                        channel.members.map { ($0.id, $0.handle) }, uniquingKeysWith: { first, _ in first })
                                     await calls.join(channelId: channel.id, name: channels.title(channel),
-                                                     client: client)
+                                                     handles: handles, client: client)
                                 }
                             } label: {
                                 Label(channels.badge(channel) ?? "Join Call",
@@ -171,7 +174,9 @@ struct SignedInView: View {
                     }
             } else {
                 ContentUnavailableView {
-                    Label("Signed in as \(shownName ?? user.displayName)", systemImage: "person.crop.circle.badge.checkmark")
+                    let name = shownName ?? user.displayName // raw name: input to the label
+                    let me = PersonName.label(name, handle: user.handle, showUsernames: showUsernames)
+                    Label("Signed in as \(me)", systemImage: "person.crop.circle.badge.checkmark")
                 } description: {
                     Text(channels.error ?? "Choose a channel.")
                 }
@@ -280,7 +285,7 @@ struct SignedInView: View {
             confirming: $confirming, manageError: $manageError, onOpen: open))
         .sheet(isPresented: $editingProfile) {
             if let account = client as? any AccountClient {
-                ProfileSheet(client: account) { shownName = $0.displayName }
+                ProfileSheet(client: account) { shownName = $0.displayName } // raw name: kept with the user's handle
             }
         }
         .sheet(item: $leaving) { row in
@@ -328,6 +333,8 @@ struct SignedInView: View {
                 AdminResetSheet(client: account, selfId: user.id)
             }
         }
+        // Outermost, so every sheet, popover and dialog above reads the preference.
+        .modifier(FollowsShowUsernames())
     }
 }
 
@@ -352,7 +359,7 @@ extension SignedInView {
         answeringFor = key
         answering = OfferAnswerModel(
             channelId: row.id, title: channels.title(row),
-            offerer: OfferAnswerModel.offererName(offer, members: row.members), client: membership)
+            offeredBy: row.members.first { $0.id == offer.offeredBy }, client: membership)
     }
 
     /// Select a channel just created, joined or opened, once the list has it.
@@ -388,7 +395,9 @@ extension SignedInView {
             feed?.pending = nil
             return
         }
-        let model = TimelineModel(channelId: channelId, client: chat, me: user.id)
+        let model = TimelineModel(
+            channelId: channelId, client: chat, me: user.id,
+            members: { [channels] in channels.channels.first { $0.id == channelId }?.members ?? [] })
         timeline = model
         channels.timeline = model
         pending = (client as? any OfflineClient).map { PendingModel(channelId: channelId, client: $0) }

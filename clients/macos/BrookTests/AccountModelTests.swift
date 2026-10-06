@@ -253,10 +253,25 @@ final class AdminResetModelTests: XCTestCase {
         model.new = "bobs-new-pass"
         model.confirm = "bobs-new-pass"
         XCTAssertNil(model.problem)
-        await model.submit()
+        await model.submit(showUsernames: false)
         XCTAssertEqual(account.calls.withLock { $0 }, ["reset:bob:admin-pw>bobs-new-pass"])
         XCTAssertNotNil(model.done)
         XCTAssertEqual([model.adminPassword, model.new, model.confirm], ["", "", ""])
+    }
+
+    func testDoneNamesByPreference() async {
+        for (on, who) in [(false, "Bob"), (true, "@bob")] {
+            let account = FakeAccount()
+            account.users = [user("bob")]
+            let model = AdminResetModel(client: account, selfId: "me")
+            await model.load()
+            model.selectedId = "bob"
+            model.adminPassword = "admin-pw"
+            model.new = "bobs-new-pass"
+            model.confirm = "bobs-new-pass"
+            await model.submit(showUsernames: on)
+            XCTAssertEqual(model.done, "\(who)'s password is set. They're signed out everywhere.")
+        }
     }
 
     func testWrongAdminPasswordAndAdminTargetAreSaidPlainly() async {
@@ -273,7 +288,7 @@ final class AdminResetModelTests: XCTestCase {
             model.adminPassword = "admin-pw"
             model.new = "bobs-new-pass"
             model.confirm = "bobs-new-pass"
-            await model.submit()
+            await model.submit(showUsernames: false)
             XCTAssertEqual(model.error, message)
             XCTAssertEqual(model.adminPassword, "admin-pw", "fields cleared after a refusal")
         }
@@ -290,7 +305,7 @@ final class AdminResetModelTests: XCTestCase {
         model.adminPassword = "admin-pw"
         model.new = "bobs-new-pass"
         model.confirm = "bobs-new-pass"
-        await model.submit()
+        await model.submit(showUsernames: false)
         XCTAssertEqual(model.error, AdminResetModel.noAnswer)
     }
 }
@@ -391,6 +406,19 @@ final class TwoFactorModelTests: XCTestCase {
         XCTAssertEqual([fresh.password, fresh.code], ["", ""], "secrets kept after success")
     }
 
+    func testDoneNamesByPreference() async {
+        for (on, who) in [(false, "Bob"), (true, "@bob")] {
+            let account = FakeAccount()
+            account.users = [user("bob")]
+            let model = AdminTotpResetModel(client: account, selfId: "me")
+            await model.load()
+            model.selectedId = "bob"
+            model.adminPassword = "admin-pw"
+            await model.submit(showUsernames: on)
+            XCTAssertEqual(model.done, "\(who)'s two-factor sign-in is off. They're signed out everywhere.")
+        }
+    }
+
     func testAdminTwoFactorResetSendsTheAdminPassword() async {
         let account = FakeAccount()
         account.users = [user("bob")]
@@ -398,7 +426,7 @@ final class TwoFactorModelTests: XCTestCase {
         await model.load()
         model.selectedId = "bob"
         model.adminPassword = "admin-pw"
-        await model.submit()
+        await model.submit(showUsernames: false)
         XCTAssertEqual(account.calls.withLock { $0 }, ["totp-reset:bob:admin-pw"])
         XCTAssertNotNil(model.done)
         XCTAssertEqual(model.adminPassword, "")

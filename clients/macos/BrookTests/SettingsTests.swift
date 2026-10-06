@@ -14,6 +14,12 @@ final class SettingsTests: XCTestCase {
         defaults.removePersistentDomain(forName: suite)
     }
 
+    @MainActor
+    func testShowUsernamesCaption() {
+        XCTAssertEqual(SettingsView.showUsernamesCaption,
+                       "Shows people as @username instead of their display name, everywhere they appear.")
+    }
+
     /// The address survives restarts; nothing from the environment overrides it.
     func testServerPrefillIsTheSavedAddressElseLocalhost() {
         XCTAssertEqual(Settings(defaults: defaults, environment: [:]).serverPrefill, "https://localhost")

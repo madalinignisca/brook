@@ -7,6 +7,7 @@ struct SearchResultsView: View {
     /// A channel's title, for a hit's channel.
     let title: (String) -> String
     let onOpen: (String) -> Void
+    @Environment(\.showUsernames) private var showUsernames
 
     var body: some View {
         switch model.state {
@@ -25,7 +26,7 @@ struct SearchResultsView: View {
             List(hits) { hit in
                 Button { onOpen(hit.channelId) } label: {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("\(title(hit.channelId)) · \(hit.author)").font(.caption).foregroundStyle(.secondary)
+                        Text("\(title(hit.channelId)) · \(hit.author(showUsernames: showUsernames))").font(.caption).foregroundStyle(.secondary)
                         Text(hit.excerpt).lineLimit(2)
                     }
                 }

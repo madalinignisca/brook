@@ -39,7 +39,7 @@ final class ProfileModel {
     }
 
     private func set(_ user: FfiUser) {
-        loadedName = user.displayName
+        loadedName = user.displayName // raw name: the field for editing your own name
         loadedStatus = user.statusText ?? ""
         name = loadedName
         status = loadedStatus

@@ -15,48 +15,59 @@ private final class Clock: @unchecked Sendable {
     }
 }
 
+/// The name as typed: no handle lookup.
+private func shown(_ userId: String, _ name: String) -> String { name }
+
 final class TypingStateTests: XCTestCase {
     func testTheLineNamesOneTwoOrMany() {
         var s = TypingState()
-        XCTAssertNil(s.line(now: t0))
+        XCTAssertNil(s.line(now: t0, label: shown))
         s.note(userId: "a", name: "Ann", at: t0)
-        XCTAssertEqual(s.line(now: t0), "Ann is typing…")
+        XCTAssertEqual(s.line(now: t0, label: shown), "Ann is typing…")
         s.note(userId: "b", name: "Bob", at: t0)
-        XCTAssertEqual(s.line(now: t0), "Ann and Bob are typing…")
+        XCTAssertEqual(s.line(now: t0, label: shown), "Ann and Bob are typing…")
         s.note(userId: "c", name: "Cy", at: t0)
-        XCTAssertEqual(s.line(now: t0), "Several people are typing…")
+        XCTAssertEqual(s.line(now: t0, label: shown), "Several people are typing…")
     }
 
     func testAnEntryExpiresFourSecondsAfterItsLastEvent() {
         var s = TypingState()
         s.note(userId: "a", name: "Ann", at: t0)
-        XCTAssertNotNil(s.line(now: t0.addingTimeInterval(3.9)))
-        XCTAssertNil(s.line(now: t0.addingTimeInterval(4)))
+        XCTAssertNotNil(s.line(now: t0.addingTimeInterval(3.9), label: shown))
+        XCTAssertNil(s.line(now: t0.addingTimeInterval(4), label: shown))
         s.note(userId: "a", name: "Ann", at: t0.addingTimeInterval(3)) // a fresh event restarts it
-        XCTAssertNotNil(s.line(now: t0.addingTimeInterval(6)))
+        XCTAssertNotNil(s.line(now: t0.addingTimeInterval(6), label: shown))
     }
 
     func testOnlyTheLiveOnesAreCounted() {
         var s = TypingState()
         s.note(userId: "a", name: "Ann", at: t0)
         s.note(userId: "b", name: "Bob", at: t0.addingTimeInterval(3))
-        XCTAssertEqual(s.line(now: t0.addingTimeInterval(5)), "Bob is typing…", "Ann's has expired")
+        XCTAssertEqual(s.line(now: t0.addingTimeInterval(5), label: shown), "Bob is typing…", "Ann's has expired")
     }
 
     func testAMessageFromThemClearsIt() {
         var s = TypingState()
         s.note(userId: "a", name: "Ann", at: t0)
         s.clear(userId: "a", at: t0)
-        XCTAssertNil(s.line(now: t0))
+        XCTAssertNil(s.line(now: t0, label: shown))
     }
 
     func testANoticeRightAfterTheirMessageIsTheOneSentJustBeforeItAndIsIgnored() {
         var s = TypingState()
         s.clear(userId: "a", at: t0) // their message arrived
         s.note(userId: "a", name: "Ann", at: t0.addingTimeInterval(0.5)) // the late notice
-        XCTAssertNil(s.line(now: t0.addingTimeInterval(0.5)))
+        XCTAssertNil(s.line(now: t0.addingTimeInterval(0.5), label: shown))
         s.note(userId: "a", name: "Ann", at: t0.addingTimeInterval(2)) // typing the next one
-        XCTAssertNotNil(s.line(now: t0.addingTimeInterval(2)))
+        XCTAssertNotNil(s.line(now: t0.addingTimeInterval(2), label: shown))
+    }
+
+    /// The line is labelled when drawn, through the caller's lookup, and sorted by what is shown.
+    func testTheLineUsesTheCallersLabelAndSortsByIt() {
+        var s = TypingState()
+        s.note(userId: "a", name: "Zed", at: t0)
+        s.note(userId: "b", name: "Amy", at: t0)
+        XCTAssertEqual(s.line(now: t0, label: { id, _ in id == "a" ? "@aaa" : "@zzz" }), "@aaa and @zzz are typing…")
     }
 
     func testAMessageFromSomeoneElseLeavesTheOthersTyping() {
@@ -64,7 +75,7 @@ final class TypingStateTests: XCTestCase {
         s.note(userId: "a", name: "Ann", at: t0)
         s.note(userId: "b", name: "Bob", at: t0)
         s.clear(userId: "b", at: t0)
-        XCTAssertEqual(s.line(now: t0), "Ann is typing…")
+        XCTAssertEqual(s.line(now: t0, label: shown), "Ann is typing…")
     }
 }
 
@@ -74,12 +85,37 @@ final class TimelineTypingTests: XCTestCase {
         TimelineModel(channelId: "c", client: FakeChat(), me: "me", now: now)
     }
 
+    private func whoIsTyping(members: [FfiMember]) -> TimelineModel {
+        TimelineModel(channelId: "c", client: FakeChat(), me: "me", members: { members }, now: { t0 })
+    }
+
+    func testTypingLineUsesMemberHandle() {
+        let t = whoIsTyping(members: [FfiMember(id: "b", handle: "bob", displayName: "Bob", role: nil)])
+        t.apply(.typing(channelId: "c", userId: "b", displayName: "Bob"))
+        XCTAssertEqual(t.typingLine(now: t0, showUsernames: false), "Bob is typing…")
+        XCTAssertEqual(t.typingLine(now: t0, showUsernames: true), "@bob is typing…")
+    }
+
+    func testTypingLineFallsBackToName() {
+        let t = whoIsTyping(members: [])
+        t.apply(.typing(channelId: "c", userId: "b", displayName: "Bob"))
+        XCTAssertEqual(t.typingLine(now: t0, showUsernames: false), "Bob is typing…")
+        XCTAssertEqual(t.typingLine(now: t0, showUsernames: true), "Bob is typing…")
+        // Not a member, but their message is in the timeline: its handle.
+        var m = msg("m1", "hi")
+        (m.authorId, m.authorHandle, m.authorDisplayName) = ("c9", "carol", "Carol")
+        t.merge([m])
+        t.apply(.typing(channelId: "c", userId: "c9", displayName: "Carol"))
+        XCTAssertEqual(t.typingLine(now: t0, showUsernames: true), "@carol and Bob are typing…")
+        XCTAssertNil(whoIsTyping(members: []).typingLine(now: t0, showUsernames: true))
+    }
+
     func testSomeoneElsesTypingShowsAndYourOwnAndOtherChannelsDont() {
         let t = timeline { t0 }
         t.apply(.typing(channelId: "c", userId: "bob", displayName: "Bob"))
         t.apply(.typing(channelId: "c", userId: "me", displayName: "Me"))
         t.apply(.typing(channelId: "other", userId: "ann", displayName: "Ann"))
-        XCTAssertEqual(t.typing.line(now: t0), "Bob is typing…")
+        XCTAssertEqual(t.typingLine(now: t0, showUsernames: false), "Bob is typing…")
     }
 
     /// Through the model, with its clock: a notice 0.5 s after their message is the late one.
@@ -89,18 +125,18 @@ final class TimelineTypingTests: XCTestCase {
         t.apply(.messageNew(message: msg("m1", "hi"))) // from "u"
         clock.now = t0.addingTimeInterval(0.5)
         t.apply(.typing(channelId: "c", userId: "u", displayName: "U"))
-        XCTAssertNil(t.typing.line(now: clock.now))
+        XCTAssertNil(t.typingLine(now: clock.now, showUsernames: false))
         clock.now = t0.addingTimeInterval(3)
         t.apply(.typing(channelId: "c", userId: "u", displayName: "U"))
-        XCTAssertNotNil(t.typing.line(now: clock.now))
+        XCTAssertNotNil(t.typingLine(now: clock.now, showUsernames: false))
     }
 
     func testTheirMessageClearsIt() {
         let t = timeline { t0 }
         t.apply(.typing(channelId: "c", userId: "u", displayName: "U"))
-        XCTAssertNotNil(t.typing.line(now: t0))
+        XCTAssertNotNil(t.typingLine(now: t0, showUsernames: false))
         t.apply(.messageNew(message: msg("m1", "hi"))) // msg() is from "u"
-        XCTAssertNil(t.typing.line(now: t0))
+        XCTAssertNil(t.typingLine(now: t0, showUsernames: false))
     }
 }
 
@@ -210,9 +246,18 @@ final class SearchModelTests: XCTestCase {
         guard case let .results(hits) = model.state else { return XCTFail("\(model.state)") }
         XCTAssertEqual(hits, [SearchHit(m)])
         XCTAssertEqual(hits[0].channelId, "c7")
-        XCTAssertEqual(hits[0].author, "Ann")
+        XCTAssertEqual(hits[0].author(showUsernames: false), "Ann")
         XCTAssertEqual(hits[0].excerpt, "hello there world")
         XCTAssertTrue(model.isShowing)
+    }
+
+    func testSearchHitAuthorFollowsShowUsernames() {
+        var m = msg("m1", "hi")
+        (m.authorDisplayName, m.authorHandle) = ("Ann", "ann")
+        XCTAssertEqual(SearchHit(m).author(showUsernames: false), "Ann")
+        XCTAssertEqual(SearchHit(m).author(showUsernames: true), "@ann")
+        (m.authorDisplayName, m.authorHandle) = (nil, nil)
+        XCTAssertEqual(SearchHit(m).author(showUsernames: true), "Someone")
     }
 
     func testNoResultsAndAFailureHaveTheirStates() async {

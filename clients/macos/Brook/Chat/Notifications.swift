@@ -19,8 +19,8 @@ enum NotificationPlanner {
         !me.isEmpty && m.authorId != me && !m.deleted && (m.mentionEveryone || m.mentions.contains(me))
     }
 
-    static func body(_ m: FfiMessage, me: String) -> String {
-        let author = m.authorDisplayName ?? m.authorHandle ?? "Someone"
+    static func body(_ m: FfiMessage, me: String, showUsernames: Bool) -> String {
+        let author = PersonName.label(m.authorDisplayName, handle: m.authorHandle, showUsernames: showUsernames) // raw name: input to the label
         if m.body.isEmpty, !m.attachments.isEmpty { return "\(author) sent a file" }
         return mentions(m, me: me) ? "\(author) mentioned you: \(m.body)" : "\(author): \(m.body)"
     }

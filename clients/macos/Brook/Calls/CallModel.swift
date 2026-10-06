@@ -63,6 +63,9 @@ final class CallModel {
     /// The system ended the share while it was still starting (before `sharing` was set).
     private var endedWhileStarting = false
 
+    /// Handles of the channel's members at join time, by user id: a participant carries a display
+    /// name only. One not in it (joined the channel since) shows their name.
+    private let handles: [String: String]
     private let handle: any FfiCallHandleProtocol
     private let media: CallMedia
     private let closeBound: Duration
@@ -70,8 +73,9 @@ final class CallModel {
 
     init(
         channelName: String, plan: JoinPlan, handle: any FfiCallHandleProtocol, media: CallMedia,
-        closeBound: Duration = .seconds(5)
+        handles: [String: String] = [:], closeBound: Duration = .seconds(5)
     ) {
+        self.handles = handles
         self.channelName = channelName
         self.plan = plan
         self.handle = handle
@@ -129,8 +133,11 @@ final class CallModel {
     }
 
     /// Self first (from local state: core's roster excludes self), then everyone else.
-    var tiles: [Tile] {
+    func tiles(showUsernames: Bool) -> [Tile] {
         guard let state, !isEnded else { return [] }
+        func who(_ p: FfiParticipant) -> String {
+            PersonName.label(p.displayName, handle: handles[p.userId], showUsernames: showUsernames) // raw name: input to the label
+        }
         let me = Tile(
             id: state.selfParticipant ?? "self", name: "You", isSelf: true, audio: micOn,
             video: cameraOn, track: cameraOn ? localVideo : nil)
@@ -140,12 +147,12 @@ final class CallModel {
         let screens = inArrivalOrder.compactMap { p -> Tile? in
             guard let track = remoteScreens[p.participantId] else { return nil }
             return Tile(
-                id: p.participantId + ".screen", name: "\(p.displayName)'s screen", isSelf: false,
+                id: p.participantId + ".screen", name: "\(who(p))'s screen", isSelf: false,
                 isScreen: true, audio: true, video: true, track: track)
         }
         return screens + [me] + others.map { p in
             Tile(
-                id: p.participantId, name: p.displayName, isSelf: false, audio: p.audio,
+                id: p.participantId, name: who(p), isSelf: false, audio: p.audio,
                 video: p.video, track: remote[p.participantId])
         }
     }

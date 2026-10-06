@@ -297,7 +297,7 @@ final class ChannelsModel {
         channels[i].unread += 1
         if NotificationPlanner.mentions(message, me: me) { channels[i].unreadMentions += 1 }
         notifier?.post(channelId: message.channelId, title: title(channels[i]),
-                       body: NotificationPlanner.body(message, me: me))
+                       body: NotificationPlanner.body(message, me: me, showUsernames: showUsernames))
     }
 
     /// Re-read the list and say whether `id` is in it, so the caller can select a channel it just
