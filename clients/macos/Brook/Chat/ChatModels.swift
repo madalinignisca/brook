@@ -1,6 +1,7 @@
 import BrookCore
 import Foundation
 import Observation
+import UniformTypeIdentifiers
 
 /// What the chat views need from the client (a fake in tests).
 protocol ChatClient: AnyObject, Sendable {
@@ -511,7 +512,12 @@ final class ComposerModel {
     }
 
     /// How a dropped file is copied out of its provider (a test passes its own).
-    var importer: (NSItemProvider) async -> DropImport.Outcome = { await DropImport.copy($0) }
+    var importer: (NSItemProvider) async -> DropImport.Outcome = { provider in
+        let types = provider.registeredTypeIdentifiers.compactMap { UTType($0) }
+        // An image with no file behind it (the clipboard's) is written out; anything else is a file.
+        let imageOnly = !types.contains { $0.conforms(to: .fileURL) } && types.contains { $0.conforms(to: .image) }
+        return imageOnly ? await PasteImport.copy(provider) : await DropImport.copy(provider)
+    }
 
     /// Files dropped on the conversation: each is copied at once (see `DropImport`), then staged
     /// like a picked one. Whatever isn't staged leaves no copy behind.

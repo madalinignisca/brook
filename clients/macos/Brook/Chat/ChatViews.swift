@@ -1,6 +1,7 @@
 import AppKit
 import BrookCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// A channel's conversation: its messages, and the box to write in.
 struct ChatView: View {
@@ -482,6 +483,9 @@ struct ComposerView: View {
                     .lineLimit(1 ... 6)
                     .textFieldStyle(.roundedBorder)
                     .focused($inputFocused)
+                    // The field takes Cmd+V itself (and disables Paste for an image), so SwiftUI's paste
+                    // command never fires there: the key is caught before it reaches the field.
+                    .onKeyboardPaste(active: inputFocused) { paste() }
                     .onSubmit { Task { await composer.send() } }
                 Button(composer.editing == nil ? "Send" : "Save") {
                     Task { await composer.send() }
@@ -496,6 +500,18 @@ struct ComposerView: View {
         .onAppear { inputFocused = true }
         .onChange(of: composer.replyingTo?.id) { _, id in if id != nil { inputFocused = true } }
         .onChange(of: composer.editing?.id) { _, id in if id != nil { inputFocused = true } }
+    }
+
+    /// Cmd+V with files or an image on the clipboard: they join the message (true). Anything else is
+    /// left to the field's own paste (false).
+    private func paste() -> Bool {
+        let pasteboard = NSPasteboard.general
+        let types = (pasteboard.types ?? []).compactMap { UTType($0.rawValue) }
+        guard PasteImport.decide(types, canAttach: composer.canAttach) == .stage else { return false }
+        let providers = PasteImport.providers(from: pasteboard)
+        guard !providers.isEmpty else { return false }
+        Task { await composer.attach(dropped: providers) }
+        return true
     }
 
     /// Files only, several at once.
@@ -515,5 +531,40 @@ struct ComposerView: View {
             Spacer()
             Button("Cancel") { composer.cancel() }.buttonStyle(.borderless).font(.caption)
         }
+    }
+}
+
+extension View {
+    /// Cmd+V while `active`: `handle` returns true if it took the paste, which then goes no further.
+    func onKeyboardPaste(active: Bool, _ handle: @escaping () -> Bool) -> some View {
+        modifier(KeyboardPaste(active: active, handle: handle))
+    }
+}
+
+private struct KeyboardPaste: ViewModifier {
+    let active: Bool
+    let handle: () -> Bool
+    @State private var monitor: Any?
+    /// What the monitor reads: its closure outlives the view value it was made from, so `active` is
+    /// copied here whenever it changes.
+    @State private var state = Active()
+
+    private final class Active { var value = false }
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: active, initial: true) { _, now in state.value = now }
+            .onAppear {
+                let state = state
+                monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                    let plainCommand = event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command
+                    guard state.value, plainCommand, event.charactersIgnoringModifiers == "v" else { return event }
+                    return handle() ? nil : event
+                }
+            }
+            .onDisappear {
+                if let monitor { NSEvent.removeMonitor(monitor) }
+                monitor = nil
+            }
     }
 }
