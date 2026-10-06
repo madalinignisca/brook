@@ -507,10 +507,9 @@ struct ComposerView: View {
     private func paste() -> Bool {
         let pasteboard = NSPasteboard.general
         let types = (pasteboard.types ?? []).compactMap { UTType($0.rawValue) }
-        guard PasteImport.decide(types, canAttach: composer.canAttach) == .stage,
-              let providers = pasteboard.readObjects(forClasses: [NSItemProvider.self]) as? [NSItemProvider],
-              !providers.isEmpty
-        else { return false }
+        guard PasteImport.decide(types, canAttach: composer.canAttach) == .stage else { return false }
+        let providers = PasteImport.providers(from: pasteboard)
+        guard !providers.isEmpty else { return false }
         Task { await composer.attach(dropped: providers) }
         return true
     }

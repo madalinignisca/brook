@@ -247,6 +247,25 @@ enum PasteImport {
         return types.contains(where: { $0.conforms(to: .image) }) ? .stage : .text
     }
 
+    /// The clipboard's files, or else its image, as the providers staging takes. Built by hand: a pasteboard
+    /// can't hand out NSItemProvider objects (it isn't pasteboard-readable, so asking returns nil).
+    static func providers(from pasteboard: NSPasteboard) -> [NSItemProvider] {
+        let files = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        if !files.isEmpty { return files.compactMap { NSItemProvider(contentsOf: $0) } }
+        // One image: the clipboard's other types are the same picture again (PNG, TIFF, ...).
+        let types = (pasteboard.types ?? []).compactMap { UTType($0.rawValue) }
+        guard let type = types.first(where: { $0.conforms(to: .png) }) ?? types.first(where: { $0.conforms(to: .image) }),
+              let data = pasteboard.data(forType: NSPasteboard.PasteboardType(type.identifier))
+        else { return [] }
+        // Read now: the clipboard may change before the provider is asked.
+        let provider = NSItemProvider()
+        provider.registerDataRepresentation(forTypeIdentifier: type.identifier, visibility: .all) { done in
+            done(data, nil)
+            return nil
+        }
+        return [provider]
+    }
+
     /// "Pasted image 2026-10-06 19.40.12.png": no colons (they show as slashes in Finder).
     static func name(at date: Date, ext: String) -> String {
         let f = DateFormatter()

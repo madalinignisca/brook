@@ -49,4 +49,46 @@ import UniformTypeIdentifiers
         guard case .refused(.tooLarge) = outcome else { Issue.record("not refused"); return }
         #expect(!FileManager.default.fileExists(atPath: root.path))
     }
+
+    @Test func aClipboardImageBecomesOneImageProvider() async throws {
+        let pasteboard = NSPasteboard(name: .init("brook-test-\(UUID())"))
+        defer { pasteboard.releaseGlobally() }
+        let image = NSImage(size: NSSize(width: 4, height: 4), flipped: false) { rect in
+            NSColor.blue.setFill(); rect.fill(); return true
+        }
+        let tiff = try #require(image.tiffRepresentation)
+        let png = try #require(NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]))
+        pasteboard.clearContents()
+        pasteboard.setData(png, forType: .png)
+        pasteboard.setData(tiff, forType: .tiff)
+
+        let providers = PasteImport.providers(from: pasteboard)
+        #expect(providers.count == 1)
+        let provider = try #require(providers.first)
+        #expect(provider.hasItemConformingToTypeIdentifier(UTType.png.identifier))
+        let data: Data? = await withCheckedContinuation { c in
+            _ = provider.loadDataRepresentation(forTypeIdentifier: UTType.png.identifier) { d, _ in c.resume(returning: d) }
+        }
+        #expect(data == png)
+    }
+
+    @Test func clipboardFilesBecomeFileProviders() throws {
+        let pasteboard = NSPasteboard(name: .init("brook-test-\(UUID())"))
+        defer { pasteboard.releaseGlobally() }
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("paste-\(UUID()).txt")
+        try Data("hi".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        pasteboard.clearContents()
+        pasteboard.writeObjects([file as NSURL])
+
+        #expect(PasteImport.providers(from: pasteboard).count == 1)
+    }
+
+    @Test func anEmptyClipboardGivesNothing() {
+        let pasteboard = NSPasteboard(name: .init("brook-test-\(UUID())"))
+        defer { pasteboard.releaseGlobally() }
+        pasteboard.clearContents()
+        pasteboard.setString("text", forType: .string)
+        #expect(PasteImport.providers(from: pasteboard).isEmpty)
+    }
 }
