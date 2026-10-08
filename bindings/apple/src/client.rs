@@ -18,8 +18,8 @@ use crate::call::{
 use crate::listener::{subscribe_receiver, AuthStateListener, Subscription};
 use crate::runtime::runtime;
 use crate::types::{
-    FfiChannel, FfiMe, FfiSecondFactor, FfiTotpChallenge, FfiTotpEnrollment, FfiUserSummary,
-    LoginError, LoginResult,
+    FfiChannel, FfiMe, FfiSecondFactor, FfiServerInfo, FfiTotpChallenge, FfiTotpEnrollment,
+    FfiUserSummary, LoginError, LoginResult,
 };
 
 /// Swift-facing wrapper around [`BrookClient`].
@@ -649,6 +649,23 @@ pub(crate) fn map_event(event: ServerEvent) -> Option<FfiServerEvent> {
     })
 }
 
+/// The server's version and source link. No session: works on the sign-in screen. Same
+/// address rules as `FfiBrookClient::new`.
+///
+/// Core is called by full path on purpose: a bare `server_info(..)` here would name this
+/// exported function (infinite recursion), and a `use brook_core::server_info` would clash with
+/// it. It goes through `run` because Swift polls futures outside any Tokio runtime, and
+/// reqwest panics without one (see the tests module, Test 1).
+#[uniffi::export]
+pub async fn server_info(
+    base_url: String,
+    allow_insecure_http: bool,
+) -> Result<FfiServerInfo, LoginError> {
+    run(async move { brook_core::server_info(&base_url, allow_insecure_http).await })
+        .await
+        .map(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -828,5 +845,63 @@ mod tests {
             Err(LoginError::InsecureServerUrl)
         ));
         assert!(FfiBrookClient::new(lan, true).is_ok());
+    }
+
+    // ---- server_info (no session) ----
+
+    async fn mock_health(source_url: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "ok", "version": "9.8.7", "source_url": source_url
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Swift polls with no Tokio runtime entered; without the `run` hop reqwest panics.
+    #[test]
+    fn server_info_works_when_polled_outside_any_tokio_runtime() {
+        let mock_rt = tokio::runtime::Runtime::new().unwrap();
+        let server = mock_rt.block_on(mock_health("https://bücher.example/brook"));
+        let uri = server.uri();
+
+        let result =
+            std::thread::spawn(move || futures::executor::block_on(server_info(uri, false)))
+                .join()
+                .expect("server_info panicked when polled outside a Tokio runtime");
+
+        assert_eq!(
+            result,
+            Ok(FfiServerInfo {
+                version: "9.8.7".into(),
+                source_url: "https://xn--bcher-kva.example/brook".into(),
+            })
+        );
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn server_info_errors_map_to_login_errors() {
+        let server = mock_health("https://user:pw@evil.example/").await;
+        assert_eq!(
+            server_info(server.uri(), false).await,
+            Err(LoginError::UnexpectedResponse)
+        );
+
+        assert_eq!(
+            server_info("http://chat.example.com".into(), false).await,
+            Err(LoginError::InsecureServerUrl)
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        assert!(matches!(
+            server_info(format!("http://{addr}"), false).await,
+            Err(LoginError::Network { .. })
+        ));
     }
 }

@@ -24,7 +24,7 @@ pub use call::{
     FfiIceCandidate, FfiIceServer, FfiMediaEngine, FfiMediaKind, FfiMediaSource, FfiParticipant,
     FfiPcKind, FfiServerEvent, FfiSubStream, ServerEventListener,
 };
-pub use client::FfiBrookClient;
+pub use client::{server_info, FfiBrookClient};
 pub use listener::{AuthStateListener, Subscription};
 pub use offline::{
     CacheEventListener, CacheStateListener, FfiCacheEvent, FfiCacheState, FfiCachedChannel,
@@ -35,6 +35,8 @@ pub use offline::{
 pub use sidebar::{
     activity_moves, conversation_label, person_label, sidebar_order, sort_key, FfiSidebarEntry,
 };
-pub use types::{FfiAuthState, FfiChannel, FfiSession, FfiUser, LoginError, LoginResult};
+pub use types::{
+    FfiAuthState, FfiChannel, FfiServerInfo, FfiSession, FfiUser, LoginError, LoginResult,
+};
 
 uniffi::setup_scaffolding!();
