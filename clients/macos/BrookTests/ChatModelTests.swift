@@ -103,12 +103,6 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     }
 }
 
-func msg(_ id: String, _ body: String, channel: String = "c", deleted: Bool = false) -> FfiMessage {
-    FfiMessage(id: id, channelId: channel, authorId: "u", authorHandle: "u", authorDisplayName: "U",
-               body: body, createdAt: "2026-09-26T10:00:00Z", clientId: nil, deleted: deleted,
-               editedAt: nil, replyToId: nil, replyTo: nil, attachments: [], mentions: [], mentionEveryone: false, reactions: [])
-}
-
 @MainActor
 final class TimelineModelTests: XCTestCase {
     /// A history page and live events merge by id, in id (time) order, with no duplicates.
