@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Account settings: the Change Password dialog (docs/PROTOCOL.md §1.1).
 //!
 //! The wording lives in plain functions ([`check`], [`confirmation`], [`error_text`]) so it is

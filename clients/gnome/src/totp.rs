@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Two-factor sign-in (TOTP): the parts of the GNOME UI that don't touch the network.
 //!
 //! QR rendering, the manual-entry key, input clean-up and wording live here as plain

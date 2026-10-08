@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Which tile fills the call window (#268). A shared screen is what everyone looks at and is
 //! unreadable in a grid cell, so a remote one takes the stage on its own; the user can put any
 //! tile on the stage by clicking it, and clicking the pinned stage releases it. Everything else

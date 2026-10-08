@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Add User (#265, admins only): the rules a new account's form is checked against before
 //! anything is sent, the generated first password, and the wording. The server decides every
 //! one of these (`POST /auth/register` with an admin's token: handle 2 to 64 of

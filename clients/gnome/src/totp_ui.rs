@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Two-factor sign-in screens (PROTOCOL.md §1.2): the code step after the password,
 //! and the settings dialog (turn on with a QR code, new recovery codes, turn off).
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The desktop keyring as core's `KeySlot` (staying signed in, #58; spec #46 §3a, §4).
 //!
 //! One Secret Service item per slot, with the attributes `{application, slot}`, in the

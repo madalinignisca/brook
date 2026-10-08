@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Install Brook for the current user (no root): the binary to ~/.local/bin and
 # the launcher to ~/.local/share/applications, the icon to the hicolor theme.
 # Re-run to upgrade; `./install.sh --uninstall` removes all three.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Process-wide shared state for the KDE client: the Tokio runtime and the
 //! logged-in `BrookClient`, so the login and chat controllers operate on the
 //! same authenticated client (which holds the session).

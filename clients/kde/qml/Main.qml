@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Brook KDE/Plasma client — Phase 1: login → chat (channels/DMs, messages).
 // Kirigami so the app follows the Plasma theme, accent, and dark/light.
 import QtQuick

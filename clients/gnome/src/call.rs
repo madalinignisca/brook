@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The in-call view: a grid of video tiles, a self-view, and the call controls
 //! (mic, camera, hang up).
 //!
