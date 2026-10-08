@@ -16,6 +16,8 @@ final class ChannelsModel {
     private(set) var ready = false
     /// channel id → participants in its live call.
     private(set) var liveCalls: [String: UInt32] = [:]
+    /// An incoming DM call's ring (#286).
+    let incoming: IncomingCalls
     private(set) var error: String?
     /// The open conversation, which takes the message events.
     var timeline: TimelineModel?
@@ -72,8 +74,9 @@ final class ChannelsModel {
 
     init(client: any FfiBrookClientProtocol, me: String? = nil, notifier: (any Notifying)? = nil,
          isActive: @escaping @MainActor () -> Bool = { AppActivity.isActive },
-         defaults: UserDefaults = .standard) {
+         defaults: UserDefaults = .standard, ringer: (any Ringer)? = nil) {
         self.client = client
+        incoming = IncomingCalls(ringer: ringer ?? SystemRinger(defaults: defaults))
         self.defaults = defaults
         showUsernames = Settings(defaults: defaults).showUsernames
         self.me = me
@@ -84,6 +87,8 @@ final class ChannelsModel {
             opened = (defaults.dictionary(forKey: key) as? [String: Int]) ?? [:]
             nextRank = (opened.values.max() ?? 0) + 1
         }
+        // Unknown (nil) until the list has the channel: the ring waits for it rather than being lost.
+        incoming.isDM = { [weak self] id in self?.channels.first { $0.id == id }.map { $0.kind == "dm" } }
     }
 
     private var offline: (any OfflineClient)? { client as? any OfflineClient }
@@ -100,6 +105,7 @@ final class ChannelsModel {
     }
 
     func stop() {
+        incoming.stop()
         events?.cancel()
         events = nil
         stopped = true
@@ -149,6 +155,7 @@ final class ChannelsModel {
             opened = opened.filter { present.contains($0.key) }
             saveRanks()
         }
+        incoming.reevaluate() // a call announced before its DM was listed
         resort()
         return true
     }
@@ -236,6 +243,7 @@ final class ChannelsModel {
     func cacheRemoved(_ ids: [String]) {
         for id in ids { removedAt[id] = generation }
         channels.removeAll { ids.contains($0.id) }
+        incoming.reevaluate() // a DM gone while ringing stops ringing
         if let open = openChannel, ids.contains(open) {
             closed = open
             timeline = nil
@@ -256,6 +264,7 @@ final class ChannelsModel {
             timeline?.apply(event)  // a failed head load is retried
         case let .channelCall(channelId, callId, count):
             liveCalls[channelId] = callId != nil && count > 0 ? count : nil
+            incoming.observe(channelId: channelId, callId: callId, count: count)
         case let .messageNew(message):
             timeline?.apply(event)  // the open conversation's
             ordered(message)

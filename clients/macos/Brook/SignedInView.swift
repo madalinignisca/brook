@@ -121,16 +121,7 @@ struct SignedInView: View {
                     .navigationTitle(channels.title(channel))
                     .toolbar {
                         ToolbarItem {
-                            Button {
-                                openWindow(id: "call")
-                                Task {
-                                    // A participant carries a name only: the handles come from here.
-                                    let handles = Dictionary(
-                                        channel.members.map { ($0.id, $0.handle) }, uniquingKeysWith: { first, _ in first })
-                                    await calls.join(channelId: channel.id, name: channels.title(channel),
-                                                     handles: handles, client: client)
-                                }
-                            } label: {
+                            Button { join(channel) } label: {
                                 Label(channels.badge(channel) ?? "Join Call",
                                       systemImage: "phone.fill")
                             }
@@ -187,11 +178,25 @@ struct SignedInView: View {
         }
         .task {
             MacNotifier.shared.onOpen = { selection = $0 } // a clicked notification opens its channel
+            wireIncomingCalls()
             await channels.start()
         }
         .onDisappear { channels.stop() } // the session ended: no late read may save its ranks
         // The feed arrives once local data is switched on, after this view appears.
         .onChange(of: feed.map(ObjectIdentifier.init), initial: true) { _, _ in registerWithFeed() }
+        // This Mac joining by any route ends a ring for that call (the rule also reads it directly).
+        .onChange(of: calls.channelId) { _, _ in channels.incoming.reevaluate() }
+        .safeAreaInset(edge: .top) {
+            if let ringing = channels.incoming.ringing,
+               let channel = channels.channels.first(where: { $0.id == ringing.channelId }) {
+                IncomingCallBanner(caller: channels.title(channel),
+                                   // Answering means leaving the current call first: the ring isn't
+                                   // consumed by an Answer that can't join.
+                                   busy: calls.call != nil || calls.joining || !channels.canJoin(channel),
+                                   answer: { if channels.incoming.answer() != nil { join(channel) } },
+                                   decline: { channels.incoming.decline() })
+            }
+        }
         .safeAreaInset(edge: .top) {
             if feed?.showsOfflineBanner == true {
                 Label("Offline: showing messages saved on this Mac", systemImage: "wifi.slash")
@@ -365,6 +370,34 @@ extension SignedInView {
             offeredBy: OfferAnswerModel.offerer(of: offer, in: row.members), client: membership)
     }
 
+    /// The toolbar's Join and the incoming call's Answer: the call window, then the join.
+    private func join(_ channel: ChannelRow) {
+        guard !channel.archived, channels.canJoin(channel), calls.call == nil, !calls.joining else { return }
+        openWindow(id: "call")
+        Task {
+            // A participant carries a name only: the handles come from here.
+            let handles = Dictionary(
+                channel.members.map { ($0.id, $0.handle) }, uniquingKeysWith: { first, _ in first })
+            await calls.join(channelId: channel.id, name: channels.title(channel),
+                             handles: handles, client: client)
+        }
+    }
+
+    /// The ring reads this Mac's call directly (never through a view update), and notifies only
+    /// while the app is in the background.
+    private func wireIncomingCalls() {
+        let calls = calls
+        let channels = channels
+        channels.incoming.localChannel = { calls.channelId }
+        channels.incoming.alert = { id, on in
+            let notice = MacNotifier.callId(id)
+            guard on else { return MacNotifier.shared.remove(id: notice) }
+            guard !AppActivity.isActive, let channel = channels.channels.first(where: { $0.id == id }) else { return }
+            MacNotifier.shared.post(id: notice, channelId: id, title: channels.title(channel), body: "is calling you")
+        }
+        channels.incoming.reevaluate()
+    }
+
     /// Select a channel just created, joined or opened, once the list has it.
     fileprivate func open(_ channel: FfiChannel) {
         Task { if await channels.reveal(channel.id) { selection = channel.id } }
@@ -424,4 +457,31 @@ extension SignedInView {
 
 extension SecondFactorModel.Action: Identifiable {
     var id: Self { self }
+}
+
+/// Across the top of the main window while a DM call rings here (#286).
+struct IncomingCallBanner: View {
+    let caller: String
+    let busy: Bool
+    let answer: () -> Void
+    let decline: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "phone.arrow.down.left.fill").foregroundStyle(.green)
+                .symbolEffect(.pulse)
+            Text("\(caller) is calling").font(.headline).lineLimit(1)
+            Spacer()
+            Button("Decline", role: .destructive, action: decline)
+                .help("Stop ringing on this Mac (the caller isn't told)")
+            Button("Answer", action: answer)
+                .buttonStyle(.borderedProminent).tint(.green) // no Return shortcut: Return sends messages
+                .disabled(busy)
+                .help(busy ? "Leave your current call to answer" : "Join the call")
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .background(.green.opacity(0.15))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(caller) is calling")
+    }
 }

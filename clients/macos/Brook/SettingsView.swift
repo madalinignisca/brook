@@ -7,6 +7,7 @@ import SwiftUI
 struct SettingsView: View {
     @AppStorage(Settings.showUsernamesKey) private var showUsernames = false
     @AppStorage(Settings.showImagePreviewsKey) private var showImagePreviews = Settings.showImagePreviewsDefault
+    @AppStorage(Settings.ringForCallsKey) private var ringForCalls = true
 
     static let showUsernamesCaption =
         "Shows people as @username instead of their display name, everywhere they appear."
@@ -17,6 +18,7 @@ struct SettingsView: View {
             Text(Self.showUsernamesCaption)
                 .font(.caption).foregroundStyle(.secondary)
             Toggle("Show image previews", isOn: $showImagePreviews)
+            Toggle("Ring for incoming calls", isOn: $ringForCalls)
             Text("Small images in conversations show by themselves. When off, an image loads only when you click Show preview.")
                 .font(.caption).foregroundStyle(.secondary)
         }

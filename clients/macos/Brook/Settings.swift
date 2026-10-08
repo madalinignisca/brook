@@ -20,6 +20,8 @@ struct Settings {
     static let showImagePreviewsKey = "ShowImagePreviews"
     /// Off: an absent value means off, here and in every `@AppStorage` initial value.
     static let showImagePreviewsDefault = false
+    /// An incoming DM call plays a sound (default on; the banner shows either way).
+    static let ringForCallsKey = "RingForCalls"
     static let fallbackServer = "https://localhost"
 
     let defaults: UserDefaults
