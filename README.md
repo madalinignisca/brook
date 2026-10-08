@@ -83,4 +83,4 @@ This is a deliberate choice for **network-oriented, self-hosted software**:
 
 Copyright © 2026 Madalin Ignisca and Brook contributors. Contributions are accepted under the same license, with a DCO sign-off; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Each server publishes where its source is (see [`BROOK_SOURCE_URL` in the admin guide](docs/admin-guide.md#source-link-agpl-13)), and the clients show that link in their About window.
+Anyone running a modified Brook server must set `BROOK_SOURCE_URL` to where their modified source is, as AGPL §13 requires. Each server publishes that link, and the clients show it in their About window ([admin guide](docs/admin-guide.md#source-link-agpl-13)).
