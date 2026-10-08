@@ -54,6 +54,11 @@ struct Chat {
     /// The scroll adjustment's (upper, value) from before older rows were added, so the view
     /// can stay on the same message once they are laid out.
     scroll_anchor: Rc<Cell<Option<(f64, f64)>>>,
+    /// This window's folder for pasted pictures (`pasted/<pid>-<uuid>`), so windows and runs
+    /// never delete each other's (#291).
+    paste_dir: std::path::PathBuf,
+    /// Pasted pictures written but not staged yet: the sweep leaves them alone until they are.
+    pending_pastes: Rc<RefCell<std::collections::HashSet<std::path::PathBuf>>>,
     /// Handles whose last Add User attempt got no clear answer (kept across sheets in this sign-in).
     add_user_uncertain: Rc<RefCell<crate::add_user::Uncertain>>,
     /// The user chose to remove this device's data: a late save mustn't bring their ranks back.
@@ -235,6 +240,8 @@ pub fn build(
     let message_list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["background"])
+        // A little room under the newest message; scrolling to the bottom keeps it (#291).
+        .margin_bottom(12)
         .build();
     let message_scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
@@ -328,6 +335,12 @@ pub fn build(
         paging: Rc::default(),
         scroll_anchor: Rc::default(),
         add_user_uncertain: Rc::default(),
+        paste_dir: pasted_root().join(format!(
+            "{}-{}",
+            std::process::id(),
+            glib::uuid_string_random()
+        )),
+        pending_pastes: Rc::default(),
         ranks_forgotten: Rc::default(),
         ended: Rc::default(),
         show_usernames: Rc::new(Cell::new(crate::prefs::show_usernames())),
@@ -498,7 +511,53 @@ pub fn build(
             }
         }
     });
-    content_box.append(&message_scroll);
+    // Scrolled up a way from the newest message: a round button bottom right jumps back to it
+    // (#291).
+    let jump = gtk::Button::builder()
+        .icon_name("go-bottom-symbolic")
+        .tooltip_text("Jump to the latest message")
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::End)
+        .margin_end(16)
+        .margin_bottom(16)
+        .visible(false)
+        .css_classes(["circular", "osd"])
+        .build();
+    jump.connect_clicked({
+        let scroll = message_scroll.downgrade();
+        move |_| {
+            if let Some(scroll) = scroll.upgrade() {
+                let adj = scroll.vadjustment();
+                adj.set_value(adj.upper());
+            }
+        }
+    });
+    {
+        let update = {
+            let jump = jump.downgrade();
+            move |adj: &gtk::Adjustment| {
+                if let Some(jump) = jump.upgrade() {
+                    jump.set_visible(crate::chat_rules::shows_jump(
+                        adj.value(),
+                        adj.page_size(),
+                        adj.upper(),
+                    ));
+                }
+            }
+        };
+        let adj = message_scroll.vadjustment();
+        adj.connect_value_changed(update.clone());
+        // A new row grows the list before the follow-to-bottom (an idle) catches up: look once
+        // that has run, so a tall new message doesn't flash the button.
+        adj.connect_changed(move |adj| {
+            let (adj, update) = (adj.clone(), update.clone());
+            glib::idle_add_local_once(move || update(&adj));
+        });
+    }
+    let messages = gtk::Overlay::new();
+    messages.set_child(Some(&message_scroll));
+    messages.add_overlay(&jump);
+    content_box.append(&messages);
     content_box.append(&typing_label);
     content_box.append(&reply_bar);
     content_box.append(&staged_box);
@@ -531,6 +590,124 @@ pub fn build(
             if !entry.text().is_empty() {
                 maybe_send_typing(&chat);
             }
+        }
+    });
+    // Ctrl+V with copied files, or a picture alone, stages them as files, like a drop (#291);
+    // text pastes as before. Pasted pictures left over from an earlier run go first.
+    sweep_dead_paste_dirs();
+    // The window closed or the account signed out (the conversation view leaves the window
+    // either way): this window's pasted pictures go too. Not tied to the chat being freed, which
+    // the handlers' references to it may keep from ever happening.
+    chat.message_list.connect_unrealize({
+        let dir = chat.paste_dir.clone();
+        move |_| {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    });
+    let composer_text = composer
+        .delegate()
+        .and_downcast::<gtk::Text>()
+        .expect("a GtkEntry edits through a GtkText");
+    composer_text.connect_paste_clipboard({
+        let chat = Rc::downgrade(&chat);
+        move |entry| {
+            let Some(chat) = chat.upgrade() else { return };
+            let clipboard = entry.clipboard();
+            let formats = clipboard.formats();
+            let mimes: Vec<String> = formats.mime_types().iter().map(|m| m.to_string()).collect();
+            let offered = crate::chat_rules::offered_from(&crate::chat_rules::Formats {
+                mimes: &mimes,
+                file_list: formats.contains_type(gtk::gdk::FileList::static_type()),
+                texture: formats.contains_type(gtk::gdk::Texture::static_type()),
+                string: formats.contains_type(glib::Type::STRING),
+            });
+            let can_attach = chat.attach_button.is_sensitive();
+            let decision = crate::chat_rules::paste(offered, can_attach);
+            if decision == crate::chat_rules::Paste::Text {
+                return; // the box's own paste
+            }
+            entry.stop_signal_emission_by_name("paste-clipboard");
+            // The clipboard answers asynchronously: what was pasted belongs to the conversation
+            // it was pasted in, so a switch meanwhile drops it.
+            let pasted_in = chat.current.borrow().clone();
+            let text_box = entry.clone();
+            glib::spawn_future_local(async move {
+                let still_here = |chat: &Rc<Chat>| *chat.current.borrow() == pasted_in;
+                let mut decision = decision;
+                if decision == crate::chat_rules::Paste::Files {
+                    let read = clipboard
+                        .read_value_future(
+                            gtk::gdk::FileList::static_type(),
+                            glib::Priority::DEFAULT,
+                        )
+                        .await;
+                    let files: Vec<gtk::gio::File> = read
+                        .ok()
+                        .and_then(|v| v.get::<gtk::gdk::FileList>().ok())
+                        .map(|l| l.files())
+                        .unwrap_or_default()
+                        .into_iter()
+                        // Copied web links come as a URI list too: only local files are files.
+                        .filter(|f| f.path().is_some())
+                        .collect();
+                    if !still_here(&chat) {
+                        return;
+                    }
+                    if !files.is_empty() {
+                        stage_files(&chat, files);
+                        return;
+                    }
+                    // No local file in it: decided again as if there were none (a picture beside
+                    // web links is a picture; links alone are text).
+                    decision = crate::chat_rules::paste(
+                        crate::chat_rules::Offered {
+                            files: false,
+                            ..offered
+                        },
+                        can_attach,
+                    );
+                    if decision == crate::chat_rules::Paste::Files {
+                        decision = crate::chat_rules::Paste::Text;
+                    }
+                }
+                match decision {
+                    crate::chat_rules::Paste::Image => {
+                        let texture = clipboard.read_texture_future().await.ok().flatten();
+                        if !still_here(&chat) {
+                            return;
+                        }
+                        let Some(png) = texture.map(|t| t.save_to_png_bytes()) else {
+                            show_send_error(&chat, "The pasted image couldn't be read.");
+                            return;
+                        };
+                        // The limits first, before anything is written.
+                        let count = chat.staged.borrow().len();
+                        if let Some(why) =
+                            crate::outgoing::refusal(count, "The pasted image", png.len() as u64)
+                        {
+                            show_send_error(&chat, &why);
+                            return;
+                        }
+                        match write_pasted(&chat, &png) {
+                            Some(path) => stage_files(&chat, vec![gtk::gio::File::for_path(path)]),
+                            None => show_send_error(&chat, "The pasted image couldn't be saved."),
+                        }
+                    }
+                    crate::chat_rules::Paste::Text => {
+                        if !still_here(&chat) {
+                            return;
+                        }
+                        // The text the box would have pasted, in place of any selection.
+                        if let Ok(Some(text)) = clipboard.read_text_future().await {
+                            text_box.delete_selection();
+                            let mut at = text_box.position();
+                            text_box.insert_text(&text, &mut at);
+                            text_box.set_position(at);
+                        }
+                    }
+                    crate::chat_rules::Paste::Files => {}
+                }
+            });
         }
     });
 
@@ -577,6 +754,17 @@ pub fn build(
                     })
                     .as_ref(),
             );
+        }
+    });
+    // Opening a conversation with a click or Enter puts the cursor in its message box (#291).
+    // On activation, not selection: a click focuses the row after selecting it, and arrow keys
+    // select rows as they move, which must keep the keyboard in the sidebar.
+    channel_list.connect_row_activated({
+        let chat = Rc::downgrade(&chat);
+        move |_, _| {
+            if let Some(chat) = chat.upgrade() {
+                focus_composer(&chat);
+            }
         }
     });
     channel_list.connect_row_selected({
@@ -912,6 +1100,8 @@ fn refresh_channels(chat: &Rc<Chat>, select: Option<String>) {
             if let Some(idx) = idx {
                 if let Some(row) = chat.channel_list.row_at_index(idx as i32) {
                     chat.channel_list.select_row(Some(&row));
+                    // A conversation just created or opened: the cursor goes to its box.
+                    focus_composer(&chat);
                 }
             }
         }
@@ -953,9 +1143,17 @@ fn redraw_sidebar(chat: &Rc<Chat>) {
     // The conversation whose row has keyboard focus (removing the rows would drop it). Rows
     // carry their conversation's id as their widget name: `chat.channels` is already in the
     // new order here while the rows are still in the old one, so a position can't say.
+    // Only when the keyboard is in the sidebar: a redraw must not take focus from the message
+    // box (#291).
+    let in_sidebar = chat
+        .channel_list
+        .root()
+        .and_then(|root| root.focus())
+        .is_some_and(|w| w.is_ancestor(&chat.channel_list));
     let focused_id = chat
         .channel_list
         .focus_child()
+        .filter(|_| in_sidebar)
         .and_downcast::<gtk::ListBoxRow>()
         .map(|row| row.widget_name().to_string());
 
@@ -1442,13 +1640,114 @@ fn add_files(chat: &Rc<Chat>) {
     crate::outgoing::pick(window.as_ref(), move |files| stage_files(&chat, files));
 }
 
+/// Where pasted pictures are written until they are sent or unstaged: this session's runtime
+/// directory, private to the user and gone at log-out. Each window has a folder of its own in it.
+fn pasted_root() -> std::path::PathBuf {
+    glib::user_runtime_dir().join("brook").join("pasted")
+}
+
+/// A folder only the user can read (the runtime directory falls back to the cache directory
+/// when there is none).
+fn private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+/// Remove the paste folders of Brook processes that are gone (a crash, a killed run); those of
+/// running windows stay.
+///
+/// Not under Flatpak: there each instance has its own process namespace, so another running
+/// instance's pid is not in this one's `/proc` and its folder would look dead. The runtime
+/// directory is cleared at log-out anyway.
+fn sweep_dead_paste_dirs() {
+    if crate::preview::in_flatpak() {
+        return;
+    }
+    let Ok(dirs) = std::fs::read_dir(pasted_root()) else {
+        return;
+    };
+    let names: Vec<String> = dirs
+        .flatten()
+        .map(|d| d.file_name().to_string_lossy().into_owned())
+        .collect();
+    let alive = |pid: u32| std::path::Path::new(&format!("/proc/{pid}")).exists();
+    for name in crate::chat_rules::dead_paste_dirs(&names, alive) {
+        let _ = std::fs::remove_dir_all(pasted_root().join(name));
+    }
+}
+
+/// Write a pasted picture as a PNG file of its own, named by the time it was pasted, in a folder
+/// of its own (two pastes in one second don't collide). `None` if it can't be written.
+fn write_pasted(chat: &Rc<Chat>, png: &glib::Bytes) -> Option<std::path::PathBuf> {
+    let now = glib::DateTime::now_local().ok()?;
+    let name = crate::chat_rules::pasted_name(
+        now.year(),
+        now.month() as u32,
+        now.day_of_month() as u32,
+        now.hour() as u32,
+        now.minute() as u32,
+        now.second() as u32,
+    );
+    private_dir(&pasted_root()).ok()?;
+    let dir = chat.paste_dir.join(glib::uuid_string_random().as_str());
+    private_dir(&dir).ok()?;
+    let path = dir.join(name);
+    if std::fs::write(&path, png.as_ref()).is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+    // Not staged yet: a sweep meanwhile (another paste, a chip removed) must leave it.
+    chat.pending_pastes.borrow_mut().insert(path.clone());
+    Some(path)
+}
+
+/// Delete this window's pasted pictures that no staged file uses any more (unstaged, sent, or
+/// refused when staged), with their folders; one still on its way to being staged stays.
+fn sweep_pasted(chat: &Rc<Chat>) {
+    let Ok(dirs) = std::fs::read_dir(&chat.paste_dir) else {
+        return;
+    };
+    let existing: Vec<std::path::PathBuf> = dirs
+        .flatten()
+        .filter_map(|d| std::fs::read_dir(d.path()).ok())
+        .flat_map(|files| files.flatten().map(|f| f.path()))
+        .collect();
+    let mut kept: Vec<std::path::PathBuf> = chat
+        .staged
+        .borrow()
+        .iter()
+        .map(|f| f.path.clone())
+        .collect();
+    kept.extend(chat.pending_pastes.borrow().iter().cloned());
+    for path in crate::chat_rules::leftovers(&chat.paste_dir, &existing, &kept) {
+        let _ = std::fs::remove_file(&path);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
 /// Put files (picked, or dropped on the conversation) under the message box, checking the
 /// limits as they're added.
 fn stage_files(chat: &Rc<Chat>, files: Vec<gtk::gio::File>) {
     let chat = chat.clone();
+    // Files staged for one conversation never go to another, even when one is opened while
+    // they are being looked at.
+    let staging_in = chat.current.borrow().clone();
     glib::spawn_future_local(async move {
         for file in files {
-            let staged = match crate::outgoing::describe(&file).await {
+            let described = crate::outgoing::describe(&file).await;
+            // Whatever happens to it now, a pasted picture is no longer on its way.
+            if let Some(path) = file.path() {
+                chat.pending_pastes.borrow_mut().remove(&path);
+            }
+            if *chat.current.borrow() != staging_in {
+                continue;
+            }
+            let staged = match described {
                 Ok(staged) => staged,
                 Err(crate::outgoing::NotStaged::NotAFile) => {
                     show_send_error(&chat, "Only files can be sent (not folders or devices).");
@@ -1498,6 +1797,8 @@ fn redraw_staged(chat: &Rc<Chat>) {
         chat.staged_box.append(&chip);
     }
     chat.staged_box.set_visible(!staged.is_empty());
+    // A pasted picture that is no longer staged is deleted.
+    sweep_pasted(chat);
 }
 
 fn clear_staged(chat: &Rc<Chat>) {
@@ -2203,6 +2504,7 @@ fn edit_message_dialog(
 ) {
     let (current, has_files) = current;
     let entry = gtk::Entry::builder().text(&current).hexpand(true).build();
+    let to_focus = entry.clone();
     let dialog = adw::AlertDialog::builder()
         .heading("Edit message")
         .extra_child(&entry)
@@ -2239,6 +2541,9 @@ fn edit_message_dialog(
         }
     });
     dialog.present(Some(&chat.message_list));
+    // Editing puts the cursor in the text, at its end (#291).
+    to_focus.grab_focus();
+    to_focus.set_position(-1);
 }
 
 /// Delete confirmation → `delete_message` (the WS `message.delete` removes the row).
@@ -4036,6 +4341,16 @@ fn search_dialog(chat: &Rc<Chat>) {
             run_search(&chat, query, results.clone(), dialog, generation.clone());
         }
     });
+    // The dialog gives focus back to the button that opened it as it goes: the message box takes
+    // it once the dialog has gone (after a result was chosen, that conversation's box).
+    dialog.connect_closed({
+        let chat = Rc::downgrade(chat);
+        move |_| {
+            if let Some(chat) = chat.upgrade() {
+                glib::idle_add_local_once(move || focus_composer(&chat));
+            }
+        }
+    });
     dialog.present(Some(&chat.message_list));
     entry.grab_focus();
 }
@@ -4121,7 +4436,17 @@ fn jump_to_channel(chat: &Rc<Chat>, channel_id: &str) {
     if let Some(idx) = idx {
         if let Some(row) = chat.channel_list.row_at_index(idx as i32) {
             chat.channel_list.select_row(Some(&row));
+            // Opened from search, a notification or a new conversation: the cursor goes to
+            // its message box too.
+            focus_composer(chat);
         }
+    }
+}
+
+/// Put the cursor in the message box, if a conversation that can be written in is open.
+fn focus_composer(chat: &Rc<Chat>) {
+    if chat.composer.is_sensitive() {
+        chat.composer.grab_focus();
     }
 }
 
