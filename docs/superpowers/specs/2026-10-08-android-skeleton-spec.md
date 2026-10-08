@@ -1,9 +1,15 @@
 # Android: app skeleton that signs in and lists channels (#273): spec
 
-Status: draft, after the owner's ruling on local-store crypto. Review dial: **Heavy** (sign-in, TOTP and a session kept on the
-device). CLAUDE.md §2 asks for an `auth-reviewer` on any authentication change, but no such agent
-is defined; the owner is asked to accept the Opus review in its place. Twin of the iOS skeleton
-(#272).
+Status: all open questions answered by the owner (2026-10-08); awaiting the owner's approval of
+the spec. Review dial: **Heavy** (sign-in, TOTP and a session kept on the device). CLAUDE.md §2
+asks for an `auth-reviewer` on any authentication change, but no such agent is defined; the owner
+accepted the Opus review in its place (2026-10-08). Twin of the iOS skeleton (#272).
+
+**Changed after the owner's answers (2026-10-08):** the five open questions are now decisions in
+section 3: FFI option (c), two sections (channels then DMs, alphabetical), no Start chat button or
+search bar until their features work, application id `me.madalin.brook` and app name Brook, and a
+labelled `http` opt-in in debug builds only. The plain-SQLite consequences are confirmed, and the
+Opus review stands in for the `auth-reviewer`.
 
 **Changed after peer notes (Apple/core and server reviewers):** the core change is gated on
 `target_os = "android"` only (macOS unchanged, iOS decided separately) and the ADR says why other
@@ -74,11 +80,22 @@ Done means:
 - **Scope is exactly #273**: sign in (server address, handle, password, TOTP when required),
   session in the Android Keystore, sign out, live channel list.
 - **CI builds the debug APK.** ABIs: arm64-v8a (phones) and x86_64 (emulator).
+- **FFI:** reuse `bindings/apple`'s `brook-ffi` (already `staticlib`, `cdylib` and `lib`): build
+  its cdylib unchanged for the Android targets and generate Kotlin from it. No second binding
+  layer (#272 asks the same). Moving or renaming the crate is a later, separate PR, not #273. Some
+  callback traits were shaped around Swift (the call engine, async traits); their Kotlin output
+  must be checked before anything relies on them. This skeleton needs none of the call ones.
+- **Channels and DMs:** two sections, channels then DMs, each alphabetical.
+- **Start chat button and search bar:** added when their features work, not in the skeleton. A
+  dead button is worse than none.
+- **Application id** `me.madalin.brook`, **app name** Brook.
+- **Plain `http`:** a labelled dev opt-in in debug builds only; release builds stay `https`-only
+  (with `http` to loopback, as core allows everywhere).
+- **Local store on Android:** plain SQLite, protected by the OS (section 4).
 
 **In scope:** building `core` and its Kotlin bindings for both ABIs, wired into the Gradle build
-(this needs changes outside `clients/android`: open question 1, and the core change in "Local
-store on Android"); the Compose app; the
-CI job; the README.
+(this needs changes outside `clients/android`: the token change in `brook-ffi` and the core change
+in "Local store on Android"); the Compose app; the CI job; the README.
 
 **Non-goals** (each gets its own ticket later):
 - Opening a conversation, messages, sending. Rows in the list are not tappable yet.
@@ -107,6 +124,9 @@ CI job; the README.
 - One screen: server address, handle, password, a "Sign in" button. The address must be a bare
   `https://host` (or `http` for loopback); credentials, a query or a fragment in it are refused
   with a message, as on Mac and GNOME. The password is sent exactly as typed.
+- Debug builds only: a clearly labelled dev option allows plain `http` to any host (e.g. a test
+  server reached from the emulator through `10.0.2.2`), warning that the password and tokens travel
+  unencrypted. Release builds do not have it.
 - While signing in the button is disabled and shows progress. Wrong credentials, an unreachable
   server, a bad address and rate limiting each get one short message under the form; the form keeps
   what was typed except the password.
@@ -133,7 +153,7 @@ CI job; the README.
   `toString`, and Kotlin cannot override that from outside the generated file (Swift redacts with
   `Redaction.swift`; Kotlin has no equivalent). The Mac does not read the tokens and core already
   persists the session through `KeySlot`, so the tokens leave the FFI record. This is a Rust change
-  in the shared wrapper that also touches Mac and iOS; where it lands depends on open question 1.
+  in `brook-ffi` (`bindings/apple`) that also touches Mac and iOS.
   The BrookCore Swift tests do read the tokens (`LoginIntegrationTests.swift:71-77`,
   `SignOutIntegrationTests.swift:41`, `TotpIntegrationTests.swift:178,182`, and `RedactionTests`
   builds an `FfiSession` with them), so those tests are rewritten in the same change, e.g. getting
@@ -157,10 +177,10 @@ CI job; the README.
 - One Material 3 screen with a top bar and a conversation list. Each row has a round avatar with
   the label's first letter, colored from the theme (stable per conversation), and the label from
   core's `conversation_label`, so a DM reads the other person's display name.
-- **Order:** channels first, then DMs, each alphabetical by label. Ordering by recent activity
-  needs data this scope does not load (no cache, no message events, and `FfiChannel` has no last
-  message).
-- Start chat button and search bar: pending the owner (open question 3).
+- **Two sections**, each with a header: "Channels", then "Direct messages", each alphabetical by
+  label. A section with no rows is not shown. Ordering by recent activity needs data this scope
+  does not load (no cache, no message events, and `FfiChannel` has no last message).
+- No Start chat button and no search bar yet (decided; they come with their features).
 - Empty account: "No conversations yet". A list that cannot load: an error message with "Try again".
 - **Live:** the app listens to core's events, opens the realtime connection, then loads the list.
   A changed channel replaces its row; a channel not in the list makes the list reload (the server's
@@ -201,7 +221,7 @@ CI job; the README.
     unlock), never in device-protected storage;
   - they stay **out of every backup**: in the no-backup directory, with `allowBackup` and
     `dataExtractionRules` keeping them out of cloud backup and device-to-device transfer.
-- **Consequences, for the owner to confirm with this ruling:**
+- **Consequences, confirmed by the owner, 2026-10-08:**
   - Protection on Android is the app sandbox plus file-based encryption, nothing more.
   - The store's wrong-key detection does not apply.
   - File sealing adds nothing there: each downloaded file's own key (made in `files.rs`, used for
@@ -224,32 +244,7 @@ CI job; the README.
   and `docs/ROADMAP.md` (line 18); "What lives in `core`" in `docs/CLIENT_PHILOSOPHY.md`; the
   `rusqlite` comment in `core/Cargo.toml`; and the module doc of `core/src/store.rs`.
 
-## 5. Open questions for the owner
+## 5. Open questions
 
-1. **Where the FFI crate lives and how Kotlin bindings are built.** `bindings/apple` (`brook-ffi`)
-   already wraps all of `core` for UniFFI, with nothing Apple-only in its Rust. Options:
-   (a) rename it to a shared crate (e.g. `bindings/uniffi`) used by Apple and Android; changes paths
-   the Apple scripts and CI use.
-   (b) a new `bindings/android` crate that wraps `core` again; duplicates the wrapper.
-   (c) build `brook-ffi`'s cdylib unchanged for the Android targets and generate Kotlin from it
-   (it is already `staticlib`, `cdylib` and `lib`).
-   **Recommended: (c)**, then (a); not (b). #272 asks for no second binding layer. The token change
-   above lands in this crate either way, and it is owned by the core/Apple side. Moving or renaming
-   the crate out of `bindings/apple` is a separate later PR, not part of #273.
-   Some callback traits were shaped around Swift (the call engine, async traits); their Kotlin
-   generation must be checked before anything relies on them. This skeleton needs none of the call
-   ones.
-2. **Channels and DMs: one list or two sections?** Messages has one list ordered by activity. That
-   needs activity data this scope does not load (handling `message.new`, or a last-message field
-   on the channel) plus a core order rule shared with Mac and GNOME: scope growth. Without it:
-   channels then DMs, alphabetical, shown as one list or as two sections with headers.
-3. **Messages chrome in the skeleton.** Your #273 comment names a Start chat button. Should the
-   Start chat button and the search bar be in the skeleton, or added when their features land?
-   Recommendation: leave both out until they work. A dead button is worse than none, and a
-   device-only search filter is scope growth.
-4. **Application id and app name** shown on the device (the package name cannot change after a
-   Play Store release).
-5. **Plain `http` test servers.** Core refuses `http` to anything but loopback unless a dev opt-in
-   is on (GNOME: an environment variable; Mac: a hidden setting), and the emulator reaches the host
-   through `10.0.2.2`, which is not loopback. A labelled dev opt-in in the debug build, or `https`
-   servers only?
+None remain. The owner answered all of them on 2026-10-08; the answers are under "Decided by the
+owner" in section 3.
