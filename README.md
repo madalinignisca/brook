@@ -81,4 +81,4 @@ This is a deliberate choice for **network-oriented, self-hosted software**:
 - The AGPL closes the "SaaS loophole" in the ordinary GPL — **anyone who runs a modified Brook as a network service must offer their modified source to its users.** You can't take Brook, improve it behind a hosted product, and keep those changes private.
 - In short: **fork freely, but contribute your changes back.** That keeps Brook honest as a community-owned alternative and prevents it from being quietly absorbed into a closed commercial offering.
 
-Copyright © Brook contributors. Contributions are accepted under the same license.
+Copyright © 2026 Madalin Ignisca and Brook contributors. Contributions are accepted under the same license, with a DCO sign-off; see [CONTRIBUTING.md](CONTRIBUTING.md).
