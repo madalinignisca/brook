@@ -2,8 +2,18 @@
 
 Status: all open questions answered by the owner (2026-10-08); awaiting the owner's approval of
 the spec. Review dial: **Heavy** (sign-in, TOTP and a session kept on the device). CLAUDE.md §2
-asks for an `auth-reviewer` on any authentication change, but no such agent is defined; the owner
-accepted the Opus review in its place (2026-10-08). Twin of the iOS skeleton (#272).
+asks for an `auth-reviewer` on any authentication change. None is defined in the repo or on this
+machine; one exists as a user-level agent on the server agent's machine. The owner accepted the
+Opus review in its place for this spec (2026-10-08); the token-removal PR goes to that
+`auth-reviewer`. Twin of the iOS skeleton (#272).
+
+**Changed after PR review (#309):** the session section now says who owns what: core only stores,
+loads and deletes the session bytes, while the Android `KeySlot` implementation owns the Keystore
+key's lifecycle (the old "core makes, uses and wipes the keys" was true only of local-data keys).
+The token removal names its `brook-ffi` Rust touch points (`types.rs`, and a `client.rs` test whose
+check moves to core) and also goes to the `auth-reviewer` through the server agent. The Android CI
+job adds clippy for `x86_64-linux-android` and a plain-SQLite store test. The iOS line no longer
+contradicts the gating. `2026-09-24-apple-ffi-bridge-design.md` joins the records to update.
 
 **Changed after the owner's answers (2026-10-08):** the five open questions are now decisions in
 section 3: FFI option (c), two sections (channels then DMs, alphabetical), no Start chat button or
@@ -138,10 +148,13 @@ in "Local store on Android"); the Compose app; the CI job; the README.
   code autofill work.
 
 ### Session in the Android Keystore
-- The app gives core its `KeySlot`. Core makes, uses and wipes the keys; the platform only stores
-  bytes under a named slot. On Android the bytes are encrypted with a non-exportable key held in the
-  Android Keystore, and the encrypted bytes live in the app's no-backup storage: not copied by
-  Android backup or device transfer, gone after uninstall.
+- The app gives core its `KeySlot`: named slots of bytes. For the session, core only stores, loads
+  and deletes bytes: it writes the signed-in user and the refresh token (never the access token) as
+  JSON with `replace`, reads them at launch, and calls `delete` on sign-out (`core/src/persist.rs`).
+- The **Android `KeySlot` implementation owns the Keystore key's whole lifecycle**: it creates the
+  non-exportable Android Keystore key, uses it to encrypt and decrypt every slot's bytes, and
+  handles a missing key (below). Core never sees that key. The encrypted bytes live in the app's
+  no-backup storage: not copied by Android backup or device transfer, gone after uninstall.
 - The Keystore key does **not** require user authentication (no unlock prompt), because core calls
   the slot without a UI and every call must answer within seconds or report `Unavailable`.
 - Core's contract holds exactly: only a slot that truly does not exist is **absent**. Bytes that
@@ -153,14 +166,20 @@ in "Local store on Android"); the Compose app; the CI job; the README.
   `toString`, and Kotlin cannot override that from outside the generated file (Swift redacts with
   `Redaction.swift`; Kotlin has no equivalent). The Mac does not read the tokens and core already
   persists the session through `KeySlot`, so the tokens leave the FFI record. This is a Rust change
-  in `brook-ffi` (`bindings/apple`) that also touches Mac and iOS.
+  in `brook-ffi` (`bindings/apple`) that also touches Mac and iOS. Its Rust touch points:
+  `types.rs` (about lines 33-51: the `FfiSession` fields, a now-stale doc comment and the redacting
+  `Debug` impl), and the test `login_success_carries_exact_tokens_and_user` in `client.rs` (about
+  lines 707-717), whose "tokens arrive intact and unswapped" check moves to core rather than being
+  deleted.
   The BrookCore Swift tests do read the tokens (`LoginIntegrationTests.swift:71-77`,
   `SignOutIntegrationTests.swift:41`, `TotpIntegrationTests.swift:178,182`, and `RedactionTests`
   builds an `FfiSession` with them), so those tests are rewritten in the same change, e.g. getting
   tokens over plain HTTP as other tests there already do, and `RedactionTests` loses its token case.
   Also touched: `clients/macos/BrookTests/FakeClient.swift` (builds an `FfiSession`) and
   `bindings/apple/swift/BrookCore/Sources/BrookCore/Redaction.swift`. The Mac's `build.sh test`
-  must pass, and the Apple/core reviewer reviews that PR.
+  must pass. The Apple/core reviewer reviews that PR, and, as the real auth change, it also goes to
+  the `auth-reviewer` (a user-level agent on the server agent's machine, not in the repo), through
+  the server agent.
 - Passwords and codes never appear in logs or crash text.
 
 ### Sign out
@@ -200,8 +219,11 @@ in "Local store on Android"); the Compose app; the CI job; the README.
   private to the system. Decided by the owner: no SQLCipher on Android (next section).
 - A new CI job builds the debug APK. It runs no device or emulator tests in this step; the sign-in
   against a real server is run by hand and its result pasted in the PR, like the Mac's `itest.sh`.
-- Note for the plan: CI runs core's tests on the host only, which is the SQLCipher path. The plan
-  must say how the Android (plain SQLite) path is tested, or say plainly that it is untested.
+- CI runs core's tests on the host only, which is the SQLCipher path. So that the Android branch
+  of `store.rs` cannot drift unseen, the Android CI job also runs `cargo clippy -D warnings` for
+  `--target x86_64-linux-android`, plus at least one test of the plain-SQLite open and reset path.
+  How that test runs (e.g. on the host with the Android branch selected, or on an emulator) is
+  left to the plan.
 
 ### Local store on Android (decided by the owner)
 - Be as native as possible and use what the device does better. Android gives each app's private
@@ -234,7 +256,8 @@ in "Local store on Android"); the Compose app; the CI job; the README.
     `Locked` when the key storage is unavailable). How is the plan's business.
 - The session itself is unaffected: core writes it as JSON straight into the `KeySlot`, which stays
   protected by the Android Keystore as above.
-- Every other platform keeps SQLCipher; the desktops have no per-app sandbox. The ADR says why.
+- The desktops keep SQLCipher (no per-app sandbox there); iOS keeps SQLCipher today, and iOS is
+  decided in #272. The ADR says why.
 - The change lands in `core` through the core implementer, before the Android app needs it.
 - **Records updated with the core change:** a new ADR, `docs/adr/0001-...` (the first; the folder
   does not exist yet); Android notes in `2026-09-25-client-local-data-encryption-design.md` (today
@@ -242,7 +265,9 @@ in "Local store on Android"); the Compose app; the CI job; the README.
   `2026-09-25-offline-cache-design.md` §3, and in `2026-09-26-keep-offline-spec.md` (line 6, "the
   encrypted, disposable file cache", and the chunk sealing around lines 105-115); the "encrypted" lines in `docs/FEATURES.md` (line 39)
   and `docs/ROADMAP.md` (line 18); "What lives in `core`" in `docs/CLIENT_PHILOSOPHY.md`; the
-  `rusqlite` comment in `core/Cargo.toml`; and the module doc of `core/src/store.rs`.
+  `rusqlite` comment in `core/Cargo.toml`; and the module doc of `core/src/store.rs`. With the
+  token removal: `2026-09-24-apple-ffi-bridge-design.md` (about lines 36-37 and 100-101, which say
+  `FfiSession` carries the tokens).
 
 ## 5. Open questions
 
