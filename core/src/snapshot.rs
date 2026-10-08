@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Outbox attachment snapshots (spec 2026-09-26-outbox-attachments-spec.md §3; offline-cache
 //! design §6.1): a file the user queued, copied at enqueue into the user's store as
 //! ciphertext, so later edits, moves or deletion of the source change nothing, and nothing of

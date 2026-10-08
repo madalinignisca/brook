@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Inline image previews, core half (spec 2026-09-26-image-previews.md §2): which bytes may be
 //! handed to a decoder at all. The kind is sniffed (never taken from the name), and the
 //! dimensions are read from the header and capped before anything decodes. The parsers are

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! How a conversation is labelled and ordered in a client's sidebar. Pure rules, no I/O, so
 //! every client lists conversations the same way; the state they need (the opened rank, the
 //! preference) stays in each client.

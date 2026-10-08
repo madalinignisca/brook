@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Offline data (the encrypted cache and outbox, plan C5) across the FFI: records, the
 //! client methods, and two listeners (spec 2026-09-25-offline-ffi-spec.md).
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! A headless call participant: joins a channel's call through core with a
 //! GstEngine, stays until Ctrl-C (or `BROOK_SECONDS`), and reports what it
 //! receives. For cross-client interop tests (e.g. macOS <-> Linux) without a

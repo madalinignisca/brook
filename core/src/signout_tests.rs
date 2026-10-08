@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Sign out, and no refresh token left live that no device holds (spec
 //! docs/superpowers/specs/2026-09-25-sign-out-design.md §5, plan P2).
 

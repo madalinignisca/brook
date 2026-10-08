@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Test harness: one in-process origin serving the REST auth endpoints and the `/ws`
 //! upgrade (the client derives both from a single base URL), with each accepted socket
 //! handed to the test to drive imperatively — so tests choose frame order exactly.

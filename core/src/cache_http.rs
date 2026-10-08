@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The cache's network side (plan C3): `GET /sync` and `GET /channels/{id}/messages`,
 //! with the signed-in session's access token. Errors carry the status only, never a body.
 

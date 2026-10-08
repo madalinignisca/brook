@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The per-user lifecycle (plan C5): stores open on sign-in, the WebSocket feeds the cache,
 //! the outbox pauses when signed out, "Remove this device's data" erases first, and another
 //! user's data is found and wiped.

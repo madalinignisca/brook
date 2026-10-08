@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The outbox (plan C4, #63; spec §5): messages written while offline (or before the server
 //! answered) are durable, go out in the order written, once, and are never dropped
 //! silently.

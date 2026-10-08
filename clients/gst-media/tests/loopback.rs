@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! In-process loopback: one engine publishes synthetic mic + camera, a second
 //! engine subscribes, with SDP and ICE shuttled the way `core` will shuttle
 //! them over the WS (PROTOCOL.md §3). Proves capture → encode → DTLS/SRTP →

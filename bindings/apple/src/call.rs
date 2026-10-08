@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Calls over the FFI: the platform engine is implemented in Swift (`FfiMediaEngine`, a
 //! foreign async trait) and adapted to core's `MediaEngine`; the call handle and its state
 //! are exposed back to Swift. See docs/superpowers/specs/2026-09-24-apple-call-engine-design.md.

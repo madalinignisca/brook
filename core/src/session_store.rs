@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The shared session: who is signed in (epoch) and which credentials they hold
 //! (credential revision).
 //!

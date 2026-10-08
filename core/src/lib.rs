@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Brook shared client core.
 //!
 //! All non-UI client logic (networking, protocol, state) lives here once and is

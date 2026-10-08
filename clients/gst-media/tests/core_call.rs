@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! A real call through core's signaling (`BrookClient::join_call` +
 //! `CallHandle`) with two GStreamer engines against a live Brook server +
 //! Janus: the Linux client stack end to end, minus the UI. This is C1b's live

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! TOTP two-factor sign-in (spec docs/superpowers/specs/2026-09-25-totp-clients-design.md §4,
 //! plan P2.1–P2.2).
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The platform's secure store, implemented in Swift (the data-protection Keychain), used by
 //! core for staying signed in (plan 2026-09-25-keyslot-session-plan.md P3).
 

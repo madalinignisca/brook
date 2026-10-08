@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The offline records and listeners across the FFI: what Swift draws must survive the
 //! mapping, and a slow listener must be told to re-read rather than skip silently.
 

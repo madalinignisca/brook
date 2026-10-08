@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The cache's front (plan C3): reads, change notices after commit, unread counts, the
 //! network-needed signal, and the sync triggers (hints, unappliable events, single-flight).
 

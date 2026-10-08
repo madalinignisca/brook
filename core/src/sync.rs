@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The sync loop (plan C2, spec §4.2) against the server's `GET /sync` (#91).
 //!
 //! Pages go through [`apply`](crate::apply::apply) and the new cursor is written **in the same
