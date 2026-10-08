@@ -64,6 +64,10 @@ services:
       BROOK_FILES_DIR: /data/files
       # The dev laptop's free space shouldn't block uploads; production keeps 5 GB.
       BROOK_FILES_MIN_FREE_BYTES: ${BROOK_FILES_MIN_FREE_BYTES:-0}
+      # AGPL-3.0 section 13: an operator running a MODIFIED server sets this in .env to where
+      # that source is. Empty means the upstream default, which lives only in the server
+      # (services/api/app/config.py), not here.
+      BROOK_SOURCE_URL: ${BROOK_SOURCE_URL:-}
     volumes:
       - files:/data/files
     depends_on:
