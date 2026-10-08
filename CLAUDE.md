@@ -91,10 +91,18 @@ outside the repo. A doc that no longer matches the code is a bug.
 
 ## 7. The clients stay in line
 
-Every client offers the same features, each in its own platform's way. When a merged PR adds or
-changes something a user can see or do in one client, the main agent opens one issue for each
-other client right after the merge: GNOME, KDE, macOS, iOS, Android, Windows. Clients not yet
-started get one too, so their backlog is complete when work starts. Each issue:
+Every client offers the same features, each in its own platform's way. Same features does not
+mean same implementation: use what the device does better. Logic is still written once in `core`;
+but where the platform already provides a capability well (app sandbox and storage encryption,
+keychain or keystore, notifications, file pickers, media codecs), the client uses it, and `core`
+should offer a seam for that instead of forcing its own version on every platform. Example (owner
+decision, not built yet): Android sandboxes and encrypts each app's storage, so `core`'s local
+database there is to become plain SQLite, not SQLCipher (#273).
+
+When a merged PR adds or changes something a user can see or do in one client, the main agent
+opens one issue for each other client right after the merge: GNOME, KDE, macOS, iOS, Android,
+Windows. Clients not yet started get one too, so their backlog is complete when work starts.
+Each issue:
 - links the merged PR and the spec, and says what the user must be able to do, not how the
   first client built it;
 - gets the client's label (`area:gtk` for GNOME, `area:kde`, `area:macos`, `area:ios`, `area:android`,
