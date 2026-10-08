@@ -1,31 +1,41 @@
 name: issue-branch
 
-# A collaborator's pull request must come from an issue they opened.
-# The reasoning, and what is not checked, is in the script.
+# Checks that a pull request from anyone but the owner comes from a branch
+# made from an issue its author opened, and is open.
+#
+# The "new branches" ruleset already refuses, at push time, a collaborator
+# branch whose name does not start with "<number>-" (the name GitHub's
+# "Create a branch" button on an issue gives). A ruleset only sees the name:
+# it cannot tell whether issue <number> exists, is still open, or was opened
+# by someone else. This job checks that.
+#
+# It is a signal for the owner, not a gate: only the owner can merge into
+# main anyway, so it is not a required check.
+#
+# Not checked: the owner (who bypasses the rulesets on purpose) and
+# Dependabot (which names its own branches). Every other bot, and a fork's
+# pull request, is checked like a person. A result is not refreshed if the
+# issue is closed later; the next push re-runs it.
 
-# pull_request_target, not pull_request: with pull_request the workflow and
-# the script would be taken from the pull request itself, so its author could
-# edit the check into a pass. pull_request_target runs main's copy. That is
-# only safe because nothing from the pull request is ever checked out or run
-# here: the checkout below is pinned to the base commit, and the branch name
-# reaches the script only as an environment variable.
+# pull_request_target, not pull_request: with pull_request the workflow would
+# be taken from the pull request itself, so its author could edit the check
+# into a pass. pull_request_target always runs the default branch's copy.
+# That is only safe because nothing from any pull request or branch is
+# checked out: the whole check is in this file, there is no checkout step
+# (a checkout of the base branch would run whatever a collaborator pushed to
+# a "5-x" branch used as the base), and the branch name reaches the shell
+# only as an environment variable, matched against a regex.
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, edited]
 
 permissions:
-  contents: read
   issues: read
 
 jobs:
   issue:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          sparse-checkout: .github/scripts
-          persist-credentials: false
       - name: Branch comes from the author's own open issue
         env:
           GH_TOKEN: ${{ github.token }}
@@ -33,4 +43,43 @@ jobs:
           OWNER: ${{ github.repository_owner }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
           BRANCH: ${{ github.event.pull_request.head.ref }}
-        run: bash .github/scripts/check-issue-branch.sh
+        run: |
+          set -euo pipefail
+
+          if [[ "$AUTHOR" == "$OWNER" || "$AUTHOR" == "dependabot[bot]" ]]; then
+            echo "Not checked: opened by $AUTHOR."
+            exit 0
+          fi
+
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          [[ "$BRANCH" =~ ^([0-9]+)- ]] ||
+            fail "Branch '$BRANCH' does not start with an issue number. Open an issue, then use its 'Create a branch' button."
+          number=${BASH_REMATCH[1]}
+
+          # Only a 404 means "no such issue". A rate limit, a 5xx or a token
+          # problem is reported as itself, not as a missing issue.
+          err=$(mktemp)
+          if ! issue=$(gh api "repos/$REPO/issues/$number" 2>"$err"); then
+            grep -q 'HTTP 404' "$err" &&
+              fail "Issue #$number (from branch '$BRANCH') does not exist."
+            fail "Could not read issue #$number: $(tr '\n' ' ' <"$err")"
+          fi
+
+          # gh follows the redirect of an issue transferred to another
+          # repository; that issue no longer belongs here.
+          [[ $(jq -r '.repository_url | ascii_downcase' <<<"$issue") == "https://api.github.com/repos/${REPO,,}" ]] ||
+            fail "Issue #$number was moved to another repository."
+          # The issues endpoint also answers for pull request numbers.
+          [[ $(jq -r '.pull_request != null' <<<"$issue") == false ]] ||
+            fail "#$number is a pull request, not an issue."
+          [[ $(jq -r '.state' <<<"$issue") == open ]] ||
+            fail "Issue #$number is closed."
+          opener=$(jq -r '.user.login' <<<"$issue")
+          [[ "$opener" == "$AUTHOR" ]] ||
+            fail "Issue #$number was opened by $opener, not by $AUTHOR. Work on an issue you opened."
+
+          echo "OK: branch '$BRANCH' comes from issue #$number, opened by $AUTHOR."
