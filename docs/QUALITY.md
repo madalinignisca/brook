@@ -7,7 +7,7 @@
 2. **GitHub Actions** — **path-filtered** per sub-project, so a Rust change doesn't run Python CI and vice-versa.
 3. **Branch protection** on `main` — green required checks + review before merge.
 
-Repo-wide: **`.editorconfig`**, markdownlint, **gitleaks** (secret scanning), Conventional-Commits-style messages (encouraged).
+Repo-wide: **`.editorconfig`**, markdownlint, **gitleaks** (secret scanning), commit subjects prefixed by area (`api:`, `mac:`, `ci:`; see CLAUDE.md).
 
 ## Per sub-project toolchains
 
@@ -16,13 +16,13 @@ Repo-wide: **`.editorconfig`**, markdownlint, **gitleaks** (secret scanning), Co
 - **mypy** — static typing, `strict` mode.
 - **pytest** (+ `pytest-asyncio`, `httpx.AsyncClient`) — unit + API tests; **coverage gate** (start ≥ 80%, ratchet up).
 - **bandit** (code security) + **pip-audit** (dependency CVEs).
-- Run: `ruff check . && ruff format --check . && mypy . && pytest`.
+- Run: `ruff check . && ruff format --check . && mypy app && pytest` (CI also runs coverage, bandit and pip-audit; see `.github/workflows/api.yml`).
 
 ### `core/`, `clients/gnome/` — Rust
 - **rustfmt** (format) + **clippy** with `-D warnings` (lint as errors).
 - **`cargo test`** / **nextest**; coverage via `cargo llvm-cov`.
 - **cargo-deny** — license + security-advisory + duplicate-dep checks.
-- Run: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
+- Run: `cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked`, from the repo root.
 
 ### `clients/kde/` — Qt 6 + Kirigami via CXX-Qt
 - Rust side: rustfmt + clippy + cargo test (as above).
