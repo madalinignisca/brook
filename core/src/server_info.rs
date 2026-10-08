@@ -41,6 +41,10 @@ const SERVER_INFO_TIMEOUT: Duration = Duration::from_secs(5);
 /// megabytes.
 const HEALTH_BODY_MAX_BYTES: usize = 64 * 1024;
 
+/// Longest `version` we accept, in characters. Real ones look like `0.2.0-beta.7` (12).
+/// 64 leaves room for a build suffix and keeps the About window's layout intact.
+pub const VERSION_MAX_CHARS: usize = 64;
+
 /// A server's version and a checked link to its source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInfo {
@@ -102,11 +106,25 @@ pub(crate) async fn fetch(config: CoreConfig) -> Result<ServerInfo> {
     }
 
     let health: Health = serde_json::from_slice(&buf).map_err(|_| Error::UnexpectedResponse)?;
+    if !valid_version(&health.version) {
+        return Err(Error::UnexpectedResponse);
+    }
     let source_url = parse_source_url(&health.source_url).ok_or(Error::UnexpectedResponse)?;
     Ok(ServerInfo {
         version: health.version,
         source_url,
     })
+}
+
+/// True for 1 to `VERSION_MAX_CHARS` printable ASCII characters (0x20..=0x7E).
+///
+/// The version is shown to the user in About, and the server is not trusted: without this a
+/// hostile one could fill the window with 60 KB of text, break the layout with newlines, or use
+/// bidi control characters (U+202E) to make the text read as something else. A real version is
+/// plain ASCII, so there is no reason to allow anything wider.
+fn valid_version(v: &str) -> bool {
+    (1..=VERSION_MAX_CHARS).contains(&v.chars().count())
+        && v.chars().all(|c| matches!(c, '\u{20}'..='\u{7E}'))
 }
 
 /// `None` unless `raw` is a short http(s) URL with a host and no userinfo.
@@ -181,6 +199,35 @@ mod tests {
         let info = info_of(&server).await.unwrap();
         assert_eq!(info.version, "1.2.3");
         assert_eq!(info.source_url.as_str(), "https://git.example.org/fork");
+    }
+
+    async fn version_accepted(version: &str) -> bool {
+        let server = MockServer::start().await;
+        let body = json!({"status": "ok", "version": version,
+                          "source_url": "https://git.example.org/fork"});
+        serve(&server, 200, body).await;
+        match info_of(&server).await {
+            Ok(info) => {
+                assert_eq!(info.version, version);
+                true
+            }
+            Err(Error::UnexpectedResponse) => false,
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn version_accepts_real_and_max_length() {
+        assert!(version_accepted("0.2.0-beta.7").await);
+        assert!(version_accepted(&"a".repeat(VERSION_MAX_CHARS)).await);
+    }
+
+    #[tokio::test]
+    async fn version_refuses_empty_long_and_control_characters() {
+        assert!(!version_accepted("").await);
+        assert!(!version_accepted(&"a".repeat(VERSION_MAX_CHARS + 1)).await);
+        assert!(!version_accepted("1.0\n2.0").await);
+        assert!(!version_accepted("1.0\u{202E}0.1").await);
     }
 
     #[tokio::test]
