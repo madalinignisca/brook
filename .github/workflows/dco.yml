@@ -8,10 +8,17 @@ name: dco
 # CONTRIBUTING.md explains it to contributors.
 #
 # Everyone is checked, the owner too, so the history reads the same whoever
-# wrote a commit. Not checked: Dependabot (it signs off its own commits, but
-# with a bot address we do not need to vouch for) and merge commits (merging
-# main into a branch adds no new authorship, and `git merge` does not sign
-# off by default).
+# wrote a commit. Commits made in the GitHub web UI get their sign-off from
+# the repository setting "Require contributors to sign off on web-based
+# commits", which is on. Not checked: Dependabot (it signs off its own
+# commits, but with a bot address we do not need to vouch for) and merge
+# commits (`git merge` does not sign off by default, and merging main into a
+# branch is routine). A merge commit could still carry new code unsigned;
+# that is accepted, because the email and the sign-off are self-asserted
+# anyway: this check stops a contributor forgetting, not one set on lying.
+#
+# Like issue-branch.yml it is a signal for the owner, not a required check:
+# only the owner merges into main, and does not merge a red pull request.
 #
 # To fix a failing pull request: `git rebase --signoff origin/main`, then
 # force-push the branch.
@@ -41,6 +48,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
+          COMMITS: ${{ github.event.pull_request.commits }}
         run: |
           set -euo pipefail
 
@@ -49,11 +57,17 @@ jobs:
             exit 0
           fi
 
+          # The commits endpoint below lists at most 250 commits; past that
+          # the rest would go unchecked and the job would pass, so refuse.
+          if (( COMMITS > 250 )); then
+            echo "::error::$COMMITS commits is more than the 250 this check can read. Split or squash the branch."
+            exit 1
+          fi
+
           # Prints the hash of each non-merge commit that has no sign-off
           # line ending in its own author's email. Compared in lower case
           # and with trailing spaces or a CR dropped, because Git keeps the
-          # email as typed and some editors save CRLF. This endpoint lists
-          # at most 250 commits, far more than a Brook pull request has.
+          # email as typed and some editors save CRLF.
           unsigned=$(gh api --paginate "repos/$REPO/pulls/$PR/commits" --jq '
             .[]
             | select((.parents | length) == 1)
