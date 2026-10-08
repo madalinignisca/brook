@@ -1,46 +1,47 @@
 # Brook — working rules for agents
 
 Brook is a small, self-hosted team chat with native clients on a shared Rust core. Read
-[README.md](README.md) for the goals and non-goals, and the file in `docs/` that covers the
-area you touch ([ARCHITECTURE](docs/ARCHITECTURE.md), [PROTOCOL](docs/PROTOCOL.md),
-[QUALITY](docs/QUALITY.md)). Each component directory has its own README. These rules come
-from the owner and apply to every change.
+[README.md](README.md) for the goals and non-goals, and the doc in `docs/` for the area you
+touch ([ARCHITECTURE](docs/ARCHITECTURE.md), [PROTOCOL](docs/PROTOCOL.md),
+[QUALITY](docs/QUALITY.md)). Most component directories have their own README.
 
 ## 1. A new feature goes spec → plan → implementation
 
-1. **Spec**: what problem, who it is for, what is out of scope, open questions. Put it in
+1. **Spec**: the problem, who it is for, what is out of scope, open questions. File:
    `docs/superpowers/specs/YYYY-MM-DD-<name>-spec.md` (or `-design.md`).
-2. **Plan**: the files to touch, the order, the risks, and how each step is tested. Same folder,
-   `...-plan.md`.
-3. **Implementation**: only after the plan is agreed.
+2. **Plan**: the files to touch, the order, the risks, and how each step is tested. Same
+   folder, `...-plan.md`.
+3. **Implementation**, only after the plan is approved.
 
-A small fix does not need a spec or plan; say so in the PR instead. When the owner has not
-approved a spec or plan, stop and ask. Do not start coding.
+Each stage is reviewed (section 2), the findings fixed, and then the owner approves it. Do not
+start the next stage before that. A small fix needs no spec or plan; say so in the PR.
 
 ## 2. Opus reviews every stage, as a subagent
 
-The newest Opus available (today Opus 5.5) reviews the spec, then the plan, then the
-implementation. Use the `brook-reviewer` agent, and give it a pinned worktree so a branch
-switch cannot change files under it mid-review. Point it at the evidence, not the style. Fix
-what it finds and have it check again before moving on. A change to authentication or
-authorization also goes to `auth-reviewer`. Every PR also gets a codex review and an LGTM from
-the owner of each area it touches; reviewers end with a `VERDICT:` line. Do not change the
-codex settings.
+The newest Opus reviews the spec, then the plan, then the implementation, using the
+`brook-reviewer` subagent in a pinned worktree (a branch switch must not change files under
+it). For a spec or plan, hand it the file and the question "does this solve the stated
+problem?"; for code, the PR and its evidence. It attacks the evidence, not the style. Fix what
+it finds and have it check again. When a newer Opus ships, change the model pinned in
+`brook-reviewer`'s definition. A change to authentication or authorization also goes to
+`auth-reviewer`, in addition to Opus. Reviewers end with a `VERDICT:` line.
 
 ## 3. Run the tests at every relevant step
 
-Run the tests of what you changed after each step, not once at the end. Run the linter against
-`origin/main`, as CI does. A bug fix ships with a test that fails without the fix: change the
-code, watch the test go red, restore it. A test that skips itself at runtime is a bug. Say in
-the PR what you did not test, and why.
+Run the tests of what you changed after each step, not once at the end. A bug fix ships with a
+test that fails without it: break the code, watch the test go red, restore it. A test that
+skips itself at runtime is a bug. The PR says what you did not test, and why.
 
-| Part | Run (from its directory) |
+Before pushing, merge `origin/main` into your branch and run what CI runs:
+
+| Part | Run |
 |---|---|
-| `services/api` | `uv run ruff check . && uv run ruff format --check . && uv run mypy app && uv run coverage run -m pytest && uv run coverage report` |
-| `core`, `clients/gnome`, `bindings/apple` | `cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked` |
+| `services/api` (from that directory, after `uv sync --locked --extra dev`) | `uv run ruff check . && uv run ruff format --check . && uv run mypy app && uv run coverage run -m pytest && uv run coverage report && uv run bandit -q -r app tests -s B101,B105,B106 && uv run pip-audit --skip-editable` |
+| Rust: `core`, `clients/gst-media`, `clients/gnome`, `bindings/apple` (from the repo root) | `cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked` |
+| macOS | `clients/macos/build.sh test` |
 
-Apple and KDE clients have their own steps in their README. [QUALITY](docs/QUALITY.md) is the
-full standard.
+CI also runs `cargo-deny` and the API tests against Postgres. `pre-commit install` runs the
+cheap checks on every commit. [QUALITY](docs/QUALITY.md) has the full standard.
 
 Fix the code; never loosen the check. Do not edit lint, type, test or CI settings, and do not
 add `noqa`, `nolint`, `# type: ignore` or skip markers, to make a check pass. If a rule is
@@ -48,39 +49,38 @@ wrong for the code, stop and ask the owner.
 
 ## 4. Keep it simple
 
-The owner wants the smallest thing that works. Do not add options, layers, abstractions or
-dependencies for a future that has not been asked for. Prefer a few plain lines over a
-framework. Do not build for old clients or old data before 1.0.0; the production database is kept through migrations.
+The owner wants the smallest thing that works. No options, layers, abstractions or
+dependencies for a future nobody asked for; a few plain lines beat a framework. Before 1.0.0,
+do not build for old clients or old data. The production database is kept through migrations.
 
 ## 5. Comment for the junior who inherits this
 
 Write comments so a junior developer who has never seen the code can learn from it. Say *why*:
-why it is this way, what breaks otherwise, what was tried and dropped, and which rule or
-document it comes from. Do not repeat what the line already says. Keep each comment focused on
-the code next to it; a long comment that wanders loses the reader. If a reason lives only in a
-chat, it is lost.
+why it is this way, what breaks otherwise, what was tried and dropped, which rule or doc it
+comes from. Do not repeat what the line says, and stay on the code next to the comment.
 
 ## 6. Keep the written record current
 
-Every change that alters behavior updates, in the same PR: the spec and plan it came from,
-[PROTOCOL](docs/PROTOCOL.md) when the wire contract moves, the user and admin guides, any ADR
-it affects (a real design decision gets a new one in `docs/adr/NNNN-title.md`), and the agent memory notes it makes wrong
-(fix or delete them). A doc that no longer matches the code is a bug.
+A change that alters behavior updates, in the same PR: the spec and plan it came from,
+[PROTOCOL](docs/PROTOCOL.md) if the wire contract moves, the
+[user guide](docs/user-guide.md) and [admin guide](docs/admin-guide.md), and any ADR it
+affects. A real design decision gets a new ADR in `docs/adr/` (`0001-title.md`, then
+`0002-...`). Also fix or delete any agent memory note the change makes wrong; those live
+outside the repo. A doc that no longer matches the code is a bug.
 
 ## 7. Commits and pull requests
 
-- **Subject**: one short line saying what changed, prefixed by the area (`api:`, `core:`,
-  `gnome:`, `mac:`, `docs:`, `ci:`).
+- **Subject**: one short line, prefixed by the area (e.g. `api:`, `core:`, `gnome:`, `mac:`,
+  `ci:`, `docs:`).
 - **Body**: 3 to 4 sentences. What changed, why, and anything a reviewer could miss.
 - One self-contained change per commit; commit as you go.
-- A PR opens from an issue, links it (`Closes #N`), and states what would be true if the
-  change were broken and what you ran to show it is not. Green CI alone is not that.
-- The owner merges, or the author after CI is green, the LGTMs are in and `main` is merged in.
-  Never force-push `main`.
+- Work starts from an issue, and the PR links it (`Closes #N`). The PR states what would be
+  true if the change were broken and what you ran to show it is not. Green CI alone is not that.
+- Only the owner merges into `main`, once CI is green and the reviews are in. Merging `main`
+  into the branch afterwards resets the approval.
 
 ## 8. Safety
 
-- Ask before touching production. Take a backup first; never loosen a security check to get
-  past a problem.
-- No secrets, tokens or real passwords in the repo, commits, PRs or logs.
-- Do not put agent or session names in the repo or on GitHub.
+No secrets, tokens or real passwords in the repo, commits, PRs or logs. In a workflow, pin
+actions by commit SHA and pass event data to scripts only through `env:`. Ask before touching
+production. Do not put agent or session names in the repo or on GitHub.
