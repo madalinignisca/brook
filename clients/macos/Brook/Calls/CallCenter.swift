@@ -15,6 +15,9 @@ final class CallCenter {
     private(set) var call: CallModel?
     private(set) var joining = false
     private(set) var joinError: String?
+    /// The channel of the call being joined or live, set before the join's first await so an
+    /// announcement of this Mac's own call can never ring here.
+    private(set) var channelId: String?
     let quit: QuitCoordinator
     private let auth: AuthorizationSource
     private let makeEngine: EngineFactory
@@ -43,13 +46,17 @@ final class CallCenter {
     /// handled from the start: core may already be publishing before join_call returns.
     func join(channelId: String, name: String, handles: [String: String], client: any FfiBrookClientProtocol) async {
         guard call == nil, joinTask == nil else { return }
+        self.channelId = channelId
         let mine = generation // when the join is accepted, not when its work starts
         let task = Task { await self.performJoin(channelId, name: name, handles: handles, client: client, generation: mine) }
         joinTask = task
         quit.leaveActiveCall = { [weak self] in await self?.shutdown() }
         await task.value
         joinTask = nil
-        if call == nil { quit.leaveActiveCall = nil }
+        if call == nil {
+            quit.leaveActiveCall = nil
+            self.channelId = nil
+        }
     }
 
     private func performJoin(
@@ -92,6 +99,7 @@ final class CallCenter {
     func endAll() async {
         generation += 1
         joinError = nil
+        channelId = nil // a join still in flight belongs to the old session
         await leave()
     }
 
@@ -99,7 +107,10 @@ final class CallCenter {
     func leave() async {
         guard let call else { return }
         await call.leave()
-        if self.call === call { self.call = nil }
+        if self.call === call {
+            self.call = nil
+            channelId = nil
+        }
         quit.leaveActiveCall = nil
     }
 }

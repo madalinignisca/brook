@@ -45,6 +45,9 @@ final class MacNotifier: NSObject, Notifying, UNUserNotificationCenterDelegate {
     /// A notification was clicked: open its channel.
     var onOpen: ((String) -> Void)?
     private var asked = false
+    /// Per notice: bumped by each post and each removal, so a post still waiting on the settings
+    /// (or the permission prompt) when its notice was removed never lands afterwards.
+    private var generations: [String: Int] = [:]
 
     private var center: UNUserNotificationCenter { UNUserNotificationCenter.current() }
 
@@ -52,7 +55,16 @@ final class MacNotifier: NSObject, Notifying, UNUserNotificationCenterDelegate {
     func install() { center.delegate = self }
 
     func post(channelId: String, title: String, body: String) {
+        post(id: channelId, channelId: channelId, title: title, body: body)
+    }
+
+    /// An incoming call's notice, apart from the channel's message one (each replaces and removes only itself).
+    static func callId(_ channelId: String) -> String { "call-\(channelId)" }
+
+    func post(id: String, channelId: String, title: String, body: String) {
         let center = self.center
+        let mine = (generations[id] ?? 0) + 1
+        generations[id] = mine
         Task {
             var settings = await center.notificationSettings()
             // Asked at the first notification, and again only while still undecided (a
@@ -71,13 +83,17 @@ final class MacNotifier: NSObject, Notifying, UNUserNotificationCenterDelegate {
             content.sound = .default
             content.threadIdentifier = channelId
             content.userInfo = ["channelId": channelId]
-            try? await center.add(UNNotificationRequest(identifier: channelId, content: content, trigger: nil))
+            guard generations[id] == mine else { return } // removed (or replaced) meanwhile
+            try? await center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
         }
     }
 
-    func remove(channelId: String) {
-        center.removeDeliveredNotifications(withIdentifiers: [channelId])
-        center.removePendingNotificationRequests(withIdentifiers: [channelId])
+    func remove(channelId: String) { remove(id: channelId) }
+
+    func remove(id: String) {
+        generations[id, default: 0] += 1
+        center.removeDeliveredNotifications(withIdentifiers: [id])
+        center.removePendingNotificationRequests(withIdentifiers: [id])
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
