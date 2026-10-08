@@ -24,6 +24,7 @@ struct BrookApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var store: SessionStore
     @State private var form: LoginForm
+    @State private var about: AboutModel
     @State private var calls = CallCenter()
 
     init() {
@@ -36,7 +37,17 @@ struct BrookApp: App {
         if others.isEmpty { DropImport.sweep(olderThan: 0) }
         let store = SessionStore(persistence: .live())
         _store = State(initialValue: store)
-        _form = State(initialValue: LoginForm(store: store))
+        let form = LoginForm(store: store)
+        _form = State(initialValue: form)
+        // The closures read the live store and form at each refresh, which a property
+        // initialiser could not reach.
+        _about = State(initialValue: AboutModel(
+            allowInsecureHTTP: { store.settings.allowInsecureHTTP },
+            target: {
+                AboutModel.target(
+                    signedInServer: store.server, typed: form.server,
+                    remembered: store.settings.lastGoodServer)
+            }))
     }
 
     var body: some Scene {
@@ -67,6 +78,16 @@ struct BrookApp: App {
             }
         }
         .defaultSize(width: 720, height: 560)
+        .commands { CommandGroup(replacing: .appInfo) { AboutCommand(model: about) } }
+
+        Window("About Brook", id: "about") {
+            AboutView(model: about)
+        }
+        .windowResizability(.contentSize)
+        // A restored About would reopen at launch for whatever server is current then.
+        .restorationBehavior(.disabled)
+        // Keeps this scene's own item out of the Window menu: the app menu's About is the way in.
+        .commandsRemoved()
 
         Window("Call", id: "call") {
             CallWindow(center: calls)
