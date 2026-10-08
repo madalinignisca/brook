@@ -1,0 +1,36 @@
+name: issue-branch
+
+# A collaborator's pull request must come from an issue they opened.
+# The reasoning, and what is not checked, is in the script.
+
+# pull_request_target, not pull_request: with pull_request the workflow and
+# the script would be taken from the pull request itself, so its author could
+# edit the check into a pass. pull_request_target runs main's copy. That is
+# only safe because nothing from the pull request is ever checked out or run
+# here: the checkout below is pinned to the base commit, and the branch name
+# reaches the script only as an environment variable.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  issue:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - name: Branch comes from the author's own open issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: bash .github/scripts/check-issue-branch.sh
