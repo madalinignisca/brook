@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import Foundation
 
 /// Validates what the user typed as the server address, before it reaches the core or

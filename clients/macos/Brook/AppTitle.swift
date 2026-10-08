@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 /// The main window's title. A Debug build says so, so it can't be mistaken for the Release app
 /// (which alone keeps the keychain group, and so alone stays signed in across launches).
 enum AppTitle {

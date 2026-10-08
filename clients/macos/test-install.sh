@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Tests for install-lib.sh (build.sh install, and the build.noindex move), run by hand: no build,
 # nothing outside a temp directory is touched.
 #   clients/macos/test-install.sh

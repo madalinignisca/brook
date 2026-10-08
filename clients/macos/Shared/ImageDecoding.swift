@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import Foundation
 
 /// The image decoder broker's one interface (spec 2026-09-26-mac-previews-spec.md §1): plain

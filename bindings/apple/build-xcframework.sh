@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Build BrookCoreFFI.xcframework + the generated Swift sources for the BrookCore package.
 #
 # Apple Silicon only, by decision: no x86_64 slice is ever built. macOS ships first;

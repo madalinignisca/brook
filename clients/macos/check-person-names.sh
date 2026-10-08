@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Fails if app code reads a person's display name outside PersonName.swift (#238): every person
 # must go through PersonName so Show usernames applies. A heuristic: it misses a name read through
 # another property, so each surface has its own test too.

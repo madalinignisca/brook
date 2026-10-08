@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Tests for the notarization scripts (#68), run by hand: no Apple, no build.
 #   clients/macos/test-notary.sh
 # notary-lib.sh against a fake `xcrun`, and check-notarizable.sh on small synthetic apps. Each

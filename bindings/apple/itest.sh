@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Integration tests of the Swift bindings against the shared test server (a real Brook
 # stack on the Linux VM, operated by the server side). No local server is started here.
 #

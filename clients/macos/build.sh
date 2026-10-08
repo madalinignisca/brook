@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Build the macOS client: fresh BrookCore xcframework (so the app never links a stale core),
 # regenerate the Xcode project, build. Pass `test` to also run the unit tests.
 #   clients/macos/build.sh          → clients/macos/build.noindex/Build/Products/Debug/Brook.app
