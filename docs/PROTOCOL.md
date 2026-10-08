@@ -50,7 +50,7 @@ needs no token: a token sent with it is ignored. It answers:
 {"status": "ok", "version": "0.0.0", "source_url": "https://github.com/madalinignisca/brook"}
 ```
 
-All three are strings. `source_url` is where this server's source is (AGPL-3.0 section 13): the
+All three are strings. `version` is 1 to 64 printable ASCII characters (0x20–0x7E); clients treat any other answer as a failed fetch (the same as a bad `source_url`). `source_url` is where this server's source is (AGPL-3.0 section 13): the
 operator's `BROOK_SOURCE_URL`, or the upstream repository. It is an absolute http or https URL
 with a host and no user or password part, at most 2048 bytes. Clients show and open only the
 form they parse from it, and treat any other answer as a failed fetch. A client reads at most

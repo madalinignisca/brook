@@ -152,6 +152,9 @@ where its source is in `GET /health`, and Brook's clients show that link in thei
   published archive of that version). Brook cannot check that the link is real or that it
   matches the code you run. Keeping it correct is your duty. Keep it pointing at the source of
   the version your users are running, including your changes.
+- Keep the server's version string (`version` in `GET /health`) to 1–64 printable ASCII
+  characters. Otherwise clients treat the answer as a failed fetch: About shows "Couldn't
+  fetch this server's source link." and no link is shown.
 
 The value must be an absolute `http` or `https` URL with a host, no user name or password, no
 spaces or control characters, and at most 2048 bytes. Any other value stops the api from
