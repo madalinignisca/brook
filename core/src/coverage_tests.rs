@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! History coverage (plan C2, spec §4.3 and §9 "Coverage").
 
 use std::sync::Arc;

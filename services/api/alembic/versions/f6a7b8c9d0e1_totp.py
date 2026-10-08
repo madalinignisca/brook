@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """totp, recovery_codes, auth_events; users.password_changed_at
 
 Revision ID: f6a7b8c9d0e1

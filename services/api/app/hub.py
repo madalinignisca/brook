@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """In-process realtime hub.
 
 Tracks live WebSocket connections per user and fans out events to a set of users

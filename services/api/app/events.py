@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Account-security events (``auth_events``, spec 2026-09-25-totp §3).
 
 Append-only. No IP address and no user agent (GDPR minimisation). ``actor_id``

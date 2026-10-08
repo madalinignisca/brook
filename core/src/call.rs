@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The call task: drives one call's signaling (PROTOCOL.md §3) and the platform
 //! [`MediaEngine`]. See docs/superpowers/specs/2026-09-24-core-call-signaling-design.md §3.4.
 //!

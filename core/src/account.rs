@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Account operations: password change and admin password reset (docs/PROTOCOL.md, auth).
 //!
 //! The server revokes **every** refresh token of the user on a password change, the caller's

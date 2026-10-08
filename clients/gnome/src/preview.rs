@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Inline image previews, GTK half (spec 2026-09-26-image-previews.md §3).
 //!
 //! Core hands over bytes it sniffed and sized (`preview_file`). They're decoded here only

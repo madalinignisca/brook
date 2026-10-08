@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! When a cached file goes (keep-offline spec §6): every cause drops its row and journals its
 //! blob in the transaction that applies the cause.
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Brook GNOME client — GTK4 + libadwaita shell over the shared Rust core.
 //!
 //! A login view (server, handle, password) that authenticates via `brook-core`
@@ -9,6 +12,7 @@
 //! back by hand. All GTK widgets are captured by **weak** reference inside async
 //! tasks and signal handlers so nothing keeps the window graph alive (no cycles).
 
+mod about;
 mod account;
 mod add_user;
 mod attachments;

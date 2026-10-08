@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Check a built Brook.app's image decoder (previews spec §5): the broker and the worker carry
 # exactly their entitlements, the Debug test kinds are compiled out of Release, and the whole
 # bundle's signature verifies. `release` also requires the hardened runtime and a team.

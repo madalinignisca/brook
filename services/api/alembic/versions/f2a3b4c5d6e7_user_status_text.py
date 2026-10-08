@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """users.status_text: the profile's status line (PATCH /auth/me)
 
 Revision ID: f2a3b4c5d6e7

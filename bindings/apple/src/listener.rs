@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Auth-state observation across the FFI.
 //!
 //! UniFFI cannot carry a `tokio::sync::watch::Receiver`, so Swift registers a listener

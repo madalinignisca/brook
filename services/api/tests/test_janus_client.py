@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """JanusClient against a scripted fake Janus WebSocket server.
 
 Guards the bug the first real call exposed: Janus answers `trickle` and

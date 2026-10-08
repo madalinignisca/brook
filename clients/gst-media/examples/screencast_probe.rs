@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Manual check of a real screen share through the engine: asks the desktop
 //! for a screen or window (portal picker + consent), shares it on a publish
 //! PC, and a second engine (standing in for the SFU) decodes it. Prints the

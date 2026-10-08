@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Brook native install/upgrade for AlmaLinux 10 (systemd, no containers).
 #
 # Run as root from the root of a Brook source tree (a `git archive` of a merged

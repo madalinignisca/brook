@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Local data per (server, user) (plan C5, spec §3 and §7): which stores exist, opening them,
 //! and wiping them.
 //!

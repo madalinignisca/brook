@@ -1,4 +1,7 @@
 // swift-tools-version: 6.2
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // BrookCore: Swift bindings of the shared Rust client core (brook-core via brook-ffi).
 // `BrookCoreFFI.xcframework` and `Sources/BrookCoreGenerated/` are build outputs of
 // `../../build-xcframework.sh` — run it before building this package.

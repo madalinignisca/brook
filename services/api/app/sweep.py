@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Attachment sweep (attachments spec §7): a periodic task inside the api.
 
 - pending files older than 1 h, unless their upload is streaming right now: rows,

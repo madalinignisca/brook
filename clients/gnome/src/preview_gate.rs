@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Whether an attachment row's preview is still wanted (#259). The row's widgets hold one of
 //! these: asking for a preview (the "Show preview" click, or the setting being on) takes a
 //! [`Token`]; turning the setting off cancels it, and every step of the preview (the queued

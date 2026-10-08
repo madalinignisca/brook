@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The offline cache and outbox, per signed-in user (plan C5): opened when a user signs in,
 //! fed by the WebSocket, paused when signed out, wiped on request.
 //!

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # The notarization steps of build.sh, as functions so test-notary.sh can run them against a fake
 # `xcrun` (#68). Sourced, never run.
 

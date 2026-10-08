@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Interop against a real Brook server + Janus (PROTOCOL.md §3), with a
 //! minimal in-test signaling client. NOT the product's signaling (that is
 //! core's `CallHandle`); this exists to prove webrtcbin ⇄ Janus VideoRoom

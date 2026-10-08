@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Screen share on the publish PC: a share started mid-call adds a sendonly
 //! video m-line by renegotiation (labelled `screen`), stopping it makes that
 //! m-line inactive, and starting again reuses it. A second engine stands in

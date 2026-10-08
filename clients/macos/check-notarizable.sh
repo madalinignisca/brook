@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Whether a built Brook.app would pass Apple's notary checks that can be told locally (#68): every
 # Mach-O binary in the bundle is signed by a Developer ID with the hardened runtime and a secure
 # timestamp, and none carries get-task-allow. It can't say the notary will accept it (that's

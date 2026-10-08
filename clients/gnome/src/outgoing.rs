@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Files sent with a message: picked in the composer, copied by core into its encrypted
 //! outbox, then uploaded (core's `send_queued_with_files`).
 //!

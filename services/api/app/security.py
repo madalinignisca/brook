@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Password hashing (Argon2id), JWT access tokens, and refresh-token helpers."""
 
 from __future__ import annotations

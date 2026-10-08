@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Which cached files belong to which cached message, kept in the cache's own transactions
 //! (keep-offline spec §4, §6; plan step 2).
 //!

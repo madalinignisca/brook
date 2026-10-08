@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Minimal async client for the Janus WebSocket API (``janus-protocol``).
 
 Only ``api`` talks to Janus (ARCHITECTURE.md §Signaling model); clients never see

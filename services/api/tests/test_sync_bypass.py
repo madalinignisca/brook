@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """No write path bypasses sync stamping (cache-core plan, "Where this fails", C2).
 
 app/sync.py stamps rows in a flush hook, which sees ORM objects only. A Core

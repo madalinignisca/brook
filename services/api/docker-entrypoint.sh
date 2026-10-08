@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Container entrypoint: bring the schema to head, then serve.
 #
 # Running `alembic upgrade head` on every start is idempotent (a no-op when

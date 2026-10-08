@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Local data per user (plan C5): wipes erase keys and files, a user switch finds the other
 //! users, a lost outbox is reported, and startup reconciliation erases only orphans.
 

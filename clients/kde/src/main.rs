@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Brook KDE/Plasma client — Qt6 + Kirigami over the shared Rust core.
 //!
 //! Phase 1: a Kirigami login page → chat (channels/DMs, messages). The

@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Check a release tarball on the distro this runs in (Debian 13 or Ubuntu 26.04):
 # install the runtime packages INSTALL.md lists, run the tarball's own install.sh, then
 # make sure that

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Sign out everywhere: a password change (checkbox, default on) or an admin reset
 revokes every other session at once, on REST and on open WebSockets, instead of
 when the 15-minute access token expires."""

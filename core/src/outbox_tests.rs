@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The outbox (plan C4, spec §5 and §9 "Outbox"): durable before pending, one message per
 //! send whatever is lost on the way, order kept, failures scoped to their channel, the
 //! status table row by row, and paused while signed out.

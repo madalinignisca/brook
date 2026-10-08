@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Ordering rules of the one apply function (plan C2, spec §4.1 and §9 "Ordering").
 
 use std::sync::Arc;

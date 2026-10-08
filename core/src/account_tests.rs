@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Password change and admin reset against the in-process origin, with strict refresh tokens
 //! (a revoked one is rejected, as on the real server), so the race these guard against can
 //! actually be lost.

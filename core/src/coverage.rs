@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! History coverage (plan C2, spec §4.3): per channel, the contiguous range of messages the
 //! cache holds. A cached message outside that range (a live one that arrived before the
 //! channel was ever opened) is kept, but it is never proof that the history around it is

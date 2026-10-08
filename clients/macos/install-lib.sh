@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # The `install` mode of build.sh and the one-time move of the build directory, as functions so
 # test-install.sh can run them against fake tools and no build. Sourced, never run.
 

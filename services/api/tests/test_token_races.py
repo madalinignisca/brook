@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Token issue/revoke ordering under concurrency: Postgres only.
 
 The race these guard (see routers/auth.lock_user): under READ COMMITTED a

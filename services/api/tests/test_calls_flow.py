@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Call flows in-process against a fake Janus: publish, subscribe offers and
 answers, renegotiation on publish/leave, ICE relay, mute, resume replay, grace
 expiry, SFU loss, channel delete, the connect snapshot, and failure paths.

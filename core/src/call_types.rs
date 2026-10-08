@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Public call types: the wire vocabulary of PROTOCOL.md §3 and the engine contract.
 //!
 //! Serde names are the wire names exactly (`sdpMid`, `sdpMLineIndex`, lowercase kinds).

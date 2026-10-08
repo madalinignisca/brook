@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The sync loop (plan C2): a page and its cursor commit together, a bad page changes
 //! nothing, `410` asks for a rebuild, and live events go through the same guard.
 

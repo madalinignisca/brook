@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Outbox idempotency (sync spec §4): a message sent with a client_id is stored once."""
 
 from __future__ import annotations

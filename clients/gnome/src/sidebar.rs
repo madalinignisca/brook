@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The sidebar's state: what each conversation's last activity is, and when this device last
 //! opened it. The rules (labels, the order, when a message re-sorts) are core's
 //! (`brook_core::sidebar`, the same as the Mac's, see

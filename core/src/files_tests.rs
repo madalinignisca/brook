@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The file cache (keep-offline plan, core PR 1 tests): downloads sealed as they arrive and
 //! resumed from what's durable, one download per file, the store's own session only, Open's
 //! refusals and its private copies, eviction, close and wipe, and reconciliation.

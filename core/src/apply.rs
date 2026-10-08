@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The one way rows enter the cache (plan C2, spec §4.1). `/sync` pages, live events,
 //! history pages and send acknowledgements all become a [`Batch`] and go through [`apply`]
 //! inside one cache.db transaction.

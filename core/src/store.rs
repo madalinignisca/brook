@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Encrypted local stores (plan docs/superpowers/specs/2026-09-25-cache-core-plan.md C1, spec
 //! 2026-09-25-offline-cache-design.md §3).
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Encrypted stores (plan C1): at rest only ciphertext, the key check decides missing vs
 //! damaged vs locked, one opener per store, and a reset that needs no read.
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Tokens and resume tokens must never reach a log line — with the dependency cap every
 //! client is required to set (`tungstenite`/`tokio_tungstenite` at `info`). The same scenario
 //! without the cap must leak, which proves the capture really sees dependency logs and that

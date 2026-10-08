@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Offering channel ownership (owner decision, 2026-09-26).
 
 An owner or an admin offers; the member accepts or declines when they next open the

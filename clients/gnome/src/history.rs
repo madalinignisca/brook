@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Paging back through a channel's history (#248): which older page to ask for, and when the
 //! start of the channel has been reached. The Mac's `loadOlder` follows the same rules: one
 //! page at a time, the cache first (loading it when it can't vouch for the page), the network

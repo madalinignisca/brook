@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Uniform error envelope for the whole API.
 
 Every error response is rendered as Brook's own shape (docs/PROTOCOL.md §5):

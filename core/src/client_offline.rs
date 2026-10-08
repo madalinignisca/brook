@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The offline cache and outbox on [`BrookClient`] (plan C5; spec §8): turned on with
 //! [`BrookClient::enable_local_data`], then following whoever signs in.
 //!

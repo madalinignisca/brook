@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Application-layer encryption of stored secrets (spec 2026-09-22 §5).
 
 Direct symmetric encryption with a configured keyring, not envelope encryption:

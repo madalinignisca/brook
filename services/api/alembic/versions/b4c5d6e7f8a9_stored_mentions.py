@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """stored mentions: message_mentions and messages.mention_everyone
 
 Revision ID: b4c5d6e7f8a9

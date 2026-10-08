@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Brook call media engine for Linux clients, on GStreamer `webrtcbin`.
 //!
 //! Implements the per-client half of [MEDIA.md](../../../docs/MEDIA.md): capture,

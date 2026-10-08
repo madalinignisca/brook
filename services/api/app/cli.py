@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Host-side admin commands: ``uv run python -m app.cli <command> ...`` on the server.
 
 For what the HTTP API deliberately can't do: an admin who lost both their phone and

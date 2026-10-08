@@ -3,6 +3,7 @@ name = "brook-api"
 version = "0.0.0"
 description = "Brook server API — auth, chat, channels, files, bots"
 requires-python = ">=3.11"
+license = "AGPL-3.0-or-later"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
@@ -32,7 +33,7 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

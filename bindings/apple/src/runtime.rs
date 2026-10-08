@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The Tokio runtime owned by the bindings.
 //!
 //! UniFFI polls exported async fns on Swift's executor, which has no Tokio reactor or

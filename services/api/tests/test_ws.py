@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """WebSocket realtime test: a message sent by one account is delivered live to
 another over the hub. This is the Phase 1 acceptance check (two accounts chat).
 """

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Attachments on messages (#66): shown with their display name, saved on request.
 //!
 //! The server's rules (attachments spec §4, §5) shape it:

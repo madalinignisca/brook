@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The offline cache's front (plan C3, spec §8, reading half): what the apps read, the change
 //! notices they re-read on, and the triggers that keep it synced.
 //!

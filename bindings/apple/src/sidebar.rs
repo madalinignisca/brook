@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The sidebar's labels and order (`brook_core::sidebar`), for the Mac to call.
 
 use crate::offline::FfiMember;

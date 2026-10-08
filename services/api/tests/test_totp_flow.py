@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """TOTP over HTTP (spec 2026-09-25-totp-server-design.md §7): login step, pending
 token, replay across endpoints, recovery codes, decrypt failure, budgets, admin
 reset, host CLI, startup canary."""

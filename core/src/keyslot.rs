@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Key storage for local data (spec docs/superpowers/specs/2026-09-25-client-local-data-encryption-design.md
 //! §3a, plan 2026-09-25-keyslot-session-plan.md P1).
 //!

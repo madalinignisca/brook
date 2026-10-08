@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """users.sessions_valid_after (sign out everywhere)
 
 Revision ID: e5f6a7b8c9d0

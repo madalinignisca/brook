@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The post-login chat view: a sidebar of channels/DMs, a message list, and a
 //! composer — over `brook-core`. Networking runs on the Tokio runtime; results
 //! are applied on the GTK main loop (await a runtime `JoinHandle` inside
@@ -2680,6 +2683,20 @@ fn main_menu_popover(chat: &Rc<Chat>) -> gtk::Popover {
         menu.append(&add_user);
     }
     menu.append(&two_factor);
+    // Standard GNOME place for it; shows the AGPL copyright and license notice.
+    let about = gtk::Button::builder()
+        .label("About Brook")
+        .has_frame(false)
+        .build();
+    about.connect_clicked({
+        let chat = chat.clone();
+        let popover = popover.clone();
+        move |_| {
+            popover.popdown();
+            crate::about::show(&chat.message_list);
+        }
+    });
+    menu.append(&about);
     menu.append(&sign_out);
     two_factor.connect_clicked({
         let chat = chat.clone();

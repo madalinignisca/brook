@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Call task tests: the real client and transport against the scripted test origin, with
 //! a fake engine whose operations can be held at gates.
 

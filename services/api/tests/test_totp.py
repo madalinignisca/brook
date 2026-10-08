@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """TOTP core (app/totp.py): RFC 6238 vectors, skew, replay, recovery codes."""
 
 from __future__ import annotations

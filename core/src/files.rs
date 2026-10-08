@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The file cache (keep-offline spec 2026-09-26, plan core PR 1): attachments downloaded into
 //! the signed-in user's store, encrypted at rest, so they open with no connection.
 //!

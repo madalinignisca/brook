@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Attachment transfers: the network layer (MVP+ #65; server: attachments spec, #81, #90).
 //!
 //! Bytes stream through two traits, never through paths this module picks, so no

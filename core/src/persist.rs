@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Staying signed in (plan docs/superpowers/specs/2026-09-25-keyslot-session-plan.md P2).
 //!
 //! The stored session mirrors the live one **write-through**: every write or clear runs inside

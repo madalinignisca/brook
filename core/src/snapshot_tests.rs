@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Snapshots (attachments spec §3): what goes in comes out, only from the right place, only
 //! whole, and never from another snapshot.
 

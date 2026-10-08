@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Realtime WebSocket endpoint at ``/ws`` (PROTOCOL.md §2).
 
 Auth is the **first frame**: ``{"type":"auth","data":{"access_token":...}}`` within

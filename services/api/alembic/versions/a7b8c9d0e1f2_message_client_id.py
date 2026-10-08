@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """messages.client_id (outbox idempotency)
 
 Revision ID: a7b8c9d0e1f2

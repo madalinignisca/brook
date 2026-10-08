@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Package a release build of the GNOME client as a tarball.
 # Usage: make-tarball.sh <version> <arch> <outdir>   (run from the repo root, after
 # `cargo build --release --locked -p brook-gnome`; BROOK_BINARY overrides the binary path):
