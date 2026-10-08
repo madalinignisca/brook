@@ -7,7 +7,7 @@ import Synchronization
 import XCTest
 
 /// Records what the model asked `fetch` for and answers by call number (0 for the first), so a
-/// test can let one call wait on a `Gate` while a later one answers at once.
+/// test can let one call wait on a `FetchGate` while a later one answers at once.
 private final class FakeFetch: @unchecked Sendable {
     typealias Handler = @Sendable (_ call: Int) async throws -> FfiServerInfo
 
@@ -35,7 +35,7 @@ private final class FakeFetch: @unchecked Sendable {
 }
 
 /// Holds a fake fetch until the test lets it go (open before wait is fine).
-private final class Gate: @unchecked Sendable {
+private final class FetchGate: @unchecked Sendable {
     private let state = Mutex<(open: Bool, waiters: [CheckedContinuation<Void, Never>])>((false, []))
 
     func wait() async {
@@ -161,7 +161,7 @@ final class AboutModelTests: XCTestCase {
 
     // Mutant: drop the generation check -> A's late answer wins, red.
     func testNewestOpenWins() async {
-        let gate = Gate()
+        let gate = FetchGate()
         let fake = FakeFetch { n in
             if n == 0 { await gate.wait(); return info("old", "https://old.example/src") }
             return info("new", "https://new.example/src")
@@ -179,7 +179,7 @@ final class AboutModelTests: XCTestCase {
 
     // Mutant: no generation check in the catch -> line == .failed, red.
     func testALateFailureDoesNotWin() async {
-        let gate = Gate()
+        let gate = FetchGate()
         let fake = FakeFetch { n in
             if n == 0 { await gate.wait(); throw CancellationError() }
             return info("new", "https://new.example/src")
