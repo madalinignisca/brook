@@ -18,14 +18,16 @@ start the next stage before that. A small fix needs no spec or plan; say so in t
 
 **Who does what.** The main agent talks to the owner, decides, writes the PR description, and
 hands each job to a subagent from `.claude/agents/`. It does not write the specs, plans, code or
-docs itself, not even for a small fix.
+docs itself, not even for a small fix. The one exception is CI and repo settings
+(`.github/`, `.pre-commit-config.yaml`, this file), which the main agent changes itself, still
+with an Opus review.
 
 | Job | Subagent | Model |
 |---|---|---|
 | Spec, and later changes to it | `brook-spec-writer` | Opus |
 | Plan, and later changes to it | `brook-plan-writer` | Opus |
 | Review of every stage | `brook-reviewer` | Opus |
-| Code and its tests, by area | `brook-server-implementer` (`services/api`, `deploy/`), `brook-core-implementer` (`core`, `clients/gst-media`, Rust in `bindings/apple`), `brook-linux-implementer` (GNOME, KDE), `brook-apple-implementer` (macOS, iOS, BrookCore Swift), `brook-android-implementer`, `brook-windows-implementer` | Sonnet |
+| Code and its tests, by area | `brook-server-implementer` (`services/`, `deploy/`), `brook-core-implementer` (`core`, `clients/gst-media`, Rust in `bindings/apple`, root Cargo files), `brook-linux-implementer` (GNOME, KDE), `brook-apple-implementer` (macOS, iOS, BrookCore Swift, `bindings/apple` scripts), `brook-android-implementer`, `brook-windows-implementer` | Sonnet |
 | Docs, once the code works | `brook-docs-writer` | Haiku |
 | Commits | `brook-committer` | Haiku |
 
@@ -95,9 +97,10 @@ other client right after the merge: GNOME, KDE, macOS, iOS, Android, Windows. Cl
 started get one too, so their backlog is complete when work starts. Each issue:
 - links the merged PR and the spec, and says what the user must be able to do, not how the
   first client built it;
-- gets the client's label (`area:gtk`, `area:kde`, `area:macos`, `area:ios`, `area:android`,
+- gets the client's label (`area:gtk` for GNOME, `area:kde`, `area:macos`, `area:ios`, `area:android`,
   `area:windows`);
-- is skipped only when the change cannot apply to that platform, and the merged PR says why.
+- is skipped only when the change cannot apply to that platform; the main agent then comments
+  on the merged PR saying why.
 
 Shared logic goes into `core` first, so each client only adds its own UI.
 
