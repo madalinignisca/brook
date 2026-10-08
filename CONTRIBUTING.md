@@ -56,7 +56,7 @@ git commit -s -m "api: rotate session tokens on login"
 
 This adds a line `Signed-off-by: Your Name <you@example.com>` to the message. The email
 must be the commit author's email. CI (`.github/workflows/dco.yml`) fails a pull request
-if any commit lacks that line. Merge commits are not checked.
+if any commit lacks that line. Merge commits are not checked. Commits made in the GitHub web interface are signed off automatically by a repository setting. The check is a signal for the maintainer, who does not merge a pull request while it is red.
 
 To fix a branch whose commits lack the sign-off:
 
