@@ -1,0 +1,89 @@
+name: dco
+
+# Checks that every commit in a pull request carries a Developer Certificate
+# of Origin sign-off (https://developercertificate.org/): a line
+# "Signed-off-by: Name <email>" whose email is the commit author's, which
+# `git commit -s` adds. With it the author certifies they may contribute the
+# change under Brook's license (AGPL-3.0-or-later) and keep their copyright.
+# CONTRIBUTING.md explains it to contributors.
+#
+# Everyone is checked, the owner too, so the history reads the same whoever
+# wrote a commit. Commits made in the GitHub web UI get their sign-off from
+# the repository setting "Require contributors to sign off on web-based
+# commits", which is on. Not checked: Dependabot (it signs off its own
+# commits, but with a bot address we do not need to vouch for) and merge
+# commits (`git merge` does not sign off by default, and merging main into a
+# branch is routine). A merge commit could still carry new code unsigned;
+# that is accepted, because the email and the sign-off are self-asserted
+# anyway: this check stops a contributor forgetting, not one set on lying.
+#
+# Like issue-branch.yml it is a signal for the owner, not a required check:
+# only the owner merges into main, and does not merge a red pull request.
+#
+# To fix a failing pull request: `git rebase --signoff origin/main`, then
+# force-push the branch.
+
+# pull_request_target, not pull_request, for the same reason as
+# issue-branch.yml: the check must run the default branch's copy of this
+# file, or a pull request could edit it into a pass. That is only safe
+# because nothing from the pull request is checked out or run: the commits
+# are read through the API, and their messages are only ever handled by jq,
+# never by the shell. Only commit hashes are printed, because a commit
+# message echoed to the log could carry a "::" workflow command.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  signoff:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every commit is signed off by its author
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          COMMITS: ${{ github.event.pull_request.commits }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$AUTHOR" == "dependabot[bot]" ]]; then
+            echo "Not checked: opened by $AUTHOR."
+            exit 0
+          fi
+
+          # The commits endpoint below lists at most 250 commits; past that
+          # the rest would go unchecked and the job would pass, so refuse.
+          if (( COMMITS > 250 )); then
+            echo "::error::$COMMITS commits is more than the 250 this check can read. Split or squash the branch."
+            exit 1
+          fi
+
+          # Prints the hash of each non-merge commit that has no sign-off
+          # line ending in its own author's email. Compared in lower case
+          # and with trailing spaces or a CR dropped, because Git keeps the
+          # email as typed and some editors save CRLF.
+          unsigned=$(gh api --paginate "repos/$REPO/pulls/$PR/commits" --jq '
+            .[]
+            | select((.parents | length) == 1)
+            | (.commit.author.email | ascii_downcase) as $email
+            | select(
+                [ .commit.message | split("\n")[]
+                  | ascii_downcase | sub("\\s+$"; "")
+                  | select(startswith("signed-off-by: ") and endswith("<" + $email + ">"))
+                ] | length == 0)
+            | .sha')
+
+          if [[ -n "$unsigned" ]]; then
+            echo "::error::Commits without a sign-off from their author: $(tr '\n' ' ' <<<"$unsigned")"
+            echo "Sign off with: git rebase --signoff origin/main && git push --force-with-lease"
+            echo "See CONTRIBUTING.md."
+            exit 1
+          fi
+
+          echo "OK: every commit is signed off by its author."
