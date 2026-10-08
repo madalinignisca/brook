@@ -16,14 +16,30 @@ touch ([ARCHITECTURE](docs/ARCHITECTURE.md), [PROTOCOL](docs/PROTOCOL.md),
 Each stage is reviewed (section 2), the findings fixed, and then the owner approves it. Do not
 start the next stage before that. A small fix needs no spec or plan; say so in the PR.
 
+**Who does what.** The main agent talks to the owner, decides, and hands each job to a
+subagent on the newest model of its tier. It does not write the work itself.
+
+| Job | Subagent model |
+|---|---|
+| Spec and plan | Opus |
+| Review of every stage | Opus (section 2) |
+| Code and its tests | Sonnet |
+| Docs, after the code works | Haiku |
+| Commit messages | Haiku |
+
+Haiku sees only the diff, so hand it the *why* in the prompt; it writes the *what*. A design
+decision that comes up while implementing goes back to the main agent and the owner, not to
+the implementing subagent. "Newest" means the newest model of that tier: when a new one ships,
+change the model pinned in the agent's definition.
+
 ## 2. Opus reviews every stage, as a subagent
 
-The newest Opus reviews the spec, then the plan, then the implementation, using the
+A newest-Opus subagent, never the one that wrote the work, reviews the spec, then the plan,
+then the implementation, using the
 `brook-reviewer` subagent in a pinned worktree (a branch switch must not change files under
 it). For a spec or plan, hand it the file and the question "does this solve the stated
 problem?"; for code, the PR and its evidence. It attacks the evidence, not the style. Fix what
-it finds and have it check again. When a newer Opus ships, change the model pinned in
-`brook-reviewer`'s definition. A change to authentication or authorization also goes to
+it finds and have it check again. A change to authentication or authorization also goes to
 `auth-reviewer`, in addition to Opus. Reviewers end with a `VERDICT:` line.
 
 ## 3. Run the tests at every relevant step
@@ -61,7 +77,8 @@ comes from. Do not repeat what the line says, and stay on the code next to the c
 
 ## 6. Keep the written record current
 
-A change that alters behavior updates, in the same PR: the spec and plan it came from,
+Once the code works, a Haiku subagent updates the docs. A change that alters behavior updates,
+in the same PR: the spec and plan it came from,
 [PROTOCOL](docs/PROTOCOL.md) if the wire contract moves, the
 [user guide](docs/user-guide.md) and [admin guide](docs/admin-guide.md), and any ADR it
 affects. A real design decision gets a new ADR in `docs/adr/` (`0001-title.md`, then
@@ -72,7 +89,8 @@ outside the repo. A doc that no longer matches the code is a bug.
 
 - **Subject**: one short line, prefixed by the area (e.g. `api:`, `core:`, `gnome:`, `mac:`,
   `ci:`, `docs:`).
-- **Body**: 3 to 4 sentences. What changed, why, and anything a reviewer could miss.
+- **Body**: 3 to 4 sentences. What changed, why, and anything a reviewer could miss. A Haiku
+  subagent writes both, from the diff and the *why* you give it.
 - One self-contained change per commit; commit as you go.
 - Work starts from an issue, and the PR links it (`Closes #N`). The PR states what would be
   true if the change were broken and what you ran to show it is not. Green CI alone is not that.
