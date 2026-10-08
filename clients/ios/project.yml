@@ -30,7 +30,9 @@ targets:
   Brook:
     type: application
     platform: iOS
-    sources: [Brook]
+    sources:
+      - Brook
+      - {path: ../apple-shared/Brook, name: AppleShared}
     configFiles:
       Debug: Signing.xcconfig
       Release: Signing.xcconfig
@@ -59,10 +61,10 @@ targets:
   BrookTests:
     type: bundle.unit-test
     platform: iOS
-    # One file, not the folder: later steps put tests there whose subjects this target does not
-    # compile yet. Step 5 widens this to the whole folder plus clients/ios/BrookTests.
+    # The iOS-only tests, plus every shared test: the shared tests run once per app.
     sources:
-      - {path: ../apple-shared/BrookTests/SmokeTests.swift, name: AppleSharedTests}
+      - BrookTests
+      - {path: ../apple-shared/BrookTests, name: AppleSharedTests}
     dependencies:
       - target: Brook
       - package: BrookCore

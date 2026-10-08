@@ -29,12 +29,17 @@ public struct SystemSecItem: SecItemCalls {
 
 /// Core's key slots in the **data-protection** Keychain (spec #46 §4): no prompts, this device
 /// only, never synced, readable after the first unlock. One generic-password item per slot.
+///
+/// On iOS, Keychain items outlive the app: deleting the app removes its files but not its
+/// Keychain items, so a reinstall would find the old sign-in. `deleteAll()` is how the iOS app
+/// clears them on its first launch after an install (see `SessionPersistence+iOS.swift`).
 public final class KeychainSlot: FfiKeySlot, Sendable {
     private let accessGroup: String?
     private let calls: SecItemCalls
 
-    /// `accessGroup`: `$(AppIdentifierPrefix)dev.brook.shared` from the signed app (nil only in
-    /// tests and unsigned builds).
+    /// `accessGroup`: `$(AppIdentifierPrefix)dev.brook.shared` from the signed Mac app. Nil means
+    /// the app's own default group: tests, unsigned builds, and the iOS app, which passes nil on
+    /// purpose because its default group is its own and needs no entitlement.
     public init(accessGroup: String?, calls: SecItemCalls = SystemSecItem()) {
         self.accessGroup = accessGroup
         self.calls = calls
@@ -104,6 +109,24 @@ public final class KeychainSlot: FfiKeySlot, Sendable {
 
     public func delete(slot: String) throws {
         switch calls.delete(query(slot)) {
+        case errSecSuccess, errSecItemNotFound: return
+        case let status: throw Self.failure(status)
+        }
+    }
+
+    /// Delete every item under Brook's service: the slot query without `kSecAttrAccount`, so it
+    /// matches each `session:<origin>` slot (and any other slot core ever wrote), whatever the
+    /// server. Same service, data-protection flag, not-synchronizable and access group as every
+    /// other query here, so it can never touch another app's or another service's items.
+    /// Nothing to delete is success; anything else maps like the other calls (a locked keychain
+    /// is `.Unavailable`).
+    ///
+    /// On iOS one `SecItemDelete` removes every match. Only the iOS app calls this; the Mac
+    /// keeps its items across reinstalls on purpose.
+    public func deleteAll() throws {
+        var q = query("")
+        q.removeValue(forKey: kSecAttrAccount as String)
+        switch calls.delete(q) {
         case errSecSuccess, errSecItemNotFound: return
         case let status: throw Self.failure(status)
         }

@@ -116,4 +116,39 @@ final class KeychainSlotTests: XCTestCase {
         let slot = KeychainSlot(accessGroup: nil, calls: FakeSecItem())
         XCTAssertNil(try slot.load(slot: "missing"), "not found must be absent, not an error")
     }
+
+    /// `deleteAll` must match every slot under the service (so no account in the query), and
+    /// only that service: same data-protection, not-synced flags, and the group only when set.
+    func testDeleteAllMatchesTheWholeServiceAndNothingElse() throws {
+        let calls = FakeSecItem()
+        try KeychainSlot(accessGroup: nil, calls: calls).deleteAll()
+        let q = try XCTUnwrap(calls.lastQuery)
+        XCTAssertEqual(q[kSecClass as String] as? String, kSecClassGenericPassword as String)
+        XCTAssertEqual(q[kSecAttrService as String] as? String, "dev.brook.Brook.datakey")
+        XCTAssertNil(q[kSecAttrAccount as String], "an account would delete one slot only")
+        XCTAssertEqual(q[kSecUseDataProtectionKeychain as String] as? Bool, true)
+        XCTAssertEqual(q[kSecAttrSynchronizable as String] as? Bool, false)
+        XCTAssertNil(q[kSecAttrAccessGroup as String], "no group set, none in the query")
+
+        let grouped = FakeSecItem()
+        try KeychainSlot(accessGroup: "ABCDE12345.dev.brook.shared", calls: grouped).deleteAll()
+        XCTAssertEqual(grouped.lastQuery?[kSecAttrAccessGroup as String] as? String, "ABCDE12345.dev.brook.shared")
+        XCTAssertNil(grouped.lastQuery?[kSecAttrAccount as String])
+    }
+
+    func testDeleteAllTreatsNothingToDeleteAsSuccessAndMapsFaults() throws {
+        // The fake answers "not found" for this query (it has no account): must not throw.
+        XCTAssertNoThrow(try KeychainSlot(accessGroup: nil, calls: FakeSecItem()).deleteAll())
+
+        let locked = FakeSecItem()
+        locked.failWith = errSecInteractionNotAllowed
+        XCTAssertThrowsError(try KeychainSlot(accessGroup: nil, calls: locked).deleteAll()) {
+            XCTAssertEqual($0 as? FfiKeySlotError, .Unavailable)
+        }
+        let broken = FakeSecItem()
+        broken.failWith = errSecMissingEntitlement
+        XCTAssertThrowsError(try KeychainSlot(accessGroup: nil, calls: broken).deleteAll()) {
+            XCTAssertEqual($0 as? FfiKeySlotError, .Fatal(status: errSecMissingEntitlement))
+        }
+    }
 }

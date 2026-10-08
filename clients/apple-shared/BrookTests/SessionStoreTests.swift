@@ -186,6 +186,46 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertFalse(fake.localCalls.withLock { $0 }.contains("enable"))
     }
 
+    /// An app with no local data (`makeFeed: nil`, the iOS app) still stores its session, and so
+    /// still needs core's sign-out fence for a Keychain delete that fails. The fence belongs to
+    /// the session, not to the feed. This uses the real core (no server needed: `logout` clears
+    /// the stored copy whether or not a session is held): the store enables persistence on the
+    /// client it makes, the slot's delete is made to fail, and core must fence instead and say
+    /// the sign-out is complete. The same failure with an unwritable directory proves it is the
+    /// fence that makes it complete, not a default.
+    func testWithoutLocalDataSigningOutStillLeavesCoresFence() async throws {
+        for (writable, expectComplete) in [(true, true), (false, false)] {
+            let dir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("brook-fence-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer {
+                try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+                try? FileManager.default.removeItem(at: dir)
+            }
+            if !writable { try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path) }
+
+            let slot = FailingDeleteSlot()
+            let made = Mutex<FfiBrookClient?>(nil)
+            let store = SessionStore(
+                settings: Settings(defaults: defaults, environment: [:]),
+                persistence: .on(slot: slot, dataDir: dir.path), makeFeed: nil,
+                makeClient: { server, allowInsecure in
+                    let client = try FfiBrookClient(baseUrl: server, allowInsecureHttp: allowInsecure)
+                    made.withLock { $0 = client }
+                    return client
+                })
+            // The sign-in fails on the network (`.invalid` never resolves), but the store has by
+            // then made the client and enabled persistence on it, which is all this needs.
+            await store.signIn(server: "https://brook.invalid", handle: "alice", password: "pw")
+            let client = try XCTUnwrap(made.withLock { $0 })
+
+            await client.logout()
+            XCTAssertTrue(slot.deleteAttempts.contains { $0.hasPrefix("session:") },
+                          "persistence was not enabled on the client (no delete reached the slot)")
+            XCTAssertEqual(client.signOutComplete(), expectComplete, "writable: \(writable)")
+        }
+    }
+
     func testSignOutEndsTheSessionQuietlyAndSignsOutOfCore() async {
         let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)))
         let store = await signedIn(fake)
@@ -355,5 +395,19 @@ final class SessionStoreTests: XCTestCase {
         await store.submitRecovery("aaaa-bbbb-cccc-dddd-eeee")
         XCTAssertEqual(store.phase, .signedIn(alice))
         XCTAssertEqual(store.recoveryCodesLeft, 2)
+    }
+}
+
+/// A key slot that holds nothing, whose delete always fails (a locked Keychain), and which
+/// records the delete attempts.
+private final class FailingDeleteSlot: FfiKeySlot, @unchecked Sendable {
+    private let attempts = Mutex<[String]>([])
+    var deleteAttempts: [String] { attempts.withLock { $0 } }
+    func load(slot _: String) throws -> Data? { nil }
+    func create(slot _: String, bytes _: Data) throws {}
+    func replace(slot _: String, bytes _: Data) throws {}
+    func delete(slot: String) throws {
+        attempts.withLock { $0.append(slot) }
+        throw FfiKeySlotError.Unavailable
     }
 }
