@@ -16,30 +16,31 @@ touch ([ARCHITECTURE](docs/ARCHITECTURE.md), [PROTOCOL](docs/PROTOCOL.md),
 Each stage is reviewed (section 2), the findings fixed, and then the owner approves it. Do not
 start the next stage before that. A small fix needs no spec or plan; say so in the PR.
 
-**Who does what.** The main agent talks to the owner, decides, and hands each job to a
-subagent on the newest model of its tier. It does not write the work itself.
+**Who does what.** The main agent talks to the owner, decides, writes the PR description, and
+hands each job to a subagent from `.claude/agents/`. It does not write the specs, plans, code or
+docs itself, not even for a small fix.
 
-| Job | Subagent model |
-|---|---|
-| Spec and plan | Opus |
-| Review of every stage | Opus (section 2) |
-| Code and its tests | Sonnet |
-| Docs, after the code works | Haiku |
-| Commit messages | Haiku |
+| Job | Subagent | Model |
+|---|---|---|
+| Spec, and later changes to it | `brook-spec-writer` | Opus |
+| Plan, and later changes to it | `brook-plan-writer` | Opus |
+| Review of every stage | `brook-reviewer` | Opus |
+| Code and its tests, by area | `brook-server-implementer` (`services/api`, `deploy/`), `brook-core-implementer` (`core`, `clients/gst-media`, Rust in `bindings/apple`), `brook-linux-implementer` (GNOME, KDE), `brook-apple-implementer` (macOS, iOS, BrookCore Swift), `brook-android-implementer`, `brook-windows-implementer` | Sonnet |
+| Docs, once the code works | `brook-docs-writer` | Haiku |
+| Commits | `brook-committer` | Haiku |
 
-Haiku sees only the diff, so hand it the *why* in the prompt; it writes the *what*. A design
-decision that comes up while implementing goes back to the main agent and the owner, not to
-the implementing subagent. "Newest" means the newest model of that tier: when a new one ships,
-change the model pinned in the agent's definition.
+The definitions name the model by tier (`opus`, `sonnet`, `haiku`), so each always runs the
+newest model of its tier. A change that spans areas goes to each area's implementer in turn. A
+design decision that comes up while implementing goes back to the main agent and the owner,
+not to the implementer.
 
 ## 2. Opus reviews every stage, as a subagent
 
-A newest-Opus subagent, never the one that wrote the work, reviews the spec, then the plan,
-then the implementation, using the
-`brook-reviewer` subagent in a pinned worktree (a branch switch must not change files under
-it). For a spec or plan, hand it the file and the question "does this solve the stated
-problem?"; for code, the PR and its evidence. It attacks the evidence, not the style. Fix what
-it finds and have it check again. A change to authentication or authorization also goes to
+`brook-reviewer` (newest Opus; never the subagent that wrote the work) reviews the spec, then
+the plan, then the implementation, in a pinned worktree (a branch switch must not change files
+under it). For a spec or plan, hand it the file; for code, the PR and its evidence. It attacks
+the evidence, not the style. Fix what it finds and have it check again.
+A change to authentication or authorization also goes to
 `auth-reviewer`, in addition to Opus. Reviewers end with a `VERDICT:` line.
 
 ## 3. Run the tests at every relevant step
@@ -77,15 +78,30 @@ comes from. Do not repeat what the line says, and stay on the code next to the c
 
 ## 6. Keep the written record current
 
-Once the code works, a Haiku subagent updates the docs. A change that alters behavior updates,
-in the same PR: the spec and plan it came from,
+A change that alters behavior updates, in the same PR: the spec and plan it came from (through
+their Opus writers),
 [PROTOCOL](docs/PROTOCOL.md) if the wire contract moves, the
 [user guide](docs/user-guide.md) and [admin guide](docs/admin-guide.md), and any ADR it
-affects. A real design decision gets a new ADR in `docs/adr/` (`0001-title.md`, then
-`0002-...`). Also fix or delete any agent memory note the change makes wrong; those live
+affects (these through `brook-docs-writer`). A real design decision gets a new ADR in
+`docs/adr/` (`0001-title.md`, then `0002-...`).
+Also fix or delete any agent memory note the change makes wrong; those live
 outside the repo. A doc that no longer matches the code is a bug.
 
-## 7. Commits and pull requests
+## 7. The clients stay in line
+
+Every client offers the same features, each in its own platform's way. When a merged PR adds or
+changes something a user can see or do in one client, the main agent opens one issue for each
+other client right after the merge: GNOME, KDE, macOS, iOS, Android, Windows. Clients not yet
+started get one too, so their backlog is complete when work starts. Each issue:
+- links the merged PR and the spec, and says what the user must be able to do, not how the
+  first client built it;
+- gets the client's label (`area:gtk`, `area:kde`, `area:macos`, `area:ios`, `area:android`,
+  `area:windows`);
+- is skipped only when the change cannot apply to that platform, and the merged PR says why.
+
+Shared logic goes into `core` first, so each client only adds its own UI.
+
+## 8. Commits and pull requests
 
 - **Subject**: one short line, prefixed by the area (e.g. `api:`, `core:`, `gnome:`, `mac:`,
   `ci:`, `docs:`).
@@ -97,7 +113,7 @@ outside the repo. A doc that no longer matches the code is a bug.
 - Only the owner merges into `main`, once CI is green and the reviews are in. Merging `main`
   into the branch afterwards resets the approval.
 
-## 8. Safety
+## 9. Safety
 
 No secrets, tokens or real passwords in the repo, commits, PRs or logs. In a workflow, pin
 actions by commit SHA and pass event data to scripts only through `env:`. Ask before touching
