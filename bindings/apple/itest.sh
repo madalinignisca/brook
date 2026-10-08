@@ -18,6 +18,13 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# This script runs build-xcframework.sh, and clients/macos/build.sh and clients/ios/build.sh run
+# it too. All three write the same output (the xcframework, the generated Swift, build/), so a
+# run that overlaps another corrupts it. Each takes the same lock for its whole run and the
+# second waits. The re-exec runs this script again under lockf; BROOK_APPLE_LOCKED stops it
+# looping. lockf passes the script's exit code through, and the kernel holds the lock, so a
+# killed run releases it.
+[[ -n "${BROOK_APPLE_LOCKED:-}" ]] || BROOK_APPLE_LOCKED=1 exec /usr/bin/lockf -k "$HERE/.build.lock" "$HERE/$(basename "$0")" "$@"
 ENV_FILE="$HERE/.itest.env"
 # Every integration suite that must run, with its test count. A suite that is skipped or
 # runs fewer tests fails the whole run.

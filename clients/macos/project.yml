@@ -193,7 +193,10 @@ targets:
   BrookTests:
     type: bundle.unit-test
     platform: macOS
-    sources: [BrookTests]
+    sources:
+      - BrookTests
+      # Tests both apps run (see clients/apple-shared).
+      - {path: ../apple-shared/BrookTests, name: AppleSharedTests}
     dependencies:
       - target: Brook
       - package: BrookCore
