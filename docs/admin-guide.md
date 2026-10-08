@@ -142,7 +142,7 @@ places).
 
 Brook is licensed under AGPL-3.0. Section 13 says that if you run a **modified** version as a
 network service, you must offer its users the source of that version. Each server publishes
-where its source is in `GET /health`, and the clients show that link in their About window.
+where its source is in `GET /health`, and Brook's clients show that link in their About window (macOS today; the others follow).
 
 **The setting is `BROOK_SOURCE_URL`.** Its default is the upstream repository,
 `https://github.com/madalinignisca/brook`. Unset or empty means the default.
