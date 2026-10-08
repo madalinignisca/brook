@@ -4,6 +4,15 @@ Spec: [2026-10-08-android-skeleton-spec.md](2026-10-08-android-skeleton-spec.md)
 every decision is in its section 3). Status: after review round 2 (Opus LGTM), with the owner's
 decisions of 2026-10-09 recorded in section 5; for the owner's approval.
 
+**Changed after peer review (#315, Apple/core agent's non-blocking notes):**
+- the macOS/Linux/iOS side of `store.rs` is described as a behaviour-preserving refactor;
+- `std::io::Write` joins the keyed-only gating list (only `write_atomically` uses it);
+- the TOTP-challenge rendering test is dropped: the Swift challenge has no fields, so that test
+  could never fail on a leak;
+- client A gets `enablePersistence` before `login` in the TOTP test;
+- step 6 notes that iOS is unaffected (grep-checked);
+- PR 2 says the main agent tells the Apple/core agent when it merges.
+
 **Changed after review round 2 (Opus LGTM with nits, Codex one finding):**
 - the round-1 note now reads "step 6 (Rust and Swift) is one commit" (Codex and Opus);
 - step 1's check uses `grep -i android`;
@@ -116,7 +125,8 @@ Three PRs, each one reviewable on its own:
   instead of `bundled-sqlcipher` (same 0.37), and `store.rs` opens databases with no key pragmas
   and no key check. A small `Protection` enum makes the plain path compile on Android and in host
   tests, so CI exercises the same functions on the host. A new CI job runs Android clippy and the
-  store tests. macOS, Linux and iOS compile exactly the code they compile today.
+  store tests. For macOS, Linux and iOS, `store.rs` gets a behaviour-preserving refactor: the keyed
+  path is today's code split into functions, with the same pragmas, key check and outcomes.
 - **PR 2 `ffi: tokens no longer cross the FFI`.** `FfiSession` keeps only `user`. Its own PR, as
   the spec requires, reviewed by Opus, the Apple/core agent and the `auth-reviewer`.
 - **PR 3 `android: app skeleton signs in and lists channels`.** A Gradle project in
@@ -220,7 +230,8 @@ clients/android/with-ndk.sh "$HOME/Android/Sdk/ndk/30.0.16248370" \
     `#[cfg(any(target_os = "android", test))]` (like `Protection::Plain`), so a host non-test build
     has no dead code. `open_as` and `reset_as` need no gate, because `open` and `reset` call them.
   - Gate every keyed-only item with `#[cfg(not(target_os = "android"))]`: `CHECK_LABEL`,
-    `key_check`, `write_atomically`, `Kind::slot`, the `zeroize` and `KeySlotError` imports, and
+    `key_check`, `write_atomically`, `Kind::slot`, the `zeroize`, `KeySlotError` and
+    `std::io::Write` imports (`Write` is used only by `write_atomically`), and
     `Opened::Locked` with its `Debug` arm. Gating `Locked` is how the spec's "a store never reports
     `Locked` because of a key it does not use" holds by construction: on Android the variant does
     not exist. `Rebuilt::KeyMissing` stays, because `local.rs` constructs it in a comparison; on
@@ -356,7 +367,8 @@ clients/android/with-ndk.sh "$HOME/Android/Sdk/ndk/30.0.16248370" \
 ### PR 2: `ffi: tokens no longer cross the FFI` (refs #273)
 
 Reviews: `brook-reviewer`, the Apple/core agent, and the `auth-reviewer` through the server agent
-(steps 6 and 7 are the auth points). It merges independently of PR 1. Implementers: core (step 5,
+(steps 6 and 7 are the auth points). It merges independently of PR 1. When it merges, the main
+agent tells the Apple/core agent, because their iOS steps 5-7 rebase over it. Implementers: core (step 5,
 the Rust half of step 6), Apple (the Swift half of step 6), server (step 7), docs (step 8).
 
 **Step 5: the token check moves to core.** *brook-core-implementer.*
@@ -395,7 +407,8 @@ commit of both, and the PR is tested as a whole there.
     - `testSessionNeverRendersTokens` and `testLoginResultNeverRendersTokens` go, since no tokens
       are left to render;
     - keep `testRedactedRenderingStillIdentifiesTheUser` and the second-factor test;
-    - add `testATotpRequiredResultNeverRendersItsChallenge` (`RedactionTests` has none today).
+    - no TOTP-challenge rendering test is added: `FfiTotpChallenge` is an object with no fields in
+      Swift, so its rendering has nothing to leak, and a test that cannot fail adds nothing.
   - `LoginIntegrationTests.testLoginReturnsWorkingTokensAndEndsLoggedIn`: rename it to
     `testLoginWorksAgainstTheServerAndEndsLoggedIn`. Replace the token asserts and the raw
     `/auth/me` request with `try await client.me()`, which must return `cfg.handle`. This proves
@@ -412,7 +425,9 @@ commit of both, and the PR is tested as a whole there.
     - then `logout()` and probe `/auth/refresh` with it, as today.
     - Count stays 1.
   - `TotpIntegrationTests.testTwoFactorSignInEndToEnd` lines 178 and 182: device B's raw tokens
-    remain. For A, read A's refresh token from the same kind of slot before activation. Drop only
+    remain. For A, give client A an in-memory slot with `enablePersistence(slot:dataDir:)` **before**
+    its `login` (core writes only through a slot that is already set), and read A's refresh token
+    from it before activation. Drop only
     the "A's old **access** token" probe: A's access token is never visible now. Step 7 moves that
     exact check into the server's own tests, so no coverage is lost. Count stays 1.
   - `clients/macos/BrookTests/FakeClient.swift:245`: `FfiSession(user: alice)`.
@@ -425,6 +440,9 @@ commit of both, and the PR is tested as a whole there.
     server);
   - `clients/macos/build.sh test`.
   Paste all summaries in the PR.
+  - iOS is unaffected and needs no run: neither `clients/ios` nor `SmokeTests.swift` reads
+    `FfiSession`'s token fields (checked with grep, 2026-10-09). `FfiSession(user:)` still compiles
+    wherever only `user` is read.
 - Docs made wrong: `2026-09-24-apple-ffi-bridge-design.md` lines 36-37 and 100-101 (step 8).
 
 **Step 7: the server test covers what the Swift TOTP test gave up.** *brook-server-implementer*
@@ -843,7 +861,8 @@ from the main agent and never go into the repo or the PR text.
 - No server or wire change, and no database migration.
 - Android has no installed base, so there is no local data to carry over. Before this, core did not
   build for Android at all.
-- macOS, iOS and Linux compile the same store code as today (`Keyed` is today's body, moved). Their
+- For macOS, iOS and Linux, `store.rs` is a behaviour-preserving refactor (`Keyed` is today's body,
+  split into functions; the existing store tests guard it). Their
   stored session format (`{user, refresh_token}` JSON) is unchanged.
 - PR 2 changes the FFI record. The Mac app and its xcframework are built together, so no old binary
   ever reads the new record.
