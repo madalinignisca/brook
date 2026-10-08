@@ -43,3 +43,13 @@ async def test_health_is_public_and_ignores_a_bad_token(client: httpx.AsyncClien
     resp = await client.get("/health", headers={"Authorization": "Bearer not-a-token"})
     assert resp.status_code == 200
     assert "source_url" in resp.json()
+
+
+async def test_health_version_is_acceptable_to_clients(client: httpx.AsyncClient) -> None:
+    # Clients refuse a /health answer whose version is not 1-64 printable ASCII characters
+    # (0x20-0x7E), and then About loses the AGPL section 13 source link. A fork that changes
+    # the version string must not break that. The limit is VERSION_MAX_CHARS in
+    # core/src/server_info.rs: keep the two the same.
+    version = (await client.get("/health")).json()["version"]
+    assert 1 <= len(version) <= 64
+    assert all(0x20 <= ord(c) <= 0x7E for c in version)

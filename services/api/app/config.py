@@ -192,7 +192,7 @@ def _source_url_is_valid(value: str) -> bool:
     if "[" in parts.netloc:
         # urlsplit only checks that the brackets pair up, so "[v1.x]" (IPvFuture) gets
         # through, and core's url parser refuses it. Only an IPv6 address is accepted here.
-        # .hostname is the text inside the brackets; a zone id ("%25eth0") is not valid
+        # .hostname is the text inside the brackets; a zone id ("%25eth0") is not valid.
         # Python's IPv6Address accepts a "%scope" suffix, but WHATWG refuses a zone id, so
         # "%" is refused explicitly.
         if "%" in host:
