@@ -126,8 +126,14 @@ Shared logic goes into `core` first, so each client only adds its own UI.
   comment syntax, after any shebang.
 - Work starts from an issue, and the PR links it (`Closes #N`). The PR states what would be
   true if the change were broken and what you ran to show it is not. Green CI alone is not that.
-- Only the owner merges into `main`, once CI is green and the reviews are in. Merging `main`
-  into the branch afterwards resets the approval.
+- Merging into `main` needs green CI and an LGTM `VERDICT:` from every required reviewer
+  (section 2) and from the other two main agents (each a role-signed `VERDICT:` comment on the
+  PR), all given after the last push; a later push, including a merge of `main`, needs them
+  again. The `main` ruleset also requires a GitHub approval, kept for outside contributors;
+  every agent uses the owner's account and cannot give it. So the PR's author agent merges on
+  the owner's behalf with `gh pr merge --merge --admin`, and only once the gates above are met.
+  `--admin` is only for that approval: never to merge past a red check or a missing verdict,
+  and never for a pull request from outside.
 
 ## 9. Safety
 
