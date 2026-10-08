@@ -252,6 +252,14 @@ final class ChannelsModel {
     func handle(_ event: FfiServerEvent) {
         switch event {
         case .ready:
+            // A call that ended while the socket was down is never announced as ended: after
+            // `ready` the server re-sends one `channel.call` per call still running and nothing
+            // for the rest. So drop every badge here and let that re-send rebuild them.
+            // This is safe because the server sends `ready` BEFORE that snapshot
+            // (services/api/app/routers/ws.py: `ready`, then the connect hooks), so the clear
+            // cannot wipe a fresh badge. A re-auth `ready` (token rotation on a live socket)
+            // never gets here: core swallows it (core/src/ws.rs, the `reauth` branch).
+            liveCalls = [:]
             ready = true
             timeline?.apply(event)  // a failed head load is retried
         case let .channelCall(channelId, callId, count):

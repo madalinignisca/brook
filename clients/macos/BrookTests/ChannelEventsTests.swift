@@ -45,6 +45,27 @@ final class ChannelEventsTests: XCTestCase {
         XCTAssertNil(t.error)
     }
 
+    /// A call that ended while the socket was down is never announced as ended: the server just
+    /// sends nothing for it after the next `ready`. So `ready` must drop every badge, and the
+    /// calls still running get theirs back from the `channel.call` the server re-sends.
+    func testReadyClearsLiveCalls() async {
+        let (client, model) = await started([channel("c1", "general")])
+        client.deliver(.channelCall(channelId: "c1", callId: "k1", participantCount: 2))
+        await drainMain()
+        XCTAssertNotNil(model.badge(model.channels[0]))
+
+        // The reconnect: the call ended meanwhile, so nothing is re-sent.
+        client.deliver(.ready)
+        await drainMain()
+        XCTAssertNil(model.badge(model.channels[0]), "a badge for a call that ended survived ready")
+        XCTAssertTrue(model.liveCalls.isEmpty)
+
+        // The call is still running: the server re-sends it after ready.
+        client.deliver(.channelCall(channelId: "c1", callId: "k1", participantCount: 2))
+        await drainMain()
+        XCTAssertEqual(model.badge(model.channels[0]), "● Call · 2")
+    }
+
     func testADeleteRemovesTheRowAndClosesTheOpenChannel() async {
         let (client, model) = await started([channel("c1", "general"), channel("c2", "random")])
         model.openChannel = "c2"
