@@ -71,6 +71,8 @@ targets:
         NSLocalNetworkUsageDescription: Brook connects to your team's Brook server, which may be on your local network.
         NSCameraUsageDescription: Brook uses the camera for video in calls in Brook.
         NSMicrophoneUsageDescription: Brook uses the microphone for calls in Brook.
+        # Shown by the standard About panel (issue #298): the copyright holder and the license.
+        NSHumanReadableCopyright: "© 2026 Madalin Ignisca and Brook contributors. Licensed under AGPL-3.0-or-later."
     entitlements:
       path: Brook/Brook.entitlements
       properties:
