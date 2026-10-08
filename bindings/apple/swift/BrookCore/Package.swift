@@ -9,8 +9,10 @@ import PackageDescription
 
 let package = Package(
     name: "BrookCore",
-    // Keep in step with MACOSX_DEPLOYMENT_TARGET in build-xcframework.sh. iOS joins later.
-    platforms: [.macOS(.v26)],
+    // Keep in step with MACOSX_DEPLOYMENT_TARGET and IPHONEOS_DEPLOYMENT_TARGET in
+    // build-xcframework.sh. The iOS app uses the BrookCore product only; BrookMedia and WebRTC
+    // are written for macOS and are not built for iOS.
+    platforms: [.macOS(.v26), .iOS(.v26)],
     products: [
         .library(name: "BrookCore", targets: ["BrookCore"]),
         .library(name: "BrookMedia", targets: ["BrookMedia"]),
