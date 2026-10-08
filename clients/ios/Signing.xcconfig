@@ -1,0 +1,10 @@
+// SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// Signing for the iOS app. The team lives in Local.xcconfig (gitignored), so the repository
+// names no account. For a run on a real iPhone, create clients/ios/Local.xcconfig with:
+//   DEVELOPMENT_TEAM = <your team id>     (the same team as the Mac app)
+//   CODE_SIGN_STYLE = Automatic
+// Without that file, simulator builds sign to run locally. A device build then needs the file,
+// except `build.sh test`'s build for generic/platform=iOS, which turns signing off.
+#include? "Local.xcconfig"

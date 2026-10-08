@@ -38,6 +38,7 @@ caddydata/
 # Apple bindings: build outputs and local test credentials
 bindings/apple/build/
 bindings/apple/.itest.env
+bindings/apple/.build.lock
 bindings/apple/swift/BrookCore/BrookCoreFFI.xcframework/
 bindings/apple/swift/BrookCore/Sources/BrookCoreGenerated/
 bindings/apple/swift/BrookCore/.build/
@@ -53,3 +54,9 @@ clients/macos/BrookImageDecoder/Info.plist
 clients/macos/BrookImageDecoder/BrookImageDecoder.entitlements
 clients/macos/BrookImageWorker/BrookImageWorker.entitlements
 clients/macos/Local.xcconfig
+
+# iOS client: generated project, build output, local signing
+clients/ios/Brook.xcodeproj/
+clients/ios/build.noindex/
+clients/ios/Brook/Info.plist
+clients/ios/Local.xcconfig

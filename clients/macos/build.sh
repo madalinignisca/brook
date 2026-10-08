@@ -17,6 +17,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
+# clients/ios/build.sh shares this script's output (the xcframework and generated Swift), so
+# both take one lock for their whole run; the second waits. The kernel holds it, so a killed
+# run releases it.
+[[ -n "${BROOK_APPLE_LOCKED:-}" ]] || BROOK_APPLE_LOCKED=1 exec /usr/bin/lockf -k "$ROOT/bindings/apple/.build.lock" "$HERE/$(basename "$0")" "$@"
 command -v xcodegen >/dev/null || { echo "xcodegen not found (brew install xcodegen)" >&2; exit 1; }
 # The install path is destructive: its tests (fast, no build) run before anything is built.
 [[ "${1:-}" == "test" ]] && { "$HERE/test-install.sh" || exit 1; }
