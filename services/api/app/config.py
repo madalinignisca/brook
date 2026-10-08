@@ -163,7 +163,14 @@ _FORBIDDEN_HOST_CHARS = frozenset("<>^|%\\")
 
 def _source_url_is_valid(value: str) -> bool:
     """True if value is a link every client will accept and show as configured."""
-    if len(value.encode("utf-8")) > SOURCE_URL_MAX_BYTES:
+    try:
+        encoded_len = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        # An env value that was not valid UTF-8 reaches us with surrogate escapes, which
+        # cannot be encoded. Refuse it like any bad value, so the operator gets the guard's
+        # message (which never echoes the value) instead of a raw traceback.
+        return False
+    if encoded_len > SOURCE_URL_MAX_BYTES:
         return False
     # Core's url parser does not refuse whitespace/control characters, it rewrites them
     # (strips leading/trailing C0 and spaces, drops tabs and newlines, percent-encodes an
@@ -182,7 +189,18 @@ def _source_url_is_valid(value: str) -> bool:
     # Catches user@, user:pass@ and the empty "@host" (.username reports "" for that).
     if "@" in parts.netloc:
         return False
-    if "[" in parts.netloc:  # IPv6 literal: urlsplit already validated the brackets
+    if "[" in parts.netloc:
+        # urlsplit only checks that the brackets pair up, so "[v1.x]" (IPvFuture) gets
+        # through, and core's url parser refuses it. Only an IPv6 address is accepted here.
+        # .hostname is the text inside the brackets; a zone id ("%25eth0") is not valid
+        # Python's IPv6Address accepts a "%scope" suffix, but WHATWG refuses a zone id, so
+        # "%" is refused explicitly.
+        if "%" in host:
+            return False
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            return False
         return True
     # The rest mirrors what core's WHATWG host parser refuses but urlsplit lets through.
     # It is the known gap, not a full UTS 46 implementation (see the plan's Risks).

@@ -67,6 +67,8 @@ REFUSED_SOURCE_URLS = [
     " https://example.com/",
     "https://example.com:99999/",
     "https://[::1/",
+    "https://[v1.x]/",  # IPvFuture: urlsplit allows it, core refuses it
+    "https://[fe80::1%25eth0]/",  # zone id
     "https://a<b.com/",
     "https://a%b.com/",
     "https://good.example\\evil/",
@@ -111,6 +113,14 @@ def test_source_url_error_never_echoes_the_value() -> None:
     with pytest.raises(RuntimeError) as exc:
         _settings("https://user:secret-pw@example.com/").assert_secure()
     assert "secret-pw" not in str(exc.value)
+
+
+def test_source_url_non_utf8_value_gets_the_guard_message() -> None:
+    # An env value that is not valid UTF-8 arrives with surrogate escapes; it must be
+    # refused with the guard's message, not crash with UnicodeEncodeError, and not be echoed.
+    with pytest.raises(RuntimeError, match="BROOK_SOURCE_URL") as exc:
+        _settings("https://example.com/\udcff").assert_secure()
+    assert "udcff" not in str(exc.value).lower()
 
 
 def test_source_url_guard_ignores_allow_insecure_auth() -> None:
