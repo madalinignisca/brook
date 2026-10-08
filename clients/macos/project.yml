@@ -26,7 +26,11 @@ targets:
   Brook:
     type: application
     platform: macOS
-    sources: [Brook, Shared]
+    sources:
+      - Brook
+      - Shared
+      # Code both apps use (clients/apple-shared).
+      - {path: ../apple-shared/Brook, name: AppleShared}
     configFiles:
       Release: Signing.xcconfig
     dependencies:
