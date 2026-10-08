@@ -19,7 +19,7 @@ start the next stage before that. A small fix needs no spec or plan; say so in t
 **Who does what.** The main agent talks to the owner, decides, writes the PR description, and
 hands each job to a subagent from `.claude/agents/`. It does not write the specs, plans, code or
 docs itself, not even for a small fix. The one exception is CI and repo settings
-(`.github/`, `.pre-commit-config.yaml`, this file), which the main agent changes itself, still
+(`.github/`, `.claude/`, `.pre-commit-config.yaml`, this file), which the main agent changes itself, still
 with an Opus review.
 
 | Job | Subagent | Model |

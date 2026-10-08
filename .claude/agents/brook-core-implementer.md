@@ -23,6 +23,8 @@ clients must follow.
 
 ## Checks (from the repo root)
 `cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked`
+After a change to the root `Cargo.toml` or `Cargo.lock`, also build `-p brook-kde` (not a default
+member; needs Qt 6), or say in your report that it was not built.
 
 ## How you work
 You write code and tests for the plan steps the caller gives you, or for a small fix it

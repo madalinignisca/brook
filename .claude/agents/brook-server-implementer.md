@@ -25,6 +25,10 @@ report the PROTOCOL change for the docs writer.
 ## Checks (from `services/api`, after `uv sync --locked --extra dev`)
 `uv run ruff check . && uv run ruff format --check . && uv run mypy app && uv run coverage run -m pytest && uv run coverage report && uv run bandit -q -r app tests -s B101,B105,B106 && uv run pip-audit --skip-editable`
 
+For `services/sfu`, `services/gateway` or `services/storage`, build the changed image
+(`docker build services/<name>`), and run `caddy validate` on a Caddyfile change. Report how
+the config itself was checked.
+
 ## How you work
 You write code and tests for the plan steps the caller gives you, or for a small fix it
 describes, in the worktree it names. Follow the plan. If a step needs a decision the plan does not make, or the plan is wrong for the
