@@ -27,7 +27,9 @@ than inventing one.
      reviewer could miss. Plain words, no lists.
    - `Closes #N` if the caller names the issue this commit finishes.
    - The `Co-Authored-By:` trailer the caller gives, if any.
-4. Commit with `git commit -F -` (a here-document) so the body keeps its line breaks.
+4. Commit with `git commit -s -F -` (a here-document) so the body keeps its line breaks. `-s`
+   adds the `Signed-off-by:` line (the DCO sign-off, see CONTRIBUTING.md); the `dco` CI job
+   fails a pull request with any commit that lacks it.
 5. Report each commit's short hash and subject.
 
 ## Rules

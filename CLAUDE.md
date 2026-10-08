@@ -111,6 +111,8 @@ Shared logic goes into `core` first, so each client only adds its own UI.
 - **Body**: 3 to 4 sentences. What changed, why, and anything a reviewer could miss. A Haiku
   subagent writes both, from the diff and the *why* you give it.
 - One self-contained change per commit; commit as you go.
+- Every commit is signed off (`git commit -s`), the owner's too: the `dco` CI job checks it.
+  See [CONTRIBUTING](CONTRIBUTING.md).
 - Work starts from an issue, and the PR links it (`Closes #N`). The PR states what would be
   true if the change were broken and what you ran to show it is not. Green CI alone is not that.
 - Only the owner merges into `main`, once CI is green and the reviews are in. Merging `main`
