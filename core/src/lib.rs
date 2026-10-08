@@ -58,6 +58,7 @@ mod persist;
 mod preview;
 #[cfg(test)]
 mod restore_tests;
+mod server_info;
 mod session;
 mod session_store;
 mod sidebar;
@@ -107,6 +108,7 @@ pub use outbox::{
 pub use preview::{
     ImageKind, ImagePreview, PREVIEW_MAX_BYTES, PREVIEW_MAX_PIXELS, PREVIEW_MAX_SIDE,
 };
+pub use server_info::{server_info, ServerInfo, SOURCE_URL_MAX_BYTES};
 pub use session::{Session, User};
 pub use sidebar::{
     activity_moves, conversation_label, person_label, sidebar_order, sort_key, SidebarEntry,

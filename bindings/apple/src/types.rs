@@ -18,6 +18,24 @@ pub struct FfiUser {
     pub status_text: Option<String>,
 }
 
+/// What a server says about itself (`/health`), for the About screen. `source_url` is core's
+/// checked and re-serialised form (http(s), no userinfo, IDN host in punycode), never the
+/// server's raw string.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiServerInfo {
+    pub version: String,
+    pub source_url: String,
+}
+
+impl From<brook_core::ServerInfo> for FfiServerInfo {
+    fn from(info: brook_core::ServerInfo) -> Self {
+        Self {
+            version: info.version,
+            source_url: info.source_url.as_str().to_owned(),
+        }
+    }
+}
+
 impl From<User> for FfiUser {
     fn from(u: User) -> Self {
         Self {

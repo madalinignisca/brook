@@ -155,6 +155,8 @@ BROOK_JWT_SIGNING_KEY=$(openssl rand -hex 32)
 BROOK_AUTO_CREATE_SCHEMA=false
 BROOK_JANUS_URL=ws://127.0.0.1:8188
 BROOK_JANUS_API_SECRET=$janus_secret
+# AGPL section 13: if you run a MODIFIED Brook, uncomment and set this to where its source is.
+# BROOK_SOURCE_URL=https://git.example.org/you/brook
 EOF
 fi
 # Keyring for encrypted secrets at rest (TOTP, later bot secrets), spec

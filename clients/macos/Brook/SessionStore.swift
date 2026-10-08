@@ -59,6 +59,9 @@ final class SessionStore {
     private let makeClient: ClientFactory
     /// Kept while signed in: later phases talk to the server through it.
     private(set) var client: FfiBrookClient?
+    /// The server of the current session; About asks it. Not `settings.lastGoodServer`, which a
+    /// second instance signing in elsewhere can overwrite.
+    private(set) var server: String?
     /// The current attempt; bumping it ends the previous one.
     private var attempt = 0
     private var observer: AuthStateObserver?
@@ -239,6 +242,7 @@ final class SessionStore {
             return
         }
         self.client = client
+        server = address
         signIns += 1
         signOutWarning = nil // the new sign-in replaced the stored copy
         settings.saveLastGoodServer(address)
@@ -459,6 +463,7 @@ final class SessionStore {
         pending = nil
         recoveryCodesLeft = nil
         client = nil
+        server = nil
         enableTask?.cancel() // its handle stays: the next enable waits for it to finish
         feed?.stop()
         feed = nil

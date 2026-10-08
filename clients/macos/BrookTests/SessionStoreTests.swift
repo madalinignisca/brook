@@ -74,6 +74,17 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(fake.calls.count, 1)
     }
 
+    /// About asks the signed-in server, so the store must expose it while signed in and drop it after.
+    func testServerIsSetWhileSignedInAndClearedOnSignOut() async {
+        let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)))
+        let (store, _) = store(fake)
+        XCTAssertNil(store.server)
+        await store.signIn(server: "https://chat.example.com", handle: "alice", password: "pw")
+        XCTAssertEqual(store.server, "https://chat.example.com")
+        store.signOut()
+        XCTAssertNil(store.server)
+    }
+
     func testCanRetryAfterAFailedLogin() async {
         let wrong = LoginError.Api(code: "auth.invalid_credentials", message: "Invalid handle or password")
         let fake = FakeClient(result: .failure(wrong))
