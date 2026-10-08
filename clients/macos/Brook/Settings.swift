@@ -10,7 +10,8 @@ import Foundation
 /// equivalent, since an app opened from Finder has no environment.
 struct Settings {
     static let lastServerKey = "LastServer"
-    /// Hidden, no UI: `defaults write dev.brook.Brook AllowInsecureHTTP -bool YES`.
+    /// Hidden, no UI: `defaults write dev.brook.Brook AllowInsecureHTTP -bool YES` (the Mac app;
+    /// the iOS app's bundle id is `me.madalin.brook`, so write that id there).
     static let allowInsecureKey = "AllowInsecureHTTP"
     /// The Settings window's "Show usernames": people read as `@handle` instead of their display
     /// name. Off by default.
@@ -20,7 +21,7 @@ struct Settings {
     static let showImagePreviewsKey = "ShowImagePreviews"
     /// Off: an absent value means off, here and in every `@AppStorage` initial value.
     static let showImagePreviewsDefault = false
-    static let fallbackServer = "https://localhost"
+    static let fallbackServer = ThisDevice.fallbackServer
 
     let defaults: UserDefaults
     let environment: [String: String]

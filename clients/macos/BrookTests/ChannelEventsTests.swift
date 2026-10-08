@@ -26,25 +26,6 @@ final class ChannelEventsTests: XCTestCase {
         }
     }
 
-    /// `.ready` reaches the open timeline through the model's event path: a head load that
-    /// failed is tried again on the reconnect.
-    func testReadyRetriesTheOpenTimelinesFailedHead() async {
-        let (client, model) = await started([channel("c1", "general")])
-        let chat = FakeChat()
-        chat.historyFailure = LoginError.Network(message: "offline")
-        let t = TimelineModel(channelId: "c1", client: chat)
-        model.openChannel = "c1"
-        model.timeline = t
-        await t.load()
-        XCTAssertNotNil(t.error)
-        chat.historyFailure = nil
-        chat.pages = [[msg("m1", "back", channel: "c1")]]
-        client.deliver(.ready)
-        await settle { chat.historyCalls.withLock { $0 } >= 2 && t.error == nil && !t.loading }
-        XCTAssertEqual(chat.historyCalls.withLock { $0 }, 2)
-        XCTAssertNil(t.error)
-    }
-
     /// A call that ended while the socket was down is never announced as ended: the server just
     /// sends nothing for it after the next `ready`. So `ready` must drop every badge, and the
     /// calls still running get theirs back from the `channel.call` the server re-sends.

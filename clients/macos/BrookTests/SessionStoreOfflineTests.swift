@@ -25,7 +25,7 @@ final class SessionStoreOfflineTests: XCTestCase {
         let recorder = FactoryRecorder { fake }
         let settings = Settings(defaults: defaults, environment: [:])
         return SessionStore(settings: settings, persistence: .on(slot: UnusedSlot(), dataDir: "/data"),
-                            makeClient: recorder.factory, localDataWait: wait)
+                            makeFeed: SessionStore.macFeed, makeClient: recorder.factory, localDataWait: wait)
     }
 
     private func signedIn() -> FakeClient { FakeClient(result: .success(.loggedIn(session: aliceSession))) }

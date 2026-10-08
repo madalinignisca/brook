@@ -454,6 +454,10 @@ final class TimelineModel {
     }
 }
 
+/// `ChannelsModel` holds the open conversation as an `OpenTimeline` (see its doc); the real
+/// model already has both members, so adopting the protocol needs no code.
+extension TimelineModel: OpenTimeline {}
+
 /// The message box: text, what it replies to, or the message being edited.
 @MainActor
 @Observable

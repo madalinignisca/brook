@@ -298,3 +298,12 @@ final class CacheStateBridge: CacheStateListener, @unchecked Sendable {
         }
     }
 }
+
+/// `CacheFeed` already has the three calls `SessionStore` needs.
+extension CacheFeed: LocalDataFeed {}
+
+extension SessionStore {
+    /// The Mac's feed factory. It lives here, beside `CacheFeed`, so the shared `SessionStore`
+    /// never has to name `CacheFeed`. Tests use it too, so they exercise the factory the app ships.
+    static let macFeed: SessionStore.FeedFactory = { CacheFeed(client: $0, defaults: $1) }
+}

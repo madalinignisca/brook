@@ -25,7 +25,7 @@ final class SessionStoreTests: XCTestCase {
     ) -> (SessionStore, FactoryRecorder) {
         let recorder = FactoryRecorder { client }
         let settings = Settings(defaults: defaults, environment: environment)
-        return (SessionStore(settings: settings, makeClient: recorder.factory), recorder)
+        return (SessionStore(settings: settings, makeFeed: nil, makeClient: recorder.factory), recorder)
     }
 
     /// Waits (bounded) until the fake has seen `count` login calls.
@@ -96,7 +96,7 @@ final class SessionStoreTests: XCTestCase {
 
     func testConstructorErrorIsShownAndLoginNeverCalled() async {
         let recorder = FactoryRecorder { throw LoginError.InsecureServerUrl }
-        let store = SessionStore(settings: Settings(defaults: defaults, environment: [:]), makeClient: recorder.factory)
+        let store = SessionStore(settings: Settings(defaults: defaults, environment: [:]), makeFeed: nil, makeClient: recorder.factory)
         await store.signIn(server: "http://h.example", handle: "alice", password: "pw")
         XCTAssertEqual(store.phase, .signedOut(error: SessionStore.Message.insecure))
         XCTAssertEqual(recorder.all.count, 1)
@@ -166,6 +166,24 @@ final class SessionStoreTests: XCTestCase {
         fake.emit(.loggedIn(user: alice))
         XCTAssertEqual(store.phase, .signedIn(alice))
         return store
+    }
+
+    /// Persistence is on but the app has no local data (`makeFeed: nil`, as iOS): sign-in must
+    /// not enable it. Without that, core would open the encrypted stores with nobody listening.
+    func testNoFeedFactoryKeepsLocalDataOff() async {
+        let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)))
+        let recorder = FactoryRecorder { fake }
+        let store = SessionStore(
+            settings: Settings(defaults: defaults, environment: [:]),
+            persistence: .on(slot: UnusedSlot(), dataDir: "/data"), makeFeed: nil, makeClient: recorder.factory)
+        await store.signIn(server: "https://h", handle: "alice", password: "pw")
+        fake.emit(.loggedIn(user: alice))
+        XCTAssertEqual(store.phase, .signedIn(alice))
+        // The enable would run in a task of its own, so give it the time it would need.
+        try? await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(store.localData, .off)
+        XCTAssertNil(store.feed)
+        XCTAssertFalse(fake.localCalls.withLock { $0 }.contains("enable"))
     }
 
     func testSignOutEndsTheSessionQuietlyAndSignsOutOfCore() async {
@@ -256,7 +274,7 @@ final class SessionStoreTests: XCTestCase {
         let second = FakeClient(result: .success(.loggedIn(session: aliceSession)))
         let clients = Mutex([first, second])
         let recorder = FactoryRecorder { clients.withLock { $0.removeFirst() } }
-        let store = SessionStore(settings: Settings(defaults: defaults, environment: [:]), makeClient: recorder.factory)
+        let store = SessionStore(settings: Settings(defaults: defaults, environment: [:]), makeFeed: nil, makeClient: recorder.factory)
         await store.signIn(server: "https://h", handle: "alice", password: "pw")
         first.emit(.loggedIn(user: alice))
         store.signOut()

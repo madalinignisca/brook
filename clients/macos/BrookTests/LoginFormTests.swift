@@ -21,7 +21,7 @@ final class LoginFormTests: XCTestCase {
 
     private func form(_ result: Result<LoginResult, LoginError>, environment: [String: String] = [:]) -> LoginForm {
         let recorder = FactoryRecorder { FakeClient(result: result) }
-        let store = SessionStore(settings: Settings(defaults: defaults, environment: environment), makeClient: recorder.factory)
+        let store = SessionStore(settings: Settings(defaults: defaults, environment: environment), makeFeed: nil, makeClient: recorder.factory)
         let form = LoginForm(store: store)
         form.server = "https://chat.example.com"
         form.handle = "alice"
@@ -52,7 +52,7 @@ final class LoginFormTests: XCTestCase {
 
     func testPrefillsTheSavedServer() {
         defaults.set("https://saved.example", forKey: Settings.lastServerKey)
-        let store = SessionStore(settings: Settings(defaults: defaults, environment: [:]))
+        let store = SessionStore(settings: Settings(defaults: defaults, environment: [:]), makeFeed: nil)
         XCTAssertEqual(LoginForm(store: store).server, "https://saved.example")
     }
 
