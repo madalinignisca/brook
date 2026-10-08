@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Attachment filename rules (attachments spec §4, owner decision)."""
 
 from __future__ import annotations

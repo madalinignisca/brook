@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Password change (self) and admin user management (list, reset)."""
 
 from __future__ import annotations

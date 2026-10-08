@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Leaving or removing a channel member, and editing your own profile.
 
 Owner decision, 2026-09-26: anyone may leave; a channel owner or an admin removes

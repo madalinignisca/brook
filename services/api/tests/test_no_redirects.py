@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """The API must never answer with a redirect.
 
 A 307/308 preserves method and body, so a redirect on a login route re-sends the

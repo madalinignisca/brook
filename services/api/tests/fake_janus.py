@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """A fake JanusClient for in-process call tests.
 
 Answers the VideoRoom requests calls.py makes the way Janus 1.4 does, records

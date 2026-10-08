@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """files.position: attachments keep the order the sender gave
 
 Revision ID: e1f2a3b4c5d6

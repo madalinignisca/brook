@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """/ws beyond Phase 1 fan-out: close reasons, re-auth, expiry, the command layer.
 
 Wire (PROTOCOL.md §2): auth {access_token} -> ready; every failure closes 1008

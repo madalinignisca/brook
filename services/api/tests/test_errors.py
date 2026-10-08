@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Error-envelope contract tests (docs/PROTOCOL.md §5).
 
 Every error — ours, the framework's, and *unanticipated* ones — must render as

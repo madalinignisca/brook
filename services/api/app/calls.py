@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Call signaling: PROTOCOL.md §3 on top of Janus VideoRoom.
 
 Model (contract §3.1): one call per channel, authorized by membership. Each

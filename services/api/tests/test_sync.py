@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """/sync (sync spec 2026-09-25 §6): stamping, scope, state-only first sync, new
 channels arriving complete, reset, paging, and seq on live events."""
 

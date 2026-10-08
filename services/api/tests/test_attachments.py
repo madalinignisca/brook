@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Attachments over the api (attachments spec §9): local files, streaming cap, atomic
 commit, attach rules, authorisation, download headers, limits, sweep, delete."""
 

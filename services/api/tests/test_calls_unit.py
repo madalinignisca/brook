@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Call commands without an SFU: registration, validation, authorization.
 
 The media path is covered end to end by e2e/call_e2e.py (real Janus + Chrome).

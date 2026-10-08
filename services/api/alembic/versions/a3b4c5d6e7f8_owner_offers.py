@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """owner_offers: pending offers to make a member a channel owner
 
 Revision ID: a3b4c5d6e7f8

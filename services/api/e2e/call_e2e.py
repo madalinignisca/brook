@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """End-to-end call test: real stack (api + Janus) and two real Chrome participants.
 
 What it proves (the question "what would be true if calls were broken?"):

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Attachment bytes on the local filesystem (attachments spec §2, owner decision).
 
 Layout: ``<files_dir>/<aa>/<file_id>``, where ``aa`` is the id's first two hex digits,

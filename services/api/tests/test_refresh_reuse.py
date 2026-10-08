@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Refresh-token reuse: families and the crash grace (routers/auth.py `_rotate`).
 
 A rotated token presented again is either a client that crashed after our rotation

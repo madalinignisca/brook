@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """sync: seq columns, counter, tombstones
 
 Revision ID: c9d0e1f2a3b4

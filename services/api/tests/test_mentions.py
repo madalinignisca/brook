@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Mentions that survive offline (owner request, 2026-09-26).
 
 Mentions are resolved once, at send, and stored with the message, so history and /sync

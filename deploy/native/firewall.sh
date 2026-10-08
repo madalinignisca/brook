@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Enable firewalld on the Brook host with only the ports Brook and SSH need.
 #
 # firewalld is OFF on the AlmaLinux 10 OCI images (the OCI security list is the

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Channels, DMs, memberships, and messages.
 
 Sending is REST-only (`POST /channels/{id}/messages`) — the single send path; the

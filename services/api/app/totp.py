@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """TOTP (RFC 6238) and recovery codes: the pure parts, no I/O.
 
 In-house on purpose (spec 2026-09-25-totp-server-design.md §4): TOTP is ~20 lines

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """``GET /sync``: what changed since a cursor (sync spec 2026-09-25 §3).
 
 The cursor is the last change sequence the client has (opaque to it). Every row

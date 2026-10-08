@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Deployment-specific values arrive as env vars and become Janus CLI flags, so the
 # .jcfg files stay static. Janus config files cannot read the environment.
 set -eu

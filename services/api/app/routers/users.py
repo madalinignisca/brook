@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Admin user management: list users, reset another user's password.
 
 Account creation stays at ``POST /auth/register`` (admin-only after bootstrap).

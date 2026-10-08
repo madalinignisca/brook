@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """In-process rate limiting and failure escalation for the auth endpoints.
 
 One uvicorn worker on one node, so no Redis: everything lives in bounded LRU maps

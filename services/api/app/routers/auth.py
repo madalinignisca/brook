@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Local authentication: bootstrap registration, login, refresh, me.
 
 OIDC and LDAP (docs/AUTH.md) arrive in Phase 0b; this is the local-account path.

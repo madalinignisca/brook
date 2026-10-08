@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Test fixtures: an isolated DB and an async HTTP client per test.
 
 Defaults to a per-test SQLite file. Set ``BROOK_TEST_DATABASE_URL`` (e.g. a
