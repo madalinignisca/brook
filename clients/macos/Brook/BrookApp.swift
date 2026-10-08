@@ -35,7 +35,7 @@ struct BrookApp: App {
         let others = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
             .filter { $0.processIdentifier != getpid() }
         if others.isEmpty { DropImport.sweep(olderThan: 0) }
-        let store = SessionStore(persistence: .live())
+        let store = SessionStore(persistence: .live(), makeFeed: SessionStore.macFeed)
         _store = State(initialValue: store)
         let form = LoginForm(store: store)
         _form = State(initialValue: form)
@@ -58,7 +58,7 @@ struct BrookApp: App {
                     if let client = store.client {
                         SignedInView(
                             user: user, client: client, calls: calls, signOut: { store.signOut() },
-                            recoveryCodesLeft: store.recoveryCodesLeft, feed: store.feed,
+                            recoveryCodesLeft: store.recoveryCodesLeft, feed: store.feed as? CacheFeed,
                             offersRemoval: store.offersRemoval,
                             signOutChoosing: { store.signOut(removeData: $0) })
                     }

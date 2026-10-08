@@ -6,6 +6,17 @@ import Foundation
 import Observation
 import Synchronization
 
+/// What `SessionStore` needs from the signed-in client's local-data notices: start listening
+/// before local data is enabled (opening the stores can report a loss), stop at sign-out,
+/// and look for a loss once enabled. The Mac's `CacheFeed` is the one implementation; the
+/// protocol keeps this shared file from naming it (and its UI types).
+@MainActor
+protocol LocalDataFeed: AnyObject {
+    func start()
+    func stop()
+    func checkLost()
+}
+
 /// The app's single owner of the Rust core: sign in, sign out, and follow core when it loses
 /// the session by itself (a remote sign-out: a password change elsewhere, an admin reset).
 ///
@@ -35,7 +46,7 @@ final class SessionStore {
         static let notJustAnAddress = "Enter just the server address, like https://chat.example.com"
         static let wrongCredentials = "Wrong handle or password."
         static let unreachable = "Couldn't reach the server. Check the address."
-        static let unreachableLAN = "Couldn't reach the server. If macOS asked to allow local network access, allow it and try again."
+        static let unreachableLAN = "Couldn't reach the server. If \(ThisDevice.system) asked to allow local network access, allow it and try again."
         static let insecure = "The server address must start with https://"
         static let unexpected = "The server sent an unexpected response."
         static let signedOut = "You're signed out. Sign in again."
@@ -46,13 +57,16 @@ final class SessionStore {
         static let recoveryFormat = "Enter one of your recovery codes."
         static let keychainUnavailable = "Your saved sign-in couldn't be read (the keychain may be locked). Sign in again."
         static let restoreOffline = "Couldn't reach the server to resume your session. It's kept for next time; you can also sign in again."
-        static let signOutIncomplete = "This Mac couldn't forget your saved sign-in, so Brook may sign you in again at the next launch. Sign in and out again to retry."
+        static let signOutIncomplete = "This \(ThisDevice.name) couldn't forget your saved sign-in, so Brook may sign you in again at the next launch. Sign in and out again to retry."
         static let secondInstance = "Brook is already open. This window won't remember your sign-in."
-        static let removalIncomplete = "Brook couldn't remove all of this Mac's data. Sign in and out again to retry."
-        static let removalAndSignOutIncomplete = "Brook couldn't remove all of this Mac's data, and may sign you in again at the next launch. Sign in and out again to retry."
+        static let removalIncomplete = "Brook couldn't remove all of this \(ThisDevice.name)'s data. Sign in and out again to retry."
+        static let removalAndSignOutIncomplete = "Brook couldn't remove all of this \(ThisDevice.name)'s data, and may sign you in again at the next launch. Sign in and out again to retry."
     }
 
     typealias ClientFactory = (_ server: String, _ allowInsecureHttp: Bool) throws -> FfiBrookClient
+    /// Makes the signed-in client's local-data notices. Each app decides whether it has any
+    /// (the Mac passes `macFeed`; an app without local data passes `nil` to `init`).
+    typealias FeedFactory = @MainActor (FfiBrookClient, UserDefaults) -> any LocalDataFeed
 
     private(set) var phase: Phase = .signedOut(error: nil)
     let settings: Settings
@@ -71,17 +85,23 @@ final class SessionStore {
     @ObservationIgnored private var delivered: DeliveryCount?
 
     private let persistence: SessionPersistence
+    /// Nil: this app has no local data, whatever `persistence` says.
+    private let makeFeed: FeedFactory?
     /// The launch restore runs at most once per process.
     @ObservationIgnored private var restoreStarted = false
 
     init(
         settings: Settings = Settings(), persistence: SessionPersistence = .off,
+        // Required, no default: a caller must say `macFeed` or `nil` out loud, so one that
+        // forgets is a compile error rather than a silent loss of local data.
+        makeFeed: FeedFactory?,
         makeClient: @escaping ClientFactory = SessionStore.liveClient,
         localDataWait: Duration = .seconds(30)
     ) {
         self.localDataWait = localDataWait
         self.settings = settings
         self.persistence = persistence
+        self.makeFeed = makeFeed
         self.makeClient = makeClient
         switch persistence {
         // Start on "Signing in…" rather than flash the form the restore may replace.
@@ -190,7 +210,7 @@ final class SessionStore {
 
     private(set) var localData: LocalData = .off
     /// The signed-in client's cache notices (nil without local data).
-    private(set) var feed: CacheFeed?
+    private(set) var feed: (any LocalDataFeed)?
     /// The last sign-out (it may still be erasing) and the last enable (it may still be
     /// opening stores): the next sign-in's enable waits for both, since the stores directory
     /// has no lock.
@@ -247,12 +267,18 @@ final class SessionStore {
         signOutWarning = nil // the new sign-in replaced the stored copy
         settings.saveLastGoodServer(address)
         phase = .signedIn(user)
-        if case let .on(slot, dataDir) = persistence { startLocalData(client, slot: slot, dataDir: dataDir) }
+        // Local data needs both: a place to keep it (persistence is on) and an app that has
+        // any (a feed factory). Without the factory it stays off, as on a platform with none.
+        if case let .on(slot, dataDir) = persistence, let makeFeed {
+            startLocalData(client, slot: slot, dataDir: dataDir, makeFeed: makeFeed)
+        }
     }
 
     /// Local data for this signed-in client: after the previous sign-out and enable (bounded),
     /// subscribe, switch on, then read losses. Dropped if the attempt moved on meanwhile.
-    private func startLocalData(_ client: FfiBrookClient, slot: FfiKeySlot, dataDir: String) {
+    private func startLocalData(
+        _ client: FfiBrookClient, slot: FfiKeySlot, dataDir: String, makeFeed: @escaping FeedFactory
+    ) {
         let mine = attempt
         let previous = Array(unsettled.values)
         let limit = localDataWait
@@ -266,7 +292,7 @@ final class SessionStore {
                 self.localData = .off
                 return
             }
-            let feed = CacheFeed(client: client, defaults: settings.defaults)
+            let feed = makeFeed(client, settings.defaults)
             feed.start() // before enabling: opening the stores can report a loss
             self.feed = feed
             let ok = await client.enableLocalData(slot: slot, dataDir: dataDir)

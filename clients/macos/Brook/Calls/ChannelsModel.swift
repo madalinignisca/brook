@@ -5,6 +5,16 @@ import BrookCore
 import Foundation
 import Observation
 
+/// What `ChannelsModel` needs from the open conversation: the server events that belong to it,
+/// and whether a read receipt is still owed. A protocol rather than `TimelineModel` itself so
+/// this file doesn't have to pull in the conversation's UI code (which is AppKit-bound on the
+/// Mac); `TimelineModel` adopts it where it is declared.
+@MainActor
+protocol OpenTimeline: AnyObject {
+    func apply(_ event: FfiServerEvent)
+    var readOwed: Bool { get }
+}
+
 /// The signed-in home: channels, which have a live call, and whether joining is possible yet.
 /// The list comes from the network, or from this device's cache when the network fails
 /// (offline mid-session, #62), with the cache's unread counts either way.
@@ -18,7 +28,7 @@ final class ChannelsModel {
     private(set) var liveCalls: [String: UInt32] = [:]
     private(set) var error: String?
     /// The open conversation, which takes the message events.
-    var timeline: TimelineModel?
+    var timeline: (any OpenTimeline)?
     /// The open channel: its unread badge stays 0 whatever the cache counts.
     var openChannel: String? {
         didSet {

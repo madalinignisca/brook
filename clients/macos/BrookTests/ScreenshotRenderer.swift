@@ -47,7 +47,7 @@ final class ScreenshotRenderer: XCTestCase {
         func form(insecure: Bool = false, result: Result<LoginResult, LoginError> = .failure(.UnexpectedResponse)) -> LoginForm {
             let env = insecure ? ["BROOK_ALLOW_INSECURE_HTTP": "1"] : [:]
             let recorder = FactoryRecorder { FakeClient(result: result) }
-            return LoginForm(store: SessionStore(settings: Settings(defaults: defaults, environment: env), makeClient: recorder.factory))
+            return LoginForm(store: SessionStore(settings: Settings(defaults: defaults, environment: env), makeFeed: nil, makeClient: recorder.factory))
         }
 
         for dark in [false, true] {

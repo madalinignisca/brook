@@ -30,7 +30,7 @@ final class RestoreTests: XCTestCase {
         if let lastServer { defaults.set(lastServer, forKey: Settings.lastServerKey) }
         let recorder = FactoryRecorder { fake }
         let settings = Settings(defaults: defaults, environment: [:])
-        return (SessionStore(settings: settings, persistence: persistence, makeClient: recorder.factory), recorder)
+        return (SessionStore(settings: settings, persistence: persistence, makeFeed: nil, makeClient: recorder.factory), recorder)
     }
 
     private func restored(
