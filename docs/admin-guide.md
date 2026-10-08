@@ -38,7 +38,7 @@ server's LAN address (e.g. `BROOK_HTTP_BIND=192.168.1.10`) and run `make up` aga
 The port is `BROOK_HTTP_PORT`. Verify from a client machine:
 
 ```bash
-curl http://<BROOK_HTTP_BIND>:8080/health      # {"status":"ok","version":"..."}
+curl http://<BROOK_HTTP_BIND>:8080/health      # {"status":"ok","version":"...","source_url":"..."}
 ```
 
 > **Don't set `BROOK_HTTP_BIND=0.0.0.0`.** Docker Compose then publishes the port on
@@ -138,12 +138,48 @@ database password after first run — it must match the existing `pgdata` volume
 (if you must rotate it, `make reset` for a clean slate, or change it in both
 places).
 
+## Source link (AGPL §13)
+
+Brook is licensed under AGPL-3.0. Section 13 says that if you run a **modified** version as a
+network service, you must offer its users the source of that version. Each server publishes
+where its source is in `GET /health`, and the clients show that link in their About window.
+
+**The setting is `BROOK_SOURCE_URL`.** Its default is the upstream repository,
+`https://github.com/madalinignisca/brook`. Unset or empty means the default.
+
+- Running an **unmodified** Brook: leave it unset.
+- Running a **modified** Brook: set it to where your modified source is (a repository, or a
+  published archive of that version). Brook cannot check that the link is real or that it
+  matches the code you run. Keeping it correct is your duty. Keep it pointing at the source of
+  the version your users are running, including your changes.
+
+The value must be an absolute `http` or `https` URL with a host, no user name or password, no
+spaces or control characters, and at most 2048 bytes. Any other value stops the api from
+starting. The error names the setting but does not repeat the value, so check what you typed.
+
+How to set it:
+
+- **Compose** (`deploy/`): set `BROOK_SOURCE_URL=<url>` in `.env`, then `make up`.
+- **Native** (`/etc/brook/api.env`): set `BROOK_SOURCE_URL=<url>` in the file (the installer
+  writes it commented out), then run `systemctl restart brook-api`. An existing `api.env` is
+  not changed when you reinstall, so add the line yourself.
+
+An existing install needs no change: after the upgrade it serves the upstream link.
+
+How to check:
+
+1. `curl <server>/health` (for example `http://<BROOK_HTTP_BIND>:8080/health`). Look at
+   `source_url`.
+2. Open About in the macOS client once. A value the server accepts but the client refuses
+   shows "Couldn't fetch this server's source link." Fix the value and check again.
+
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
 | `api` exits immediately, logs mention the signing key | `BROOK_JWT_SIGNING_KEY` is weak/default. `make init` sets a strong one; ensure `.env` has a ≥32-char value. |
 | `api` can't connect to the database after editing `.env` | The DB password in `.env` no longer matches the `pgdata` volume. Restore the old password, or `make reset` to rebuild. |
+| `api` exits at start, logs say `BROOK_SOURCE_URL must be an absolute http(s) URL…` | The value is not a valid link (see [Source link](#source-link-agpl-13)). Fix it, or unset it to use the upstream default. |
 | Port 8080 already in use | Set `BROOK_HTTP_PORT` in `.env` to a free port, then `make up`. |
 | Client can't reach the server | `BROOK_HTTP_BIND` must be the server's LAN IP (the default `127.0.0.1` is local-only), and the host firewall must allow the port. |
 

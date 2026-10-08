@@ -91,6 +91,24 @@ data (no offline cache, no sending or opening files, no Keep available offline).
   defaults write dev.brook.Brook AllowInsecureHTTP -bool YES
   ```
 
+## About Brook (macOS)
+
+Choose **Brook → About Brook** from the menu bar. The window shows the app's version, build,
+copyright and license, and then about the server you use:
+
+- **Server version** and **Server source**: the version of the connected server, and a link to
+  its source code. The link opens in your browser. Use it to find the code behind the server,
+  including any changes its operator made.
+
+The server is the one you are signed in to. If you are signed out, it is the address typed on
+the sign-in screen.
+
+- **No server yet.** You have not entered a server address. Brook asks no server.
+- **Fetching…** Brook is asking the server.
+- **Couldn't fetch this server's source link.** The server could not be reached, or it did not
+  give a valid link. On a LAN server, check the Local Network permission (see above), then open
+  About again.
+
 ## Signing in
 
 1. Launch Brook: you'll see the **login** screen.

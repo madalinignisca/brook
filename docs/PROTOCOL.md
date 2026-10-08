@@ -22,7 +22,6 @@
 | `GET  /users` · `?handle=` | **admin**: all users by handle · exact handle (404 `not_found` if none) |
 | `POST /users/{id}/password` | **admin**: set a member's password `{admin_password, new_password}` → 204; see §1.1 |
 | `GET  /sync?since=<cursor>&limit=` | what changed since the cursor, for the offline cache: `{channels, removed_channels, memberships, left_members, users, messages, next, more}`. `since=0` is **state only** (no messages; page history with `before=`). Every row and every live event carries `seq`: keep the highest per row. `410 sync.reset` means wipe the cache and sync from 0. The cursor is opaque. A `sync.hint {seq}` WebSocket event means "run /sync now". It is sent only for changes with no live event of their own: to every member when someone joins or leaves a channel, to you when your read position moved on another of your devices, and to everyone sharing a channel with someone whose profile changed. Messages, reactions and channel edits have their own events and send no hint. The hint's `seq` lets a client drop stale ones: skip a hint whose `seq` is at or below the local cursor, otherwise run `/sync` (debounced, ~500 ms). Design: `docs/superpowers/specs/2026-09-25-sync-and-idempotent-send-design.md` |
-| `GET  /health` | liveness/readiness (also on `sfu`; unauthenticated) |
 | `GET  /auth/me` · `PATCH /auth/me` | current user (`MeOut`: handle, `display_name`, `status_text`, TOTP state) · update your profile: `{display_name?, status_text?}` → `MeOut`. Omitted fields stay; `display_name` 1–64 and `status_text` 0–100 characters after trimming (`""` clears the status); control, invisible and text-direction characters are refused (emoji joiners and tag characters stay), and a name must contain something visible: `422 profile.invalid` (the same rule applies at registration). Display names aren't unique: show the handle next to them. The handle (sign-in name) can't change. Others see it through `/sync` (`users[].display_name`, `users[].status_text`) and a `sync.hint` |
 | `GET  /channels` | channels/DMs the user belongs to |
 | `POST /channels` | create channel |
@@ -43,6 +42,19 @@
 | `GET /bots/{id}` · `PATCH /bots/{id}` · `DELETE /bots/{id}` | get / update (url, regen secret) / delete |
 | `POST /channels/{id}/bots` · `DELETE /channels/{id}/bots/{bot}` | add / remove bot from channel |
 | `POST /bots/{id}/webhook` | **inbound** webhook: external posts as bot (HMAC-signed) |
+
+`GET /health` is not under `/api/v1`. It is served at the root, `https://<host>/health`, and
+needs no token: a token sent with it is ignored. It answers:
+
+```json
+{"status": "ok", "version": "0.0.0", "source_url": "https://github.com/madalinignisca/brook"}
+```
+
+All three are strings. `source_url` is where this server's source is (AGPL-3.0 section 13): the
+operator's `BROOK_SOURCE_URL`, or the upstream repository. It is an absolute http or https URL
+with a host and no user or password part, at most 2048 bytes. Clients show and open only the
+form they parse from it, and treat any other answer as a failed fetch. A client reads at most
+64 KiB of the answer. Only the api serves `/health`; the SFU (Janus) does not.
 
 ### 1.0 Refresh tokens
 
