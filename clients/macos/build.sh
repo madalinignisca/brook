@@ -25,7 +25,7 @@ command -v xcodegen >/dev/null || { echo "xcodegen not found (brew install xcode
 # The install path is destructive: its tests (fast, no build) run before anything is built.
 [[ "${1:-}" == "test" ]] && { "$HERE/test-install.sh" || exit 1; }
 # Every person is shown through PersonName (Show usernames, #238): cheap, so before the build too.
-[[ "${1:-}" == "test" ]] && { "$HERE/check-person-names.sh" || exit 1; }
+[[ "${1:-}" == "test" ]] && { "$HERE/check-person-names.sh" && "$HERE/check-person-names.sh" "$ROOT/clients/apple-shared/Brook" || exit 1; }
 
 args=(build)
 config=Debug
