@@ -69,8 +69,12 @@ final class LoginIntegrationTests: XCTestCase {
 
         XCTAssertEqual(session.user.handle, cfg.handle)
 
-        // The client's own access token works: `me()` goes out with it. Tokens do not cross
-        // the FFI, so this proves it without exposing it.
+        // This does NOT prove the access token is good: core sends `me()` with
+        // `OnExpired::SingleFlight`, so a bad access token would be hidden by a silent refresh.
+        // What the call shows is that the session is usable and returns the right user. The
+        // access token itself is checked where it can be seen: login's `session_for` calls /me
+        // with it, and core's `login_success_resolves_user_and_state` (core/src/client.rs)
+        // asserts both tokens. Tokens do not cross the FFI, so this layer cannot do it.
         let me = try await client.me()
         XCTAssertEqual(me.user.handle, cfg.handle)
 

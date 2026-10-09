@@ -167,13 +167,16 @@ final class TotpIntegrationTests: XCTestCase {
         // slot that is already set), because A's refresh token no longer crosses the FFI.
         let a = try client(cfg)
         let aSlot = MemorySlot()
-        try aSlot.attach(to: a)
+        try aSlot.attach(to: a, in: self)
         guard case .loggedIn = try await paced({ try await a.login(handle: handle, password: self.password) })
         else { return XCTFail("password login") }
         let (_, bBody) = try await send(cfg, "POST", "auth/login", json: ["handle": handle, "password": password])
         let b = Pair(access: bBody["access_token"] as! String, refresh: bBody["refresh_token"] as! String)
 
         let aOldRefresh = try aSlot.storedRefreshToken()
+        // B's refresh token comes from the raw HTTP login above, so it is readable. If the two
+        // were equal, the "both old refresh tokens are dead" loop below would check one token twice.
+        XCTAssertNotEqual(aOldRefresh, b.refresh, "A and B must hold different sessions")
 
         // 1. Enrol and activate on A: both devices' old tokens are cut off; A's new pair works.
         let enrollment = try await paced { try await a.totpEnroll(password: self.password) }
@@ -181,8 +184,9 @@ final class TotpIntegrationTests: XCTestCase {
         var used = Self.step()
         let codes = try await paced { try await a.totpActivate(code: Self.code(secret, step: used)) }
         XCTAssertEqual(codes.count, 10)
-        // A's old access token is not probed: it never leaves core now. The server's own tests
-        // cover that activation revokes other sessions' access tokens.
+        // A's OWN old access token is not probed: it never leaves core now. The server test
+        // `test_activation_signs_out_every_old_session_including_the_callers`
+        // (services/api/tests/test_totp_flow.py) covers it. B's access token is probed below.
         let (bMe, _) = try await send(cfg, "GET", "auth/me", bearer: b.access)
         XCTAssertEqual(bMe, 401, "B access token survived activation")
         for (who, refresh) in [("B", b.refresh), ("A's old", aOldRefresh)] {

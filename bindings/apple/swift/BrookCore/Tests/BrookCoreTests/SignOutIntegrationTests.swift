@@ -22,7 +22,7 @@ final class SignOutIntegrationTests: XCTestCase {
             baseUrl: server, allowInsecureHttp: env["BROOK_TEST_ALLOW_INSECURE_HTTP"] == "1")
         // The refresh token no longer crosses the FFI: read it from the slot core stores it in.
         let slot = MemorySlot()
-        try slot.attach(to: client)
+        try slot.attach(to: client, in: self)
         // Credential checks share the server's per-IP bucket with the other suites: wait out
         // a 429 as the server asks, never count it as a result.
         var result: LoginResult?

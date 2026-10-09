@@ -14,11 +14,13 @@ import XCTest
 /// back from the stored JSON, which is what the Keychain slot would hold in the app.
 extension MemorySlot {
     /// Give `client` this slot. Call it BEFORE `login`: core writes the session only through
-    /// a slot that is already set.
-    func attach(to client: FfiBrookClient) throws {
+    /// a slot that is already set. The data directory is a fresh temp directory; `test`
+    /// removes it when the test ends (pass or fail), so runs do not litter the temp folder.
+    func attach(to client: FfiBrookClient, in test: XCTestCase) throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("brook-itest-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        test.addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         client.enablePersistence(slot: self, dataDir: dir.path)
     }
 
@@ -32,6 +34,9 @@ extension MemorySlot {
         let data = try XCTUnwrap(sessions.values.first, file: file, line: line)
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any],
                                  file: file, line: line)
-        return try XCTUnwrap(json["refresh_token"] as? String, file: file, line: line)
+        let token = try XCTUnwrap(json["refresh_token"] as? String, file: file, line: line)
+        // An empty token would make later "this token is dead" checks pass for the wrong reason.
+        XCTAssertFalse(token.isEmpty, "stored refresh token is empty", file: file, line: line)
+        return token
     }
 }
