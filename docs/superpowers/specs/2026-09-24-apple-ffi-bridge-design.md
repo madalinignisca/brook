@@ -33,8 +33,9 @@ macOS and the iOS simulator?** Everything later (Keychain, UI, chat) rests on th
 3. `bindings/apple/itest.sh` exits 0, which requires **all** of the following, run against the shared
    test server (§3.4) — on macOS (`swift test`). (iOS slices and the simulator run are deferred: macOS ships first.)
    - `login` with valid credentials returns `LoginResult.loggedIn(session)` whose `user.handle`
-     matches, whose `accessToken` and `refreshToken` are non-empty and different, and whose
-     `accessToken` **works against the server** (`GET /api/v1/auth/me` from Swift → 200, same handle).
+     matches. The session carries only the user; tokens are kept in core through the `KeySlot`
+     the client provides. Proof: `session.user` can be read, and the client can call `me()` which
+     uses the stored token internally.
    - The listener's **final** observed state is `loggedIn(user)`, and the observed sequence never
      regresses (no `authenticating` after `loggedIn` within one login).
    - A wrong password yields `LoginError.Api(code: "auth.invalid_credentials", …)` and a final
@@ -97,13 +98,13 @@ UDL-free, proc-macro UniFFI (`uniffi::setup_scaffolding!()`), pinned to an exact
   `allow_insecure_http = true`, `http` to **any** host is allowed — which sends the password and
   receives tokens in cleartext. That flag is dev-only; the Step 3 UI must gate it behind an
   explicit, labelled opt-in. Tested with both flag values at the FFI boundary.
-- **Tokens across the boundary:** `FfiSession` carries `access_token`/`refresh_token` because
-  Step 2 must store them in the Keychain. On the Swift side, `FfiSession` **and** `LoginResult`
-  get (in a hand-written file, not the generated one) a redacting `CustomStringConvertible`,
-  `CustomDebugStringConvertible` **and `CustomReflectable`** — the last is what `dump()` and the
-  debugger's child view use; description conformances alone do not stop `dump()` printing tokens.
-  Sentinel test: `print`, `debugPrint`, `dump`, `String(reflecting:)` of both types never contain
-  the token strings.
+- **Session across the boundary:** `FfiSession` carries only `user`. Core keeps the session
+  itself through the `KeySlot` the client provides, so no client needs the raw tokens. This also
+  avoids Kotlin's generated `toString()` printing every field, which cannot be redacted. On the
+  Swift side, `LoginResult` gets (in a hand-written file, not the generated one) a redacting
+  `CustomStringConvertible` and `CustomDebugStringConvertible` to keep the challenge out of
+  descriptions. Sentinel test: `print`, `debugPrint`, `String(reflecting:)` of `LoginResult` never
+  contain the challenge.
 
 ### 3.2 Linux CI stays green
 
@@ -217,3 +218,8 @@ fail them. Spec gate closed.
 **Scope change (owner, after approval):** macOS first. iOS slices and the simulator integration run
 are deferred to the iOS client; arm64 Apple targets only. The Linux CI gate is not run locally
 (Apple-only builds on this machine); GitHub Actions is the Linux check.
+
+**Changed (PR 2, #273, 2026-10-09):** `FfiSession` carries only `user`, not tokens. Core keeps the
+session through `KeySlot`; no client needs raw tokens, and Kotlin's generated `toString()` cannot
+be redacted. Updated §2.2 requirements and §3.1 design; §3.1 redaction now covers `LoginResult`
+only.

@@ -456,7 +456,7 @@ commit of both, and the PR is tested as a whole there.
     from it before activation. Drop only
     the "A's old **access** token" probe: A's access token is never visible now. Step 7 moves that
     exact check into the server's own tests, so no coverage is lost. Count stays 1.
-  - `clients/macos/BrookTests/FakeClient.swift:245`: `FfiSession(user: alice)`.
+  - `clients/apple-shared/BrookTests/FakeClient.swift:245`: `FfiSession(user: alice)`.
 - Test first: the build itself. Any reader of the removed fields, in Rust or Swift, fails to
   compile.
 - Run, on the Mac, on the combined tree:
