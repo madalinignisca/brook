@@ -526,8 +526,8 @@ final class ComposerModel {
         }
     }
 
-    /// How a dropped file is copied out of its provider (a test passes its own). The Mac sets
-    /// `ComposerModel.macImporter`, which also writes out pasted images; iOS has no drop or paste
+    /// How a dropped file is copied out of its provider (a test passes its own). The Mac app sets
+    /// its own importer (pasted images need AppKit); iOS has no drop or paste
     /// screen yet, so this plain default is never called there. It cannot be the Mac's closure:
     /// that needs AppKit, which shared code must not import.
     var importer: (NSItemProvider) async -> DropImport.Outcome = { await DropImport.copy($0) }
@@ -654,7 +654,7 @@ final class ComposerModel {
             do {
                 _ = try await cache.sendQueued(channelId: channelId, body: body, replyToId: reply?.id,
                                                clientId: id)
-                filesUnavailable = false // the queue works: this Mac's storage is there now
+                filesUnavailable = false // the queue works: this device's storage is there now
                 draft = nil
                 error = nil
                 await pending?.reload()
