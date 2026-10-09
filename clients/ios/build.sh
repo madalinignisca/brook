@@ -133,6 +133,10 @@ if [[ "$mode" == "test" ]]; then
     ScrollFollowTests/testGrowthAtTheVeryBottomWhileIdlePinsToTheBottom
     ScrollFollowTests/testGrowthDoesNotPinWhenAboveTheBottomScrollingOrNotGrowing
     ScrollFollowTests/testMovedWhenFurtherThanTheToleranceFromTheAsk
+    ComposerModelTests/testOnlySpacesCannotBeSent
+    ComposerModelTests/testASignedOutSendSaysSo
+    ConversationSessionTests/testASentMessageShowsOnceWhenItsEchoArrives
+    ConversationSessionTests/testArchivingTheChannelMakesItArchived
   )
 
   # 1. All three slices are in the xcframework (a Mac build leaves only the macOS one).

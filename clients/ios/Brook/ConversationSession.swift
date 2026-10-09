@@ -15,6 +15,9 @@ final class ConversationSession {
     let channelId: String
     let channels: ChannelsModel
     let timeline: TimelineModel
+    /// The message box's model. Shared with the Mac; there is no outbox on iOS, so its send goes
+    /// straight to the server with the draft's `client_id`.
+    let composer: ComposerModel
     /// This user's id, for the follow rule ("mine").
     let me: String
     /// The title as it was when the conversation opened: after a removal the row is gone, but the
@@ -36,6 +39,12 @@ final class ConversationSession {
             // iOS suspends the socket in the background and keeps no cache: a re-read of the newest
             // page is the only way to show what was sent meanwhile (see the flag).
             rereadOnReady: true)
+        composer = ComposerModel(channelId: channelId, client: client, onMessage: { [weak timeline] in
+            // The sent message shows from the server's answer; the live echo of it merges into
+            // the same row (`merge` is by id). Weak, as the Mac does: the composer must not keep
+            // the timeline alive.
+            timeline?.merge([$0])
+        })
     }
 
     func start() async {
@@ -85,6 +94,11 @@ final class ConversationSession {
     var title: String {
         channels.channels.first { $0.id == channelId }.map(channels.title) ?? openedTitle
     }
+
+    /// The channel is archived: nothing can be written to it, so the view shows a note instead of
+    /// the box. Read from the row each time, not once at init: `channel.update` changes the row
+    /// while the conversation is open and the note must appear (or go) with it.
+    var archived: Bool { channels.channels.first { $0.id == channelId }?.archived ?? false }
 
     /// The row left the list: the channel was deleted, or this user left or was removed. Not
     /// `channels.closed`: a live `channel.delete` sets that, but a list re-read after a reconnect

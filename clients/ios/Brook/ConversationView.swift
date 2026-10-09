@@ -36,8 +36,8 @@ struct ConversationHost: View {
     }
 }
 
-/// One conversation, read-only for now: the messages oldest at the top, older pages loading as you
-/// scroll up, new ones arriving live. The view forwards to `ConversationSession`.
+/// One conversation: the messages oldest at the top, older pages loading as you scroll up, new
+/// ones arriving live, and the message box at the bottom. The view forwards to `ConversationSession`.
 struct ConversationView: View {
     let session: ConversationSession
     @Environment(\.scenePhase) private var scenePhase
@@ -179,12 +179,19 @@ struct ConversationView: View {
                 }
             }
             .animation(.easeInOut(duration: 0.15), value: away)
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if let error = timeline.visibleError {
-                Text(error).foregroundStyle(.red).font(.caption)
-                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal).padding(.vertical, 4)
-                    .background(.bar)
+            // Scrolling the messages dismisses the keyboard, as in Messages.
+            .scrollDismissesKeyboard(.interactively)
+            // An inset, not a stacked view: the system lifts it above the keyboard and shrinks the
+            // scroll view's area by its height, so the box never covers the newest message.
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(spacing: 0) {
+                    if let error = timeline.visibleError {
+                        Text(error).foregroundStyle(.red).font(.caption)
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal).padding(.vertical, 4)
+                    }
+                    ComposerBar(composer: session.composer, archived: session.archived, onFocus: { focused(proxy) })
+                }
+                .background(.bar)
             }
         }
         .navigationTitle(session.title)
@@ -198,9 +205,27 @@ struct ConversationView: View {
         // A plain call, not inside a `Task`: the session takes its gap anchor synchronously, so
         // nothing can be merged between the scene change and the anchor.
         .onChange(of: scenePhase) { old, new in session.sceneChanged(from: old, to: new) }
+        // Archived: nothing writes. Here and not in `ComposerBar`, which is not there to carry a
+        // modifier while the note is shown (see `ConversationHost` for why modifiers stay on views
+        // that always exist).
+        .onChange(of: session.archived, initial: true) { _, archived in session.composer.readOnly = archived }
         // The channel left the list (deleted, or this user was removed): back to the list.
         .onChange(of: session.isRemoved, initial: true) { _, removed in
             if removed { dismiss() }
+        }
+    }
+
+    /// The box got the focus and the keyboard is on its way. If the view was at the bottom, keep the
+    /// newest message in view above the keyboard. `away` is read now, before the keyboard shrinks
+    /// the scroll area: the smaller area itself makes the view count as scrolled away, and a reader
+    /// who was up in the history must stay there.
+    private func focused(_ proxy: ScrollViewProxy) {
+        guard !away else { return }
+        Task {
+            // The keyboard takes about a quarter of a second to rise; a scroll before it ends
+            // would target the old, taller area.
+            try? await Task.sleep(for: .milliseconds(300))
+            restore(Self.bottomId, proxy, anchor: .bottom)
         }
     }
 
@@ -267,6 +292,51 @@ struct ConversationView: View {
                     .frame(maxWidth: .infinity)
             }
         }
+    }
+}
+
+/// The message box: a text field that grows to six lines and a Send button, or, for an archived
+/// channel, the note that replaces them. Pasting plain text is the field's own; copying a message
+/// is the long-press Copy on its text (`MessageRowView`).
+private struct ComposerBar: View {
+    @Bindable var composer: ComposerModel
+    let archived: Bool
+    /// Called when the field gains the focus (the view scrolls to the newest message).
+    let onFocus: () -> Void
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        // The outer VStack always exists, so it carries the modifier; the field it holds is gone
+        // while the archived note shows (see `ConversationHost` for why this matters, #335).
+        VStack(spacing: 0) {
+            if archived {
+                Text("This channel is archived. An owner or admin can unarchive it.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity).padding(10)
+            } else {
+                if let error = composer.error {
+                    Text(error).foregroundStyle(.red).font(.caption)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal).padding(.vertical, 4)
+                }
+                HStack(alignment: .bottom, spacing: 8) {
+                    // No `.onSubmit`: with a vertical axis Return adds a new line, as in Messages
+                    // (spec section 4, Sending). Send is the button.
+                    TextField("Message", text: $composer.text, axis: .vertical)
+                        .lineLimit(1...6)
+                        .focused($focused)
+                        .textFieldStyle(.roundedBorder)
+                    Button {
+                        Task { await composer.send() }
+                    } label: {
+                        Image(systemName: "arrow.up.circle.fill").font(.title)
+                    }
+                    .disabled(!composer.canSend)
+                    .accessibilityLabel("Send")
+                }
+                .padding(.horizontal).padding(.vertical, 8)
+            }
+        }
+        .onChange(of: focused) { _, now in if now { onFocus() } }
     }
 }
 
