@@ -31,10 +31,12 @@ val alice = FfiUser(id = "u1", handle = "alice", displayName = "Alice", globalRo
 val aliceSession = FfiSession(user = alice)
 
 class FakeSubscription : Subscription(NoHandle) {
-    var cancelled = false
+    var cancels = 0
+        private set
+    val cancelled get() = cancels > 0
 
     override fun cancel() {
-        cancelled = true
+        cancels++
     }
 }
 
@@ -65,6 +67,9 @@ class FakeClient(
 
     private val gate = CompletableDeferred<Unit>().apply { if (!gated) complete(Unit) }
     private var listener: AuthStateListener? = null
+
+    /** The auth subscription the model made, to check it is cancelled when the attempt ends. */
+    var authSubscription: FakeSubscription? = null
     var logouts = 0
         private set
     var closes = 0
@@ -78,7 +83,9 @@ class FakeClient(
     var totpResult: Result<UInt?> = Result.success(null)
     var restoreOutcome: FfiRestoreOutcome = FfiRestoreOutcome.NotSignedIn
     var signOutIsComplete = true
+    var persistenceFails = false
     private var logoutGate: CompletableDeferred<Unit>? = null
+    private var totpGate: CompletableDeferred<Unit>? = null
 
     /** What core's state is right now (`authState()`), independent of what was delivered. */
     var coreState: FfiAuthState = FfiAuthState.LoggedIn(alice)
@@ -97,7 +104,7 @@ class FakeClient(
     /** Keeps the listener so a test can deliver core's auth states in any order. */
     override fun subscribe(listener: AuthStateListener): Subscription {
         this.listener = listener
-        return FakeSubscription()
+        return FakeSubscription().also { authSubscription = it }
     }
 
     /** Deliver an auth state as core would (on a Rust thread in production). */
@@ -109,6 +116,7 @@ class FakeClient(
 
     override suspend fun completeTotp(challenge: FfiTotpChallenge, code: String): UInt? {
         totpCalls += "code:$code"
+        totpGate?.await()
         if (totpResult.isSuccess) coreState = FfiAuthState.LoggedIn(alice)
         return totpResult.getOrThrow()
     }
@@ -134,12 +142,22 @@ class FakeClient(
         logoutGate = CompletableDeferred()
     }
 
+    /** `completeTotp` suspends until [releaseTotp] (a code check still in flight). */
+    fun gateTotp() {
+        totpGate = CompletableDeferred()
+    }
+
+    fun releaseTotp() {
+        totpGate?.complete(Unit)
+    }
+
     fun releaseLogouts() {
         logoutGate?.complete(Unit)
     }
 
     override fun enablePersistence(slot: FfiKeySlot, dataDir: String) {
         log += "enablePersistence"
+        if (persistenceFails) error("keystore unavailable")
         persistence += dataDir
     }
 
@@ -174,7 +192,22 @@ class FakeClient(
     override suspend fun listChannels(): List<FfiChannel> {
         listCalls += "listChannels"
         if (listFails) error("offline")
-        return channels
+        // The server's answer is fixed when the read starts, so a gated read returns what was
+        // true then, as a slow real read would.
+        val answer = channels
+        listGate?.await()
+        return answer
+    }
+
+    private var listGate: CompletableDeferred<Unit>? = null
+
+    /** From now on `listChannels` suspends until [releaseLists] (a read still in flight). */
+    fun gateLists() {
+        listGate = CompletableDeferred()
+    }
+
+    fun releaseLists() {
+        listGate?.complete(Unit)
     }
 
     /** Deliver a realtime event as core would (on a Rust thread in production). */

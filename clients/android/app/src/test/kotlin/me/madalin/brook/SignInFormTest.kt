@@ -3,7 +3,10 @@
 
 package me.madalin.brook
 
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -16,6 +19,7 @@ import uniffi.brook_ffi.LoginResult
  * Port of the Mac's `LoginFormTests` into [SignInForm]. These run in a plain JVM test: Compose's
  * `mutableStateOf` works outside a composition, so no fallback to `MutableStateFlow` was needed.
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 class SignInFormTest {
     private fun TestScope.form(
         result: Result<LoginResult>,
@@ -66,5 +70,20 @@ class SignInFormTest {
         assertNull(form(failure).insecureWarning)
         val optedIn = settingsWith().also { it.allowInsecureHttp = true }
         assertNotNull(form(failure, optedIn).insecureWarning)
+    }
+
+    @Test
+    fun passwordClearedWhenTheWaitIsCancelled() = runTest {
+        val fake = FakeClient(Result.success(LoginResult.LoggedIn(aliceSession)), gated = true)
+        val form = SignInForm(sessionModel(settingsWith(), FactoryRecorder { fake }, backgroundScope)).also {
+            it.server = "https://chat.example.com"
+            it.handle = "alice"
+            it.password = "secret"
+        }
+        val caller = launch { form.submit() }
+        runCurrent()
+        caller.cancel()
+        runCurrent()
+        assertEquals("", form.password)
     }
 }

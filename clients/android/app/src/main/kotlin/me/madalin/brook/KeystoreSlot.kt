@@ -38,26 +38,29 @@ interface SlotKeys {
 }
 
 /**
- * The real thing: one AES-256 key in the Android Keystore under [ALIAS].
+ * The real thing: one AES-256 key in the Android Keystore under [alias].
  *
  * No user authentication, no `setUnlockedDeviceRequired`, no StrongBox. Core calls slots from
  * background work with no UI and needs an answer within seconds (the `KeySlot` contract in
  * core/src/keyslot.rs); an auth prompt or a slow StrongBox call would break that.
  */
-class AndroidKeystoreKeys : SlotKeys {
+class AndroidKeystoreKeys(
+    // A parameter so the device test can use its own alias and never touch the real app's key.
+    private val alias: String = "brook-keyslots",
+) : SlotKeys {
     private fun store(): KeyStore = KeyStore.getInstance(PROVIDER).apply { load(null) }
 
     override fun existing(): SecretKey? {
         val store = store()
-        if (!store.containsAlias(ALIAS)) return null
+        if (!store.containsAlias(alias)) return null
         // The alias is there, so a missing key now is a Keystore fault, not "absent": throw.
-        return store.getKey(ALIAS, null) as? SecretKey
+        return store.getKey(alias, null) as? SecretKey
             ?: throw KeyStoreException("alias present but no secret key")
     }
 
     override fun create(): SecretKey {
         val spec = KeyGenParameterSpec.Builder(
-            ALIAS,
+            alias,
             KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
         )
             .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
@@ -70,7 +73,6 @@ class AndroidKeystoreKeys : SlotKeys {
     }
 
     companion object {
-        const val ALIAS = "brook-keyslots"
         private const val PROVIDER = "AndroidKeyStore"
     }
 }

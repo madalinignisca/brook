@@ -6,6 +6,7 @@ package me.madalin.brook
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -200,13 +201,23 @@ class SessionModel(
         }
 
         _phase.value = Phase.SigningIn
-        attempt++
+        // A new attempt replaces any earlier one still held (the code step's client): end it
+        // first, or its client and subscription would leak when `current` is overwritten.
+        end()?.close()
         val mine = attempt
+        // Runs in the model's scope, not the caller's: a screen's scope dies with the Activity
+        // (a rotation), and a login cancelled halfway would leave the phase on SigningIn
+        // forever, refusing every retry. If the caller is cancelled, only its wait ends.
+        scope.async { attemptLogin(address, handle, password, mine) }.await()
+        return true
+    }
+
+    private suspend fun attemptLogin(address: String, handle: String, password: String, mine: Int) {
         try {
             val client = clientFor(address)
             follow(client, mine)
             val result = client.login(handle, password)
-            if (mine != attempt) return true // ended meanwhile (a sign-out won)
+            if (mine != attempt) return // ended meanwhile (a sign-out won)
             when (result) {
                 is LoginResult.LoggedIn -> finishSignIn(client, result.session.user, address)
                 is LoginResult.TotpRequired -> {
@@ -218,10 +229,9 @@ class SessionModel(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            if (mine != attempt) return true
+            if (mine != attempt) return
             showForm(if (e is LoginException) message(e) else Message.unexpected)
         }
-        return true
     }
 
     /** The 6-digit code (spaces allowed, as pasted from "123 456"). */
@@ -267,6 +277,15 @@ class SessionModel(
         val code = pending
         if (_phase.value !is Phase.NeedsCode || code == null || _codeBusy.value) return
         _codeBusy.value = true
+        // In the model's scope for the same reason as the login in [signIn].
+        scope.async { checkCode(code, recovery, call) }.await()
+    }
+
+    private suspend fun checkCode(
+        code: PendingCode,
+        recovery: Boolean,
+        call: suspend (FfiBrookClient, FfiTotpChallenge) -> UInt?,
+    ) {
         try {
             call(code.client, code.challenge)
             if (code.attempt != attempt) return
@@ -323,7 +342,13 @@ class SessionModel(
     /** The client for `address`, with persistence on before anything signs in or restores. */
     private fun clientFor(address: String): FfiBrookClient {
         val client = makeClient(address, settings.allowInsecureHttp)
-        client.enablePersistence(slot, dataDir)
+        try {
+            client.enablePersistence(slot, dataDir)
+        } catch (e: Exception) {
+            // Nothing owns this client yet (`current` is not set), so free it here.
+            client.close()
+            throw e
+        }
         current = client
         return client
     }

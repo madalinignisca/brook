@@ -24,6 +24,10 @@ import uniffi.brook_ffi.FfiKeySlotException
 class KeystoreSlotDeviceTest {
     private lateinit var dir: File
 
+    // Not the app's alias: setUp and tearDown delete this key, and the app's own session key
+    // (if the app is installed and signed in on this device) must survive a test run.
+    private val testAlias = "brook-keyslots-test"
+
     @Before
     fun setUp() {
         val context = ApplicationProvider.getApplicationContext<Context>()
@@ -39,10 +43,10 @@ class KeystoreSlotDeviceTest {
 
     private fun deleteAlias() {
         KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-            .deleteEntry(AndroidKeystoreKeys.ALIAS)
+            .deleteEntry(testAlias)
     }
 
-    private fun slots() = KeystoreSlot(dir, AndroidKeystoreKeys())
+    private fun slots() = KeystoreSlot(dir, AndroidKeystoreKeys(testAlias))
 
     @Test
     fun roundTripThroughTheRealKeystore() {

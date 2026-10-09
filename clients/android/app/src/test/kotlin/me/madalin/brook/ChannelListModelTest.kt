@@ -222,6 +222,21 @@ class ChannelListModelTest {
         assertEquals(1, lists(client))
         assertEquals(listOf("c1"), model.channelIds())
     }
+
+    @Test
+    fun aDeleteDuringAnInFlightReloadStaysDeleted() = runTest {
+        val client = fake(channel("c1", "general"), channel("c2", "random"))
+        val model = started(client)
+        client.gateLists()
+        client.deliver(FfiServerEvent.Ready)
+        runCurrent() // the reload has read the server's list (with c2) and is still waiting
+        client.deliver(FfiServerEvent.ChannelDelete("c2"))
+        runCurrent()
+        client.releaseLists()
+        runCurrent()
+        // Events are handled one at a time: the reload lands first, then the delete applies.
+        assertEquals(listOf("c1"), model.channelIds())
+    }
 }
 
 private fun uniffi.brook_ffi.FfiUser.asMember() = FfiMember(id = id, handle = handle, displayName = displayName, role = null)

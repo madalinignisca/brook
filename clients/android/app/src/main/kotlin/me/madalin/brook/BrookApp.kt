@@ -32,6 +32,8 @@ class BrookApp : Application() {
         super.onCreate()
         // `BuildConfig.DEBUG` is what keeps the plain-`http` switch out of release builds (see
         // [Settings.allowInsecureHttp]); it is passed in here so tests can pass both values.
+        // This reads the preferences file on the main thread, once at startup. Left as it is: the
+        // file holds a couple of values, so the read is quick and not worth restructuring.
         val settings = Settings(getSharedPreferences("brook", Context.MODE_PRIVATE), BuildConfig.DEBUG)
         // `noBackupFilesDir`, not `filesDir`: Android backup and device transfer skip it, and it
         // is gone after uninstall, so neither the encrypted session nor core's sign-out fences

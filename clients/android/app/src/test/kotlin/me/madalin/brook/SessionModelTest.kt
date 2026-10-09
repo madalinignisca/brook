@@ -178,6 +178,76 @@ class SessionModelTest {
         assertEquals(listOf(false), recorder.all.map { it.allowInsecureHttp })
     }
 
+    @Test
+    fun aCancelledCallerDoesNotStrandTheLoginInSigningIn() = runTest {
+        // A rotation cancels the screen's scope while the login is in flight.
+        val fake = FakeClient(Result.success(LoginResult.LoggedIn(aliceSession)), gated = true)
+        val (model, _) = model(fake)
+        val caller = launch { model.signIn("https://h", "alice", "pw") }
+        runCurrent()
+        assertEquals(Phase.SigningIn, model.state)
+        caller.cancel()
+        runCurrent()
+        fake.release()
+        runCurrent()
+        assertEquals(Phase.SignedIn(alice), model.state)
+    }
+
+    @Test
+    fun aCancelledCallerThatLosesTheLoginEndsInTheFormWithRetryAccepted() = runTest {
+        val fake = FakeClient(Result.failure(LoginException.Network("down")), gated = true)
+        val (model, _) = model(fake)
+        val caller = launch { model.signIn("https://h", "alice", "pw") }
+        runCurrent()
+        caller.cancel()
+        runCurrent()
+        fake.release()
+        runCurrent()
+        assertTrue(model.state is Phase.SignedOut)
+        assertTrue("retry refused", model.signIn("https://h", "alice", "pw"))
+    }
+
+    @Test
+    fun aClientWhosePersistenceFailsToStartIsClosed() = runTest {
+        val fake = loggedIn().also { it.persistenceFails = true }
+        val (model, _) = model(fake)
+        model.signIn("https://h", "alice", "pw")
+        assertEquals(Phase.SignedOut(SessionModel.Message.unexpected), model.state)
+        assertEquals(1, fake.closes)
+    }
+
+    /** Two clients in turn: the first stops at the code step, the second is whatever `second` is. */
+    private fun TestScope.twoAttempts(second: FakeClient): Triple<SessionModel, FakeClient, FakeClient> {
+        val first = FakeClient(Result.success(LoginResult.TotpRequired(FakeChallenge())))
+        first.coreState = FfiAuthState.Authenticating
+        val queue = ArrayDeque(listOf(first, second))
+        val recorder = FactoryRecorder { queue.removeFirst() }
+        return Triple(sessionModel(settingsWith(), recorder, backgroundScope), first, second)
+    }
+
+    @Test
+    fun signingInAgainAfterAnExpiredChallengeEndsTheFirstClientOnce() = runTest {
+        val (model, first, _) = twoAttempts(loggedIn())
+        model.signIn("https://h", "alice", "pw")
+        first.totpResult = Result.failure(LoginException.Api("auth.totp_expired", "x"))
+        model.submitCode("123456")
+        model.signIn("https://h", "alice", "pw")
+        assertEquals(Phase.SignedIn(alice), model.state)
+        assertEquals(1, first.closes)
+        assertEquals(1, first.authSubscription!!.cancels)
+    }
+
+    @Test
+    fun signingInAgainFromTheCodeStepEndsTheFirstClientOnce() = runTest {
+        val (model, first, _) = twoAttempts(loggedIn())
+        model.signIn("https://h", "alice", "pw")
+        assertEquals(Phase.NeedsCode(null), model.state)
+        model.signIn("https://h", "alice", "pw")
+        assertEquals(Phase.SignedIn(alice), model.state)
+        assertEquals(1, first.closes)
+        assertEquals(1, first.authSubscription!!.cancels)
+    }
+
     // MARK: sign out, and following a remote sign-out
 
     private suspend fun TestScope.signedIn(fake: FakeClient): SessionModel {
@@ -387,6 +457,21 @@ class SessionModelTest {
         model.submitRecovery("   ")
         assertEquals(Phase.NeedsCode(SessionModel.Message.recoveryFormat), model.state)
         assertTrue(fake.totpCalls.isEmpty())
+    }
+
+    @Test
+    fun aCancelledCallerDoesNotStrandTheCodeCheck() = runTest {
+        val (model, fake) = atCodeStep()
+        fake.gateTotp()
+        val caller = launch { model.submitCode("123456") }
+        runCurrent()
+        assertTrue(model.codeBusy.value)
+        caller.cancel()
+        runCurrent()
+        fake.releaseTotp()
+        runCurrent()
+        assertEquals(Phase.SignedIn(alice), model.state)
+        assertTrue("code check left busy", !model.codeBusy.value)
     }
 
     // MARK: the channel list follows the session

@@ -6,6 +6,7 @@ package me.madalin.brook
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.CancellationException
 
 /**
  * What the sign-in screens show and edit. Port of the Mac's `LoginForm`.
@@ -47,7 +48,13 @@ class SignInForm(val model: SessionModel) {
         }
 
     suspend fun submit() {
-        if (model.signIn(server, handle, password)) password = ""
+        // A cancelled wait (the screen was recreated) still means the attempt was made.
+        try {
+            if (model.signIn(server, handle, password)) password = ""
+        } catch (e: CancellationException) {
+            password = ""
+            throw e
+        }
     }
 
     /** Send the code (or recovery code); the field is cleared after each attempt. */

@@ -32,7 +32,11 @@ abstract class RustLibs : DefaultTask() {
     @get:Internal
     abstract val ndkDir: DirectoryProperty
 
-    /** `$CARGO_TARGET_DIR` when set (a shared cache outside the repo), else `<repo>/target`. */
+    /**
+     * `$CARGO_TARGET_DIR` when set (a shared cache outside the repo), else `<repo>/target`. A
+     * relative value is taken from the repo root, the directory cargo runs in. A cargo config
+     * `build.target-dir` is not supported: only the environment variable is read.
+     */
     @get:Internal
     abstract val cargoTargetDir: DirectoryProperty
 
@@ -157,7 +161,7 @@ val rustLibs = tasks.register<RustLibs>("rustLibs") {
     cargoTargetDir.set(
         layout.dir(
             providers.environmentVariable("CARGO_TARGET_DIR")
-                .map { File(it) }
+                .map { File(it).let { dir -> if (dir.isAbsolute) dir else repoDir.resolve(dir) } }
                 .orElse(provider { repoDir.resolve("target") }),
         ),
     )
