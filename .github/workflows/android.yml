@@ -5,7 +5,7 @@
 # only way the `#[cfg(target_os = "android")]` branch of core's store (plain SQLite, ADR 0001)
 # is compiled in CI: the host build in rust.yml never sees it. It also runs the plain-store
 # tests, which run on the host through `Protection::Plain`, so they cannot drop out unseen.
-# The app job joins this file with the Android client (plan for #273, step 15).
+# `app` builds the debug APK with its unit tests and lint (plan for #273, step 15).
 name: android
 
 on:
@@ -61,3 +61,47 @@ jobs:
 
       - name: Plain-store tests
         run: cargo test --locked -p brook-core --lib store_tests
+
+  # Builds the debug APK the way a developer does, so a broken Gradle wiring, Kotlin binding,
+  # unit test or lint finding fails here. It needs core-android first: there is no point building
+  # the app when core does not compile for Android. No APK is uploaded: the spec asks CI to build
+  # it, not to publish it.
+  app:
+    needs: core-android
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # New to the repo: the pin is the commit of release v6.0.1 (gh api, 2026-10-08).
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # The Kotlin generator runs on the host and links core, which builds SQLCipher against the
+      # system OpenSSL headers on Linux.
+      - name: OpenSSL headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev
+
+      # Same packages as the app's build.gradle.kts pins (compileSdk 37, build-tools 37.0.0, the
+      # NDK). The default shell has no pipefail, so `yes` ending on SIGPIPE does not fail the step.
+      - name: Android SDK packages
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-37.0" "build-tools;37.0.0" "ndk;$NDK_VERSION" > /dev/null
+
+      # The repo carries Gradle's wrapper jar, a binary: check it against Gradle's published
+      # checksums before running it. The v6.4.0 tag is annotated; this is the commit it points to.
+      - uses: gradle/actions/wrapper-validation@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+
+      - name: Build, unit tests, lint
+        working-directory: clients/android
+        run: ./gradlew --no-daemon assembleDebug testDebugUnitTest lintDebug

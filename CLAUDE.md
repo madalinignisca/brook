@@ -59,6 +59,7 @@ Before pushing, merge `origin/main` into your branch and run what CI runs:
 | Rust: `core`, `clients/gst-media`, `clients/gnome`, `bindings/apple` (from the repo root) | `cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked` |
 | macOS | `clients/macos/build.sh test` |
 | Rust for Android: `core`, `bindings/apple` (from the repo root; NDK path as in the [Android plan](docs/superpowers/specs/2026-10-08-android-skeleton-plan.md)) | `clients/android/with-ndk.sh "$HOME/Android/Sdk/ndk/30.0.16248370" cargo clippy --locked -p brook-core -p brook-ffi --all-targets --target x86_64-linux-android -- -D warnings && cargo test --locked -p brook-core --lib store_tests` |
+| Android app (`clients/android`) | `cd clients/android && ./gradlew assembleDebug testDebugUnitTest lintDebug` |
 
 CI also runs `cargo-deny` and the API tests against Postgres. `pre-commit install` runs the
 cheap checks on every commit. [QUALITY](docs/QUALITY.md) has the full standard.

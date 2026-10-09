@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+  SPDX-License-Identifier: AGPL-3.0-or-later
+
+  Nothing of Brook is copied off the phone: not by cloud backup, not by a device-to-device
+  transfer. The sign-in is in the Android Keystore (it cannot be copied), and the bytes it
+  encrypts are useless without it, so restoring them on another phone would only leave a
+  session that can never be read. `allowBackup="false"` covers Android 11 and older; this file
+  is what Android 12 and newer read.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+        <exclude domain="device_root" />
+        <exclude domain="device_file" />
+        <exclude domain="device_database" />
+        <exclude domain="device_sharedpref" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+        <exclude domain="device_root" />
+        <exclude domain="device_file" />
+        <exclude domain="device_database" />
+        <exclude domain="device_sharedpref" />
+    </device-transfer>
+</data-extraction-rules>

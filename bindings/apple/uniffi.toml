@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# UniFFI per-crate config, read by library-mode bindgen from the crate root (so the generator
+# must run inside the workspace). Only the Kotlin names change: the FFI symbols stay the same
+# and Swift reads no `[bindings.kotlin]` key, so Swift and Rust are untouched.
+#
+# Why these renames: a Kotlin error class extends `Throwable`, which already has a `message`
+# property, so an error field called `message` would hide it and not compile. And every
+# generated object implements `AutoCloseable.close()`, which clashes with the media engine's
+# own `close()`.
+[bindings.kotlin.rename]
+"LoginError.Network.message" = "detail"
+"LoginError.InvalidServerUrl.message" = "detail"
+"LoginError.Api.message" = "detail"
+"FfiEngineError.Failed.message" = "detail"
+"FfiMediaEngine.close" = "closeEngine"
