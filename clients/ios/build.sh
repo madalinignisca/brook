@@ -112,6 +112,7 @@ if [[ "$mode" == "test" ]]; then
     TimelineRereadTests/testALiveEditToAFetchedMessageDuringThePageBackSurvives
     TimelineRereadTests/testARereadAskedDuringAReplacingTurnAsksOnlyTheHeadPage
     TimelineRereadTests/testAFailedRereadKeepsItsAnchorForTheNextOne
+    TimelineRereadTests/testATouchedMessageBelowTheFetchedRangeIsNotKeptByAReplace
     ScrollFollowTests/testFollowsANewMessageAtTheBottom
     ScrollFollowTests/testStaysPutForSomeoneElsesMessageWhenAway
     ScrollFollowTests/testFollowsTheUsersOwnMessageEvenWhenAway

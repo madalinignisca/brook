@@ -310,10 +310,10 @@ final class TimelineRereadTests: XCTestCase {
         t.apply(.ready)
         await settle { self.asked(chat).count == 3 } // the first page-back is held
         // Ids are made when a send starts, so a message committed now can sort below a20.
-        t.apply(.messageNew(message: msg("a10", "late")))
+        t.apply(.messageNew(message: msg("a15", "late")))
         gate.open()
         await settle { !t.isRereading }
-        XCTAssertEqual(ids(t), ["a10", "a14", "a16", "a18", "a20"], "a live message below the fetched newest was dropped")
+        XCTAssertEqual(ids(t), ["a14", "a15", "a16", "a18", "a20"], "a live message below the fetched newest was dropped")
     }
 
     // 18
@@ -332,6 +332,25 @@ final class TimelineRereadTests: XCTestCase {
         gate.open()
         await settle { !t.isRereading }
         XCTAssertEqual(t.messages.first { $0.id == "a18" }?.body, "edited", "the fetched copy undid a live edit")
+    }
+
+    // 21
+    func testATouchedMessageBelowTheFetchedRangeIsNotKeptByAReplace() async {
+        let chat = FakeChat()
+        chat.pages = [page("a01", "a02"), page("a20"), page("a18"), page("a16"), page("a14")]
+        let t = timeline(chat)
+        await t.load()
+        chat.olderGate = Gate()
+        let gate = chat.olderGate!
+        t.apply(.ready)
+        await settle { self.asked(chat).count == 3 }
+        // A reaction on a message far above the fetch. Kept, it would be the oldest shown message
+        // and loadOlder would ask before it, so a03 to a13 would never load.
+        t.apply(.reactionUpdate(channelId: "c", messageId: "a02", emoji: "👍", userId: "bob",
+                                added: true, count: 1, seq: 1))
+        gate.open()
+        await settle { !t.isRereading }
+        XCTAssertEqual(ids(t), ["a14", "a16", "a18", "a20"], "an old touched message left a hole below the fetch")
     }
 
     // 19

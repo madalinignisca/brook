@@ -40,7 +40,7 @@ before the first fetch has started, are served by that one fetch (the drain's ex
 that arrives while a fetch runs gets exactly one more.
 The extra fetch asks only for the newest page when the turn before it already proved the history
 contiguous (its anchor is raised to that turn's newest fetched id). A replace also keeps shown
-messages that live events or the user's own sends touched while it ran, whatever their ids.
+messages that live events or the user's own sends touched while it ran, inside the fetched range (one below it would leave a hole).
 
 Changed after approval: the owner took the recommended answer to each open question; §7 records
 them, and the spec now reads as decided: the checks' servers (Done), `client_id` on the direct

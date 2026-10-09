@@ -383,7 +383,15 @@ final class TimelineModel {
                 // deleted earlier stays a tombstone.
                 let newest = fetched.map(\.id).max() ?? ""
                 let touched = touchedDuringFetch ?? []
-                messages = messages.filter { $0.id > newest || touched.contains($0.id) }
+                // A touched message counts only INSIDE the fetched range: a real late UUIDv7 falls
+                // between the fetched ids. One below the oldest fetched id (a reaction or edit on a
+                // message far up the screen) would stay as the oldest shown message, and
+                // `loadOlder` asks before it, so everything between it and the fetch would never
+                // load: a permanent hole.
+                let oldestFetched = fetched.map(\.id).min() ?? ""
+                messages = messages.filter {
+                    $0.id > newest || ($0.id >= oldestFetched && touched.contains($0.id))
+                }
                 atStart = false // the start of the channel is no longer the oldest shown message's
                 replaced += 1
                 store(fetched)
