@@ -40,19 +40,20 @@ struct BrookApp: App {
     }
 }
 
-/// Owns the channel list's model for one signed-in session. It is created with the view and
-/// dropped with it, so a sign-out (or a remote one) and the next sign-in start from a fresh model.
+/// Holds the signed-in session for as long as this view lives, so a sign-out (or a remote one)
+/// drops it and the next sign-in starts from a fresh one.
 private struct SignedInHome: View {
     let store: SessionStore
-    @State private var channels: ChannelsModel
-
-    init(store: SessionStore, client: FfiBrookClient, user: FfiUser) {
-        self.store = store
-        // No notifier: iOS notifications are later work. `AppActivity` is iOS's default.
-        _channels = State(initialValue: ChannelsModel(client: client, me: user.id))
-    }
+    let client: FfiBrookClient
+    let user: FfiUser
+    /// Built once, in `.task`. Building it in `init` would run on every re-render of the parent
+    /// (a `State(initialValue:)` argument is evaluated each time and all but the first dropped).
+    @State private var session: SignedInSession?
 
     var body: some View {
-        ChannelListView(store: store, channels: channels)
+        Group {
+            if let session { ChannelListView(store: store, session: session) }
+        }
+        .task { if session == nil { session = SignedInSession(client: client, me: user.id) } }
     }
 }

@@ -268,6 +268,26 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertNil(store(.secondInstance).signOutNotice)
     }
 
+    /// L1 of the step-7 review: the notice is in the confirmation, but after Sign Out the sign-in
+    /// screen must keep saying it (the user may not have read it), through `signOutWarning`.
+    /// Only in a locked launch: a normal sign-out leaves no warning.
+    func testSignOutInALockedLaunchLeavesTheNoticeOnTheSignInScreen() async {
+        func signedOut(_ persistence: SessionPersistence) async -> SessionStore {
+            let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)))
+            let recorder = FactoryRecorder { fake }
+            let store = SessionStore(
+                settings: Settings(defaults: defaults, environment: [:]), persistence: persistence,
+                makeFeed: nil, makeClient: recorder.factory)
+            await store.signIn(server: "https://h", handle: "alice", password: "pw")
+            store.signOut()
+            return store
+        }
+        let locked = await signedOut(.lockedUntilFirstUnlock)
+        XCTAssertEqual(locked.signOutWarning, SessionStore.Message.signOutCannotReachSavedSignIn)
+        let plain = await signedOut(.off)
+        XCTAssertNil(plain.signOutWarning)
+    }
+
     func testSignOutEndsTheSessionQuietlyAndSignsOutOfCore() async {
         let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)))
         let store = await signedIn(fake)

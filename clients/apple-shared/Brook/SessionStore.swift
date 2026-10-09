@@ -435,6 +435,11 @@ final class SessionStore {
         let defaults = settings.defaults
         end()
         phase = .signedOut(error: nil)
+        // A locked launch could not remove the saved sign-in (see `signOutNotice`). The
+        // confirmation said so, but it is gone now: keep saying it on the sign-in screen, until
+        // a sign-in replaces the stored copy. Set before the task below, which may overwrite it
+        // with a more specific failure.
+        if let notice = signOutNotice { signOutWarning = notice }
         let before = signIns
         // The user asked for removal: their opened-order ranks go even if the core's removal
         // fails (a failure is said below and retried by the user). Here, before anything

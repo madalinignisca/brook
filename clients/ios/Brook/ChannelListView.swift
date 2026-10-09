@@ -15,9 +15,10 @@ func recoveryCodesWarning(left: UInt32?) -> String? {
 /// event stream. Plain system List; rows do not open anything yet.
 struct ChannelListView: View {
     let store: SessionStore
-    let channels: ChannelsModel
+    let session: SignedInSession
     @Environment(\.scenePhase) private var scenePhase
     @State private var confirmingSignOut = false
+    private var channels: ChannelsModel { session.channels }
 
     var body: some View {
         NavigationStack {
@@ -37,10 +38,10 @@ struct ChannelListView: View {
                     if let notice = store.signOutNotice { Text(notice) }
                 }
         }
-        .task { await channels.start() }
-        .onDisappear { channels.stop() }
+        .task { await session.start() }
+        .onDisappear { session.stop() }
         .onChange(of: scenePhase) { old, new in
-            Task { await channels.sceneChanged(from: old, to: new) }
+            Task { await session.sceneChanged(from: old, to: new) }
         }
     }
 
@@ -69,7 +70,11 @@ private struct ChannelRowView: View {
     let row: ChannelRow
 
     var body: some View {
-        // One VoiceOver stop per row: title, then call, mentions and unread, each with its own label.
+        // One VoiceOver stop per row: title, then call and mentions, each with its own label.
+        // No unread count here, on purpose: the server's `unread_mentions` comes with every list
+        // read, but a plain unread count only exists in the Mac's local cache. iOS has no cache
+        // to clear one, and nothing can open a channel yet, so a count would only go up. Add it
+        // with the cache or the first screen that opens a channel.
         HStack {
             Text(channels.title(row))
             Spacer()
@@ -83,10 +88,6 @@ private struct ChannelRowView: View {
             if let mentions = channels.mentions(row) {
                 Text("@\(mentions)").font(.caption.bold()).foregroundStyle(.red)
                     .accessibilityLabel("\(mentions) unread mention\(mentions == 1 ? "" : "s")")
-            }
-            if let unread = channels.unread(row) {
-                Text("\(unread)").font(.caption.bold()).foregroundStyle(.secondary)
-                    .accessibilityLabel("\(unread) unread")
             }
         }
         .accessibilityElement(children: .combine)

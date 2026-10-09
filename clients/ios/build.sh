@@ -62,6 +62,12 @@ if [[ "$mode" == "test" ]]; then
     SessionStoreTests/testWithoutLocalDataSigningOutStillLeavesCoresFence
     ChannelEventsTests/testReadyClearsLiveCalls
     SessionStoreTests/testSignOutSaysItCannotReachTheSavedSignInOnlyInALockedLaunch
+    ChannelEventsTests/testReconnectReadyRereadsTheListOnlyWhenAsked
+    SessionStoreTests/testSignOutInALockedLaunchLeavesTheNoticeOnTheSignInScreen
+    SignedInSessionTests/testStopCancelsTheEventSubscription
+    SignedInSessionTests/testASecondSessionGetsAFreshModel
+    SignedInSessionTests/testSceneChangesReloadThroughTheSession
+    SignedInSessionTests/testAReconnectShowsWhatChangedWhileTheSocketWasDown
     ForegroundReloadTests/testComingBackToTheForegroundReadsTheListAgain
     RecoveryWarningTests/testWarnsAtTwoOrFewerAndPluralizes
   )
