@@ -526,13 +526,11 @@ final class ComposerModel {
         }
     }
 
-    /// How a dropped file is copied out of its provider (a test passes its own).
-    var importer: (NSItemProvider) async -> DropImport.Outcome = { provider in
-        let types = provider.registeredTypeIdentifiers.compactMap { UTType($0) }
-        // An image with no file behind it (the clipboard's) is written out; anything else is a file.
-        let imageOnly = !types.contains { $0.conforms(to: .fileURL) } && types.contains { $0.conforms(to: .image) }
-        return imageOnly ? await PasteImport.copy(provider) : await DropImport.copy(provider)
-    }
+    /// How a dropped file is copied out of its provider (a test passes its own). The Mac app sets
+    /// its own importer (pasted images need AppKit); iOS has no drop or paste
+    /// screen yet, so this plain default is never called there. It cannot be the Mac's closure:
+    /// that needs AppKit, which shared code must not import.
+    var importer: (NSItemProvider) async -> DropImport.Outcome = { await DropImport.copy($0) }
 
     /// Files dropped on the conversation: each is copied at once (see `DropImport`), then staged
     /// like a picked one. Whatever isn't staged leaves no copy behind.
@@ -656,7 +654,7 @@ final class ComposerModel {
             do {
                 _ = try await cache.sendQueued(channelId: channelId, body: body, replyToId: reply?.id,
                                                clientId: id)
-                filesUnavailable = false // the queue works: this Mac's storage is there now
+                filesUnavailable = false // the queue works: this device's storage is there now
                 draft = nil
                 error = nil
                 await pending?.reload()
@@ -761,7 +759,7 @@ final class ComposerModel {
         case "outbox.empty_message": return "Write something or add a file."
         case "outbox.file_unreadable": return "A file couldn't be read. Is it still there?"
         case "outbox.store": return "Couldn't prepare the files. Is the disk full?"
-        case "local.unavailable": return "Sending files needs this Mac's storage, which isn't available yet."
+        case "local.unavailable": return "Sending files needs this \(ThisDevice.name)'s storage, which isn't available yet."
         default: return explain(error)
         }
     }

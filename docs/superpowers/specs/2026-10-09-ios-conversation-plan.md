@@ -326,13 +326,22 @@ Commit 3:
 - `clients/ios/BrookTests/MessageWordingTests.swift`, `testNoMessageNamesTheMac`: its hand-made
   list gains the `explainFiles` `local.unavailable` text, now that iOS compiles it. Mutant: put
   "Mac" back as a literal in that text: it must fail;
-- `clients/ios/build.sh`, `REQUIRED_TESTS` gains:
+- `clients/ios/build.sh`, `REQUIRED_TESTS` gains these 23, in this order. Six of the composer
+  tests (from `testChangingTheQuoteGetsANewClientId` to
+  `testARetryAnsweredWithADeletedMessageIsNotShown`) were added by step 1's pull request (#347)
+  beyond the four it planned, and the moved file carries them:
   - `ComposerModelTests/testASendClearsAndHandsTheMessageOver`
   - `ComposerModelTests/testAFailedSendGivesTheTextBack`
   - `ComposerModelTests/testANetworkFailureDoesntClaimItWasntSent`
   - `ComposerModelTests/testADirectSendPassesAClientId`
   - `ComposerModelTests/testSendingTheSameTextAgainAfterAFailureReusesItsClientId`
   - `ComposerModelTests/testChangedTextGetsANewClientId`
+  - `ComposerModelTests/testChangingTheQuoteGetsANewClientId`
+  - `ComposerModelTests/testChangingThenRestoringTheTextGetsANewClientId`
+  - `ComposerModelTests/testClearingTheBoxGetsANewClientId`
+  - `ComposerModelTests/testStartingAnEditDropsTheDraft`
+  - `ComposerModelTests/testDeletingAMessageDropsTheDraft`
+  - `ComposerModelTests/testARetryAnsweredWithADeletedMessageIsNotShown`
   - `ComposerModelTests/testTheNextMessageAfterASuccessGetsANewClientId`
   - `TimelineModelTests/testHistoryAndLiveEventsMergeByIdInOrder`
   - `TimelineModelTests/testEditsReplaceAndDeletesStay`
