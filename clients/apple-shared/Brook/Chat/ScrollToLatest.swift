@@ -31,12 +31,15 @@ enum ScrollToLatest {
         abs(now - askedAt) <= tolerance
     }
 
-    /// Whether the view must scroll to keep the bottom in view: it was at the bottom (not away)
-    /// before the content got taller (a row grew, as when a reaction lands on the last message, or
-    /// rows were added). Without it the growth pushes the bottom out of view, the jump button shows,
-    /// and the next new message is not followed. iOS only.
-    static func pinsToBottom(wasAway: Bool, oldContentHeight: CGFloat, newContentHeight: CGFloat) -> Bool {
-        !wasAway && newContentHeight > oldContentHeight
+    /// Whether the view must scroll to keep the bottom in view: it was at the very bottom (within
+    /// `gap` of it, not the looser "away" band) before the content got taller (a row grew, as when
+    /// a reaction lands on the last message, or rows were added), and the user is not scrolling.
+    /// The strict distance and the idle check keep it from fighting a slow drag up while the lazy
+    /// stack measures rows. Without it the growth pushes the bottom out of view, the jump button
+    /// shows, and the next new message is not followed. iOS only.
+    static func pinsToBottom(oldDistanceFromBottom: CGFloat, oldContentHeight: CGFloat,
+                             newContentHeight: CGFloat, scrolling: Bool) -> Bool {
+        !scrolling && oldDistanceFromBottom <= gap && newContentHeight > oldContentHeight
     }
 
     /// Whether the view scrolls to a new newest message. At the bottom it follows; scrolled up, only

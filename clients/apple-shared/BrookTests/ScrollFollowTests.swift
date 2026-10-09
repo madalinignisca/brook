@@ -37,14 +37,23 @@ final class ScrollFollowTests: XCTestCase {
         XCTAssertFalse(ScrollToLatest.stayedPut(askedAt: 100, now: 55))
     }
 
-    func testGrowthAtTheBottomPinsToTheBottom() {
-        XCTAssertTrue(ScrollToLatest.pinsToBottom(wasAway: false, oldContentHeight: 1000, newContentHeight: 1040))
+    func testGrowthAtTheVeryBottomWhileIdlePinsToTheBottom() {
+        XCTAssertTrue(ScrollToLatest.pinsToBottom(oldDistanceFromBottom: 0, oldContentHeight: 1000,
+                                                  newContentHeight: 1040, scrolling: false))
+        XCTAssertTrue(ScrollToLatest.pinsToBottom(oldDistanceFromBottom: ScrollToLatest.gap, oldContentHeight: 1000,
+                                                  newContentHeight: 1040, scrolling: false))
     }
 
-    func testGrowthWhileAwayOrNoGrowthDoesNotPin() {
-        XCTAssertFalse(ScrollToLatest.pinsToBottom(wasAway: true, oldContentHeight: 1000, newContentHeight: 1040))
-        XCTAssertFalse(ScrollToLatest.pinsToBottom(wasAway: false, oldContentHeight: 1000, newContentHeight: 1000))
-        XCTAssertFalse(ScrollToLatest.pinsToBottom(wasAway: false, oldContentHeight: 1000, newContentHeight: 900))
+    func testGrowthDoesNotPinWhenAboveTheBottomScrollingOrNotGrowing() {
+        // Above the bottom, even inside the "away" band: a slow drag up must not be pulled back.
+        XCTAssertFalse(ScrollToLatest.pinsToBottom(oldDistanceFromBottom: ScrollToLatest.gap + 1, oldContentHeight: 1000,
+                                                   newContentHeight: 1040, scrolling: false))
+        XCTAssertFalse(ScrollToLatest.pinsToBottom(oldDistanceFromBottom: 0, oldContentHeight: 1000,
+                                                   newContentHeight: 1040, scrolling: true))
+        XCTAssertFalse(ScrollToLatest.pinsToBottom(oldDistanceFromBottom: 0, oldContentHeight: 1000,
+                                                   newContentHeight: 1000, scrolling: false))
+        XCTAssertFalse(ScrollToLatest.pinsToBottom(oldDistanceFromBottom: 0, oldContentHeight: 1000,
+                                                   newContentHeight: 900, scrolling: false))
     }
 
     func testFollowsTheUsersOwnMessageEvenWhenAway() {

@@ -37,8 +37,9 @@ final class TimelineModel {
     /// No older page: the start of the channel is on screen.
     private(set) var atStart = false
     /// The last older page failed: the view offers a retry instead of a spinner. It stays until
-    /// tapped, or until the newest page loads again (then the loader asks by itself): a spinner that
-    /// retried on every change is what looped.
+    /// tapped, or until the newest page loads again (then the loader asks by itself, on the Mac when
+    /// it appears, on iOS when the view sees `offersOlder` turn true again): a spinner that retried
+    /// on every change is what looped.
     private(set) var olderFailed = false
     /// An older page is being asked for: another ask (the Retry button's new spinner appearing, say)
     /// joins it instead of waiting to start one more.

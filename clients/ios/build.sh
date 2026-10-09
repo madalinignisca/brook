@@ -130,8 +130,8 @@ if [[ "$mode" == "test" ]]; then
     ScrollFollowTests/testTheTopIsNearWithinOneScreen
     ScrollFollowTests/testTheTopIsNotNearFurtherThanOneScreen
     ScrollFollowTests/testStayedPutWithinTheToleranceOfTheAsk
-    ScrollFollowTests/testGrowthAtTheBottomPinsToTheBottom
-    ScrollFollowTests/testGrowthWhileAwayOrNoGrowthDoesNotPin
+    ScrollFollowTests/testGrowthAtTheVeryBottomWhileIdlePinsToTheBottom
+    ScrollFollowTests/testGrowthDoesNotPinWhenAboveTheBottomScrollingOrNotGrowing
     ScrollFollowTests/testMovedWhenFurtherThanTheToleranceFromTheAsk
   )
 

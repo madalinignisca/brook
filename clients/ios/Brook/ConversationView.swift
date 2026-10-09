@@ -54,6 +54,8 @@ struct ConversationView: View {
     /// when `nearTop` turns true, not by a view appearing: a view that stays on screen while a page
     /// lands never appears again, and asking from `.task(id:)` chained through every page.
     @State private var visible = CGRect.zero
+    /// The user is dragging, or the view is decelerating or animating a scroll.
+    @State private var scrolling = false
     private var nearTop: Bool {
         ScrollToLatest.isNearTop(visibleMinY: visible.minY, viewportHeight: visible.height)
     }
@@ -109,16 +111,30 @@ struct ConversationView: View {
                 // Taller content while at the bottom (a reaction on the last row, say) keeps the
                 // bottom in view. "At the bottom" is judged on the geometry BEFORE this change, which
                 // is `old`: the new geometry already counts the growth as scrolled away.
-                let wasAway = ScrollToLatest.isAway(contentHeight: old.content, offset: old.visible.minY,
-                                                    viewportHeight: old.visible.height)
-                if landed, ScrollToLatest.pinsToBottom(wasAway: wasAway, oldContentHeight: old.content,
-                                                       newContentHeight: new.content) {
+                let distance = old.content - old.visible.maxY
+                if landed, ScrollToLatest.pinsToBottom(oldDistanceFromBottom: distance, oldContentHeight: old.content,
+                                                       newContentHeight: new.content, scrolling: scrolling) {
                     restore(Self.bottomId, proxy, anchor: .bottom)
                 }
             }
             // A short conversation is near the top from the start, so no turn ever happens: ask once,
             // when the first landing is done. One ask, never repeated by itself.
             .onChange(of: landed) { if nearTop { askOlder(proxy) } }
+            // Not while the user is dragging or the view is decelerating or animating (see
+            // `ScrollToLatest.pinsToBottom`).
+            .onScrollPhaseChange { _, phase in scrolling = phase != .idle }
+            // The loader can come back with nothing asking: a failed older page or newest page set
+            // `olderFailed`/`headFailed`, a later successful re-read cleared it, and the user is still
+            // at the top, so no turn from far to near happens. Ask when it turns true again.
+            .onChange(of: timeline.offersOlder && !timeline.olderFailed && !timeline.headFailed) { _, ready in
+                if ready, nearTop { askOlder(proxy) }
+            }
+            // The first page renders at offset 0 until `.task` below lands the view (it waits for
+            // `load()`, which includes a read-receipt round trip). Go to the bottom as soon as the
+            // page is there.
+            .onChange(of: timeline.messages.isEmpty) { _, empty in
+                if !empty, !landed { proxy.scrollTo(Self.bottomId, anchor: .bottom) }
+            }
             .onChange(of: timeline.messages.last?.id) {
                 // Before the first landing `.task` below decides where the view goes (a live message
                 // can arrive before the first page and must not count as the landing).
