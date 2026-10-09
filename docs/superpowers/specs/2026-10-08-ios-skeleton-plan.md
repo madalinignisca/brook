@@ -578,7 +578,10 @@ Files:
   It calls `reloadList()` when `new == .active && old != .active`. A comment says why: iOS
   suspends the socket in the background, and what changed meanwhile only shows after a re-read.
 - `BrookApp.swift`: `.signedIn(user)` with a client shows `SignedInHome`, which holds the
-  `SignedInSession` and shows `ChannelListView` with it.
+  `SignedInSession` and shows `ChannelListView` with it. Until the session is built it shows a
+  `ProgressView`. Without it, on a real iPhone (iOS 26.6.1) the screen stayed black after sign-in:
+  the `.task` on an empty `Group` evidently never ran. The simulators did not show this, so no
+  unit test covers it (#335, PR #338).
 
 Test first: `ForegroundReloadTests`, with `FakeRealtime`. After `start()`, `order` has one
 `"list"`. `.background` → `.active` adds one. `.active` → `.inactive` adds none. `.inactive` →
