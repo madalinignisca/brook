@@ -50,8 +50,8 @@ private struct SignedInHome: View {
     /// (a `State(initialValue:)` argument is evaluated each time and all but the first dropped).
     /// While it is nil the body must still show a real view (the `ProgressView`): `.task` is
     /// applied to the view's children, and a `Group` with no child has none. On a real iPhone
-    /// (iOS 26.6.1) the task then never ran and the screen stayed black after sign-in. The iOS
-    /// simulators do run it, so no unit test catches this (a hosted-view test passed with and
+    /// (iOS 26.6.1) the screen stayed black after sign-in, so the task evidently never ran. The
+    /// iOS simulators do run it, so no unit test catches this (a hosted-view test passed with and
     /// without the placeholder); do not remove the `else` on the strength of a green test run.
     @State private var session: SignedInSession?
 
@@ -63,6 +63,9 @@ private struct SignedInHome: View {
                 ProgressView()
             }
         }
+        // The guard matters: the task runs again when the child changes from the ProgressView
+        // to ChannelListView, and a second session would replace the first, whose event
+        // subscription would then never be stopped.
         .task { if session == nil { session = SignedInSession(client: client, me: user.id) } }
     }
 }
