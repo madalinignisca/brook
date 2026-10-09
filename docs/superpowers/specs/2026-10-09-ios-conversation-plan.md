@@ -912,9 +912,9 @@ with `clients/ios/build.sh run`, which uses `simctl` and attaches no debugger.
 
 ## 5. Decisions for the owner
 
-Decisions 1, 2 and 4 were approved by the owner on 2026-10-09. Decisions 3, 5, 6 and 7 are
-pending the owner and go to the owner with this plan, each with a recommendation. The spec is
-aligned with them in this plan's pull request, by `brook-spec-writer`.
+All seven decisions were approved by the owner on 2026-10-09; 3, 5, 6 and 7 each as
+recommended below. The spec is aligned with them in this plan's pull request, by
+`brook-spec-writer`.
 
 1. **Approved. The second account in the agent's checks is the API, not the Mac app.** The spec's Done
    items run "with the Mac app signed in to the same server as a second account". In the
@@ -927,7 +927,7 @@ aligned with them in this plan's pull request, by `brook-spec-writer`.
    covers a removal seen only by a re-read. The Mac's flaw (spec §5 risks) gets its own issue.
    The alternative is to clear `closed` when a new channel opens, in the shared model, with a
    test: one line, but a Mac behavior change outside this issue.
-3. **Pending the owner. With the flag on, every newest-page fetch checks for a gap**: the first load, a `ready`, a
+3. **Approved. With the flag on, every newest-page fetch checks for a gap**: the first load, a `ready`, a
    foreground re-read, and a `resync`. That removes the spec's first known limit ("a `resync`
    merges the head page without this gap check") at no extra cost; the spec is amended in this
    plan's pull request.
@@ -940,14 +940,14 @@ aligned with them in this plan's pull request, by `brook-spec-writer`.
    otherwise route them to `brook-linux-implementer`. In the core commit, every Rust commit
    builds. Whether GNOME and KDE should pass their own draft ids on their direct sends (GNOME has
    one at hand, `chat.rs:1597`) is a follow-up issue for each, not part of this plan.
-5. **Pending the owner. A page-back that fails keeps what is shown and says "Couldn't load
+5. **Approved. A page-back that fails keeps what is shown and says "Couldn't load
    messages."**, and the next `ready` or foreground tries again. The alternative, replacing with
    what was fetched, would show the newest messages sooner but drop history on any blip.
    Recommended: keep what is shown; it is the same rule as a failed newest page today.
-6. **Pending the owner. `ComposerView.replyBanner` stays on the Mac.** Spec §5 lists it among
+6. **Approved. `ComposerView.replyBanner` stays on the Mac.** Spec §5 lists it among
    the helpers to share, but iOS has no reply yet, so nothing on iOS would call it. It moves with
    the reply issue. Recommended: keep it on the Mac; moving it now adds a Mac edit for no iOS use.
-7. **Pending the owner. "Joins it" for a second `ready` during a page-back** means: no second
+7. **Approved. "Joins it" for a second `ready` during a page-back** means: no second
    fetch runs beside it, and, as today for a `resync`, exactly one more newest-page fetch
    follows when the drain ends, with the fresh anchor that `ready` noted, because it may know of
    newer messages. Test 7 of step 3 pins this. Recommended: accept; it is the drain's existing

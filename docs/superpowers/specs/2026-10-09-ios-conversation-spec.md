@@ -10,10 +10,10 @@ Changed at plan stage (2026-10-09), from the plan's §5 decisions: in the agent'
 second account acts through the API, and "shows on the Mac" moves to the owner's iPhone check
 (Done, §7 decision 1); iOS closes the conversation when its row leaves the list, and `closed`
 stays as it is (§3, §4, §5, Done 10); GNOME and KDE pass no `client_id` for now (§4 Sending,
-§7 decision 2). Those three are owner-approved. Plan stage, pending the owner: every
-newest-page fetch on iOS, `resync` included, goes through the gap check, so that known limit
-is gone (§4); what "joins" means for a second `ready` during a page-back (§4, Done 10);
-`ComposerView.replyBanner` stays on the Mac (§5). Also from the plan: the gap's anchor is
+§7 decision 2); every newest-page fetch on iOS, `resync` included, goes through the gap
+check, so that known limit is gone (§4); what "joins" means for a second `ready` during a
+page-back (§4, Done 10); `ComposerView.replyBanner` stays on the Mac (§5). The owner approved
+all six on 2026-10-09. Also from the plan: the gap's anchor is
 taken when the re-read is asked for, and a replace keeps shown messages newer than what it
 fetched and restarts a running older page (§4 Staying live, Done 10).
 
@@ -201,8 +201,8 @@ that need the Mac app ("shows on the Mac", Done 3 and 7) are checked there:
   fetch at a time). This is the conversation's twin of the list's `rereadOnReconnect` (#272),
   and is off on the Mac, where a `ready` only retries a failed head, as today.
 - Every newest-page fetch on iOS goes through the gap check below: the first load, a `ready`, a
-  foreground re-read, and a `resync` (events dropped inside core). (Plan stage, pending the
-  owner.)
+  foreground re-read, and a `resync` (events dropped inside core). (Plan stage, approved by
+  the owner 2026-10-09.)
 - The anchor (the point a gap is closed back to) is the newest shown message at the moment the
   re-read is asked for: on `ready`, on `resync`, or on return to the foreground. It is not taken
   when the fetch runs, because live events can land in between: a live message or the user's
@@ -219,7 +219,7 @@ that need the Mac app ("shows on the Mac", Done 3 and 7) are checked there:
     none, up to 3 pages. Then everything fetched is merged. The page-back runs inside the same
     one-at-a-time head fetch as the re-read. A second `ready` meanwhile starts no fetch beside
     it; exactly one more newest-page fetch follows when the page-back ends, because that
-    `ready` may know of newer messages. (Plan stage, pending the owner.)
+    `ready` may know of newer messages. (Plan stage, approved by the owner 2026-10-09.)
   - Still no meeting point after 3 pages: the screen keeps what the re-read fetched, plus any
     shown messages newer than the newest fetched one (live arrivals and the user's own sends
     that landed while the pages ran). `atStart` and `olderFailed` are reset, and the view
@@ -286,7 +286,7 @@ move is for the plan.
 | `Chat/PendingModel.swift` | moves | Named by `ComposerModel` |
 | `Chat/TypingSearch.swift` | moves whole | `TimelineModel` needs `TypingState`, the composer `TypingSender`. `SearchModel` and `SearchClient` come along: the whole file is Foundation only, so splitting it gains nothing |
 | `FileRowModel`, `CacheFeed`, `NSWorkspaceBridge` | stay on the Mac | not needed |
-| `ChatViews.swift` | stays on the Mac; pure helpers shared | `MessageRow.excerpt`, `MessageRow.time`, `AttachmentRow.icon`, `ScrollToLatest`. The views use AppKit and a desktop layout; iOS writes its own. `ComposerView.replyBanner` stays on the Mac: iOS has no reply yet, so nothing there would call it; it moves with the reply issue (plan stage, pending the owner) |
+| `ChatViews.swift` | stays on the Mac; pure helpers shared | `MessageRow.excerpt`, `MessageRow.time`, `AttachmentRow.icon`, `ScrollToLatest`. The views use AppKit and a desktop layout; iOS writes its own. `ComposerView.replyBanner` stays on the Mac: iOS has no reply yet, so nothing there would call it; it moves with the reply issue (plan stage, approved by the owner 2026-10-09) |
 
 The Mac's tests that cover the moved code (`ChatModelTests`, `OfflineTimelineTests`,
 `ReadWhenActiveTests`, `TypingSearchTests`, `ReactionTests`, `PendingModelTests`,
