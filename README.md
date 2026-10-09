@@ -53,7 +53,8 @@ Brook/
 │   ├── macos/                 Swift + SwiftUI / AppKit
 │   ├── windows/               C# / .NET + WinUI 3
 │   ├── android/               Kotlin + Jetpack Compose (Material 3)
-│   └── ios/                   Swift + SwiftUI / UIKit
+│   ├── ios/                   Swift + SwiftUI / UIKit
+│   └── apple-shared/          Swift code the macOS and iOS clients share
 └── deploy/               ← docker-compose for local dev, deployment notes
 ```
 
