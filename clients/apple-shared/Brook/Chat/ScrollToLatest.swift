@@ -42,6 +42,17 @@ enum ScrollToLatest {
         !scrolling && oldDistanceFromBottom <= gap && newContentHeight > oldContentHeight
     }
 
+    /// The same pin for a shorter visible area with unchanged content: the keyboard rising, or the
+    /// message box growing to more lines, shrinks the viewport from the bottom, which covers the
+    /// newest message and turns "away" on by itself. If the view was at the very bottom and idle,
+    /// scroll to keep it there. Not while scrolling (a drag back down during the keyboard's
+    /// animation must not be pulled), and not when above the bottom (a reader in the history stays).
+    /// A viewport that grows (the keyboard going away) needs nothing: the bottom stays in view.
+    static func pinsAfterShrink(oldDistanceFromBottom: CGFloat, oldViewportHeight: CGFloat,
+                                newViewportHeight: CGFloat, scrolling: Bool) -> Bool {
+        !scrolling && oldDistanceFromBottom <= gap && newViewportHeight < oldViewportHeight
+    }
+
     /// Whether the view scrolls to a new newest message. At the bottom it follows; scrolled up, only
     /// the user's own message moves it (spec 2026-10-09-ios-conversation, decision 3). The Mac
     /// does not call this yet.

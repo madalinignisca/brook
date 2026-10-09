@@ -133,6 +133,8 @@ if [[ "$mode" == "test" ]]; then
     ScrollFollowTests/testGrowthAtTheVeryBottomWhileIdlePinsToTheBottom
     ScrollFollowTests/testGrowthDoesNotPinWhenAboveTheBottomScrollingOrNotGrowing
     ScrollFollowTests/testMovedWhenFurtherThanTheToleranceFromTheAsk
+    ScrollFollowTests/testAShrinkAtTheVeryBottomWhileIdlePinsToTheBottom
+    ScrollFollowTests/testAShrinkDoesNotPinWhenAboveTheBottomScrollingOrNotShrinking
     ComposerModelTests/testOnlySpacesCannotBeSent
     ComposerModelTests/testASignedOutSendSaysSo
     ConversationSessionTests/testASentMessageShowsOnceWhenItsEchoArrives

@@ -116,6 +116,14 @@ struct ConversationView: View {
                                                        newContentHeight: new.content, scrolling: scrolling) {
                     restore(Self.bottomId, proxy, anchor: .bottom)
                 }
+                // A shorter visible area with the same content: the keyboard rose, or the message box
+                // grew. The bottom would be covered, so keep it in view (see `pinsAfterShrink`).
+                if landed, ScrollToLatest.pinsAfterShrink(oldDistanceFromBottom: distance,
+                                                          oldViewportHeight: old.visible.height,
+                                                          newViewportHeight: new.visible.height,
+                                                          scrolling: scrolling) {
+                    restore(Self.bottomId, proxy, anchor: .bottom)
+                }
             }
             // A short conversation is near the top from the start, so no turn ever happens: ask once,
             // when the first landing is done. One ask, never repeated by itself.
@@ -189,7 +197,7 @@ struct ConversationView: View {
                         Text(error).foregroundStyle(.red).font(.caption)
                             .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal).padding(.vertical, 4)
                     }
-                    ComposerBar(composer: session.composer, archived: session.archived, onFocus: { focused(proxy) })
+                    ComposerBar(composer: session.composer, archived: session.archived)
                 }
                 .background(.bar)
             }
@@ -212,20 +220,6 @@ struct ConversationView: View {
         // The channel left the list (deleted, or this user was removed): back to the list.
         .onChange(of: session.isRemoved, initial: true) { _, removed in
             if removed { dismiss() }
-        }
-    }
-
-    /// The box got the focus and the keyboard is on its way. If the view was at the bottom, keep the
-    /// newest message in view above the keyboard. `away` is read now, before the keyboard shrinks
-    /// the scroll area: the smaller area itself makes the view count as scrolled away, and a reader
-    /// who was up in the history must stay there.
-    private func focused(_ proxy: ScrollViewProxy) {
-        guard !away else { return }
-        Task {
-            // The keyboard takes about a quarter of a second to rise; a scroll before it ends
-            // would target the old, taller area.
-            try? await Task.sleep(for: .milliseconds(300))
-            restore(Self.bottomId, proxy, anchor: .bottom)
         }
     }
 
@@ -301,9 +295,6 @@ struct ConversationView: View {
 private struct ComposerBar: View {
     @Bindable var composer: ComposerModel
     let archived: Bool
-    /// Called when the field gains the focus (the view scrolls to the newest message).
-    let onFocus: () -> Void
-    @FocusState private var focused: Bool
 
     var body: some View {
         // The outer VStack always exists, so it carries the modifier; the field it holds is gone
@@ -323,7 +314,6 @@ private struct ComposerBar: View {
                     // (spec section 4, Sending). Send is the button.
                     TextField("Message", text: $composer.text, axis: .vertical)
                         .lineLimit(1...6)
-                        .focused($focused)
                         .textFieldStyle(.roundedBorder)
                     Button {
                         Task { await composer.send() }
@@ -336,7 +326,6 @@ private struct ComposerBar: View {
                 .padding(.horizontal).padding(.vertical, 8)
             }
         }
-        .onChange(of: focused) { _, now in if now { onFocus() } }
     }
 }
 
