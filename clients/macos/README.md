@@ -26,9 +26,12 @@ Rendered screenshots of the views (light + dark, off-screen, no window):
 (written to the app container's `tmp/brook-screens`, the test host is sandboxed).
 
 ## Shape
-- `SessionStore` — the only owner of `BrookCore`; phase follows `login`'s result.
-- `LoginForm` / `LoginView` / `SignedInView` — SwiftUI, native controls only.
-- `ServerAddress` / `Settings` — address validation, remembered server, hidden plain-http opt-in.
+Code the Mac and iOS apps share lives in [`clients/apple-shared`](../apple-shared): the session
+store (`SessionStore`, the only owner of `BrookCore`), the sign-in form (`LoginForm`), address
+validation and the remembered server (`ServerAddress`, `Settings`), and the channel model. Its tests
+run in both apps. The Mac's own files include the SwiftUI views (`LoginView`, `SignedInView`) and its
+platform files (`ThisDevice`, `AppActivity`, `SessionPersistence+Mac`), which fill in the platform
+facts that shared code asks for. The rule for those is in the [iOS README](../ios/README.md#what-is-shared-and-what-is-ios-only).
 
 Specs: [design](../../docs/superpowers/specs/2026-09-24-macos-phase0-app-design.md) ·
 [plan](../../docs/superpowers/specs/2026-09-24-macos-phase0-app-plan.md).

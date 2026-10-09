@@ -31,17 +31,6 @@ final class SignedInSessionTests: XCTestCase {
         XCTAssertTrue(sub?.cancelled.withLock { $0 } ?? false, "stop() left the subscription running")
     }
 
-    /// The next sign-in must not see the last one's rows.
-    func testASecondSessionGetsAFreshModel() async {
-        let client = FakeRealtime(channels: [channel("c1", "general")])
-        let first = session(client)
-        await first.start()
-        first.stop()
-        let second = session(client)
-        XCTAssertFalse(first.channels === second.channels)
-        XCTAssertTrue(second.channels.channels.isEmpty, "the new session started with the old rows")
-    }
-
     /// The foreground re-read goes through the session, which is what the view calls.
     func testSceneChangesReloadThroughTheSession() async {
         let client = FakeRealtime(channels: [channel("c1", "general")])
