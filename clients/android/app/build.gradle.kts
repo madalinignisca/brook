@@ -130,6 +130,7 @@ android {
         targetSdk = 37
         versionCode = 1
         versionName = "0.1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildFeatures {
@@ -192,4 +193,8 @@ dependencies {
     // The plain jar, so JVM tests can load the generated classes (the @aar is Android-only).
     testImplementation("net.java.dev.jna:jna:5.19.1")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
+
+    // Device tests: the real Android Keystore, run by hand on an emulator (CI has none).
+    androidTestImplementation("androidx.test:runner:1.7.0")
+    androidTestImplementation("androidx.test.ext:junit:1.3.0")
 }
