@@ -58,14 +58,43 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     var sendFailure: Error?
     /// The direct send answers with a tombstone (a retry of a message deleted meanwhile).
     var sendAnswersDeleted = false
-    var read: [String?] = []
+    /// The `messageId` of each `markRead`, in order. Behind a lock: two re-reads can mark read from
+    /// different threads at once, and an unlocked array append there crashes the test host.
+    private let readCalls = Mutex<[String?]>([])
+    var read: [String?] { readCalls.withLock { $0 } }
 
     var historyFailure: Error?
     /// `channelHistory` calls so far, and a gate that holds each one after it is counted.
     let historyCalls = Mutex(0)
     var historyGate: Gate?
+    /// The `before` of each `channelHistory` call, in order (nil: a newest page).
+    let historyAsked = Mutex<[String?]>([])
+    /// Holds the next call that has a `before`, once, after it is recorded (as `cacheGate` does for
+    /// the cache). The page is taken when the gate opens, not when the call is made.
+    var olderGate: Gate? {
+        get { olderGateBox.withLock { $0 } }
+        set { olderGateBox.withLock { $0 = newValue } }
+    }
+    private let olderGateBox = Mutex<Gate?>(nil)
+    /// Calls in flight now, and the most there ever were at once: a head fetch must never run
+    /// beside another.
+    let historyInFlight = Mutex(0)
+    let historyMaxInFlight = Mutex(0)
     func channelHistory(channelId: String, before: String?) async throws -> [FfiMessage] {
+        // Claim the gate BEFORE the call is recorded: a test that waits for the record and then
+        // opens the gate must find the gate already taken by this call, not by a later one.
+        let gate: Gate? = before == nil ? nil : olderGateBox.withLock { box in
+            defer { box = nil }
+            return box
+        }
         historyCalls.withLock { $0 += 1 }
+        historyAsked.withLock { $0.append(before) }
+        historyInFlight.withLock { n in
+            n += 1
+            historyMaxInFlight.withLock { $0 = max($0, n) }
+        }
+        defer { historyInFlight.withLock { $0 -= 1 } }
+        await gate?.wait()
         await historyGate?.wait()
         if let historyFailure { throw historyFailure }
         return pages.isEmpty ? [] : pages.removeFirst()
@@ -83,7 +112,9 @@ final class FakeChat: ChatClient, @unchecked Sendable {
         return msg(messageId, body, channel: channelId)
     }
     func deleteMessage(channelId: String, messageId: String) async throws {}
-    func markRead(channelId: String, messageId: String?) async throws { read.append(messageId) }
+    func markRead(channelId: String, messageId: String?) async throws {
+        readCalls.withLock { $0.append(messageId) }
+    }
     let typed = Mutex<[String]>([])
     func sendTyping(channelId: String) async throws { typed.withLock { $0.append(channelId) } }
     var reactionAnswer: [FfiReaction] = []

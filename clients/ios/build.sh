@@ -92,6 +92,30 @@ if [[ "$mode" == "test" ]]; then
     TimelineEventsTests/testReadyRetriesTheOpenTimelinesFailedHead
     TimelineReactionTests/testAnEventForAMessageHereAdjustsItsChips
     TimelineReactionTests/testAResyncForgetsTheOrderingSoALowerSeqIsHeardAgain
+    TimelineRereadTests/testWithoutTheFlagAReadyOnlyRetriesAFailedHead
+    TimelineRereadTests/testWithTheFlagEveryReadyRereadsTheNewestPage
+    TimelineRereadTests/testARereadThatOverlapsMerges
+    TimelineRereadTests/testARereadThatDoesNotMeetPagesBackUntilAPageMeets
+    TimelineRereadTests/testARereadThatNeverMeetsReplacesAfterThreePagesAndResets
+    TimelineRereadTests/testAnOlderPageStartedBeforeAReplacingRereadIsDiscarded
+    TimelineRereadTests/testAReadyDuringThePageBackJoinsIt
+    TimelineRereadTests/testAPageBackThatFailsKeepsTheShownMessagesAndSaysSo
+    TimelineRereadTests/testARereadWhileActiveMarksTheNewestRead
+    TimelineRereadTests/testARereadWhileInactiveLeavesTheReadOwed
+    TimelineRereadTests/testAReadyClearsTheReactionMarks
+    TimelineRereadTests/testAForegroundRereadKeepsTheReactionMarks
+    TimelineRereadTests/testAReplaceKeepsMessagesThatArrivedDuringThePageBack
+    TimelineRereadTests/testTheGapAnchorIsTakenWhenTheReadyArrives
+    TimelineRereadTests/testAnOlderPageWaitingOnAReplacingRereadAsksFromTheNewOldest
+    TimelineRereadTests/testAResyncTakesTheGapAnchorWhenItArrives
+    TimelineRereadTests/testALiveMessageWithALowerIdThanTheFetchedNewestSurvivesAReplace
+    TimelineRereadTests/testALiveEditToAFetchedMessageDuringThePageBackSurvives
+    TimelineRereadTests/testARereadAskedDuringAReplacingTurnAsksOnlyTheHeadPage
+    TimelineRereadTests/testAFailedRereadKeepsItsAnchorForTheNextOne
+    TimelineRereadTests/testATouchedMessageBelowTheFetchedRangeIsNotKeptByAReplace
+    ScrollFollowTests/testFollowsANewMessageAtTheBottom
+    ScrollFollowTests/testStaysPutForSomeoneElsesMessageWhenAway
+    ScrollFollowTests/testFollowsTheUsersOwnMessageEvenWhenAway
   )
 
   # 1. All three slices are in the xcframework (a Mac build leaves only the macOS one).

@@ -30,6 +30,18 @@ real-iPhone check runs from the Home Screen (question 1, Done); the page-back jo
 fetch (§4); reaction marks clear only on `ready` (§4, Done 10); the Mac's direct send keeps its
 draft id if question 2 is yes (§5 risks); `TypingSearch.swift` moves whole (§5).
 
+As built, step 3 (the shared timeline's re-read, behind `rereadOnReady`, off on the Mac): the
+gap anchor is taken when the re-read is asked for (`ready`, `resync`, return to the foreground),
+not when the fetch runs; a replace keeps the shown messages newer than the newest one fetched, so
+a live message or the user's own send that landed during the page-backs is not lost; and an older
+page that started before a replace is dropped when its answer lands, or before it is sent, and
+`loadOlder` asks again from the new oldest message. Two `ready` events delivered back to back,
+before the first fetch has started, are served by that one fetch (the drain's existing rule); one
+that arrives while a fetch runs gets exactly one more.
+The extra fetch asks only for the newest page when the turn before it already proved the history
+contiguous (its anchor is raised to that turn's newest fetched id). A replace also keeps shown
+messages that live events or the user's own sends touched while it ran, inside the fetched range (one below it would leave a hole).
+
 Changed after approval: the owner took the recommended answer to each open question; §7 records
 them, and the spec now reads as decided: the checks' servers (Done), `client_id` on the direct
 send (§4 Sending, §5, Done 7, 10), and the scroll rule with the jump-to-latest button (§4, Done
