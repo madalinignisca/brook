@@ -15,8 +15,8 @@ final class ConversationSession {
     let channelId: String
     let channels: ChannelsModel
     let timeline: TimelineModel
-    /// The message box's model. Shared with the Mac; there is no outbox on iOS, so its send goes
-    /// straight to the server with the draft's `client_id`.
+    /// The message box's model. Shared with the Mac. iOS has no outbox, so a send asks it first,
+    /// gets `local.unavailable`, and then goes straight to the server with the draft's `client_id`.
     let composer: ComposerModel
     /// This user's id, for the follow rule ("mine").
     let me: String
@@ -97,7 +97,9 @@ final class ConversationSession {
 
     /// The channel is archived: nothing can be written to it, so the view shows a note instead of
     /// the box. Read from the row each time, not once at init: `channel.update` changes the row
-    /// while the conversation is open and the note must appear (or go) with it.
+    /// while the conversation is open and the note must appear (or go) with it. A missing row reads
+    /// false: for a moment after a removal the box can show before the view's `dismiss()` runs, and
+    /// a send in that moment gets the server's refusal ("Couldn't send.").
     var archived: Bool { channels.channels.first { $0.id == channelId }?.archived ?? false }
 
     /// The row left the list: the channel was deleted, or this user left or was removed. Not
