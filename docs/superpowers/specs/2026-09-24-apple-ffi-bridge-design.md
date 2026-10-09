@@ -33,9 +33,9 @@ macOS and the iOS simulator?** Everything later (Keychain, UI, chat) rests on th
 3. `bindings/apple/itest.sh` exits 0, which requires **all** of the following, run against the shared
    test server (§3.4) — on macOS (`swift test`). (iOS slices and the simulator run are deferred: macOS ships first.)
    - `login` with valid credentials returns `LoginResult.loggedIn(session)` whose `user.handle`
-     matches. The session carries only the user; tokens are kept in core through the `KeySlot`
-     the client provides. Proof: `session.user` can be read, and the client can call `me()` which
-     uses the stored token internally.
+     matches. The session carries only the user; core keeps the access token in memory and persists
+     the refresh token through the `KeySlot` the client provides. Proof: `session.user` can be read,
+     and the client can call `me()` which uses the in-memory access token.
    - The listener's **final** observed state is `loggedIn(user)`, and the observed sequence never
      regresses (no `authenticating` after `loggedIn` within one login).
    - A wrong password yields `LoginError.Api(code: "auth.invalid_credentials", …)` and a final
@@ -98,13 +98,12 @@ UDL-free, proc-macro UniFFI (`uniffi::setup_scaffolding!()`), pinned to an exact
   `allow_insecure_http = true`, `http` to **any** host is allowed — which sends the password and
   receives tokens in cleartext. That flag is dev-only; the Step 3 UI must gate it behind an
   explicit, labelled opt-in. Tested with both flag values at the FFI boundary.
-- **Session across the boundary:** `FfiSession` carries only `user`. Core keeps the session
-  itself through the `KeySlot` the client provides, so no client needs the raw tokens. This also
-  avoids Kotlin's generated `toString()` printing every field, which cannot be redacted. On the
-  Swift side, `LoginResult` gets (in a hand-written file, not the generated one) a redacting
-  `CustomStringConvertible` and `CustomDebugStringConvertible` to keep the challenge out of
-  descriptions. Sentinel test: `print`, `debugPrint`, `String(reflecting:)` of `LoginResult` never
-  contain the challenge.
+- **Session across the boundary:** `FfiSession` carries only `user`. Core keeps the access token
+  in memory and the refresh token in the `KeySlot` the client provides, so no client needs raw
+  tokens. This also avoids Kotlin's generated `toString()` printing every field, which cannot be
+  redacted. On the Swift side, `LoginResult` gets (in a hand-written file, not the generated one)
+  a redacting `CustomStringConvertible`, `CustomDebugStringConvertible`, and `CustomReflectable`
+  to keep the challenge out of descriptions, `debugDescription`, and reflection views.
 
 ### 3.2 Linux CI stays green
 
@@ -192,7 +191,7 @@ GNOME client's `BROOK_ALLOW_INSECURE_HTTP=1`.
 | Futures polled without a Tokio reactor | panic "no reactor running" | runtime hop; tested from a thread with no runtime entered |
 | Listener called after Swift deinit | crash on a dangling foreign object | UniFFI holds a strong `Arc` to the foreign listener; `Subscription` drop cancels |
 | `watch` coalesces transitions | UI misses `Authenticating` | contract is latest-state; tests assert final state + no regression, never an exact sequence |
-| Tokens leak into logs via Swift reflection | secrets in console/crash logs | `CustomReflectable` redaction + sentinel test incl. `dump` |
+| Tokens leak into logs via Swift reflection | secrets in console/crash logs | `FfiSession` holds no tokens (moved to core); `LoginResult` redacts with `CustomReflectable` |
 | Integration tests silently skipped | false green | `BROOK_REQUIRE_ITEST=1` turns skip into failure; script counts executed tests |
 | New crate breaks Linux CI | blocks every Rust PR, incl. GNOME | full CI gate (§2.1) run in a Linux container before pushing |
 | Stopping halfway | — | only new directories + one workspace member + CI path filter; reverting the member line restores the previous state |
