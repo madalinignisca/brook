@@ -29,10 +29,16 @@ Repo-wide: **`.editorconfig`**, markdownlint, **gitleaks** (secret scanning), co
 - QML: `qmllint` / `qmlformat`; **clang-format** if any hand-written C++ glue.
 - QML unit tests where logic warrants.
 
+### `clients/android/` — Kotlin + Jetpack Compose
+- **Android Lint** with warnings as errors; **Kotlin compiler** with all warnings as errors.
+- **JUnit** unit tests (JVM).
+- **Keystore device tests** on an emulator (`connectedDebugAndroidTest`).
+- `ktlint`/`detekt` and Compose UI tests are scheduled for a later phase (owner decisions, 2026-10-09).
+- Run: `cd clients/android && ./gradlew assembleDebug testDebugUnitTest lintDebug`.
+
 ### Future clients (reference)
 - **macOS/iOS** (Swift): `swiftformat` + `swiftlint`, XCTest.
 - **Windows** (C#): `dotnet format` + Roslyn analyzers, xUnit.
-- **Android** (Kotlin): `ktlint`/`detekt`, JUnit + Compose UI tests.
 
 ## Testing philosophy
 - **Test behavior, not implementation.** API tests hit real endpoints (via `httpx`/test client) against an ephemeral DB.

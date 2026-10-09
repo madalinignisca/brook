@@ -4,6 +4,17 @@ Spec: [2026-10-08-android-skeleton-spec.md](2026-10-08-android-skeleton-spec.md)
 every decision is in its section 3). Status: after review round 2 (Opus LGTM), with the owner's
 decisions of 2026-10-09 recorded in section 5; for the owner's approval.
 
+**Changed during implementation (PR 3, 2026-10-09):**
+- Step 9's grep is for ``val `detail` ``: UniFFI backtick-quotes identifiers.
+- The adaptive icon moved from step 14 to step 10, because lint's `MissingApplicationIcon` fails
+  without it.
+- Step 10's `BrookApp.kt` starts as an empty `Application` subclass, and `versionCode` and
+  `versionName` are set.
+- Step 12 declares `androidx.core:core-ktx:1.19.1`, for lint's `UseKtx` (`prefs.edit { }`).
+- Step 13's break-and-watch names the right test: `aLateInitialLoggedOutNeverEndsAGoodSession`.
+- Step 14's accepted deviations are listed: injectable `label`/`sortKey`, no system action bar, a
+  way back out of recovery mode, a letter-or-digit avatar, `SignInForm` held in `BrookApp`.
+
 **Changed during implementation (PR 1, 2026-10-09):**
 - After step 2, the emulator run showed 6 more tests that need a key slot. With the main agent's
   approval they are gated, one is split, and one keeps its non-slot assertions everywhere. Two
@@ -516,7 +527,8 @@ this commit).
     the generator must run inside the workspace (repo root). Do **not** pass this file as
     `--config`: in 0.32.2 that flag takes a *global* file (`[defaults]`, `[crates.<name>]`) and
     ignores a flat per-crate file with an "old-style --config" warning (`global_config.rs`).
-- Test first: grep the generated file for `closeEngine` and `val detail`. Without `uniffi.toml`
+- Test first: grep the generated file for `closeEngine` and ``val `detail` `` (UniFFI
+  backtick-quotes identifiers, so the plain `val detail` never matches). Without `uniffi.toml`
   both are absent; with it, both are present. The real proof, that the Kotlin compiles, is step
   10's build, where the break-and-watch of the renames lives.
 - Run, from the repo root:
@@ -576,7 +588,12 @@ this commit).
       load the generated classes) and `org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0`.
 - `app/src/main/AndroidManifest.xml`: `INTERNET`, the application with `android:name=".BrookApp"`,
   and the launcher `MainActivity`. `MainActivity` shows only a Compose `Text` of
-  `conversationLabel("channel", "general", emptyList(), "me", false)` for now.
+  `conversationLabel("channel", "general", emptyList(), "me", false)` for now. `BrookApp.kt` starts
+  as an empty `Application` subclass; step 14 fills it.
+- `defaultConfig` also sets `versionCode = 1` and `versionName = "0.1.0"`.
+- The adaptive icon (`mipmap-anydpi/ic_launcher.xml`) with a monochrome layer for themed icons,
+  drawn from the GNOME placeholder mark (`clients/gnome/data/icons/dev.brook.Brook.svg`), lands
+  here, not in step 14: lint's `MissingApplicationIcon` fails `lintDebug` without it.
 - New `clients/android/.gitignore`: `.gradle/`, `local.properties`, `.kotlin/`. `build/` is
   already ignored by the root file, which this step does not touch.
 - Test first: `app/src/test/.../BindingsLoadTest.kt`. It implements the generated `FfiKeySlot` in
@@ -660,6 +677,9 @@ this commit).
   - `ServerAddressTest`: ports the four Mac `ServerAddressTests`;
   - `SettingsTest`: a stored `true` reads `false` when `isDebugBuild = false`.
   Use a small in-memory `SharedPreferences` fake in the test source set; there is no Robolectric.
+- `app/build.gradle.kts` declares `androidx.core:core-ktx:1.19.1`. Lint's `UseKtx` requires
+  `prefs.edit { }`, and the library was already on the classpath through AndroidX; it is now
+  declared rather than relied on transitively.
 - Run: `./gradlew testDebugUnitTest`.
 - Docs: none (the README in step 15 mentions the debug-only switch).
 
@@ -761,7 +781,8 @@ this commit).
     `PasswordClearedAfterTheServerRejectsIt`, `PasswordKeptWhenTheFormIsRejectedLocally`,
     `PrefillsTheSavedServer`, `InsecureWarningOnlyWhenOptedIn`.
   Break-and-watch: drop the `authState()` re-check in the remote sign-out path, and
-  `aFreshClientsInitialLoggedOutIsNotASignOut` must go red.
+  `aLateInitialLoggedOutNeverEndsAGoodSession` must go red. (`aFreshClientsInitialLoggedOutIsNotASignOut`
+  is protected by `settled` alone, so it stays green without the re-check.)
 - Run: `./gradlew testDebugUnitTest lintDebug`.
 - Docs: none of its own; step 15's README describes sign-in, restore and sign-out as built.
 
@@ -817,14 +838,23 @@ this commit).
     `directBootAware`, so `noBackupFilesDir` and `filesDir` are credential-encrypted storage, as the
     spec requires.
   - `android:enableOnBackInvokedCallback="true"` (predictive back); `android:label="Brook"`.
-  - An adaptive icon (`mipmap-anydpi/ic_launcher.xml`) with a monochrome layer for themed icons,
-    drawn from the GNOME placeholder mark (`clients/gnome/data/icons/dev.brook.Brook.svg`).
 - `BrookApp.kt`:
   - builds `Settings`, `KeystoreSlot(File(noBackupFilesDir, "keyslots"), AndroidKeystoreKeys())`
     and `SessionModel` with `MainScope()`;
   - starts `restoreAtLaunch()`.
   The comment says why the model lives here and not in the Activity (rotation, one restore per
   process).
+- **Accepted deviations found while implementing:**
+  - `ChannelListModel` takes `label` and `sortKey` as constructor parameters, defaulting to core's
+    `conversationLabel` and `sortKey`. JVM tests cannot load the native library, so they pass
+    plain Kotlin functions.
+  - The app theme has no system action bar (`android:windowActionBar` false): the system bar drew a
+    second "Brook" above the Compose top bar.
+  - The code step also has "Use the authenticator code instead", to leave recovery mode again.
+  - The avatar shows the label's first letter or digit, so a label starting with `#` or a symbol
+    still gets a readable letter.
+  - `SignInForm` lives in `BrookApp`, in process memory. Rotation keeps the typed text, and the
+    password never goes into saved instance state.
 - Test first: the model tests above. There are no Compose UI tests in this step (owner decision 3).
 - Run: `./gradlew assembleDebug testDebugUnitTest lintDebug`, then the manual check below.
 - Docs: none of its own; step 15's README covers the screens, the dev http switch and the backup
