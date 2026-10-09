@@ -4,36 +4,39 @@ Date: 2026-10-08
 
 ## Status
 
-Accepted
+Accepted (2026-10-08, owner; #273)
 
 ## Context
 
-The local offline cache and outbox stores (spec 2026-09-25-offline-cache-design.md §3) are built as **SQLCipher** databases on desktop and iOS platforms. SQLCipher provides at-rest encryption with a per-store random key held in the platform's secure key store (`KeySlot`).
+The local offline cache and outbox stores are built as **SQLCipher** databases on every platform except Android, using at-rest encryption with a per-store random key in the platform's secure key store.
 
-However, on Android:
-- SQLCipher depends on **OpenSSL / libcrypto**, which the NDK does not provide.
-- Android's sandbox model grants each app exclusive access to its private `app_private` directory (Linux user isolation + SELinux).
-- The OS encrypts all app private storage via **File-Based Encryption (FBE)** for free, transparent to the app.
-
-Given this, adding a vendored OpenSSL dependency to the Android build is unjustified overhead when the same protection — ciphertext at rest, kept from other apps — is already provided by the OS.
+On Android:
+- Use what the device does better: each app's private storage has its own UID sandbox and is encrypted at rest via **File-Based Encryption (FBE)**, mandatory on every Android 13 device.
+- SQLCipher depends on **libcrypto** for the target, which the NDK does not provide.
 
 ## Decision
 
-**Local stores on Android use plain SQLite, not SQLCipher.** The decision is gated on `target_os = "android"` at compile time: only Android builds use plain SQLite; all other platforms (Linux, macOS, iOS, Windows) use SQLCipher with a random key.
+**Local stores on Android use plain SQLite, not SQLCipher.** The change is gated on `target_os = "android"` at compile time: only Android builds use plain SQLite; all other platforms use SQLCipher.
 
-**Why desktops keep SQLCipher:** On Linux and Windows, the app's data directory is not protected for the app's use alone. A second user or a physical attacker with disk access could read the database files. SQLCipher protects against this. macOS' `~/Library/Application Support/` is user-writable by default (before recent SIP hardening), so SQLCipher is also necessary there.
+Desktops keep SQLCipher because they have no per-app sandbox.
 
-**Why iOS decided differently (#272):** iOS apps run in a sandbox with mandatory code signing and secure enclave hardware; the OS guarantees file protection, and relying on it avoids the OpenSSL dependency on mobile.
+iOS keeps SQLCipher today; it is decided in #272.
 
-## Consequences (confirmed by owner, spec §4)
+## Consequences
 
-- **Protection mechanism**: on Android, the sandbox plus FBE provide the encryption barrier. An app reading another app's files is impossible. An attacker with the device would need to decrypt the partition (OS task), not the app.
-- **No wrong-key detection**: unlike SQLCipher (which fails to open if the key doesn't match), plain SQLite opens any file. No "locked" or "missing key" state for Android stores. A readable but corrupt database signals damage, not a key issue.
-- **File keys in plaintext**: per-file encryption keys (for attachments, in the `files` table) are stored plaintext inside the database. They are as protected as the database itself: under FBE. This is acceptable because the file's encryption is not the sole protection — the file's ciphertext is also guarded by the app's sandbox.
-- **Sign-out wipe is file deletion**: crypto-erase (secure deletion) is a server responsibility, not the app's. A store wipe on Android deletes the files and directories; deleted files may recover from filesystem free blocks (as on any OS).
-- **No `Locked` state**: the `core` API has no "waiting for the key to unlock" state on Android. The store either opens cleanly, or is marked damaged and rebuilt.
+Protection on Android is the app sandbox plus file-based encryption, nothing more.
+
+The store's wrong-key detection does not apply.
+
+File sealing adds nothing there: each downloaded file's own key is kept in a `key BLOB` column of the store, and each outgoing file's snapshot key (`outbox_files.key` in `outbox.db`) is kept the same way. On Android, both sit in plain SQLite next to the files they seal.
+
+Sign-out wipe is not a crypto-erase. A store wipe on Android relies on deleting the files, not on destroying a key first.
+
+A store never reports `Locked` because of a key it does not use.
+
+A damaged plain store is reported `Damaged` and kept, never rebuilt.
 
 ## Requirements
 
-- Credential-encrypted storage: tokens and session keys continue to live in the platform's secure key store, not on the filesystem (Android `EncryptedSharedPreferences` or equivalent). [Deferred to separate work; #46 §8a already specifies this.]
-- Every backup must **exclude** the `stores/` directory (app-private offline cache is not backed up). On Android this is the default (private app storage is never backed up).
+- The databases live in credential-encrypted storage, never device-protected storage.
+- They stay out of every backup: in the no-backup directory, plus `allowBackup` and `dataExtractionRules` keeping them out of cloud backup and device-to-device transfer.

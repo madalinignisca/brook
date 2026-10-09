@@ -121,7 +121,8 @@ drop it.
 - Already complete: returns at once and updates `last_used`.
 - **On Android:** the per-file key and AES-256-GCM chunks apply the same way. The database
   itself (where the key is stored) is plain SQLite, protected by OS File-Based Encryption and
-  the app sandbox (ADR 0001). The file's ciphertext blobs are protected the same way.
+  the app sandbox (ADR 0001). Each file's key sits in plain SQLite next to the file it seals,
+  so the sealing adds no protection beyond the app sandbox and file-based encryption.
 
 ### 4.2 `open_file(id, file_id) -> Result<PathBuf>`
 - `cache_file` first, then decrypts into the Open directory (§4.4) under
