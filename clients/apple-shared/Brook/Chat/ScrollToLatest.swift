@@ -15,4 +15,9 @@ enum ScrollToLatest {
         // Content shorter than the view can't be scrolled up.
         contentHeight - (offset + viewportHeight) > threshold
     }
+
+    /// Whether the view scrolls to a new newest message. At the bottom it follows; scrolled up, only
+    /// the user's own message moves it (spec 2026-10-09-ios-conversation, decision 3). The Mac
+    /// does not call this yet.
+    static func follows(away: Bool, mine: Bool) -> Bool { !away || mine }
 }

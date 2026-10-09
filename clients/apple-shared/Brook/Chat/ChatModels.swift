@@ -57,6 +57,21 @@ final class TimelineModel {
     /// stored with. Never a finished label, so Show usernames relabels without a reload.
     private(set) var authors: [String: (name: String, handle: String)] = [:]
 
+    /// iOS only (see `init`): every newest-page fetch also closes a gap, and `.ready` re-reads.
+    private let rereadOnReady: Bool
+    /// Up to 150 older messages (3 pages of `pageSize`) are fetched to find where a re-read meets
+    /// what is shown. Past that, replacing the shown history is cheaper than paging further.
+    static let rereadPageBacks = 3
+    /// How many times a re-read replaced the shown history. The view scrolls to the newest message
+    /// when it changes, and `loadOlder` drops an older page that started before the change: that
+    /// page belongs to history that is no longer shown.
+    private(set) var replaced = 0
+    /// The newest message that was shown when a re-read was asked for, and has not been filled up
+    /// to yet. The gap check compares the re-read's pages against this, not against whatever is
+    /// newest when the fetch finally runs: a live message merged in between (a `message.new`
+    /// right after `ready`, or the user's own send) is newer than the gap and would hide it.
+    private var gapAnchor: String?
+
     /// Ids deleted, including ones not shown yet: every later copy stays a tombstone.
     private var deleted: Set<String> = []
     /// Messages here came from the cache.
@@ -111,12 +126,19 @@ final class TimelineModel {
     /// name, and the handle comes from here.
     private let members: @MainActor () -> [FfiMember]
 
+    /// `rereadOnReady` is iOS only, the twin of `ChannelsModel.rereadOnReconnect`. iOS suspends the
+    /// socket in the background and keeps no cache, so events sent meanwhile are lost; a re-read of
+    /// the newest page (on every `.ready` and on return to the foreground) is the only way to show
+    /// them. The Mac's `CacheFeed` fills that hole, so it leaves this off, and there a `.ready` only
+    /// retries a failed head, as before.
     init(channelId: String, client: any ChatClient, me: String = "",
          members: @escaping @MainActor () -> [FfiMember] = { [] }, now: @escaping () -> Date = Date.init,
          errorLifetime: Duration = .seconds(5),
-         isActive: @escaping @MainActor () -> Bool = { AppActivity.isActive }) {
+         isActive: @escaping @MainActor () -> Bool = { AppActivity.isActive },
+         rereadOnReady: Bool = false) {
         self.channelId = channelId
         self.client = client
+        self.rereadOnReady = rereadOnReady
         self.me = me
         self.members = members
         self.now = now
@@ -198,26 +220,40 @@ final class TimelineModel {
         while loading || headDrain != nil, !olderInFlight, !Task.isCancelled {
             try? await Task.sleep(for: .milliseconds(25))
         }
-        guard !Task.isCancelled, !olderInFlight, !atStart, !loading,
-              let oldest = messages.first else { return }
+        guard !Task.isCancelled, !olderInFlight, !atStart, !loading, !messages.isEmpty else { return }
         olderInFlight = true
         defer { olderInFlight = false }
         olderFailed = false
-        loading = true // one page at a time
-        let fromCache = await readCache(before: oldest.id, loadIfIncomplete: true)
-        loading = false
-        if fromCache { return }
-        // A newest-page fetch may have started meanwhile (a returning connection, a resync): its
-        // outcome decides whether an older page may be asked for, so it is waited for.
-        if let drain = headDrain { await drain.value }
-        // Cached history is paged whatever the network does, but behind a newest page that failed the
-        // network is not asked for older ones (an empty answer would read as the start of the
-        // conversation): the Retry button instead, so no spinner is left that nothing will end.
-        if headFailed {
-            olderFailed = true
+        // A re-read can replace the shown history (`replaced`) while this waits on the cache or on
+        // a head fetch, or while the older request is in the air. The oldest message noted below
+        // then belongs to history that is gone, and so does the answer. So: note `replaced` together
+        // with the oldest message (no suspension between the two), check it again just before the
+        // request and when the answer lands, and on a change start over from the new oldest message.
+        // Starting over, not giving up: the loader's spinner asks once, when it appears, and a dropped
+        // ask would leave it spinning for good. A replace needs a whole re-read, so this cannot spin.
+        while !Task.isCancelled {
+            guard !atStart, let oldest = messages.first else { return }
+            let replacedAtStart = replaced
+            loading = true // one page at a time
+            let fromCache = await readCache(before: oldest.id, loadIfIncomplete: true)
+            loading = false
+            if fromCache { return }
+            // A newest-page fetch may have started meanwhile (a returning connection, a resync): its
+            // outcome decides whether an older page may be asked for, so it is waited for.
+            if let drain = headDrain { await drain.value }
+            // The last look before the request. Nothing suspends between this check and the call
+            // inside `fetch`, so no replace can land in between.
+            if replaced != replacedAtStart { continue }
+            // Cached history is paged whatever the network does, but behind a newest page that failed the
+            // network is not asked for older ones (an empty answer would read as the start of the
+            // conversation): the Retry button instead, so no spinner is left that nothing will end.
+            if headFailed {
+                olderFailed = true
+                return
+            }
+            if await fetch(before: oldest.id, replacedAtAsk: replacedAtStart) { continue }
             return
         }
-        await fetch(before: oldest.id)
     }
 
     /// The loader above the first message: shown while an older page can be asked for. Behind a failed
@@ -264,11 +300,18 @@ final class TimelineModel {
         }
     }
 
-    private func fetch(before: String?) async {
+    /// One page from the network, merged. Returns true when this was an older page whose answer
+    /// was dropped because a re-read replaced the history after the ask (`replacedAtAsk`): the
+    /// caller starts over. The head fetch (`before == nil`) never drops its answer.
+    @discardableResult
+    private func fetch(before: String?, replacedAtAsk: Int = 0) async -> Bool {
         loading = true
         defer { loading = false }
         do {
             let page = try await client.channelHistory(channelId: channelId, before: before)
+            // The answer belongs to history that was replaced while it was in the air: merging it
+            // would put old messages above the new ones, and `atStart` would describe the wrong end.
+            if before != nil, replaced != replacedAtAsk { return true }
             if page.isEmpty, before != nil { atStart = true }
             // The newest page is back: an older page is asked for again, and a Retry left from the time
             // it was held back is not shown.
@@ -276,8 +319,95 @@ final class TimelineModel {
             merge(page)
             error = nil
         } catch {
+            // A failure of a dropped ask says nothing about the new history either.
+            if before != nil, replaced != replacedAtAsk { return true }
             self.error = "Couldn't load messages."
             if before != nil { olderFailed = true } else { headFailed = true }
+        }
+        return false
+    }
+
+    /// The newest page for a re-read (`rereadOnReady`), closing the gap behind it. Runs inside the
+    /// head drain, so it is one fetch at a time like any head fetch. Steps:
+    /// 1. Take the anchor (the newest message shown when the re-read was asked for, see
+    ///    `noteGapAnchor`) and clear it, so a trigger during this turn notes a fresh one for the
+    ///    turn queued behind it. No anchor was noted for a first load or a failed head's retry; the
+    ///    newest shown message is then the right point.
+    /// 2. Fetch the newest page. It "meets" the shown messages when there is no anchor, it is
+    ///    empty, or its oldest id is at or below the anchor (ids are UUIDv7: id order is time order).
+    /// 3. Not met: page back with `before:` the oldest fetched id, up to `rereadPageBacks` times. An
+    ///    empty page-back is the start of the channel: everything since is fetched, so that meets.
+    /// 4. Met: merge. Not met: replace (see below).
+    /// Any request failing leaves everything as it was: merging part of a fetch would leave a hole
+    /// in the middle of the conversation. The anchor goes back, so the next try (the next `ready`
+    /// or foreground) still compares against the oldest point that may have a gap.
+    private func fetchHeadFillingGap() async {
+        loading = true
+        defer { loading = false }
+        let anchor = gapAnchor ?? messages.last?.id
+        gapAnchor = nil
+        do {
+            var fetched = try await client.channelHistory(channelId: channelId, before: nil)
+            var met = Self.meets(fetched, anchor: anchor)
+            var pageBacks = 0
+            while !met, pageBacks < Self.rereadPageBacks, let oldest = fetched.map(\.id).min() {
+                pageBacks += 1
+                let older = try await client.channelHistory(channelId: channelId, before: oldest)
+                fetched = older + fetched
+                met = older.isEmpty || Self.meets(older, anchor: anchor)
+            }
+            if met {
+                merge(fetched)
+            } else {
+                // Still no meeting point: the shown history is too far behind to join. Keep what was
+                // fetched, plus the shown messages newer than the newest fetched one: live messages
+                // and the user's own sends merged while the page-backs ran are in `messages` and
+                // not in `fetched`. Dropping them would lose a message the user just saw. `deleted`
+                // is kept, so a message deleted earlier stays a tombstone in `merge`.
+                let newest = fetched.map(\.id).max() ?? ""
+                messages = messages.filter { $0.id > newest }
+                atStart = false // the start of the channel is no longer the oldest shown message's
+                olderFailed = false
+                replaced += 1
+                merge(fetched)
+            }
+            headFailed = false
+            olderFailed = false
+            error = nil
+        } catch {
+            // The older of this turn's anchor and any fresh one a trigger noted meanwhile.
+            gapAnchor = [anchor, gapAnchor].compactMap { $0 }.min()
+            self.error = "Couldn't load messages."
+            headFailed = true
+        }
+    }
+
+    /// A page meets the shown messages when nothing is owed (no anchor), it is empty (nothing
+    /// newer exists), or it reaches back to the anchor.
+    private static func meets(_ page: [FfiMessage], anchor: String?) -> Bool {
+        guard let anchor, let oldest = page.map(\.id).min() else { return true }
+        return oldest <= anchor
+    }
+
+    /// Remember the newest shown message as the point a coming re-read must reach back to. Every
+    /// trigger calls this synchronously, before anything else can be merged. Triggers before the
+    /// next head fetch starts share the first (oldest) anchor: `gapAnchor` is only set when empty.
+    private func noteGapAnchor() {
+        if gapAnchor == nil { gapAnchor = messages.last?.id }
+    }
+
+    /// iOS: read the newest page again (a `ready`, or the app coming back to the front), closing any
+    /// gap. The anchor is taken here, synchronously, and not when the fetch runs. Returns the task so
+    /// a caller can wait for the result. It marks the newest message read when it brought a newer
+    /// one (owed while the app is not active). It leaves the reaction marks alone: with the socket
+    /// still up no event was missed (`.ready` clears them, see `apply`).
+    @discardableResult
+    func reread() -> Task<Void, Never> {
+        noteGapAnchor()
+        let newestBefore = messages.last?.id
+        return Task {
+            await fetchHead()
+            if error == nil, messages.last?.id != newestBefore { await markNewestRead() }
         }
     }
 
@@ -304,7 +434,7 @@ final class TimelineModel {
         let drain = Task { [self] in
             repeat {
                 headRefetchPending = false
-                await fetch(before: nil)
+                if rereadOnReady { await fetchHeadFillingGap() } else { await fetch(before: nil) }
             } while headRefetchPending
             headDrain = nil
         }
@@ -364,6 +494,11 @@ final class TimelineModel {
             // A reconnect (or a restored server) may number events from lower values again.
             reactionSeqs = [:]
             reactionMineSeqs = [:]
+            // With the flag, the head fetch below also closes a gap, and needs its anchor now: the
+            // binding delivers the events it kept right after `Resync` (bindings/apple/src/client.rs),
+            // so they are merged before the fetch runs, and the newest shown message by then is newer
+            // than the events that were dropped.
+            if rereadOnReady { noteGapAnchor() }
             Task { await fetchHead() }
         case let .reactionUpdate(channel, messageId, emoji, userId, added, count, seq):
             guard channel == channelId, let i = messages.firstIndex(where: { $0.id == messageId }) else { return }
@@ -387,7 +522,16 @@ final class TimelineModel {
                 messages[i].reactions[j] = FfiReaction(emoji: r.emoji, count: r.count, me: added)
             }
         case .ready:
-            retryFailedHead() // every (re)connect
+            if rereadOnReady {
+                // PROTOCOL.md section 2, `reaction.update`: on every reconnect the order marks are
+                // forgotten before the refetch, since a restored server may number from lower values
+                // again. Only here: a foreground re-read (`reread()`) has the socket still up.
+                reactionSeqs = [:]
+                reactionMineSeqs = [:]
+                reread()
+            } else {
+                retryFailedHead() // every (re)connect
+            }
         case .channelCall, .channelUpdate, .channelDelete:
             break
         }
