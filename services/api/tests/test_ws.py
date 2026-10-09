@@ -8,6 +8,7 @@ another over the hub. This is the Phase 1 acceptance check (two accounts chat).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -135,6 +136,83 @@ def test_ws_rejects_missing_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         ws.send_json({"type": "typing", "data": {}})
         with pytest.raises(Exception):  # noqa: B017 - starlette raises on the close
             ws.receive_json()
+    config.get_settings.cache_clear()
+    db._engine = None
+    db._sessionmaker = None
+
+
+def test_ws_channel_update_when_channel_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Creating a channel pushes `channel.update` to the creator's other sessions only (#343)."""
+    _reset(tmp_path, monkeypatch)
+    app = create_app()
+    with TestClient(app) as http:
+
+        def register(handle: str, token: str | None = None) -> None:
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            r = http.post(
+                "/api/v1/auth/register",
+                json={
+                    "handle": handle,
+                    "display_name": handle.title(),
+                    "password": PW,
+                    "admin_password": PW,
+                },
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+        def login(handle: str) -> str:
+            r = http.post("/api/v1/auth/login", json={"handle": handle, "password": PW})
+            return str(r.json()["access_token"])
+
+        register("alice")  # admin
+        alice = login("alice")
+        register("bob", token=alice)
+        bob = login("bob")
+        ha = {"Authorization": f"Bearer {alice}"}
+
+        with http.websocket_connect("/ws") as wa, http.websocket_connect("/ws") as wb:
+            wa.send_json({"type": "auth", "data": {"access_token": alice}})
+            wb.send_json({"type": "auth", "data": {"access_token": bob}})
+            assert wa.receive_json()["type"] == "ready" and wb.receive_json()["type"] == "ready"
+
+            chan = http.post(
+                "/api/v1/channels",
+                json={"kind": "channel", "name": "general", "public": True},
+                headers=ha,
+            ).json()
+
+            # Frames reach a socket in order, so a message sent afterwards bounds each
+            # read: a missing (or leaked) event shows up as a failed assert, never a hang.
+            dm = http.post("/api/v1/channels", json={"kind": "dm", "member": "bob"}, headers=ha)
+            http.post(
+                f"/api/v1/channels/{dm.json()['id']}/messages", json={"body": "probe"}, headers=ha
+            )
+
+            def frames_through_probe(ws: Any) -> list[dict[str, Any]]:
+                seen: list[dict[str, Any]] = []
+                while True:
+                    f = ws.receive_json()
+                    seen.append(f)
+                    if f["type"] == "message.new" and f["data"]["body"] == "probe":
+                        return seen
+
+            def updates_for_chan(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                return [
+                    f
+                    for f in frames
+                    if f["type"] == "channel.update" and f["data"]["id"] == chan["id"]
+                ]
+
+            (event,) = updates_for_chan(frames_through_probe(wa))
+            assert event["data"]["seq"] > 0
+            roles = {m["handle"]: m["role"] for m in event["data"]["members"]}
+            assert roles == {"alice": "owner"}
+            # Bob is not a member, so he must not see it, even though it is public.
+            assert updates_for_chan(frames_through_probe(wb)) == []
+
     config.get_settings.cache_clear()
     db._engine = None
     db._sessionmaker = None
