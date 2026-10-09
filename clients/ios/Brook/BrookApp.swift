@@ -4,8 +4,8 @@
 import BrookCore
 import SwiftUI
 
-/// Placeholder until the sign-in and channel list arrive (#272, steps 6 and 7). It builds what
-/// they will need: the store, with session persistence on and local data off, and the login form.
+/// The app: the root follows `store.phase`, as on the Mac. The signed-in screen is still a
+/// placeholder until the channel list arrives (#272, step 7).
 @main
 struct BrookApp: App {
     @State private var store: SessionStore
@@ -22,9 +22,24 @@ struct BrookApp: App {
 
     var body: some Scene {
         WindowGroup {
-            // A call into Rust made by the app (not only by the test bundle), visible on screen:
-            // it reads "#general" when the core is linked and running.
-            Text(conversationLabel(kind: "public", name: "general", members: [], me: "", showUsernames: false))
+            Group {
+                switch store.phase {
+                case let .signedIn(user):
+                    // A call into Rust made by the app (not only by the test bundle): reads
+                    // "#general" when the core is linked and running.
+                    VStack(spacing: 8) {
+                        Text("Signed in as \(user.displayName)")
+                        Text(conversationLabel(kind: "public", name: "general", members: [], me: "", showUsernames: false))
+                            .foregroundStyle(.secondary)
+                    }
+                case .restoring:
+                    ProgressView("Signing in…")
+                case .signedOut, .signingIn, .needsCode:
+                    LoginView(form: form)
+                }
+            }
+            // Once per process; later appearances no-op. Restores the stored session.
+            .task { await store.restoreAtLaunch() }
         }
     }
 }

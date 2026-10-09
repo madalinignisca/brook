@@ -76,11 +76,11 @@ final class SessionPersistenceIOSTests: XCTestCase {
     }
     private func prepare(
         _ keychain: SecItemCalls, _ s: (defaults: UserDefaults, domain: String), dir: URL? = nil,
-        unlocked: Bool = true
+        probe: SessionPersistence.ProtectedData = .available
     ) -> SessionPersistence {
         SessionPersistence.prepare(
             dataDir: dir ?? dataDir, calls: keychain, defaults: s.defaults, defaultsDomain: s.domain,
-            protectedDataAvailable: { unlocked })
+            protectedData: { probe })
     }
     private var dataDir: URL { tmp.appending(path: "Brook", directoryHint: .isDirectory) }
     private func cleared(_ s: (defaults: UserDefaults, domain: String)) -> Bool {
@@ -181,8 +181,8 @@ final class SessionPersistenceIOSTests: XCTestCase {
     func testProtectedDataUnavailableStaysOffWithoutDeletingOrMarking() {
         let keychain = RecordingKeychain()
         let defaults = suite()
-        let locked = prepare(keychain, defaults, unlocked: false)
-        XCTAssertTrue(isOff(locked))
+        let locked = prepare(keychain, defaults, probe: .locked)
+        guard case .lockedUntilFirstUnlock = locked else { return XCTFail("expected .lockedUntilFirstUnlock, got \(locked)") }
         XCTAssertEqual(keychain.events, [], "a locked launch touched the Keychain")
         XCTAssertFalse(cleared(defaults), "a locked launch set the marker")
         XCTAssertFalse(FileManager.default.fileExists(atPath: dataDir.path))
@@ -225,16 +225,63 @@ final class SessionPersistenceIOSTests: XCTestCase {
         XCTAssertEqual(markerSeenAtDelete, false, "the marker was already set when the delete ran")
     }
 
-    /// The real check: a fresh directory counts as available and gets its probe file; a probe
-    /// that exists but can't be read (a directory stands in for a locked file) counts as locked.
-    func testTheFileProbeSaysAvailableWhenReadableAndLockedWhenNot() throws {
-        XCTAssertTrue(SessionPersistence.protectedDataAvailable(in: dataDir))
+    /// A probe that failed for a reason other than the lock (disk full, directory can't be made,
+    /// probe file malformed) is not "locked": the screen must not tell the user to unlock a
+    /// phone that is unlocked. It stays off, silently, as before step 6, and touches nothing.
+    func testAProbeThatFailedButIsNotLockedStaysOffWithoutTouchingAnything() {
+        let keychain = RecordingKeychain()
+        let defaults = suite()
+        let result = prepare(keychain, defaults, probe: .failed)
+        XCTAssertTrue(isOff(result), "expected .off, got \(result)")
+        XCTAssertEqual(keychain.events, [], "a failed probe touched the Keychain")
+        XCTAssertFalse(cleared(defaults), "a failed probe set the marker")
+    }
+
+    /// The real check: a fresh directory counts as available and gets its probe file.
+    func testTheFileProbeSaysAvailableWhenReadable() throws {
+        XCTAssertEqual(SessionPersistence.protectedData(in: dataDir), .available)
         let probe = dataDir.appending(path: "protected-data-probe")
         XCTAssertTrue(FileManager.default.fileExists(atPath: probe.path))
-        XCTAssertTrue(SessionPersistence.protectedDataAvailable(in: dataDir), "second call reads it back")
+        XCTAssertEqual(SessionPersistence.protectedData(in: dataDir), .available, "second call reads it back")
+    }
 
+    /// Failures that are not the lock: a probe that exists but can't be read (a directory stands
+    /// in for a malformed one), and a data directory that can't be made (its parent is a file).
+    func testTheFileProbeSaysFailedForOtherFailures() throws {
+        _ = SessionPersistence.protectedData(in: dataDir)
+        let probe = dataDir.appending(path: "protected-data-probe")
         try FileManager.default.removeItem(at: probe)
         try FileManager.default.createDirectory(at: probe, withIntermediateDirectories: false)
-        XCTAssertFalse(SessionPersistence.protectedDataAvailable(in: dataDir), "an unreadable probe means locked")
+        XCTAssertEqual(SessionPersistence.protectedData(in: dataDir), .failed, "an unreadable probe is not a lock")
+
+        let file = tmp.appending(path: "a-file")
+        try Data("x".utf8).write(to: file)
+        XCTAssertEqual(
+            SessionPersistence.protectedData(in: file.appending(path: "Brook", directoryHint: .isDirectory)), .failed,
+            "a directory that can't be made is not a lock")
+    }
+
+    /// Only a permission-style refusal is the protection class saying "not yet": EPERM or EACCES,
+    /// bare or inside a Cocoa error, or the Cocoa no-permission codes. A device that is really
+    /// locked can't be simulated here, so this pins the rule the probe applies to its errors.
+    func testOnlyAPermissionRefusalCountsAsLocked() {
+        func posix(_ code: Int32) -> NSError { NSError(domain: NSPOSIXErrorDomain, code: Int(code)) }
+        func cocoa(_ code: Int, underlying: NSError? = nil) -> NSError {
+            NSError(domain: NSCocoaErrorDomain, code: code,
+                    userInfo: underlying.map { [NSUnderlyingErrorKey: $0] } ?? [:])
+        }
+        let locked: [NSError] = [
+            posix(EPERM), posix(EACCES),
+            cocoa(NSFileReadNoPermissionError), cocoa(NSFileWriteNoPermissionError),
+            cocoa(NSFileReadUnknownError, underlying: posix(EPERM)),
+            cocoa(NSFileWriteUnknownError, underlying: posix(EACCES)),
+        ]
+        for error in locked { XCTAssertTrue(SessionPersistence.isProtectionRefusal(error), "\(error)") }
+        let other: [NSError] = [
+            posix(ENOSPC), posix(EISDIR), posix(ENOENT),
+            cocoa(NSFileWriteOutOfSpaceError), cocoa(NSFileReadCorruptFileError),
+            cocoa(NSFileReadUnknownError, underlying: posix(EISDIR)),
+        ]
+        for error in other { XCTAssertFalse(SessionPersistence.isProtectionRefusal(error), "\(error)") }
     }
 }
