@@ -6,6 +6,17 @@ first: the direct send carries a `client_id` (§7, decision 2).
 
 The #335 dependency (blank screen after sign-in on a real iPhone) is met: #338 fixed it.
 
+Changed at plan stage (2026-10-09), from the plan's §5 decisions: in the agent's checks the
+second account acts through the API, and "shows on the Mac" moves to the owner's iPhone check
+(Done, §7 decision 1); iOS closes the conversation when its row leaves the list, and `closed`
+stays as it is (§3, §4, §5, Done 10); GNOME and KDE pass no `client_id` for now (§4 Sending,
+§7 decision 2); every newest-page fetch on iOS, `resync` included, goes through the gap
+check, so that known limit is gone (§4); what "joins" means for a second `ready` during a
+page-back (§4, Done 10); `ComposerView.replyBanner` stays on the Mac (§5). The owner approved
+all six on 2026-10-09. Also from the plan: the gap's anchor is
+taken when the re-read is asked for, and a replace keeps shown messages newer than what it
+fetched and restarts a running older page (§4 Staying live, Done 10).
+
 Changed after the first review: a re-read now marks read (§4 Read state; Done 6, 10); the gap
 rule pages back before it replaces, and resets what it must (§4 Staying live); duplicate sends
 are open question 2; the composer and its file code move whole, with the sharing rule relaxed to
@@ -42,8 +53,10 @@ iOS the user has: a system navigation push, a plain scrolling list of messages, 
 with a Send button above the keyboard. Nothing branded.
 
 Done when, each checked and written in the PR. Items 1 to 8 run as §7 decision 1 says
-(the simulator against the local stack, then a real iPhone against the owner's server), with
-the Mac app signed in to the same server as a second account:
+(the simulator against the local stack, then a real iPhone against the owner's server). "The
+Mac" below is the second account. In the agent's simulator checks, that account acts through
+the server API, not the Mac app. In the owner's iPhone check it is the Mac app, and the parts
+that need the Mac app ("shows on the Mac", Done 3 and 7) are checked there:
 
 1. Tapping a channel row opens its conversation with `#name` as the title; tapping a DM row
    opens it with the other person as the title. The newest messages show at the bottom within
@@ -88,10 +101,15 @@ the Mac app signed in to the same server as a second account:
       becomes active (the scene-phase wiring, as `ForegroundReload` is tested for the list);
     - a re-read with the app active marks the newest message read; with it not active, it
       leaves the read owed;
-    - a re-read that overlaps merges; one that does not pages back and merges when a page meets
-      the shown messages; one that never meets them within the limit replaces them, with
-      `atStart` and `olderFailed` reset and an older page that started before the re-read
-      discarded; a second `ready` during the page-back joins it instead of starting another;
+    - a re-read that overlaps merges; one that does not pages back and merges when a page
+      reaches the anchor; one that never reaches it within the limit replaces the shown
+      messages but keeps those newer than what it fetched, with `atStart` and `olderFailed`
+      reset, and an older page that was running dropped and asked again from the new oldest
+      message; the anchor is the newest message shown when the re-read was asked for, not when
+      it ran; a second `ready` during the page-back starts no fetch beside it, and exactly one
+      more newest-page fetch follows when it ends;
+    - the conversation closes when its row leaves the list, both on a live removal and on a
+      list re-read after a reconnect;
     - a `ready` clears the reaction order marks; a foreground re-read with the socket still up
       does not;
     - a send that fails puts the text back with the right message;
@@ -122,7 +140,7 @@ the Mac app signed in to the same server as a second account:
 | Live: new, edited and deleted messages, reactions changing | In, shown only | The shared model already applies these events. Hiding them would show a different conversation from the Mac's. |
 | Mark read when a conversation is open and the app is active | In | Without it the mention badge never clears, and other devices of the same account keep counting the messages as unread. The shared model already does it. |
 | Archived channel: no box, a note instead | In | The server refuses the send (`403`); a box that always fails is worse. The shared composer has the read-only switch. |
-| Removed from the open channel: back to the list | In | The model already reports it (`closed`); a stale screen whose sends fail is worse. |
+| Removed from the open channel: back to the list | In | The list already drops the row; iOS closes when the row is gone (§4). A stale screen whose sends fail is worse. |
 | A reply's quote line, a file's name and size, the "edited" mark, the tombstone | In, shown only | The data is in every message. A message with a file and no caption would otherwise look empty. |
 | Copying a message's text | In | Text selection on, the system's own long-press. One modifier, as the Mac. |
 | Follow new messages only at the bottom; jump-to-latest button | In | §7, decision 3. The Mac has the button (#284). |
@@ -150,6 +168,10 @@ the Mac app signed in to the same server as a second account:
   message events go to it. Going back stops both. The list's own updates keep running
   underneath, so a rename while the conversation is open shows on return.
 - Each opening starts from nothing: there is no cache to show first.
+- Removed from the channel: the conversation closes and the list shows again, as soon as the
+  channel's row leaves the list. That covers both ways iOS learns of it: the live
+  `channel.delete` event, and the list's re-read after a reconnect, which drops the row without
+  any event. iOS does not watch `ChannelsModel.closed` (§5 risks).
 
 ### Reading and history
 - The newest page (50 messages, the server's default) loads first, oldest at the top, and the
@@ -178,26 +200,36 @@ the Mac app signed in to the same server as a second account:
   becomes active again. Re-reads that overlap join one fetch (the model already runs one head
   fetch at a time). This is the conversation's twin of the list's `rereadOnReconnect` (#272),
   and is off on the Mac, where a `ready` only retries a failed head, as today.
+- Every newest-page fetch on iOS goes through the gap check below: the first load, a `ready`, a
+  foreground re-read, and a `resync` (events dropped inside core). (Plan stage, approved by
+  the owner 2026-10-09.)
+- The anchor (the point a gap is closed back to) is the newest shown message at the moment the
+  re-read is asked for: on `ready`, on `resync`, or on return to the foreground. It is not taken
+  when the fetch runs, because live events can land in between: a live message or the user's
+  own send would be newer than the gap and hide it. A `resync` takes its anchor at its trigger
+  too, so it gets the same gap check as the others.
 - A `ready` (a reconnect) clears the reaction order marks before its re-read: events may have
   been missed, and a restored server may number from lower values again (PROTOCOL.md §2,
   `reaction.update`). A foreground re-read with the socket still up keeps them: no event was
   missed, and the marks still order the ones in flight.
 - The re-read page and the shown messages:
-  - It reaches back to the newest shown message (ids are time-ordered): merged.
+  - It reaches back to the anchor (ids are time-ordered): merged.
   - It does not (more than a page arrived while away): the model pages back with `before=`
-    from the oldest fetched message until a page meets the shown messages, or the server
-    returns none, up to 3 pages. Then everything fetched is merged. The page-back runs inside
-    the same one-at-a-time head fetch as the re-read, so a second `ready` meanwhile joins it
-    rather than starting another.
-  - Still no meeting point after 3 pages: the screen keeps only what the re-read fetched.
-    `atStart` and `olderFailed` are reset, an older page (scrolling up) that started before
-    the re-read is discarded when it lands (it belongs to the replaced history), and the view
-    lands at the newest message, so the jump-to-latest button is gone. Older history loads
-    again by scrolling up.
+    from the oldest fetched message until a page reaches the anchor, or the server returns
+    none, up to 3 pages. Then everything fetched is merged. The page-back runs inside the same
+    one-at-a-time head fetch as the re-read. A second `ready` meanwhile starts no fetch beside
+    it; exactly one more newest-page fetch follows when the page-back ends, because that
+    `ready` may know of newer messages. (Plan stage, approved by the owner 2026-10-09.)
+  - Still no meeting point after 3 pages: the screen keeps what the re-read fetched, plus any
+    shown messages newer than the newest fetched one (live arrivals and the user's own sends
+    that landed while the pages ran). `atStart` and `olderFailed` are reset, and the view
+    lands at the newest message, so the jump-to-latest button is gone. An older page
+    (scrolling up) that was running when the replace happened is dropped when it lands (it
+    belongs to the replaced history), and the request starts again by itself from the new
+    oldest message, so the loader never waits on an answer that was dropped.
 - Why not the server's `after=` forward sync: core's history call takes only `before`, and
   this needs no core change. A later core change can swap it in.
-- Known limits, accepted for now: a `resync` (events dropped inside core) merges the head page
-  without this gap check; edits and deletes made while away to messages older than the
+- Known limit, accepted for now: edits and deletes made while away to messages older than the
   re-read pages stay stale until the conversation is reopened.
 
 ### Read state
@@ -222,7 +254,8 @@ the Mac app signed in to the same server as a second account:
   server returns the stored message for a repeated id and never makes a duplicate (PROTOCOL.md
   §1, `POST /channels/{id}/messages`), so a send that timed out but arrived, sent again, shows
   once. Core's `send_message` and the binding gain an optional `client_id` for this; it lands
-  before the iOS work.
+  before the iOS work. GNOME and KDE pass none in that change, so they behave as today; each
+  passing its own draft id is a follow-up issue.
 - Archived: no box; the Mac's note in its place, updated live from `channel.update`.
 
 ### What having no local cache costs
@@ -246,14 +279,14 @@ move is for the plan.
 
 | Mac code | What happens | Notes |
 |---|---|---|
-| `ChannelsModel` (already shared) | used as is | `openChannel`, `timeline`, `closed`, `title`, `mentions` |
+| `ChannelsModel` (already shared) | used as is | `openChannel`, `timeline`, `channels`, `title`, `mentions`. Not `closed` (risks below) |
 | `TimelineModel`, `ChatClient`, `ReactionRules`, `SaveModel` (`clients/macos/Brook/Chat/ChatModels.swift`) | move to shared | No AppKit. Needs `TypingState` (`Chat/TypingSearch.swift`, Foundation only), `AppActivity` (a seam both apps have), `PersonName` and `OfflineClient` (shared). With no local data its cache reads answer `local.unavailable` and it takes the network path. Gains the iOS re-read flag, off by default (§4) |
 | `ComposerModel` (same file) | moves whole | Its file half stays; no iOS screen calls it. Its default `importer` names `PasteImport`, which stays on the Mac, so the Mac injects it and the shared default does not name it |
 | `Chat/Staging.swift` | moves, except `PasteImport` | `PasteImport` reads `NSPasteboard` (AppKit) and stays Mac-only. `FileAccess`, `StagedFile`, `Staging`, `DropImport`, `StagingRefusal` move |
 | `Chat/PendingModel.swift` | moves | Named by `ComposerModel` |
 | `Chat/TypingSearch.swift` | moves whole | `TimelineModel` needs `TypingState`, the composer `TypingSender`. `SearchModel` and `SearchClient` come along: the whole file is Foundation only, so splitting it gains nothing |
 | `FileRowModel`, `CacheFeed`, `NSWorkspaceBridge` | stay on the Mac | not needed |
-| `ChatViews.swift` | stays on the Mac; pure helpers shared | `MessageRow.excerpt`, `MessageRow.time`, `ComposerView.replyBanner`, `AttachmentRow.icon`, `ScrollToLatest`. The views use AppKit and a desktop layout; iOS writes its own |
+| `ChatViews.swift` | stays on the Mac; pure helpers shared | `MessageRow.excerpt`, `MessageRow.time`, `AttachmentRow.icon`, `ScrollToLatest`. The views use AppKit and a desktop layout; iOS writes its own. `ComposerView.replyBanner` stays on the Mac: iOS has no reply yet, so nothing there would call it; it moves with the reply issue (plan stage, approved by the owner 2026-10-09) |
 
 The Mac's tests that cover the moved code (`ChatModelTests`, `OfflineTimelineTests`,
 `ReadWhenActiveTests`, `TypingSearchTests`, `ReactionTests`, `PendingModelTests`,
@@ -271,8 +304,9 @@ Risks and notes for the plan:
   the direct send; it must keep the id until the direct send succeeds, so a retry reuses it.
 - `ChannelsModel.closed` is set on a removal and never cleared (ChannelsModel.swift, in
   `cacheRemoved`). A view that reacts to it changing misses a second removal of the same
-  channel in one session (removed, re-added, removed again). The Mac has the same flaw. The
-  plan says how iOS reacts to it and whether to fix it in the shared model.
+  channel in one session (removed, re-added, removed again). Decided (owner, 2026-10-09): iOS
+  does not use `closed`; it closes when the row leaves the list (§4), so it is not affected.
+  `closed` stays as it is in the shared model, and the Mac's flaw gets its own issue.
 
 ## 6. Decisions
 
@@ -299,10 +333,17 @@ Each is the answer this spec recommended.
    check is the owner's, against chat.madalin.me (https), in a dedicated test channel, with the
    app launched from the Home Screen, not from Xcode. Why: a debugger keeps the app from being
    suspended, and the local stack listens on loopback only, which a phone cannot reach without
-   a LAN bind and the insecure-http flag. Nothing is posted to real channels.
+   a LAN bind and the insecure-http flag. Nothing is posted to real channels. At plan stage
+   the owner added: in the agent's checks the second account acts through the server API, and
+   no Mac app runs. Any Mac build shares the owner's bundle id, defaults and Keychain, so
+   signing it in to the local stack would replace the owner's saved server and session. The
+   Mac app as the other client, "shows on the Mac" included, is checked in the owner's iPhone
+   check.
 2. **The direct send is safe to repeat.** Core's `send_message` and the binding gain an
    optional `client_id`, and the composer passes its existing draft id. A small core change,
-   done first, by the core implementer. The Mac's direct send gains the same safety.
+   done first, by the core implementer. The Mac's direct send gains the same safety. At plan
+   stage the owner added: GNOME and KDE pass none in the core commit (one `None` each, forced by
+   the new signature); each passing its own draft id is a follow-up issue.
 3. **New messages while reading history.** Follow only at the bottom or for the user's own
    message, plus the jump-to-latest button, sharing `ScrollToLatest.isAway` with the Mac.
 
