@@ -186,6 +186,9 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.13.0")
     // What UniFFI's Kotlin calls native code through. The @aar carries libjnidispatch.so per ABI.
     implementation("net.java.dev.jna:jna:5.19.1@aar")
+    // `SharedPreferences.edit {}`, which lint (UseKtx, warnings are errors) requires over
+    // `edit().apply()`. Already on the classpath as `core`; this adds only the Kotlin extensions.
+    implementation("androidx.core:core-ktx:1.19.1")
     // UniFFI's async functions are `suspend` functions.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
 
