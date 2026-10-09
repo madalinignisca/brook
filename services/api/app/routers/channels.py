@@ -384,9 +384,11 @@ async def create_channel(
         session.add(Membership(channel_id=channel.id, user_id=user.id, role="owner"))
         await session.commit()
         await session.refresh(channel)
-        # Only the creator is a member yet, so this reaches just their other sessions
-        # (e.g. a phone with the channel list open). Not-yet-members get nothing, even
-        # for a public channel: they find it through the REST listing (#343).
+        # Only the creator is a member yet, so this reaches just the creator's sessions:
+        # all of them, including the device that made this request (a client must not
+        # ignore its own device's event), e.g. a phone with the channel list open.
+        # Not-yet-members get nothing, even for a public channel: they find it through
+        # the REST listing (#343).
         await _emit_channel_update(hub, session, channel)
         return await _channel_out_for(session, channel)
 

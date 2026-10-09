@@ -144,7 +144,7 @@ def test_ws_rejects_missing_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 def test_ws_channel_update_when_channel_created(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Creating a channel pushes `channel.update` to the creator's other sessions only (#343)."""
+    """Creating a channel pushes `channel.update` to the creator's sessions only (#343)."""
     _reset(tmp_path, monkeypatch)
     app = create_app()
     with TestClient(app) as http:
@@ -187,9 +187,11 @@ def test_ws_channel_update_when_channel_created(
             # Frames reach a socket in order, so a message sent afterwards bounds each
             # read: a missing (or leaked) event shows up as a failed assert, never a hang.
             dm = http.post("/api/v1/channels", json={"kind": "dm", "member": "bob"}, headers=ha)
-            http.post(
+            assert dm.status_code == 201, dm.text
+            probe = http.post(
                 f"/api/v1/channels/{dm.json()['id']}/messages", json={"body": "probe"}, headers=ha
             )
+            assert probe.status_code == 201, probe.text
 
             def frames_through_probe(ws: Any) -> list[dict[str, Any]]:
                 seen: list[dict[str, Any]] = []
