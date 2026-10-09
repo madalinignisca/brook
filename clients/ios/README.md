@@ -49,7 +49,8 @@ make down    # stop, keep the data
 ```
 
 - In the app, enter `http://127.0.0.1:8080` as the server. Plain http is allowed for loopback
-  addresses, so no flag is needed.
+  addresses, so no flag is needed. For plain http to any other address, run
+  `BROOK_ALLOW_INSECURE_HTTP=1 clients/ios/build.sh run`.
 - The simulator shares the Mac's network, so it reaches the server at that address.
 - Create a test account as the [admin guide](../../docs/admin-guide.md#create-the-first-administrator)
   describes. The first account on a server becomes its admin. Use a placeholder handle and a
@@ -62,8 +63,9 @@ make down    # stop, keep the data
 
 **Shared** (the same files build for the Mac):
 - The Rust core, through `bindings/apple/swift/BrookCore`.
-- `clients/apple-shared/Brook`: the session store, the sign-in form, the server address, the
-  settings, the channel model, and the offline client.
+- `clients/apple-shared/Brook`: among other files, the session store, the sign-in form, the server
+  address, the settings, the channel model, the offline client, `Chat/Notifications.swift` and
+  `PersonName.swift`.
 - `clients/apple-shared/BrookTests`: the shared tests, which run in both apps.
 
 **iOS-only** (`clients/ios`):
@@ -87,15 +89,16 @@ one symbol is not enough. To add a platform fact, add a seam type; do not add a 
   launch.
 - **Fresh installs.** Keychain items survive an app delete on iOS. On the first launch, the app
   removes the items an earlier install left, once. So a reinstall starts signed out.
-- **Channel list.** Channels and direct messages, in the server's order. Each row shows a red
-  `@N` for unread mentions and a call badge with the participant count while a call is running.
+- **Channel list.** Channels first, then direct messages. Within each, the newest activity comes
+  first, then the most recently opened, then the name. The Mac uses the same order. Each row shows
+  a red `@N` for unread mentions and a call badge with the participant count while a call is running.
   The list updates live, and re-reads when the app comes back to the foreground or reconnects.
 - **Sign out** from the list screen, after a confirmation.
 
 ## Known limits
 
-- **No unread counts.** The server sends them with each list read, but iOS keeps no local cache to
-  hold them, so only mention counts show.
+- **No unread counts.** Only mention counts show. The Mac's unread counts come from its local
+  cache, and iOS has none yet. Nothing opens a channel yet either, so a count could only grow.
 - **Nothing opens a channel yet.** Tapping a row does nothing.
 - **A launch before the first unlock.** After a restart, the saved sign-in cannot be read until
   the phone is unlocked once. Brook says so. Unlock the phone, then quit Brook and open it again.

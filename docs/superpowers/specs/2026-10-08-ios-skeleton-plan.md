@@ -564,8 +564,12 @@ Files:
 - New `clients/ios/Brook/SignedInSession.swift`: owns the per-session `ChannelsModel`, built once
   per sign-in with `me: user.id`, no notifier, the `AppActivity` default and
   `rereadOnReconnect: true`. The view only forwards `start`, `stop` and the scene change to it,
-  so `SignedInSessionTests` can prove `stop()` cancels the subscription and each sign-in gets a
-  fresh model.
+  so `SignedInSessionTests` can prove that `stop()` cancels the subscription, that scene changes
+  re-read through the session, and that a reconnect shows what changed while the socket was
+  down.
+- The fresh model per sign-in lives in `SignedInHome` (`BrookApp.swift`), not in
+  `SignedInSession`: an `@State` session inside the `.signedIn` branch of the phase switch,
+  built in `.task`, and dropped when the phase changes. No unit test covers it.
 - Shared `ChannelsModel`: `rereadOnReconnect` (default off). When on, any `ready` after the first
   re-reads the list: iOS has no cache to re-read after a reconnect. The Mac leaves it off; its
   `CacheFeed` re-reads. A flag, because the iOS client still conforms to `OfflineClient`.
@@ -573,7 +577,8 @@ Files:
   `extension ChannelsModel { func sceneChanged(from old: ScenePhase, to new: ScenePhase) async }`.
   It calls `reloadList()` when `new == .active && old != .active`. A comment says why: iOS
   suspends the socket in the background, and what changed meanwhile only shows after a re-read.
-- `BrookApp.swift`: `.signedIn(user)` with a client shows `ChannelListView`.
+- `BrookApp.swift`: `.signedIn(user)` with a client shows `SignedInHome`, which holds the
+  `SignedInSession` and shows `ChannelListView` with it.
 
 Test first: `ForegroundReloadTests`, with `FakeRealtime`. After `start()`, `order` has one
 `"list"`. `.background` → `.active` adds one. `.active` → `.inactive` adds none. `.inactive` →
@@ -630,11 +635,18 @@ server:
 - On the iPhone, the pre-unlock path, which the simulator cannot produce (it does not enforce
   file protection):
   - restart the iPhone and open Brook before unlocking it: it must not restore, and must show
-    the unlock message;
-  - restart, unlock, then open Brook: it must restore. This also checks that a prewarm before
-    the first unlock does not leave the process off;
-  - which error a locked device returns for the probe (`isProtectionRefusal` assumes a
-    permission error). The safety does not depend on it, only the message does.
+    the unlock-then-reopen message;
+  - restart, unlock, then open Brook for the first time: it must restore. This catches a
+    prewarm before the first unlock leaving the process off;
+  - after a locked launch, unlock, quit Brook from the app switcher and reopen it: it must
+    restore;
+  - in a pre-unlock launch, sign in by hand and tap Sign Out: the dialog, and then the sign-in
+    screen, show the couldn't-reach-the-saved-sign-in notice;
+  - the probe error (`isProtectionRefusal` assumes a permission error): if a restart shows
+    neither a restore nor the unlock message, that guess is wrong; report it back. The safety
+    does not depend on it, only the message does.
+- On the iPhone: rename a channel while Brook is in the background, then bring it back without
+  quitting. It must show the new name.
 - On the iPhone: type a recovery code, then open the app switcher. The app's card must not show
   the code.
 
