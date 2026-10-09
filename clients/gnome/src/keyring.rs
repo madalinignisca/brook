@@ -710,7 +710,7 @@ mod live_local_data {
         let while_open = rt.block_on(async {
             let client = signed_in(&live, &scratch).await;
             client
-                .send_message(&live.channel, &marker, None)
+                .send_message(&live.channel, &marker, None, None)
                 .await
                 .unwrap();
             client

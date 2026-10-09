@@ -308,7 +308,7 @@ impl qobject::ChatController {
         app::runtime().spawn(async move {
             if let Some(client) = app::client().await {
                 if let Err(err) = client
-                    .send_message(&channel_id, &body, reply.as_deref())
+                    .send_message(&channel_id, &body, reply.as_deref(), None)
                     .await
                 {
                     tracing::warn!(%err, "failed to send message");

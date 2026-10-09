@@ -43,10 +43,16 @@ final class ChatIntegrationTests: XCTestCase {
         let tag = UUID().uuidString.prefix(8)
 
         // Send, reply, edit, delete: each read back through history.
+        // The same client id twice is one message: this is a retry after a lost answer, and
+        // the server must return the stored message, not make a second (PROTOCOL.md §1).
+        let sendId = UUID().uuidString.lowercased()
         let first = try await client.sendMessage(channelId: channel, body: "itest \(tag)",
-                                                 replyToId: nil)
+                                                 replyToId: nil, clientId: sendId)
+        let again = try await client.sendMessage(channelId: channel, body: "itest \(tag)",
+                                                 replyToId: nil, clientId: sendId)
+        XCTAssertEqual(again.id, first.id, "the same client id made a second message")
         let reply = try await client.sendMessage(channelId: channel, body: "reply \(tag)",
-                                                 replyToId: first.id)
+                                                 replyToId: first.id, clientId: nil)
         _ = try await client.editMessage(channelId: channel, messageId: first.id,
                                          body: "itest \(tag) edited")
         var page = try await client.channelHistory(channelId: channel, before: nil)

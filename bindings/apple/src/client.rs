@@ -206,16 +206,24 @@ impl FfiBrookClient {
     }
 
     /// Send a message directly (online). With local data on, prefer `send_queued`.
+    /// With `client_id` (a UUID the caller keeps for this one message), sending the same
+    /// message again is safe: the server returns the one it stored (PROTOCOL.md §1).
     pub async fn send_message(
         &self,
         channel_id: String,
         body: String,
         reply_to_id: Option<String>,
+        client_id: Option<String>,
     ) -> Result<crate::offline::FfiMessage, LoginError> {
         let inner = Arc::clone(&self.inner);
         let m = run(async move {
             inner
-                .send_message(&channel_id, &body, reply_to_id.as_deref())
+                .send_message(
+                    &channel_id,
+                    &body,
+                    reply_to_id.as_deref(),
+                    client_id.as_deref(),
+                )
                 .await
         })
         .await?;

@@ -101,7 +101,8 @@ final class OfflineAPITests: XCTestCase {
             XCTFail("history without a session")
         } catch LoginError.NotAuthenticated {}
         do {
-            _ = try await client.sendMessage(channelId: "c", body: "hi", replyToId: nil)
+            _ = try await client.sendMessage(channelId: "c", body: "hi", replyToId: nil,
+                                             clientId: nil)
             XCTFail("sent without a session")
         } catch LoginError.NotAuthenticated {}
     }

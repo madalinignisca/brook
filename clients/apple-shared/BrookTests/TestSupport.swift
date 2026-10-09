@@ -175,7 +175,8 @@ extension FakeRealtime {
     func pendingMessages(channelId: String) async throws -> [FfiPendingMessage] { throw unused }
     func retrySend(clientId: String) async throws { throw unused }
     func retryWithoutReply(clientId: String) async throws { throw unused }
-    func sendMessage(channelId: String, body: String, replyToId: String?) async throws -> FfiMessage { throw unused }
+    func sendMessage(channelId: String, body: String, replyToId: String?,
+                     clientId: String?) async throws -> FfiMessage { throw unused }
     func sendQueued(channelId: String, body: String, replyToId: String?, clientId: String) async throws -> String { throw unused }
     func sendQueuedWithFiles(channelId: String, body: String, replyToId: String?, clientId: String, files: [FfiOutgoingFile]) async throws -> FfiSendReceipt { throw unused }
     func signOutAndForget() async throws { throw unused }

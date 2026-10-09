@@ -1602,7 +1602,7 @@ fn send_current(chat: &Rc<Chat>) {
                     Err(err) => return Err(err),
                 }
                 client
-                    .send_message(&channel_id, &body, reply_to.as_deref())
+                    .send_message(&channel_id, &body, reply_to.as_deref(), None)
                     .await
                     .map(|_| false)
             }

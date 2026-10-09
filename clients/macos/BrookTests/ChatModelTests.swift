@@ -52,7 +52,11 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     let wipeFails = Mutex(false)
     let wipeTried = Mutex(0)
     let sent = Mutex<[String]>([])
+    /// The `clientId` of each direct send, in order.
+    let sentIds = Mutex<[String?]>([])
     var sendFailure: Error?
+    /// The direct send answers with a tombstone (a retry of a message deleted meanwhile).
+    var sendAnswersDeleted = false
     var read: [String?] = []
 
     var historyFailure: Error?
@@ -65,10 +69,12 @@ final class FakeChat: ChatClient, @unchecked Sendable {
         if let historyFailure { throw historyFailure }
         return pages.isEmpty ? [] : pages.removeFirst()
     }
-    func sendMessage(channelId: String, body: String, replyToId: String?) async throws -> FfiMessage {
+    func sendMessage(channelId: String, body: String, replyToId: String?,
+                     clientId: String?) async throws -> FfiMessage {
+        sentIds.withLock { $0.append(clientId) }
         sent.withLock { $0.append("\(body)|\(replyToId ?? "-")") }
         if let sendFailure { throw sendFailure }
-        return msg("m9", body, channel: channelId)
+        return msg("m9", body, channel: channelId, deleted: sendAnswersDeleted)
     }
     func editMessage(channelId: String, messageId: String, body: String) async throws -> FfiMessage {
         sent.withLock { $0.append("edit:\(messageId):\(body)") }
@@ -291,6 +297,177 @@ final class ComposerModelTests: XCTestCase {
         await c.send()
         XCTAssertEqual(c.text, "hello")
         XCTAssertTrue(c.error?.contains("may not have been sent") == true, c.error ?? "")
+    }
+
+    /// The direct send (taken when local data is off, as on iOS) carries a lowercase UUID.
+    func testADirectSendPassesAClientId() async throws {
+        let chat = FakeChat()
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hello"
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 1)
+        let id = try XCTUnwrap(ids[0])
+        XCTAssertNotNil(UUID(uuidString: id))
+        XCTAssertEqual(id, id.lowercased())
+    }
+
+    /// After a network failure the message may be on the server; sending the same text again
+    /// must carry the same id so the server keeps one copy.
+    func testSendingTheSameTextAgainAfterAFailureReusesItsClientId() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.Network(message: "offline")
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hello"
+        await c.send()
+        XCTAssertEqual(c.text, "hello")
+        chat.sendFailure = nil
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertNotNil(ids[0])
+        XCTAssertEqual(ids[0], ids[1])
+    }
+
+    /// Failing, then typing something else and putting the same words back, is a new message:
+    /// only an unchanged box may reuse the failed id.
+    func testChangingThenRestoringTheTextGetsANewClientId() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.Network(message: "offline")
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hello"
+        await c.send()
+        c.text = "hello!"
+        c.text = "hello"
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertNotEqual(ids[0], ids[1])
+    }
+
+    /// Quoting another message and going back to the first, or dropping the quote and quoting
+    /// it again, is a changed message: it gets a new id.
+    func testChangingTheQuoteGetsANewClientId() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.Network(message: "offline")
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        let q = msg("q", "quoted")
+        c.reply(to: q)
+        c.text = "hello"
+        await c.send() // fails: the box comes back with the quote
+        c.reply(to: msg("r", "other"))
+        c.reply(to: q)
+        await c.send()
+        c.cancel() // drop the quote ...
+        c.text = "hello"
+        c.reply(to: q) // ... and quote it again
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 3)
+        XCTAssertNotEqual(ids[0], ids[1])
+        XCTAssertNotEqual(ids[1], ids[2])
+    }
+
+    /// "hello" fails but arrives and is then deleted; sending the unchanged box must not reuse
+    /// its id, or the server would answer with the tombstone and nothing would be posted.
+    func testDeletingAMessageDropsTheDraft() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.Network(message: "offline")
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hello"
+        await c.send()
+        chat.sendFailure = nil
+        await c.delete(msg("m1", "hello"))
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertNotEqual(ids[0], ids[1])
+    }
+
+    /// Clearing the restored box and typing the same words again is a new message.
+    func testClearingTheBoxGetsANewClientId() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.Network(message: "offline")
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hello"
+        await c.send()
+        c.text = ""
+        c.text = "hello"
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertNotEqual(ids[0], ids[1])
+    }
+
+    /// "hello" fails but arrives; the user edits that message to "goodbye", then sends "hello"
+    /// again. The new "hello" must not carry the delivered one's id, or it would be lost.
+    func testStartingAnEditDropsTheDraft() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.Network(message: "offline")
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hello"
+        await c.send()
+        chat.sendFailure = nil
+        c.edit(msg("m1", "hello"))
+        c.text = "goodbye"
+        await c.send()
+        c.text = "hello"
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 2) // the edit sends no id
+        XCTAssertNotEqual(ids[0], ids[1])
+    }
+
+    /// The retry's answer is a tombstone: the message was deleted after it arrived. It is not
+    /// shown as a live message, and the draft is gone.
+    func testARetryAnsweredWithADeletedMessageIsNotShown() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.Network(message: "offline")
+        var got: [String] = []
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { got.append($0.id) })
+        c.text = "hello"
+        await c.send()
+        chat.sendFailure = nil
+        chat.sendAnswersDeleted = true
+        await c.send()
+        XCTAssertEqual(got, [])
+        XCTAssertEqual(c.text, "")
+        XCTAssertNil(c.error)
+        chat.sendAnswersDeleted = false
+        c.text = "hello"
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 3)
+        XCTAssertNotEqual(ids[1], ids[2])
+    }
+
+    /// Different text is a different message: it must not borrow the failed one's id.
+    func testChangedTextGetsANewClientId() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.Network(message: "offline")
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hello"
+        await c.send()
+        c.text = "hello!"
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertNotEqual(ids[0], ids[1])
+    }
+
+    /// After a success the draft is gone: the same text again is a new message. Reusing the id
+    /// would make the server return the first "hi" and lose the second.
+    func testTheNextMessageAfterASuccessGetsANewClientId() async {
+        let chat = FakeChat()
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hi"
+        await c.send()
+        c.text = "hi"
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertNotNil(ids[0])
+        XCTAssertNotEqual(ids[0], ids[1])
     }
 
     func testAnEditSavesTheNewText() async {
