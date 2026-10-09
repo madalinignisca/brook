@@ -69,6 +69,29 @@ if [[ "$mode" == "test" ]]; then
     SignedInSessionTests/testAReconnectShowsWhatChangedWhileTheSocketWasDown
     ForegroundReloadTests/testComingBackToTheForegroundReadsTheListAgain
     RecoveryWarningTests/testWarnsAtTwoOrFewerAndPluralizes
+    ComposerModelTests/testASendClearsAndHandsTheMessageOver
+    ComposerModelTests/testAFailedSendGivesTheTextBack
+    ComposerModelTests/testANetworkFailureDoesntClaimItWasntSent
+    ComposerModelTests/testADirectSendPassesAClientId
+    ComposerModelTests/testSendingTheSameTextAgainAfterAFailureReusesItsClientId
+    ComposerModelTests/testChangedTextGetsANewClientId
+    ComposerModelTests/testChangingTheQuoteGetsANewClientId
+    ComposerModelTests/testChangingThenRestoringTheTextGetsANewClientId
+    ComposerModelTests/testClearingTheBoxGetsANewClientId
+    ComposerModelTests/testStartingAnEditDropsTheDraft
+    ComposerModelTests/testDeletingAMessageDropsTheDraft
+    ComposerModelTests/testARetryAnsweredWithADeletedMessageIsNotShown
+    ComposerModelTests/testTheNextMessageAfterASuccessGetsANewClientId
+    TimelineModelTests/testHistoryAndLiveEventsMergeByIdInOrder
+    TimelineModelTests/testEditsReplaceAndDeletesStay
+    TimelineModelTests/testAnOlderPageAskedWhileTheHeadLoadsWaitsAndEndsAtTheStart
+    TimelineModelTests/testAFailedOlderPageIsRetryable
+    TimelineModelTests/testAnEmptyOlderPageIsTheStart
+    ReadWhenActiveTests/testInTheBackgroundAMessageIsOwedAndReadOnceActive
+    ReadWhenActiveTests/testInFrontItsReadAtOnce
+    TimelineEventsTests/testReadyRetriesTheOpenTimelinesFailedHead
+    TimelineReactionTests/testAnEventForAMessageHereAdjustsItsChips
+    TimelineReactionTests/testAResyncForgetsTheOrderingSoALowerSeqIsHeardAgain
   )
 
   # 1. All three slices are in the xcframework (a Mac build leaves only the macOS one).

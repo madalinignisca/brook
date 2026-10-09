@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 @testable import Brook
+import BrookCore
 import XCTest
 
 /// No text the iOS app shows may name the Mac. The shared messages interpolate `ThisDevice`;
@@ -33,6 +34,8 @@ final class MessageWordingTests: XCTestCase {
         SessionStore.Message.signOutCannotReachSavedSignIn,
         SessionStore.Message.removalIncomplete,
         SessionStore.Message.removalAndSignOutIncomplete,
+        // The composer's own messages are shared too: this one names the device.
+        ComposerModel.explainFiles(LoginError.Api(code: "local.unavailable", message: "")),
     ]
 
     func testNoMessageNamesTheMac() throws {
