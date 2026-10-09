@@ -14,7 +14,7 @@ final class RedactionTests: XCTestCase {
         FfiSession(
             accessToken: access,
             refreshToken: refresh,
-            user: FfiUser(id: "u1", handle: "alice", displayName: "Alice", globalRole: "admin")
+            user: FfiUser(id: "u1", handle: "alice", displayName: "Alice", globalRole: "admin", statusText: nil)
         )
     }
 

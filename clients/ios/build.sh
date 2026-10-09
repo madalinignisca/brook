@@ -41,6 +41,22 @@ if [[ "$mode" == "test" ]]; then
     SmokeTests/testAppLinksAndCallsTheRustCore
     SmokeTests/testAsyncLoginRunsOnTheRuntimeAndFailsOnTheNetwork
     SmokeTests/testRestoreCallsBackIntoASwiftKeySlot
+    SessionPersistenceIOSTests/testFirstLaunchDeletesTheWholeServiceOnceMarksItAndTurnsPersistenceOn
+    SessionPersistenceIOSTests/testSecondLaunchDoesNotDeleteAgain
+    SessionPersistenceIOSTests/testAFailingDeleteStaysOffLeavesTheMarkerUnsetAndIsRetried
+    SessionPersistenceIOSTests/testADataDirectoryThatCannotBeMadeStaysOff
+    SessionPersistenceIOSTests/testAFatalProbeStaysOff
+    SessionPersistenceIOSTests/testALockedProbeStaysOn
+    SessionPersistenceIOSTests/testProtectedDataUnavailableStaysOffWithoutDeletingOrMarking
+    SessionPersistenceIOSTests/testTheFileProbeSaysAvailableWhenReadableAndLockedWhenNot
+    SessionPersistenceIOSTests/testAMarkerOnlyInANonPersistentDomainDoesNotCount
+    SessionPersistenceIOSTests/testTheCleanupDeletesBeforeAnyReadAndBeforeTheMarker
+    SessionPersistenceIOSTests/testOtherDefaultsAlreadySetDoNotSkipTheFirstLaunchCleanup
+    MessageWordingTests/testNoMessageNamesTheMac
+    MessageWordingTests/testTheIPhoneWording
+    SessionStoreTests/testNoFeedFactoryKeepsLocalDataOff
+    SessionStoreTests/testWithoutLocalDataSigningOutStillLeavesCoresFence
+    ChannelEventsTests/testReadyClearsLiveCalls
   )
 
   # 1. All three slices are in the xcframework (a Mac build leaves only the macOS one).
