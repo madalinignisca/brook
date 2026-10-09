@@ -4,8 +4,7 @@
 import BrookCore
 import SwiftUI
 
-/// The app: the root follows `store.phase`, as on the Mac. The signed-in screen is still a
-/// placeholder until the channel list arrives (#272, step 7).
+/// The app: the root follows `store.phase`, as on the Mac.
 @main
 struct BrookApp: App {
     @State private var store: SessionStore
@@ -25,12 +24,9 @@ struct BrookApp: App {
             Group {
                 switch store.phase {
                 case let .signedIn(user):
-                    // A call into Rust made by the app (not only by the test bundle): reads
-                    // "#general" when the core is linked and running.
-                    VStack(spacing: 8) {
-                        Text("Signed in as \(user.displayName)")
-                        Text(conversationLabel(kind: "public", name: "general", members: [], me: "", showUsernames: false))
-                            .foregroundStyle(.secondary)
+                    // `store.client` is set whenever the phase is signed in.
+                    if let client = store.client {
+                        SignedInHome(store: store, client: client, user: user)
                     }
                 case .restoring:
                     ProgressView("Signing in…")
@@ -41,5 +37,23 @@ struct BrookApp: App {
             // Once per process; later appearances no-op. Restores the stored session.
             .task { await store.restoreAtLaunch() }
         }
+    }
+}
+
+/// Holds the signed-in session for as long as this view lives, so a sign-out (or a remote one)
+/// drops it and the next sign-in starts from a fresh one.
+private struct SignedInHome: View {
+    let store: SessionStore
+    let client: FfiBrookClient
+    let user: FfiUser
+    /// Built once, in `.task`. Building it in `init` would run on every re-render of the parent
+    /// (a `State(initialValue:)` argument is evaluated each time and all but the first dropped).
+    @State private var session: SignedInSession?
+
+    var body: some View {
+        Group {
+            if let session { ChannelListView(store: store, session: session) }
+        }
+        .task { if session == nil { session = SignedInSession(client: client, me: user.id) } }
     }
 }

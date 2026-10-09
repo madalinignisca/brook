@@ -50,6 +50,13 @@ final class ChannelsModel {
     private let notifier: (any Notifying)?
     private let isActive: @MainActor () -> Bool
     private let defaults: UserDefaults
+    /// iOS only. A reconnect's `ready` re-reads the list. The Mac does not need this: its local
+    /// cache re-reads through `CacheFeed` when the socket reconnects. iOS keeps no cache, so
+    /// nothing else would show a rename or removal made while the socket was down (it is never
+    /// sent as an event). An init flag, not a check for "no offline client": the real client
+    /// always conforms to `OfflineClient` (it just answers "unavailable"), so that check could
+    /// not tell the two apps apart. Off by default, so the Mac path is unchanged.
+    private let rereadOnReconnect: Bool
     /// The Settings window's "Show usernames", pushed in by the view: flipping it relabels the
     /// rows in place and never moves one (the order ignores labels' form).
     var showUsernames: Bool {
@@ -82,8 +89,9 @@ final class ChannelsModel {
 
     init(client: any FfiBrookClientProtocol, me: String? = nil, notifier: (any Notifying)? = nil,
          isActive: @escaping @MainActor () -> Bool = { AppActivity.isActive },
-         defaults: UserDefaults = .standard) {
+         defaults: UserDefaults = .standard, rereadOnReconnect: Bool = false) {
         self.client = client
+        self.rereadOnReconnect = rereadOnReconnect
         self.defaults = defaults
         showUsernames = Settings(defaults: defaults).showUsernames
         self.me = me
@@ -270,7 +278,11 @@ final class ChannelsModel {
             // cannot wipe a fresh badge. A re-auth `ready` (token rotation on a live socket)
             // never gets here: core swallows it (core/src/ws.rs, the `reauth` branch).
             liveCalls = [:]
+            // `ready` is still true from before only on a reconnect: the first one is covered
+            // by the read `start()` makes.
+            let reconnect = ready
             ready = true
+            if rereadOnReconnect, reconnect { Task { await reloadList() } }
             timeline?.apply(event)  // a failed head load is retried
         case let .channelCall(channelId, callId, count):
             liveCalls[channelId] = callId != nil && count > 0 ? count : nil

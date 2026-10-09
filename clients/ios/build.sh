@@ -61,6 +61,15 @@ if [[ "$mode" == "test" ]]; then
     SessionStoreTests/testALaunchBeforeTheFirstUnlockSaysSoAndStoresNothing
     SessionStoreTests/testWithoutLocalDataSigningOutStillLeavesCoresFence
     ChannelEventsTests/testReadyClearsLiveCalls
+    SessionStoreTests/testSignOutSaysItCannotReachTheSavedSignInOnlyInALockedLaunch
+    ChannelEventsTests/testReconnectReadyRereadsTheListOnlyWhenAsked
+    SessionStoreTests/testSignOutInALockedLaunchLeavesTheNoticeOnTheSignInScreen
+    SignedInSessionTests/testStopCancelsTheEventSubscription
+    SignedInSessionTests/testASecondSessionGetsAFreshModel
+    SignedInSessionTests/testSceneChangesReloadThroughTheSession
+    SignedInSessionTests/testAReconnectShowsWhatChangedWhileTheSocketWasDown
+    ForegroundReloadTests/testComingBackToTheForegroundReadsTheListAgain
+    RecoveryWarningTests/testWarnsAtTwoOrFewerAndPluralizes
   )
 
   # 1. All three slices are in the xcframework (a Mac build leaves only the macOS one).

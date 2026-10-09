@@ -23,6 +23,8 @@ final class FakeSubscription: Subscription, @unchecked Sendable {
 final class FakeRealtime: FfiBrookClientProtocol, @unchecked Sendable {
     let order = Mutex<[String]>([])
     let listener = Mutex<ServerEventListener?>(nil)
+    /// The subscription last handed out, so a test can see whether it was cancelled.
+    let subscription = Mutex<FakeSubscription?>(nil)
     var channels: [FfiChannel]
     /// Successive answers for `listChannels` (empty: always `channels`).
     let readQueue = Mutex<[[FfiChannel]]>([])
@@ -38,7 +40,9 @@ final class FakeRealtime: FfiBrookClientProtocol, @unchecked Sendable {
     func subscribeEvents(listener: ServerEventListener) -> Subscription {
         order.withLock { $0.append("subscribe") }
         self.listener.withLock { $0 = listener }
-        return FakeSubscription()
+        let sub = FakeSubscription()
+        subscription.withLock { $0 = sub }
+        return sub
     }
     func startRealtime() async throws {
         order.withLock { $0.append("start") }

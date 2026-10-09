@@ -61,6 +61,10 @@ final class SessionStore {
         // Worded as steps because the person reading it has usually already unlocked: Brook was
         // started before that, and it does not check again (a relaunch is the retry).
         static let waitingForFirstUnlock = "Brook can't use its saved sign-in until \(ThisDevice.system) has been unlocked once after restarting. Unlock it, then close Brook and open it again."
+        // Shown in Sign Out's confirmation. Persistence is decided once per process, so a launch
+        // before the first unlock stored nothing and Sign Out cannot remove what an earlier
+        // launch stored. A relaunch (after unlocking) is the way to reach it.
+        static let signOutCannotReachSavedSignIn = "Brook couldn't reach this \(ThisDevice.name)'s saved sign-in in this session. Close Brook and open it again, then sign out to remove it."
         static let secondInstance = "Brook is already open. This window won't remember your sign-in."
         static let removalIncomplete = "Brook couldn't remove all of this \(ThisDevice.name)'s data. Sign in and out again to retry."
         static let removalAndSignOutIncomplete = "Brook couldn't remove all of this \(ThisDevice.name)'s data, and may sign you in again at the next launch. Sign in and out again to retry."
@@ -195,6 +199,15 @@ final class SessionStore {
             phase = .signedOut(error: Message.unexpected)
         }
         return true
+    }
+
+    /// Said in Sign Out's confirmation when this process cannot clear a session an earlier launch
+    /// stored: the launch came before the first unlock, so it never opened the Keychain item.
+    /// Decided from the persistence state, which is fixed for the process. A plain `.off` is
+    /// not told this: nothing is known to be stored there.
+    var signOutNotice: String? {
+        if case .lockedUntilFirstUnlock = persistence { return Message.signOutCannotReachSavedSignIn }
+        return nil
     }
 
     /// Set when a sign-out couldn't make the stored session unusable; shown until a sign-in.
@@ -422,6 +435,11 @@ final class SessionStore {
         let defaults = settings.defaults
         end()
         phase = .signedOut(error: nil)
+        // A locked launch could not remove the saved sign-in (see `signOutNotice`). The
+        // confirmation said so, but it is gone now: keep saying it on the sign-in screen, until
+        // a sign-in replaces the stored copy. Set before the task below, which may overwrite it
+        // with a more specific failure.
+        if let notice = signOutNotice { signOutWarning = notice }
         let before = signIns
         // The user asked for removal: their opened-order ranks go even if the core's removal
         // fails (a failure is said below and retried by the user). Here, before anything

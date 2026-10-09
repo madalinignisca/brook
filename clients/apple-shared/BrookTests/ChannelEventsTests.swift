@@ -47,6 +47,31 @@ final class ChannelEventsTests: XCTestCase {
         XCTAssertEqual(model.badge(model.channels[0]), "● Call · 2")
     }
 
+    /// iOS keeps no cache, so a rename made while the socket was down is only seen by re-reading
+    /// on the reconnect's `ready`. The first `ready` does not (start() read already), and the
+    /// default (the Mac) never does: its cache feed re-reads instead.
+    func testReconnectReadyRereadsTheListOnlyWhenAsked() async {
+        func lists(_ c: FakeRealtime) -> Int { c.order.withLock { $0.filter { $0 == "list" }.count } }
+        for (asked, expected) in [(true, 2), (false, 1)] {
+            let client = FakeRealtime(channels: [channel("c1", "general")])
+            let suite = "brook.tests.\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suite)!
+            addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+            let model = ChannelsModel(client: client, me: "me", isActive: { true }, defaults: defaults,
+                                      rereadOnReconnect: asked)
+            await model.start()
+            client.deliver(.ready) // the first ready
+            await drainMain(); await Task.yield()
+            XCTAssertEqual(lists(client), 1, "asked: \(asked): the first ready read again")
+            client.readQueue.withLock { $0 = [[channel("c1", "renamed")]] }
+            client.deliver(.ready) // a reconnect
+            for _ in 0..<50 where lists(client) < expected { await drainMain(); await Task.yield() }
+            await drainMain()
+            XCTAssertEqual(lists(client), expected, "asked: \(asked)")
+            XCTAssertEqual(model.channels.first?.name, asked ? "renamed" : "general", "asked: \(asked)")
+        }
+    }
+
     func testADeleteRemovesTheRowAndClosesTheOpenChannel() async {
         let (client, model) = await started([channel("c1", "general"), channel("c2", "random")])
         model.openChannel = "c2"
