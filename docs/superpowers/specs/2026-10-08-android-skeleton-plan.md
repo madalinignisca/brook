@@ -4,6 +4,14 @@ Spec: [2026-10-08-android-skeleton-spec.md](2026-10-08-android-skeleton-spec.md)
 every decision is in its section 3). Status: after review round 2 (Opus LGTM), with the owner's
 decisions of 2026-10-09 recorded in section 5; for the owner's approval.
 
+**Changed during implementation (PR 1, 2026-10-09):**
+- After step 2, the emulator run showed 6 more tests that need a key slot. With the main agent's
+  approval they are gated, one is split, and one keeps its non-slot assertions everywhere. Two
+  helpers and two imports are gated too. Step 2's list now has all of them.
+- The final emulator result is recorded: 528 passed, 0 failed, on two runs.
+- A one-off failure of `files_tests::a_pin_that_fails_is_fetched_again_later_and_after_a_restart`
+  is recorded as risk 12, not gated.
+
 **Changed after peer review (#315, Apple/core agent's non-blocking notes):**
 - the macOS/Linux/iOS side of `store.rs` is described as a behaviour-preserving refactor;
 - `std::io::Write` joins the keyed-only gating list (only `write_atomically` uses it);
@@ -259,7 +267,7 @@ clients/android/with-ndk.sh "$HOME/Android/Sdk/ndk/30.0.16248370" \
 - Existing tests: gate with `#[cfg(not(target_os = "android"))]` every test that relies on a key,
   the `.check` file or ciphertext on disk, with a one-line comment ("keyed stores only; Android
   stores are plain, ADR 0001").
-  - **The 11 the emulator run names today** (run twice, the same list):
+  - **The 11 the emulator run named before step 2** (run twice during planning, the same list):
     - in `store_tests`: `nothing_under_the_store_is_plaintext`,
       `a_store_opens_only_with_its_own_key`,
       `a_copied_store_is_unreadable_once_its_slot_is_destroyed`,
@@ -278,6 +286,20 @@ clients/android/with-ndk.sh "$HOME/Android/Sdk/ndk/30.0.16248370" \
     `.check` mode assertion in `only_the_owner_can_enter_the_store_directory`). For the last one,
     move the `.check` assertion into a keyed-only test of its own and keep the directory-mode
     assertion running everywhere.
+  - **Found by the emulator run after step 2 (2026-10-09):** 6 more tests need a key slot.
+    The main agent approved gating them under the spec's "never `Locked` from an unused key": a
+    plain store never reads a slot, so a locked or failing slot cannot affect it.
+    - `local_tests`: `a_locked_index_means_no_local_data_and_nothing_deleted` and
+      `a_key_that_wont_go_keeps_the_wipe_pending`.
+    - `offline_tests::client`: `an_index_with_no_stores_is_nothing_to_erase` and
+      `forget_with_stores_that_never_opened_is_an_error`.
+    - `forget_with_nothing_stored_is_still_ok` is split in two:
+      - `forget_when_local_data_was_never_enabled_is_ok` runs everywhere;
+      - `forget_after_a_locked_first_launch_is_ok` is gated.
+    - `local_tests::a_wipe_erases_the_keys_and_the_files`: only its four slot assertions are gated.
+      Its file-deletion and fresh-store-id checks run on Android too.
+  - **Helpers and imports gated so nothing is dead code on Android:** `plaintext_anywhere`
+    (`store_tests`), `lose_the_index_key`, and `local_tests`' `Kind` and `KeySlotError` imports.
   - **`snapshot_tests::only_a_regular_file_is_copied`** is gated `#[cfg(not(target_os =
     "android"))]` with this comment: "the adb-shell test harness cannot make a FIFO: SELinux denies
     `mkfifo` to the shell domain in `/data/local/tmp` (verified 2026-10-08); the host run covers
@@ -286,7 +308,7 @@ clients/android/with-ndk.sh "$HOME/Android/Sdk/ndk/30.0.16248370" \
     FIFO creation itself.
   This is compile-time selection of what applies to the platform, not a runtime skip (CLAUDE.md
   §3). Nothing is gated "just in case": every gate either names a key, a check file or ciphertext,
-  or is the FIFO case above.
+  or a key slot (the step 2 additions), or is the FIFO case above.
 - Commands:
   - the Rust gate;
   - `cargo test --locked -p brook-core --lib store_tests`;
@@ -312,6 +334,10 @@ clients/android/with-ndk.sh "$HOME/Android/Sdk/ndk/30.0.16248370" \
   **Expected:** `test result: ok`, 0 failed, for the whole `--lib`. Before step 2 it is 514 passed
   and 12 failed; after step 2, the gated tests drop out of the count and the four new plain tests
   are in it. Any other failure is a finding to report, not a test to gate.
+  **Result in PR 1 (2026-10-09):** 528 passed, 0 failed, on two runs. One earlier run had a
+  single failure, `files_tests::a_pin_that_fails_is_fetched_again_later_and_after_a_restart`,
+  which passed on the next two runs and on the host. It is likely a timing flake, so it is not
+  gated (risk 12).
 - Docs made wrong: the ADR and the records in step 4.
 
 **Step 3: CI runs the Android branch of core.** *Main agent.*
@@ -911,6 +937,12 @@ from the main agent and never go into the repo or the PR text.
     ticket inherits it.
 11. **The `/tmp` quota on this machine.** The emulator and big builds filled it during planning.
     Keep emulator temp files and large target directories under `$HOME`.
+12. **A likely timing flake on the emulator.**
+    `files_tests::a_pin_that_fails_is_fetched_again_later_and_after_a_restart` failed once in PR
+    1's emulator runs, and passed on the next two runs and on the host. It is not gated, because a
+    one-off on a slow emulator is not a reason to hide a test (CLAUDE.md §3). If it fails again,
+    investigate its timing (a fixed wait or a retry window that is too tight on slow hardware)
+    rather than gating it.
 
 ## 5. Decisions for the owner
 

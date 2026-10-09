@@ -15,8 +15,7 @@ item (#53–#68). What it adds to today's MVP
 - **TOTP two-factor sign-in**: server, core and both apps (in progress).
 - **Stay signed in across restarts**: the session kept in the platform's secret store
   (data-protection Keychain on Apple; Secret portal or Secret Service on Linux).
-- **Local data, encrypted**: a per-device key in that same store (spec #46); local data is
-  disposable, so a lost key means wipe and re-sync.
+- **Local data, encrypted except on Android**: a per-device key in that same store (spec #46, ADR 0001). On Android the OS provides File-Based Encryption; elsewhere the app stores use SQLCipher. Local data is disposable, so a lost key means wipe and re-sync.
 - **Offline cache in core** (one SQLite store for every app): channels, members and messages
   saved as they arrive, so the app opens with the last-known content with or without a
   connection, and **catches up** on reconnect (`after=` forward sync).

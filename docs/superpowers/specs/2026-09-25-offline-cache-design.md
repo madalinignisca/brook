@@ -46,6 +46,11 @@ connection**, and catches up exactly on what it missed. Done means, observably:
   **Decision worth arguing:** SQLCipher, over per-row AES-GCM on plain SQLite. Per-row
   encryption avoids libcrypto on Linux but leaves ids, times and counts readable, and indexes
   work only on cleartext columns.
+  **Android exception (ADR 0001):** On Android, stores are plain SQLite. The OS encrypts
+  the app's private storage via File-Based Encryption, and the sandbox prevents other apps
+  from reading the files. SQLCipher's OpenSSL dependency is not vendored for Android, so
+  the decision is compile-time: `target_os = "android"` uses plain SQLite; all other
+  platforms use SQLCipher.
 - **Keys are random, and a store's key is independently destroyable** (crypto-erase per store):
   - each store has its own random 256-bit key, held in the `KeySlot` under a named slot
     (`cache:<store id>`, `outbox:<store id>`; #46 §3a takes a slot name);

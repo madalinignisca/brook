@@ -8,7 +8,7 @@ The **single shared brain** of every client. All non-UI logic lives here once; e
 - Local state model + event log; observable state for the UI.
 - File transfer orchestration (presigned URL flow, progress, resume).
 - **Call signaling** state machine (negotiates with Janus via the WS relay; drives the platform `MediaEngine`).
-- Crypto: token handling, webhook/request signing. (No E2EE — non-goal; see [../docs/SECURITY.md](../docs/SECURITY.md).)
+- Crypto: token handling, webhook/request signing. Local store encryption (SQLCipher on desktop and iOS; plain SQLite on Android protected by OS File-Based Encryption; see [../docs/adr/0001-plain-sqlite-on-android.md](../docs/adr/0001-plain-sqlite-on-android.md)). (No E2EE — non-goal; see [../docs/SECURITY.md](../docs/SECURITY.md).)
 - Auth session lifecycle: secure token storage in the **platform keystore**, refresh, and driving the OIDC system-browser flow. See [../docs/AUTH.md](../docs/AUTH.md).
 - Slash-command / bot parsing.
 
