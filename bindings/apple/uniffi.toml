@@ -12,6 +12,5 @@
 [bindings.kotlin.rename]
 "LoginError.Network.message" = "detail"
 "LoginError.InvalidServerUrl.message" = "detail"
-"LoginError.Api.message" = "detail"
 "FfiEngineError.Failed.message" = "detail"
 "FfiMediaEngine.close" = "closeEngine"
