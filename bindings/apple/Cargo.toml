@@ -19,6 +19,12 @@ path = "src/bin/uniffi-bindgen-swift.rs"
 # Keeps clap & friends out of the default (Linux CI) build.
 required-features = ["cli"]
 
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+# The Kotlin generator (Android). Same reason as above.
+required-features = ["cli"]
+
 [features]
 cli = ["uniffi/cli"]
 
