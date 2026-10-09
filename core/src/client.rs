@@ -814,21 +814,33 @@ impl BrookClient {
     }
 
     /// Send a message into a channel (the only send path); the server fans it out.
+    ///
+    /// With `client_id` (a UUID the caller keeps for this one message), sending the same
+    /// message again is safe: the server returns the one it stored (PROTOCOL.md §1). The key
+    /// is left out of the body when there is none, so a send without one is byte-for-byte
+    /// what it was before the field existed.
     pub async fn send_message(
         &self,
         channel_id: &str,
         body: &str,
         reply_to_id: Option<&str>,
+        client_id: Option<&str>,
     ) -> Result<Message> {
         let token = self.access_token().await?;
         let url = self
             .base
             .join(&format!("api/v1/channels/{channel_id}/messages"))?;
+        let mut payload = json!({ "body": body, "reply_to_id": reply_to_id });
+        // Inserted only when given. A `"client_id": null` is not "absent" on the
+        // wire, and the route's contract is an optional UUID, not a nullable one.
+        if let Some(client_id) = client_id {
+            payload["client_id"] = json!(client_id);
+        }
         let resp = self
             .http
             .post(url)
             .bearer_auth(token)
-            .json(&json!({ "body": body, "reply_to_id": reply_to_id }))
+            .json(&payload)
             .send()
             .await?;
         self.parse(resp).await
@@ -1768,9 +1780,54 @@ mod tests {
             .mount(&server)
             .await;
 
-        let message = client.send_message("c1", "hi bob", None).await.unwrap();
+        let message = client
+            .send_message("c1", "hi bob", None, None)
+            .await
+            .unwrap();
         assert_eq!(message.body, "hi bob");
         assert_eq!(message.author_handle.as_deref(), Some("alice"));
+    }
+
+    /// Mounts a 201 answer for a send into `c1` and returns the JSON body the
+    /// client actually put on the wire, so the tests below can look at the
+    /// exact keys, not only at what the code meant to send.
+    async fn sent_body(client_id: Option<&str>) -> serde_json::Value {
+        let server = MockServer::start().await;
+        let client = logged_in_client(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/channels/c1/messages"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "019ed8", "channel_id": "c1", "author_id": "u1",
+                "author_handle": "alice", "author_display_name": "Alice",
+                "body": "hi", "created_at": "2026-06-18T00:00:00Z", "edited_at": null
+            })))
+            .mount(&server)
+            .await;
+        client
+            .send_message("c1", "hi", None, client_id)
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let send = requests
+            .iter()
+            .find(|r| r.url.path() == "/api/v1/channels/c1/messages")
+            .unwrap();
+        serde_json::from_slice(&send.body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_message_sends_the_client_id_it_is_given() {
+        let id = "0b7c1c52-2f55-4b8e-9d52-3f5a3d3a2c11";
+        let body = sent_body(Some(id)).await;
+        assert_eq!(body["client_id"], id);
+    }
+
+    // Absent, not `null`: the server must see the same body it saw before the
+    // field existed, so a send without an id behaves as it always did.
+    #[tokio::test]
+    async fn send_message_without_a_client_id_sends_none() {
+        let body = sent_body(None).await;
+        assert!(body.get("client_id").is_none());
     }
 
     #[tokio::test]
