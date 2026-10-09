@@ -50,9 +50,13 @@ Older pages are asked for from the scroll geometry, not from the loader appearin
 visible area turns from far to within one screen of the top (`ScrollToLatest.isNearTop`), one page
 is asked for. When it lands, the reading place is put back with `scrollTo` only if the user has not
 moved since the ask (`ScrollToLatest.stayedPut`, 44 pt), after a layout turn and checked once by
-geometry. There is no automatic re-ask: after a good restore the top is a page away, so the next
-page needs the user to scroll up again (a short conversation gets one ask when the landing is done).
-The first landing happens after
+geometry. Scrolling alone does not re-ask: after a good restore the top is a page away, so the next
+page needs the user to scroll up again. The view asks once by itself in two other cases: when a
+short conversation has its landing done, and when older history can be offered again (a failed
+older page or head fetch recovers, so `olderFailed` and `headFailed` clear) while the view is near
+the top.
+The first page is scrolled to the bottom as soon as it appears (`messages.isEmpty` turns false),
+before the landing is confirmed. The first landing happens after
 `session.start()` returns (the newest page is merged), and older pages and the follow rule wait for
 it, so a live message before the first page cannot count as the landing. The "away" test uses
 `visibleRect`, not `contentOffset` (which carries the safe-area inset). An empty channel shows no
@@ -60,7 +64,11 @@ start text on iOS, as on the Mac (its loader needs a message to offer older ones
 simulator: it opens on the newest message with no jump button, swiping up shows the button and
 tapping it returns and hides it, and the first older page keeps the reading position. The geometry-driven asking (pages beyond the first) is
 checked on screen (flicks load one page per arrival and reach the start). Content that grows while the
-view is at the bottom (a reaction on the last row) keeps the bottom in view (`ScrollToLatest.pinsToBottom`).
+view is at the very bottom (within the 12 pt gap) and the scroll is idle keeps the bottom in view
+(a reaction on the last row, say; `ScrollToLatest.pinsToBottom`). A drag up is not pulled back.
+Checked on the simulator: with the gateway stopped at the top, "Couldn't load older messages. Retry"
+showed; after it restarted, the reconnect re-read was followed by one older-page request with no tap,
+and the place held.
 Done 6 (background with a dead socket) and the Retry check with the network off move to step 5's
 full simulator pass.
 
