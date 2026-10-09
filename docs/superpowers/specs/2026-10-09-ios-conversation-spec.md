@@ -1,8 +1,8 @@
 # iOS: open a conversation, read it, send to it (#337)
 
 Review: `brook-reviewer`. No server, protocol or auth change. Shared Swift that the Mac app also
-builds changes, so the Mac's tests must stay green. Core changes only if open question 2 is
-answered yes.
+builds changes, so the Mac's tests must stay green. One small core and binding change comes
+first: the direct send carries a `client_id` (§7, decision 2).
 
 The #335 dependency (blank screen after sign-in on a real iPhone) is met: #338 fixed it.
 
@@ -18,6 +18,11 @@ Changed after the second review: the checks run in the simulator on loopback, an
 real-iPhone check runs from the Home Screen (question 1, Done); the page-back joins the head
 fetch (§4); reaction marks clear only on `ready` (§4, Done 10); the Mac's direct send keeps its
 draft id if question 2 is yes (§5 risks); `TypingSearch.swift` moves whole (§5).
+
+Changed after approval: the owner took the recommended answer to each open question; §7 records
+them, and the spec now reads as decided: the checks' servers (Done), `client_id` on the direct
+send (§4 Sending, §5, Done 7, 10), and the scroll rule with the jump-to-latest button (§4, Done
+4).
 
 ## 1. Problem
 
@@ -36,7 +41,7 @@ and sends a text message. Both the list and the open conversation stay live. It 
 iOS the user has: a system navigation push, a plain scrolling list of messages, a text field
 with a Send button above the keyboard. Nothing branded.
 
-Done when, each checked and written in the PR. Items 1 to 8 run where open question 1 says
+Done when, each checked and written in the PR. Items 1 to 8 run as §7 decision 1 says
 (the simulator against the local stack, then a real iPhone against the owner's server), with
 the Mac app signed in to the same server as a second account:
 
@@ -54,7 +59,10 @@ the Mac app signed in to the same server as a second account:
 4. While the conversation is open on the phone, the Mac sends a message: it shows on the phone
    within a few seconds, without reopening. The Mac edits it: the phone shows the new text and
    "edited". The Mac deletes it: the phone shows "Message deleted". The Mac reacts to a
-   message: the phone shows the reaction and its count.
+   message: the phone shows the reaction and its count. Scrolled up into older history, a new
+   message from the Mac does not move the view, and a jump-to-latest button shows; tapping it
+   goes to the newest message. At the bottom, a new message scrolls into view. A message sent
+   from the phone always scrolls into view.
 5. The Mac mentions the phone's account in a channel; the row shows `@1`. Opening the channel
    clears the badge. Back on the list, pull to refresh: the badge stays gone (the server's read
    marker moved, not only the phone's copy). A new mention from the Mac after going back shows
@@ -64,7 +72,8 @@ the Mac app signed in to the same server as a second account:
    three show without reopening and without a pull. Go back to the list and pull to refresh:
    that channel shows no mention badge (the re-read marked them read).
 7. With the network off, Send puts the text back in the box with "It may not have been sent:
-   check the conversation before sending again."
+   check the conversation before sending again." With the network back, Send again: the
+   message shows once, on the phone and on the Mac.
 8. The Mac archives the channel while it is open on the phone: within a few seconds the box is
    replaced by "This channel is archived. An owner or admin can unarchive it." The Mac removes
    the phone's account from a channel open on the phone: the phone goes back to the list, and
@@ -85,7 +94,14 @@ the Mac app signed in to the same server as a second account:
       discarded; a second `ready` during the page-back joins it instead of starting another;
     - a `ready` clears the reaction order marks; a foreground re-read with the socket still up
       does not;
-    - a send that fails puts the text back with the right message.
+    - a send that fails puts the text back with the right message;
+    - a direct send passes a `client_id`, and sending the same text again after a failure
+      passes the same one; changed text gets a new one;
+    - the view follows a new message only when not scrolled away, or when it is the user's
+      own (`ScrollToLatest.isAway`).
+
+    `cargo test` covers core's `send_message` sending the `client_id` it is given, and none
+    when given none.
 
     `clients/macos/build.sh test` still passes, and covers that the re-read flag is off on the
     Mac: a `ready` there only retries a failed head, as today (mirroring the
@@ -109,6 +125,7 @@ the Mac app signed in to the same server as a second account:
 | Removed from the open channel: back to the list | In | The model already reports it (`closed`); a stale screen whose sends fail is worse. |
 | A reply's quote line, a file's name and size, the "edited" mark, the tombstone | In, shown only | The data is in every message. A message with a file and no caption would otherwise look empty. |
 | Copying a message's text | In | Text selection on, the system's own long-press. One modifier, as the Mac. |
+| Follow new messages only at the bottom; jump-to-latest button | In | §7, decision 3. The Mac has the button (#284). |
 | Paste of plain text into the box | In | The system text field does it; nothing to build. |
 | The typing signal sent while typing | In | The shared composer sends it already; turning it off would need a switch. |
 | Showing who is typing | Out | Nice later; its own issue. |
@@ -147,7 +164,10 @@ the Mac app signed in to the same server as a second account:
 - A newest page that fails shows "Couldn't load messages." It is tried again on the next
   `ready` or when the app returns to the foreground.
 - Scrolling the messages dismisses the keyboard, the iOS habit.
-- New messages while reading older history: open question 3.
+- New messages (§7, decision 3): the view follows one only when it is already at the bottom
+  (`ScrollToLatest.isAway`, shared with the Mac), or when the message is the user's own.
+  Scrolled away, the view stays put and a jump-to-latest button shows, as on the Mac (#284);
+  tapping it goes to the newest message.
 
 ### Staying live without a cache
 - Live events (`message.new`, `message.update`, `message.delete`, `reaction.update`) reach the
@@ -172,7 +192,8 @@ the Mac app signed in to the same server as a second account:
   - Still no meeting point after 3 pages: the screen keeps only what the re-read fetched.
     `atStart` and `olderFailed` are reset, an older page (scrolling up) that started before
     the re-read is discarded when it lands (it belongs to the replaced history), and the view
-    lands at the newest message. Older history loads again by scrolling up.
+    lands at the newest message, so the jump-to-latest button is gone. Older history loads
+    again by scrolling up.
 - Why not the server's `after=` forward sync: core's history call takes only `before`, and
   this needs no core change. A later core change can swap it in.
 - Known limits, accepted for now: a `resync` (events dropped inside core) merges the head page
@@ -196,8 +217,12 @@ the Mac app signed in to the same server as a second account:
 - Failure: the text comes back in the box, with the Mac's messages: a network failure says "It
   may not have been sent: check the conversation before sending again."; signed out says "You
   were signed out."; anything else "Couldn't send."
-- Without the outbox the send goes straight to the server. Today that send carries no
-  `client_id`, so a send that timed out and is sent again can arrive twice: open question 2.
+- Without the outbox the send goes straight to the server, with a `client_id` (§7, decision
+  2): the composer's draft id, the same for the same text and quote after a failure. The
+  server returns the stored message for a repeated id and never makes a duplicate (PROTOCOL.md
+  §1, `POST /channels/{id}/messages`), so a send that timed out but arrived, sent again, shows
+  once. Core's `send_message` and the binding gain an optional `client_id` for this; it lands
+  before the iOS work.
 - Archived: no box; the Mac's note in its place, updated live from `channel.update`.
 
 ### What having no local cache costs
@@ -209,8 +234,8 @@ the Mac app signed in to the same server as a second account:
 ### Errors and limits
 - No wire-contract change: the same routes, codes and events the Mac uses
   (`GET`/`POST /channels/{id}/messages`, `POST /channels/{id}/read`, `POST
-  /channels/{id}/typing`, and the WebSocket events in PROTOCOL.md §2). Question 2 would have
-  core send `client_id`, a field the send route already accepts; no route changes.
+  /channels/{id}/typing`, and the WebSocket events in PROTOCOL.md §2). Core now sends
+  `client_id` on the direct send, a field the route already accepts; no route changes.
 - A conversation's messages stay in memory only while it is open.
 
 ## 5. Sharing with the Mac app (input for the plan)
@@ -242,8 +267,7 @@ Risks and notes for the plan:
   above the keyboard, are where plain SwiftUI scroll views most often misbehave. Both are in
   the device check (Done 2, 3).
 - The move must leave the Mac's send path unchanged: the Mac's tests run before and after.
-  The one exception, only if question 2 is answered yes: the Mac's direct send changes on
-  purpose. Today the composer drops its draft id (`draft = nil`, ChatModels.swift:629) before
+  The one exception (§7, decision 2): the Mac's direct send changes on purpose. Today the composer drops its draft id (`draft = nil`, ChatModels.swift:629) before
   the direct send; it must keep the id until the direct send succeeds, so a retry reuses it.
 - `ChannelsModel.closed` is set on a removal and never cleared (ChannelsModel.swift, in
   `cacheRemoved`). A view that reacts to it changing misses a second removal of the same
@@ -262,28 +286,24 @@ Taken in this spec (the owner may override):
 - The typing signal goes out (it comes with the shared composer); others' typing is not shown.
 - No drafts, no outbox, no retry queue.
 - Plain unread counts: a separate issue.
+- The decisions the owner took are in §7.
 
-## 7. Open questions
+## 7. Decided by the owner (2026-10-09)
 
-1. **Which server do the device checks use?** They need more than 100 messages in one
-   channel, a DM, archiving a channel and removing the testing account from it.
-   Recommended: the agent's checks run in the iOS simulator against the local stack on
-   loopback (`clients/ios/README.md`, "Test against a local server"), seeding of more than
-   100 messages, archiving and removal included. Launch with `clients/ios/build.sh run`
+Each is the answer this spec recommended.
+
+1. **Where the checks run.** The agent's checks run in the iOS simulator against the local
+   stack on loopback (`clients/ios/README.md`, "Test against a local server"), seeding of more
+   than 100 messages, archiving and removal included. Launch with `clients/ios/build.sh run`
    (simctl, no debugger attached), so suspension in the background is real. The real-iPhone
-   check is the owner's, against chat.madalin.me (https), in a dedicated test channel, with
-   the app launched from the Home Screen, not from Xcode. Why: a debugger keeps the app from
-   being suspended, and the local stack listens on loopback only, which a phone cannot reach
-   without a LAN bind and the insecure-http flag. Nothing is posted to real channels.
-2. **Make the direct send safe to repeat?** The server already returns the stored message for
-   a repeated `client_id` and never makes a duplicate (PROTOCOL.md §1, `POST
-   /channels/{id}/messages`). Core's `send_message` and the binding do not pass one.
-   Recommended: yes. Add an optional `client_id` to core's `send_message` and the binding, and
-   have the composer pass its existing `draftId` (the same id for the same text after a
-   failure). A small core change, done by the core implementer first. The Mac's direct send
-   gains the same safety.
-3. **A new message while the user reads older history.** The Mac always scrolls to the newest
-   message and offers a jump-to-latest button (#284). Recommended for iOS: follow new messages
-   only when the view is already at the bottom (`ScrollToLatest.isAway`, shared), or when the
-   message is the user's own; plus the same jump-to-latest button while away. A replacement
-   after a long absence (§4) always lands at the newest message, so the button is gone then.
+   check is the owner's, against chat.madalin.me (https), in a dedicated test channel, with the
+   app launched from the Home Screen, not from Xcode. Why: a debugger keeps the app from being
+   suspended, and the local stack listens on loopback only, which a phone cannot reach without
+   a LAN bind and the insecure-http flag. Nothing is posted to real channels.
+2. **The direct send is safe to repeat.** Core's `send_message` and the binding gain an
+   optional `client_id`, and the composer passes its existing draft id. A small core change,
+   done first, by the core implementer. The Mac's direct send gains the same safety.
+3. **New messages while reading history.** Follow only at the bottom or for the user's own
+   message, plus the jump-to-latest button, sharing `ScrollToLatest.isAway` with the Mac.
+
+No open questions remain.
