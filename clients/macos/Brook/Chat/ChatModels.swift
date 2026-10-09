@@ -9,7 +9,8 @@ import UniformTypeIdentifiers
 /// What the chat views need from the client (a fake in tests).
 protocol ChatClient: AnyObject, Sendable {
     func channelHistory(channelId: String, before: String?) async throws -> [FfiMessage]
-    func sendMessage(channelId: String, body: String, replyToId: String?) async throws -> FfiMessage
+    func sendMessage(channelId: String, body: String, replyToId: String?,
+                     clientId: String?) async throws -> FfiMessage
     func editMessage(channelId: String, messageId: String, body: String) async throws -> FfiMessage
     func deleteMessage(channelId: String, messageId: String) async throws
     func markRead(channelId: String, messageId: String?) async throws
@@ -599,8 +600,10 @@ final class ComposerModel {
     }
 
     /// Sends (or saves an edit). The box clears at once; on failure the text and the reply
-    /// come back, with why. A network failure may still have delivered it (a direct send
-    /// can't be retried safely), so it says so instead of "not sent".
+    /// come back, with why. A network failure may still have delivered it, so it says so
+    /// instead of "not sent". Sending the same text and quote again is safe: the direct send
+    /// reuses the failed attempt's `client_id` (the draft's), and the server returns the
+    /// message it already stored instead of making a second one (PROTOCOL.md §1).
     func send() async {
         guard canSend, !readOnly else { return }
         if editing == nil, !staged.isEmpty {
@@ -615,8 +618,11 @@ final class ComposerModel {
         self.editing = nil
         sending = true
         defer { sending = false }
-        if editing == nil, let cache = client as? any OfflineClient {
-            let id = draftId(body: body, reply: reply?.id, files: [])
+        // One id for this message, for the queue and for the direct send below: if the
+        // network drops after the server stored it, the retry carries the same id and the
+        // server answers with the stored message. An edit has no id (`editMessage` takes none).
+        let id = editing == nil ? draftId(body: body, reply: reply?.id, files: []) : nil
+        if let id, let cache = client as? any OfflineClient {
             do {
                 _ = try await cache.sendQueued(channelId: channelId, body: body, replyToId: reply?.id,
                                                clientId: id)
@@ -626,7 +632,8 @@ final class ComposerModel {
                 await pending?.reload()
                 return
             } catch where error.isLocalUnavailable {
-                draft = nil // no local data (yet): sent directly below, as before
+                // No local data (yet): sent directly below, as before. The draft stays: if this
+                // send fails after the server stored it, sending again must reuse the id.
             } catch {
                 if text.isEmpty { // unless something new was typed meanwhile
                     restore(typed)
@@ -643,7 +650,10 @@ final class ComposerModel {
                                                        body: body)
             } else {
                 message = try await client.sendMessage(channelId: channelId, body: body,
-                                                       replyToId: reply?.id)
+                                                       replyToId: reply?.id, clientId: id)
+                // Delivered: the next message, even with the same text, is a new one and needs
+                // a new id, or the server would hand back this one and drop the new one.
+                draft = nil
             }
             error = nil
             onMessage(message)

@@ -52,6 +52,8 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     let wipeFails = Mutex(false)
     let wipeTried = Mutex(0)
     let sent = Mutex<[String]>([])
+    /// The `clientId` of each direct send, in order.
+    let sentIds = Mutex<[String?]>([])
     var sendFailure: Error?
     var read: [String?] = []
 
@@ -65,7 +67,9 @@ final class FakeChat: ChatClient, @unchecked Sendable {
         if let historyFailure { throw historyFailure }
         return pages.isEmpty ? [] : pages.removeFirst()
     }
-    func sendMessage(channelId: String, body: String, replyToId: String?) async throws -> FfiMessage {
+    func sendMessage(channelId: String, body: String, replyToId: String?,
+                     clientId: String?) async throws -> FfiMessage {
+        sentIds.withLock { $0.append(clientId) }
         sent.withLock { $0.append("\(body)|\(replyToId ?? "-")") }
         if let sendFailure { throw sendFailure }
         return msg("m9", body, channel: channelId)
@@ -291,6 +295,65 @@ final class ComposerModelTests: XCTestCase {
         await c.send()
         XCTAssertEqual(c.text, "hello")
         XCTAssertTrue(c.error?.contains("may not have been sent") == true, c.error ?? "")
+    }
+
+    /// The direct send (taken when local data is off, as on iOS) carries a lowercase UUID.
+    func testADirectSendPassesAClientId() async throws {
+        let chat = FakeChat()
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hello"
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 1)
+        let id = try XCTUnwrap(ids[0])
+        XCTAssertNotNil(UUID(uuidString: id))
+        XCTAssertEqual(id, id.lowercased())
+    }
+
+    /// After a network failure the message may be on the server; sending the same text again
+    /// must carry the same id so the server keeps one copy.
+    func testSendingTheSameTextAgainAfterAFailureReusesItsClientId() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.Network(message: "offline")
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hello"
+        await c.send()
+        XCTAssertEqual(c.text, "hello")
+        chat.sendFailure = nil
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertNotNil(ids[0])
+        XCTAssertEqual(ids[0], ids[1])
+    }
+
+    /// Different text is a different message: it must not borrow the failed one's id.
+    func testChangedTextGetsANewClientId() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.Network(message: "offline")
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hello"
+        await c.send()
+        c.text = "hello!"
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertNotEqual(ids[0], ids[1])
+    }
+
+    /// After a success the draft is gone: the same text again is a new message. Reusing the id
+    /// would make the server return the first "hi" and lose the second.
+    func testTheNextMessageAfterASuccessGetsANewClientId() async {
+        let chat = FakeChat()
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hi"
+        await c.send()
+        c.text = "hi"
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertNotNil(ids[0])
+        XCTAssertNotEqual(ids[0], ids[1])
     }
 
     func testAnEditSavesTheNewText() async {
