@@ -716,9 +716,10 @@ mod tests {
         drop(server);
     }
 
-    /// Test 2: tokens cross the mapping intact and unswapped.
+    /// Test 2: the user crosses the mapping intact. The tokens no longer cross the FFI; core's
+    /// own `login_success_resolves_user_and_state` checks them.
     #[tokio::test]
-    async fn login_success_carries_exact_tokens_and_user() {
+    async fn login_success_carries_the_user() {
         let server = mock_login_ok().await;
         let client = FfiBrookClient::new(server.uri(), false).unwrap();
 
@@ -728,8 +729,6 @@ mod tests {
             panic!("expected a session");
         };
 
-        assert_eq!(session.access_token, ACCESS);
-        assert_eq!(session.refresh_token, REFRESH);
         assert_eq!(session.user.handle, "alice");
     }
 

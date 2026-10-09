@@ -153,7 +153,7 @@ contract:
 - **Enrolment** (full access session): `enroll {password}` → `{otpauth_uri,
   expires_in: 600}`, returned once (the client renders the QR);
   `activate {code}` → `{recovery_codes, access_token, refresh_token}`. Activation
-  **signs out every other session**; commit its pair like `/auth/password`'s.
+  **signs out every other session and the caller's own previous pair** (old tokens get 401); commit the new pair like `/auth/password`'s.
   `409 auth.totp_enrollment_expired` means scan again; `409 conflict` means TOTP is
   already on, or nothing is pending.
 - **`disable`** and **`recovery-codes`** take `{password, code}`, where `code` may be a

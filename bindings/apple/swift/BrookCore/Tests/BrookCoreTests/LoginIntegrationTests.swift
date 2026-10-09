@@ -57,7 +57,7 @@ final class LoginIntegrationTests: XCTestCase {
         }
     }
 
-    func testLoginReturnsWorkingTokensAndEndsLoggedIn() async throws {
+    func testLoginWorksAgainstTheServerAndEndsLoggedIn() async throws {
         let cfg = try config()
         let client = try FfiBrookClient(baseUrl: cfg.server, allowInsecureHttp: cfg.allowInsecureHttp)
         let states = StateLog()
@@ -68,17 +68,15 @@ final class LoginIntegrationTests: XCTestCase {
         guard case let .loggedIn(session) = result else { return XCTFail("unexpected \(result)") }
 
         XCTAssertEqual(session.user.handle, cfg.handle)
-        XCTAssertFalse(session.accessToken.isEmpty)
-        XCTAssertFalse(session.refreshToken.isEmpty)
-        XCTAssertNotEqual(session.accessToken, session.refreshToken)
 
-        // The token Swift received must be the one the server accepts as an access token.
-        var me = URLRequest(url: URL(string: cfg.server)!.appending(path: "api/v1/auth/me"))
-        me.setValue("Bearer \(session.accessToken)", forHTTPHeaderField: "Authorization")
-        let (body, response) = try await URLSession.shared.data(for: me)
-        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
-        let meJSON = try JSONSerialization.jsonObject(with: body) as? [String: Any]
-        XCTAssertEqual(meJSON?["handle"] as? String, cfg.handle)
+        // This does NOT prove the access token is good: core sends `me()` with
+        // `OnExpired::SingleFlight`, so a bad access token would be hidden by a silent refresh.
+        // What the call shows is that the session is usable and returns the right user. The
+        // access token itself is checked where it can be seen: login's `session_for` calls /me
+        // with it, and core's `login_success_resolves_user_and_state` (core/src/client.rs)
+        // asserts both tokens. Tokens do not cross the FFI, so this layer cannot do it.
+        let me = try await client.me()
+        XCTAssertEqual(me.user.handle, cfg.handle)
 
         let observed = waitForState(states) { if case .loggedIn = $0 { true } else { false } }
         guard case let .loggedIn(user)? = observed.last else {

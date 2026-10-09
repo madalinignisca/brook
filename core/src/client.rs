@@ -1324,7 +1324,8 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "access_token": "a", "refresh_token": "r", "token_type": "bearer"
+                "access_token": "access-sentinel-A", "refresh_token": "refresh-sentinel-R",
+                "token_type": "bearer"
             })))
             .mount(&server)
             .await;
@@ -1344,7 +1345,10 @@ mod tests {
         };
 
         assert_eq!(session.user.handle, "alice");
-        assert_eq!(session.access_token, "a");
+        // Distinct values, both checked: a swap of the two fields in the login mapping must
+        // fail here. The binding crate no longer sees the tokens, so this is the only check.
+        assert_eq!(session.access_token, "access-sentinel-A");
+        assert_eq!(session.refresh_token, "refresh-sentinel-R");
         assert_eq!(
             *state.borrow_and_update(),
             AuthState::LoggedIn(session.user.clone())

@@ -163,11 +163,20 @@ final class TotpIntegrationTests: XCTestCase {
         let (handle, id) = try await throwaway(cfg)
 
         // Two devices signed in with the password: A (the app), B (raw tokens).
+        // A keeps its session in an in-memory slot, set BEFORE login (core writes only through a
+        // slot that is already set), because A's refresh token no longer crosses the FFI.
         let a = try client(cfg)
-        guard case let .loggedIn(aSession) = try await paced({ try await a.login(handle: handle, password: self.password) })
+        let aSlot = MemorySlot()
+        try aSlot.attach(to: a, in: self)
+        guard case .loggedIn = try await paced({ try await a.login(handle: handle, password: self.password) })
         else { return XCTFail("password login") }
         let (_, bBody) = try await send(cfg, "POST", "auth/login", json: ["handle": handle, "password": password])
         let b = Pair(access: bBody["access_token"] as! String, refresh: bBody["refresh_token"] as! String)
+
+        let aOldRefresh = try aSlot.storedRefreshToken()
+        // B's refresh token comes from the raw HTTP login above, so it is readable. If the two
+        // were equal, the "both old refresh tokens are dead" loop below would check one token twice.
+        XCTAssertNotEqual(aOldRefresh, b.refresh, "A and B must hold different sessions")
 
         // 1. Enrol and activate on A: both devices' old tokens are cut off; A's new pair works.
         let enrollment = try await paced { try await a.totpEnroll(password: self.password) }
@@ -175,11 +184,12 @@ final class TotpIntegrationTests: XCTestCase {
         var used = Self.step()
         let codes = try await paced { try await a.totpActivate(code: Self.code(secret, step: used)) }
         XCTAssertEqual(codes.count, 10)
-        for (who, access) in [("B", b.access), ("A's old", aSession.accessToken)] {
-            let (me, _) = try await send(cfg, "GET", "auth/me", bearer: access)
-            XCTAssertEqual(me, 401, "\(who) access token survived activation")
-        }
-        for (who, refresh) in [("B", b.refresh), ("A's old", aSession.refreshToken)] {
+        // A's OWN old access token is not probed: it never leaves core now. The server test
+        // `test_activation_signs_out_every_old_session_including_the_callers`
+        // (services/api/tests/test_totp_flow.py) covers it. B's access token is probed below.
+        let (bMe, _) = try await send(cfg, "GET", "auth/me", bearer: b.access)
+        XCTAssertEqual(bMe, 401, "B access token survived activation")
+        for (who, refresh) in [("B", b.refresh), ("A's old", aOldRefresh)] {
             let (r, _) = try await send(cfg, "POST", "auth/refresh", json: ["refresh_token": refresh])
             XCTAssertEqual(r, 401, "\(who) refresh token survived activation")
         }

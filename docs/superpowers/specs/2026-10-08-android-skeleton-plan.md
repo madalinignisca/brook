@@ -51,7 +51,7 @@ decisions of 2026-10-09 recorded in section 5; for the owner's approval.
   - the APK upload is dropped.
 - **PR 2:**
   - step 6 (Rust and Swift) is one commit, so the Mac build never breaks;
-  - a new server step (`test_activation_signs_out_other_sessions` also checks the activating
+  - a new server step (`test_activation_signs_out_every_old_session_including_the_callers` also checks the activating
     device's own old pair), flagged for the `auth-reviewer`;
   - the test reads the one `session:` slot instead of rebuilding its name.
 - **Session model:**
@@ -456,7 +456,7 @@ commit of both, and the PR is tested as a whole there.
     from it before activation. Drop only
     the "A's old **access** token" probe: A's access token is never visible now. Step 7 moves that
     exact check into the server's own tests, so no coverage is lost. Count stays 1.
-  - `clients/macos/BrookTests/FakeClient.swift:245`: `FfiSession(user: alice)`.
+  - `clients/apple-shared/BrookTests/FakeClient.swift:245`: `FfiSession(user: alice)`.
 - Test first: the build itself. Any reader of the removed fields, in Rust or Swift, fails to
   compile.
 - Run, on the Mac, on the combined tree:
@@ -473,16 +473,15 @@ commit of both, and the PR is tested as a whole there.
 
 **Step 7: the server test covers what the Swift TOTP test gave up.** *brook-server-implementer*
 (the server agent's machine). **Flagged for the `auth-reviewer`.**
-- `services/api/tests/test_totp_flow.py::test_activation_signs_out_other_sessions` (line 212)
-  today checks only the *other* device's pair (`other`) after `_enable`. Add asserts that the
-  activating device's own pre-activation pair (`pair["access_token"]` on `GET /auth/me` and
-  `pair["refresh_token"]` on `POST /auth/refresh`) both get 401, while
-  `activated["access_token"]` still gets 200. That is what the dropped Swift probe checked
-  end to end.
+- `services/api/tests/test_totp_flow.py::test_activation_signs_out_every_old_session_including_the_callers` (line 212)
+  checks both the *other* device's pair (`other`) after `_enable` and the activating device's
+  own pre-activation pair (`pair["access_token"]` on `GET /auth/me` and `pair["refresh_token"]`
+  on `POST /auth/refresh`), which both get 401, while `activated["access_token"]` still gets 200.
+  That is what the dropped Swift probe checked end to end.
 - Test first: it is the test. If it fails, the server does not cut off the activating device's old
   pair, which contradicts what the Swift test has asserted until now. Stop and report it to the
   main agent and the owner; do not change the server in this PR.
-- Run, from `services/api`: `uv run pytest tests/test_totp_flow.py::test_activation_signs_out_other_sessions`,
+- Run, from `services/api`: `uv run pytest tests/test_totp_flow.py::test_activation_signs_out_every_old_session_including_the_callers`,
   then the full `services/api` row of CLAUDE.md §3.
 - Docs: PROTOCOL §1.2 says activation "signs out every **other** session; commit its pair like
   `/auth/password`'s", which leaves the activating device's previous pair unstated. Once the test

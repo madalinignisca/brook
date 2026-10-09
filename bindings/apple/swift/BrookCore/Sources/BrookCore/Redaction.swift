@@ -3,33 +3,14 @@
 
 import BrookCoreGenerated
 
-// Tokens must never reach a log, crash report or the debugger's variable view.
+// Nothing here holds a token any more: tokens stay inside core (it keeps the session itself
+// through the `KeySlot`), so `FfiSession` is `{ user }` and needs no redaction. What is left
+// keeps the secrets that still cross the FFI out of logs, crash reports and the debugger's
+// variable view.
 //
 // `description` alone is not enough: `dump()` and the debugger walk a value's stored
-// properties through reflection, independently of its description. So every type that
-// carries a token redacts all three: description, debugDescription and its Mirror.
-
-extension FfiSession: CustomStringConvertible, CustomDebugStringConvertible,
-    CustomReflectable
-{
-    public var description: String {
-        "FfiSession(user: \(user.handle), accessToken: <redacted>, refreshToken: <redacted>)"
-    }
-
-    public var debugDescription: String { description }
-
-    public var customMirror: Mirror {
-        Mirror(
-            self,
-            children: [
-                "user": user,
-                "accessToken": "<redacted>",
-                "refreshToken": "<redacted>",
-            ],
-            displayStyle: .struct
-        )
-    }
-}
+// properties through reflection, independently of its description. So every type below
+// redacts all three: description, debugDescription and its Mirror.
 
 extension LoginResult: CustomStringConvertible, CustomDebugStringConvertible,
     CustomReflectable
@@ -43,7 +24,7 @@ extension LoginResult: CustomStringConvertible, CustomDebugStringConvertible,
 
     public var debugDescription: String { description }
 
-    // The child is the session itself, whose own Mirror redacts the tokens.
+    // The child is the session, which is only the user.
     public var customMirror: Mirror {
         switch self {
         case let .loggedIn(session):

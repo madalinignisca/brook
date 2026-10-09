@@ -19,6 +19,8 @@ final class MemorySlot: FfiKeySlot, @unchecked Sendable {
     }
     func replace(slot: String, bytes: Data) throws { slots.withLock { $0[slot] = bytes } }
     func delete(slot: String) throws { _ = slots.withLock { $0.removeValue(forKey: slot) } }
+    /// Everything stored, for tests that read back what core wrote (see `MemorySlot.swift`).
+    func contents() -> [String: Data] { slots.withLock { $0 } }
 }
 
 /// The chat surface against the shared test server (configured by `itest.sh`): send, reply,
