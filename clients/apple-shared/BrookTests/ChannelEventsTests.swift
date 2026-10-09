@@ -52,7 +52,12 @@ final class ChannelEventsTests: XCTestCase {
     /// default (the Mac) never does: its cache feed re-reads instead.
     func testReconnectReadyRereadsTheListOnlyWhenAsked() async {
         func lists(_ c: FakeRealtime) -> Int { c.order.withLock { $0.filter { $0 == "list" }.count } }
-        for (asked, expected) in [(true, 2), (false, 1)] {
+        // Two models side by side, one per flag value, fed the same events. "Nothing happened" can
+        // only be asserted once something that should have happened has: the flag-on model's
+        // second read is the marker that a re-read had time to land, so the flag-off count is
+        // checked after it, not after a guessed number of main-queue turns.
+        var models: [Bool: (client: FakeRealtime, model: ChannelsModel)] = [:]
+        for asked in [true, false] {
             let client = FakeRealtime(channels: [channel("c1", "general")])
             let suite = "brook.tests.\(UUID().uuidString)"
             let defaults = UserDefaults(suiteName: suite)!
@@ -64,12 +69,18 @@ final class ChannelEventsTests: XCTestCase {
             await drainMain(); await Task.yield()
             XCTAssertEqual(lists(client), 1, "asked: \(asked): the first ready read again")
             client.readQueue.withLock { $0 = [[channel("c1", "renamed")]] }
-            client.deliver(.ready) // a reconnect
-            for _ in 0..<50 where lists(client) < expected { await drainMain(); await Task.yield() }
-            await drainMain()
-            XCTAssertEqual(lists(client), expected, "asked: \(asked)")
-            XCTAssertEqual(model.channels.first?.name, asked ? "renamed" : "general", "asked: \(asked)")
+            models[asked] = (client, model)
         }
+        let on = models[true]!, off = models[false]!
+        on.client.deliver(.ready) // a reconnect, to both
+        off.client.deliver(.ready)
+        for _ in 0..<200 where lists(on.client) < 2 { await drainMain(); await Task.yield() }
+        XCTAssertEqual(lists(on.client), 2, "asked: the reconnect did not read again")
+        // The marker has landed; give the other model the same turns again, then assert.
+        for _ in 0..<50 { await drainMain(); await Task.yield() }
+        XCTAssertEqual(lists(off.client), 1, "not asked: the reconnect read again")
+        XCTAssertEqual(on.model.channels.first?.name, "renamed")
+        XCTAssertEqual(off.model.channels.first?.name, "general")
     }
 
     func testADeleteRemovesTheRowAndClosesTheOpenChannel() async {

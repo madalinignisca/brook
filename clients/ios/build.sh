@@ -65,7 +65,6 @@ if [[ "$mode" == "test" ]]; then
     ChannelEventsTests/testReconnectReadyRereadsTheListOnlyWhenAsked
     SessionStoreTests/testSignOutInALockedLaunchLeavesTheNoticeOnTheSignInScreen
     SignedInSessionTests/testStopCancelsTheEventSubscription
-    SignedInSessionTests/testASecondSessionGetsAFreshModel
     SignedInSessionTests/testSceneChangesReloadThroughTheSession
     SignedInSessionTests/testAReconnectShowsWhatChangedWhileTheSocketWasDown
     ForegroundReloadTests/testComingBackToTheForegroundReadsTheListAgain
