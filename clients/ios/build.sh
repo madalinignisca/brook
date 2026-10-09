@@ -46,6 +46,11 @@ if [[ "$mode" == "test" ]]; then
     SessionPersistenceIOSTests/testAFailingDeleteStaysOffLeavesTheMarkerUnsetAndIsRetried
     SessionPersistenceIOSTests/testADataDirectoryThatCannotBeMadeStaysOff
     SessionPersistenceIOSTests/testAFatalProbeStaysOff
+    SessionPersistenceIOSTests/testALockedProbeStaysOn
+    SessionPersistenceIOSTests/testProtectedDataUnavailableStaysOffWithoutDeletingOrMarking
+    SessionPersistenceIOSTests/testTheFileProbeSaysAvailableWhenReadableAndLockedWhenNot
+    SessionPersistenceIOSTests/testAMarkerOnlyInANonPersistentDomainDoesNotCount
+    SessionPersistenceIOSTests/testTheCleanupDeletesBeforeAnyReadAndBeforeTheMarker
     SessionPersistenceIOSTests/testOtherDefaultsAlreadySetDoNotSkipTheFirstLaunchCleanup
     MessageWordingTests/testNoMessageNamesTheMac
     MessageWordingTests/testTheIPhoneWording

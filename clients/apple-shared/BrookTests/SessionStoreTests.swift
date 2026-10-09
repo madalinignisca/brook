@@ -223,6 +223,9 @@ final class SessionStoreTests: XCTestCase {
             XCTAssertTrue(slot.deleteAttempts.contains { $0.hasPrefix("session:") },
                           "persistence was not enabled on the client (no delete reached the slot)")
             XCTAssertEqual(client.signOutComplete(), expectComplete, "writable: \(writable)")
+            // The fence itself: exactly one file under `signed-out/` when the directory is writable.
+            let fences = (try? FileManager.default.contentsOfDirectory(atPath: dir.appendingPathComponent("signed-out").path)) ?? []
+            XCTAssertEqual(fences.count, writable ? 1 : 0, "fence files: \(fences)")
         }
     }
 
