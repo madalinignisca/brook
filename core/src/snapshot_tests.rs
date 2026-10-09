@@ -299,6 +299,9 @@ async fn a_sealer_resumes_at_a_chunk_boundary_and_stops_at_the_size() {
 /// (holding a blocking thread for good), and a folder or a device isn't a file to send:
 /// each is refused at once, judged on what was opened (a path swapped after staging
 /// can't slip past a check made earlier).
+#[cfg(not(target_os = "android"))]
+// The adb-shell test harness cannot make a FIFO: SELinux denies `mkfifo` to the shell domain in
+// `/data/local/tmp` (verified 2026-10-08); the host run covers this code.
 #[test]
 fn only_a_regular_file_is_copied() {
     let dir = tempfile::tempdir().unwrap();

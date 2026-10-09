@@ -7,8 +7,13 @@
 use std::sync::Arc;
 
 use crate::local::LocalData;
-use crate::store::{Kind, Opened};
-use crate::{InMemoryKeySlot, KeySlot, KeySlotError};
+// `Kind` and `KeySlotError` are used only by the keyed tests (ADR 0001).
+#[cfg(not(target_os = "android"))]
+use crate::store::Kind;
+use crate::store::Opened;
+#[cfg(not(target_os = "android"))]
+use crate::KeySlotError;
+use crate::{InMemoryKeySlot, KeySlot};
 
 async fn open(root: &std::path::Path, slot: &Arc<InMemoryKeySlot>) -> LocalData {
     LocalData::open(root, slot.clone() as Arc<dyn KeySlot>)
@@ -44,13 +49,18 @@ async fn a_wipe_erases_the_keys_and_the_files() {
     let id = stores.store_id.clone();
     ready(stores.cache).close().await;
     ready(stores.outbox).close().await;
+    // The key assertions are for keyed stores only: Android stores use no key (ADR 0001).
+    #[cfg(not(target_os = "android"))]
     assert!(slot.contains(&format!("cache:{id}")) && slot.contains(&format!("outbox:{id}")));
     local.wipe("https://a", "u1").await.unwrap();
-    assert!(
-        !slot.contains(&format!("cache:{id}")),
-        "the key survived the wipe"
-    );
-    assert!(!slot.contains(&format!("outbox:{id}")));
+    #[cfg(not(target_os = "android"))]
+    {
+        assert!(
+            !slot.contains(&format!("cache:{id}")),
+            "the key survived the wipe"
+        );
+        assert!(!slot.contains(&format!("outbox:{id}")));
+    }
     assert!(
         !root.path().join(&id).exists(),
         "the files survived the wipe"
@@ -86,6 +96,8 @@ async fn an_open_store_cant_be_wiped_under_its_user() {
 /// The key store refuses to delete a key: the files still go, the wipe says it's
 /// incomplete, and the row stays doomed. The next sign-in of that user finishes the erase
 /// first and gets fresh stores (the old keys are never reused).
+#[cfg(not(target_os = "android"))]
+// Relies on a key that refuses to be destroyed; Android stores use no key (ADR 0001).
 #[tokio::test]
 async fn a_key_that_wont_go_keeps_the_wipe_pending() {
     let root = tempfile::tempdir().unwrap();
@@ -142,6 +154,8 @@ async fn a_user_switch_finds_the_other_users() {
 }
 
 /// The outbox's key is gone: its unsent messages are lost, and the app is told so.
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 #[tokio::test]
 async fn a_lost_outbox_is_reported() {
     let root = tempfile::tempdir().unwrap();
@@ -179,6 +193,8 @@ async fn reconciliation_erases_only_orphans() {
 
 /// Orphans `n` stores after the index key goes, the first holding `unsent` queued messages;
 /// returns whether the reopened data said unsent messages were lost.
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 async fn lose_the_index_key(unsent: usize) -> bool {
     let root = tempfile::tempdir().unwrap();
     let slot = Arc::new(InMemoryKeySlot::default());
@@ -219,6 +235,8 @@ async fn lose_the_index_key(unsent: usize) -> bool {
 
 /// The index's key is gone: nobody knows whose stores these are, so they're all erased, and
 /// unsent messages among them are reported lost.
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 #[tokio::test]
 async fn a_lost_index_key_orphans_every_store() {
     assert!(
@@ -228,11 +246,15 @@ async fn a_lost_index_key_orphans_every_store() {
 }
 
 /// Only an outbox that held something is a loss.
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 #[tokio::test]
 async fn orphaned_empty_outboxes_are_not_a_loss() {
     assert!(!lose_the_index_key(0).await, "a loss reported for nothing");
 }
 
+#[cfg(not(target_os = "android"))]
+// Relies on a locked key slot turning local data off; Android stores use no key (ADR 0001).
 #[tokio::test]
 async fn a_locked_index_means_no_local_data_and_nothing_deleted() {
     let root = tempfile::tempdir().unwrap();

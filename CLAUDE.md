@@ -58,6 +58,7 @@ Before pushing, merge `origin/main` into your branch and run what CI runs:
 | `services/api` (from that directory, after `uv sync --locked --extra dev`) | `uv run ruff check . && uv run ruff format --check . && uv run mypy app && uv run coverage run -m pytest && uv run coverage report && uv run bandit -q -r app tests -s B101,B105,B106 && uv run pip-audit --skip-editable` |
 | Rust: `core`, `clients/gst-media`, `clients/gnome`, `bindings/apple` (from the repo root) | `cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked` |
 | macOS | `clients/macos/build.sh test` |
+| Rust for Android: `core`, `bindings/apple` (from the repo root; NDK path as in the [Android plan](docs/superpowers/specs/2026-10-08-android-skeleton-plan.md)) | `clients/android/with-ndk.sh "$HOME/Android/Sdk/ndk/30.0.16248370" cargo clippy --locked -p brook-core -p brook-ffi --all-targets --target x86_64-linux-android -- -D warnings && cargo test --locked -p brook-core --lib store_tests` |
 
 CI also runs `cargo-deny` and the API tests against Postgres. `pre-commit install` runs the
 cheap checks on every commit. [QUALITY](docs/QUALITY.md) has the full standard.
@@ -95,9 +96,9 @@ Every client offers the same features, each in its own platform's way. Same feat
 mean same implementation: use what the device does better. Logic is still written once in `core`;
 but where the platform already provides a capability well (app sandbox and storage encryption,
 keychain or keystore, notifications, file pickers, media codecs), the client uses it, and `core`
-should offer a seam for that instead of forcing its own version on every platform. Example (owner
-decision, not built yet): Android sandboxes and encrypts each app's storage, so `core`'s local
-database there is to become plain SQLite, not SQLCipher (#273).
+should offer a seam for that instead of forcing its own version on every platform. Example:
+Android sandboxes and encrypts each app's storage, so `core`'s local database there is plain
+SQLite, not SQLCipher ([ADR 0001](docs/adr/0001-plain-sqlite-on-android.md)).
 
 When a merged PR adds or changes something a user can see or do in one client, the main agent
 opens one issue for each other client right after the merge: GNOME, KDE, macOS, iOS, Android,

@@ -1,8 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Encrypted local stores (plan docs/superpowers/specs/2026-09-25-cache-core-plan.md C1, spec
+//! Local stores (plan docs/superpowers/specs/2026-09-25-cache-core-plan.md C1, spec
 //! 2026-09-25-offline-cache-design.md §3).
+//!
+//! **On Android** a store is plain SQLite in the app's private storage, which the OS
+//! encrypts and keeps from other apps (ADR 0001): no key, no `KeySlot` slot, no check file,
+//! so nothing here can be "locked" or "missing its key". A plain store that won't open is
+//! `Damaged` and kept, and a format change is rebuilt exactly as below. What follows is
+//! everywhere else (Linux, macOS, iOS, Windows), where the app's storage is not protected
+//! for us and the store protects itself:
 //!
 //! Each store is a SQLCipher database with its own random key in a named `KeySlot` slot.
 //! Beside it, a non-secret **key check** file holds `HMAC-SHA256(key, CHECK_LABEL)`: the
@@ -21,16 +28,39 @@
 
 use std::collections::HashSet;
 use std::fs;
+#[cfg(not(target_os = "android"))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, LazyLock, Mutex};
 
 use rusqlite::Connection;
+#[cfg(not(target_os = "android"))]
 use zeroize::Zeroizing;
 
-use crate::{KeySlot, KeySlotError, KeyStore};
+#[cfg(not(target_os = "android"))]
+use crate::KeySlotError;
+use crate::{KeySlot, KeyStore};
 
+#[cfg(not(target_os = "android"))]
 const CHECK_LABEL: &[u8] = b"brook-store-check";
+
+/// How a store is kept safe at rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Protection {
+    /// SQLCipher with a random key in a `KeySlot` slot (everywhere but Android).
+    #[cfg(not(target_os = "android"))]
+    Keyed,
+    /// Plain SQLite: the OS protects the app's storage (Android, ADR 0001). Also built for
+    /// tests, so the host can drive this path; no host build uses it otherwise.
+    #[cfg(any(target_os = "android", test))]
+    Plain,
+}
+
+/// The one place the platform picks a `Protection`; `open`, `rebuild` and `reset` use it.
+#[cfg(not(target_os = "android"))]
+const PROTECTION: Protection = Protection::Keyed;
+#[cfg(target_os = "android")]
+const PROTECTION: Protection = Protection::Plain;
 
 /// Which store, with its file names and schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +81,7 @@ impl Kind {
     }
 
     /// The key slot's name (spec §3: `cache:<store id>`, `outbox:<store id>`).
+    #[cfg(not(target_os = "android"))]
     fn slot(self, store_id: &str) -> String {
         match self {
             Kind::Index => "index".to_string(),
@@ -155,7 +186,9 @@ pub(crate) enum Opened {
         db: Db,
         rebuilt: Option<Rebuilt>,
     },
-    /// The key can't be read now: nothing opened, nothing deleted. Online-only.
+    /// The key can't be read now: nothing opened, nothing deleted. Online-only. Not on
+    /// Android: a store there has no key to be locked out of.
+    #[cfg(not(target_os = "android"))]
     Locked,
     /// The key is right but the database won't open: nothing deleted. Only an explicit
     /// `reset` clears it.
@@ -172,6 +205,7 @@ impl std::fmt::Debug for Opened {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Opened::Ready { rebuilt, .. } => write!(f, "Ready({rebuilt:?})"),
+            #[cfg(not(target_os = "android"))]
             Opened::Locked => f.write_str("Locked"),
             Opened::Damaged => f.write_str("Damaged"),
             Opened::NeedsRebuild { unsent } => write!(f, "NeedsRebuild({unsent:?})"),
@@ -267,9 +301,20 @@ pub(crate) fn open(
     store_id: &str,
     keys: &KeyStore<dyn KeySlot>,
 ) -> Result<Opened, StoreError> {
+    open_as(PROTECTION, dir, kind, store_id, keys)
+}
+
+/// `open` with the protection named, so tests can drive the plain path on the host.
+pub(crate) fn open_as(
+    protection: Protection,
+    dir: &Path,
+    kind: Kind,
+    store_id: &str,
+    keys: &KeyStore<dyn KeySlot>,
+) -> Result<Opened, StoreError> {
     let paths = paths_in(dir, kind)?;
     let reservation = Reservation::take(paths.db.clone())?;
-    open_reserved(kind, store_id, keys, &paths, reservation)
+    open_reserved(protection, kind, store_id, keys, &paths, reservation)
 }
 
 enum Inner {
@@ -278,13 +323,14 @@ enum Inner {
 }
 
 fn open_reserved(
+    protection: Protection,
     kind: Kind,
     store_id: &str,
     keys: &KeyStore<dyn KeySlot>,
     paths: &Paths,
     reservation: Reservation,
 ) -> Result<Opened, StoreError> {
-    let mut inner = open_inner(kind, store_id, keys, paths)?;
+    let mut inner = open_inner(protection, kind, store_id, keys, paths)?;
     if let Inner::Ready(conn, None) = inner {
         // A cache in another format is remade (pre-1.0: no migrations), under the same
         // reservation.
@@ -305,7 +351,7 @@ fn open_reserved(
             Ok(_) => {
                 drop(conn);
                 remove_all(paths)?;
-                inner = match open_inner(kind, store_id, keys, paths)? {
+                inner = match open_inner(protection, kind, store_id, keys, paths)? {
                     Inner::Ready(conn, _) => Inner::Ready(conn, Some(Rebuilt::FormatChanged)),
                     other => other,
                 };
@@ -328,6 +374,43 @@ fn format_of(conn: &Connection) -> rusqlite::Result<i64> {
 }
 
 fn open_inner(
+    protection: Protection,
+    kind: Kind,
+    store_id: &str,
+    keys: &KeyStore<dyn KeySlot>,
+    paths: &Paths,
+) -> Result<Inner, StoreError> {
+    match protection {
+        #[cfg(not(target_os = "android"))]
+        Protection::Keyed => open_keyed(kind, store_id, keys, paths),
+        #[cfg(any(target_os = "android", test))]
+        Protection::Plain => {
+            // A plain store has no key slot to name or read.
+            #[cfg(target_os = "android")]
+            let _ = (store_id, keys);
+            open_plain(kind, paths)
+        }
+    }
+}
+
+/// A plain store: no key, no check file, `KeyStore` never touched. With nothing to prove
+/// whose a file is, a database that won't open is damaged and kept, never deleted; only an
+/// explicit `reset` clears it.
+#[cfg(any(target_os = "android", test))]
+fn open_plain(kind: Kind, paths: &Paths) -> Result<Inner, StoreError> {
+    if paths.db.exists() {
+        return Ok(match connect_plain(&paths.db) {
+            Ok(conn) => Inner::Ready(conn, None),
+            Err(_) => Inner::Other(Opened::Damaged),
+        });
+    }
+    let conn = connect_plain(&paths.db).map_err(|_| StoreError::Io)?;
+    create_schema(kind, &conn)?;
+    Ok(Inner::Ready(conn, None))
+}
+
+#[cfg(not(target_os = "android"))]
+fn open_keyed(
     kind: Kind,
     store_id: &str,
     keys: &KeyStore<dyn KeySlot>,
@@ -361,7 +444,7 @@ fn open_inner(
         // damage, I/O and locking fail the same way. (The probe itself may checkpoint a
         // committed WAL into the file; that moves pages, it loses nothing.)
         let keyless = found == Check::Other || (found == Check::Absent && made_now);
-        return Ok(match (found, connect(&paths.db, key.bytes())) {
+        return Ok(match (found, connect_keyed(&paths.db, key.bytes())) {
             (Check::Matches, Ok(conn)) => Inner::Ready(conn, None),
             // The key opens it: it's this key's, whatever the check said. Restore the check.
             (_, Ok(conn)) => {
@@ -383,13 +466,23 @@ fn open_inner(
     ))
 }
 
+#[cfg(not(target_os = "android"))]
 fn create(
     kind: Kind,
     paths: &Paths,
     key: &[u8; 32],
     check: &[u8],
 ) -> Result<Connection, StoreError> {
-    let conn = connect(&paths.db, key).map_err(|_| StoreError::Io)?;
+    let conn = connect_keyed(&paths.db, key).map_err(|_| StoreError::Io)?;
+    create_schema(kind, &conn)?;
+    // A crash before this line leaves a database without a check: the next open finds the
+    // key still opens it, and restores the check.
+    write_atomically(&paths.check, check)?;
+    Ok(conn)
+}
+
+/// The schema and the `meta` row of a new database, the same for both protections.
+fn create_schema(kind: Kind, conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(kind.schema())
         .map_err(|_| StoreError::Sql)?;
     conn.execute(
@@ -397,10 +490,7 @@ fn create(
         [kind.format()],
     )
     .map_err(|_| StoreError::Sql)?;
-    // A crash before this line leaves a database without a check: the next open finds the
-    // key still opens it, and restores the check.
-    write_atomically(&paths.check, check)?;
-    Ok(conn)
+    Ok(())
 }
 
 /// Make `kind`'s store fresh after the caller surfaced what is lost (an outbox's format
@@ -414,14 +504,26 @@ pub(crate) fn rebuild(
     let paths = paths_in(dir, kind)?;
     let reservation = Reservation::take(paths.db.clone())?;
     remove_all(&paths)?;
-    open_reserved(kind, store_id, keys, &paths, reservation)
+    open_reserved(PROTECTION, kind, store_id, keys, &paths, reservation)
 }
 
 /// Erase a store without reading it (a damaged or locked one, or a sign-out wipe once its
 /// handles are closed): destroy the key first (crypto-erase), then delete the files. The
 /// store must not be open, and stays reserved throughout. Returns whether the key was
-/// destroyed; the files go either way.
+/// destroyed; the files go either way. A plain store has no key: the files go and the
+/// answer is `true`, so `LocalData::erase_row`'s "keys gone" condition is met.
 pub(crate) fn reset(
+    dir: &Path,
+    kind: Kind,
+    store_id: &str,
+    keys: &KeyStore<dyn KeySlot>,
+) -> Result<bool, StoreError> {
+    reset_as(PROTECTION, dir, kind, store_id, keys)
+}
+
+/// `reset` with the protection named, so tests can drive the plain path on the host.
+pub(crate) fn reset_as(
+    protection: Protection,
     dir: &Path,
     kind: Kind,
     store_id: &str,
@@ -429,12 +531,22 @@ pub(crate) fn reset(
 ) -> Result<bool, StoreError> {
     let paths = paths_in(dir, kind)?;
     let _reservation = Reservation::take(paths.db.clone())?;
-    let destroyed = keys.destroy(&kind.slot(store_id)).is_ok();
+    let destroyed = match protection {
+        #[cfg(not(target_os = "android"))]
+        Protection::Keyed => keys.destroy(&kind.slot(store_id)).is_ok(),
+        #[cfg(any(target_os = "android", test))]
+        Protection::Plain => {
+            #[cfg(target_os = "android")]
+            let _ = (store_id, keys);
+            true
+        }
+    };
     remove_all(&paths)?;
     Ok(destroyed)
 }
 
-fn connect(path: &Path, key: &[u8; 32]) -> rusqlite::Result<Connection> {
+#[cfg(not(target_os = "android"))]
+fn connect_keyed(path: &Path, key: &[u8; 32]) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     // Before the key: a wrong key otherwise makes SQLCipher print to stderr by itself.
     conn.execute_batch("PRAGMA cipher_log_level = NONE;")?;
@@ -444,9 +556,21 @@ fn connect(path: &Path, key: &[u8; 32]) -> rusqlite::Result<Connection> {
         "PRAGMA key = \"x'{}'\";",
         hex.as_str()
     )))?;
+    conn.execute_batch("PRAGMA cipher_memory_security = ON;")?;
+    finish_connect(conn)
+}
+
+/// A plain database: opened as it is, with no key pragma at all (the SQLCipher library on
+/// the host would encrypt the moment one is set).
+#[cfg(any(target_os = "android", test))]
+fn connect_plain(path: &Path) -> rusqlite::Result<Connection> {
+    finish_connect(Connection::open(path)?)
+}
+
+/// What both protections share once the connection is opened (and keyed, if it is).
+fn finish_connect(conn: Connection) -> rusqlite::Result<Connection> {
     conn.execute_batch(
-        "PRAGMA cipher_memory_security = ON;
-         PRAGMA temp_store = MEMORY;
+        "PRAGMA temp_store = MEMORY;
          PRAGMA foreign_keys = ON;",
     )?;
     // Reading the journal mode touches page 1: a wrong key or damage fails here.
@@ -457,11 +581,13 @@ fn connect(path: &Path, key: &[u8; 32]) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+#[cfg(not(target_os = "android"))]
 fn key_check(key: &[u8; 32]) -> Vec<u8> {
     let mac = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
     ring::hmac::sign(&mac, CHECK_LABEL).as_ref().to_vec()
 }
 
+#[cfg(not(target_os = "android"))]
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let tmp = path.with_extension("check.tmp");
     let io = |_| StoreError::Io;

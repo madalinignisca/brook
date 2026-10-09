@@ -3,7 +3,8 @@
 > Builds on the offline-cache design (2026-09-25-offline-cache-design.md §6, §7), which fixed
 > the file cache's format, Open and Save, and pinning. This spec makes it buildable: the
 > public API, what a cached file's life looks like, and the GTK UI. It also takes over the
-> part of #65 that was left: the encrypted, disposable file cache.
+> part of #65 that was left: the encrypted, disposable file cache. (Encrypted except on
+> Android, where the OS provides File-Based Encryption; see ADR 0001.)
 
 ## 1. What the user gets
 
@@ -118,6 +119,10 @@ drop it.
 - On a cancel the partial stays, for a later resume.
 - A `404` drops the row and blob and returns `file.gone`.
 - Already complete: returns at once and updates `last_used`.
+- **On Android:** the per-file key and AES-256-GCM chunks apply the same way. The database
+  itself (where the key is stored) is plain SQLite, protected by OS File-Based Encryption and
+  the app sandbox (ADR 0001). Each file's key sits in plain SQLite next to the file it seals,
+  so the sealing adds no protection beyond the app sandbox and file-based encryption.
 
 ### 4.2 `open_file(id, file_id) -> Result<PathBuf>`
 - `cache_file` first, then decrypts into the Open directory (§4.4) under

@@ -36,7 +36,7 @@ chat" it's in; when it's a platform/growth/enterprise-suite feature, it's out
 | Multi-device sessions + revoke | 🟡 | P0b | refresh tokens exist; no session list UI |
 | Logout | 🟡 | P0 | server revoke done; client wiring in progress (MVP+) |
 | Stay signed in across restarts (platform secret store) | ⬜ | MVP+ | Keychain / Secret portal |
-| Offline cache (channels, members, messages) | ⬜ | MVP+ | core SQLite, encrypted (#46); opens offline |
+| Offline cache (channels, members, messages) | ⬜ | MVP+ | core SQLite, encrypted except on Android (#46, ADR 0001); opens offline |
 | Offline outbox (send when back online) | ⬜ | MVP+ | |
 
 ## 2. Conversations & channels

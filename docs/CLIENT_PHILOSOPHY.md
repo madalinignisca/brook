@@ -65,7 +65,7 @@ This is a proven pattern (Signal, Matrix's `matrix-rust-sdk`, 1Password): native
 - Local state model + event log; offline queue.
 - File transfer orchestration (request presigned URL, drive upload/download, resume).
 - **Call signaling** state machine (negotiate with Janus via the WS relay; produce/consume SDP/ICE).
-- Crypto: token handling, request signing (no E2EE — non-goal).
+- Crypto: token handling, request signing (no E2EE — non-goal). Local store encryption (SQLCipher on desktop and iOS, plain SQLite on Android protected by OS File-Based Encryption; see ADR 0001).
 - Auth session lifecycle (platform keystore for tokens; drives the OIDC system-browser flow).
 - Bot/slash-command parsing and dispatch.
 
