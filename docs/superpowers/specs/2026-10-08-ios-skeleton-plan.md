@@ -4,6 +4,13 @@ Spec: [2026-10-08-ios-skeleton-spec.md](2026-10-08-ios-skeleton-spec.md). Review
 for every step; `brook-security-reviewer` also for steps 3 and 5 (the session's Keychain items and
 data directory on a new platform, and the first-launch delete).
 
+Changed after steps 1 to 7 merged, to match what was built: step 4 was two commits; the iOS
+`prepare` gained a protected-data check first and reads its marker from the persistent domain
+(section 1, step 5); step 6's path check is corrected (a path is accepted) and the pre-unlock
+state is recorded; step 7 records `SignedInSession`, mention-only counts, the reconnect re-read
+and the locked-launch Sign Out notice; step 8's owner check gains the pre-unlock, restore,
+app-switcher and probe-error checks; the backup risk is settled (section 4).
+
 ## 1. Approach
 
 **Sharing: one folder, `clients/apple-shared/`, listed by both XcodeGen projects.** It holds
@@ -98,7 +105,16 @@ synchronizable, and the access group when one is set. That matches every `sessio
 (and any other slot core ever wrote) under the service, whatever the server. On iOS
 `SecItemDelete` removes every match. `errSecItemNotFound` counts as success.
 `SessionPersistence.prepare(dataDir:calls:defaults:)` (iOS) runs these steps, in this order:
-1. If the defaults key `KeychainCleared` is absent: call `deleteAll()`. On failure, return `.off`
+0. Check that files of the "until first user authentication" class can be read, with a probe
+   file in `dataDir` written with that class (`UIApplication.shared` is still nil in
+   `App.init`, so `isProtectedDataAvailable` cannot be used). Three outcomes: available (go on);
+   locked, only for a permission refusal (EPERM, EACCES, or the Cocoa no-permission codes),
+   which returns `.lockedUntilFirstUnlock` (step 6); any other failure, which returns `.off`.
+   Before the first unlock the defaults read as empty and the delete finds nothing, so without
+   this check the marker would be set while the old install's session is still there.
+1. If the defaults key `KeychainCleared` is absent from the app's persistent domain (not
+   `object(forKey:)`, which a `-KeychainCleared YES` launch argument would satisfy): call
+   `deleteAll()`. On failure, return `.off`
    for this launch, leave the key unset (so the next launch tries again), and never restore. On
    success, set the key.
 2. Create `dataDir`; on failure, `.off`.
@@ -340,7 +356,9 @@ Docs made wrong: the `.off` doc comment, which is fixed in this step.
 
 ### Step 4: move the shared files to `clients/apple-shared`
 
-Subagent: `brook-apple-implementer`. Commit: `apple: move code both apps use to clients/apple-shared`.
+Subagent: `brook-apple-implementer`. Built as two commits, which keeps the move a pure rename:
+first the `git mv` of the 19 files with the `project.yml` and `build.sh` edits, then the
+test-support cut and paste into `TestSupport.swift`.
 
 Every moved file is moved with `git mv` and left **byte-identical**, so git follows its history
 (`git log --follow`, rename detection at 100%). The only edited files are:
@@ -423,6 +441,8 @@ Files:
 - `clients/ios/Brook/BrookApp.swift`: builds `Settings()`, then
   `SessionStore(persistence: .live(), makeFeed: nil)`, and `LoginForm`. It keeps a placeholder
   signed-in view until step 7.
+- `SessionPersistence+iOS.swift`, beside `live()`: a comment that the data directory stays in
+  backups on purpose (section 4, backup).
 
 Tests first (in `clients/ios/BrookTests/`):
 - `SessionPersistenceIOSTests`, with a recording `SecItemCalls` fake, a temp directory and
@@ -483,9 +503,18 @@ Files:
 - `clients/ios/Brook/BrookApp.swift`: the root switches on `store.phase`, as the Mac does:
   `.restoring` shows `ProgressView("Signing in…")`; the signed-out phases show `LoginView`; and
   `.task { await store.restoreAtLaunch() }` restores at launch.
+- Shared `SessionPersistence.swift`: a new case `.lockedUntilFirstUnlock` (the Mac never
+  produces it, like `.secondInstance` on iOS). `SessionStore` starts it on the sign-in screen
+  with `Message.waitingForFirstUnlock`: "Brook can't use its saved sign-in until your iPhone has
+  been unlocked once after restarting. Unlock it, then close Brook and open it again." No
+  automatic re-check: decided for simplicity.
+- The recovery-code field is a `SecureField`, so the app-switcher snapshot cannot show it. The
+  6-digit code stays a visible `.oneTimeCode` field, so iOS can fill it.
 
-Tests: none new. The view is wiring; `LoginFormTests` and `SessionStoreTests` (shared, running on
-iOS) cover its logic. The on-screen checks below are the evidence, against the local stack
+Tests: none for the view, which is wiring; `LoginFormTests` and `SessionStoreTests` (shared,
+running on iOS) cover its logic. The new state gets tests: the exact message text, and
+`testOnlyAPermissionRefusalCountsAsLocked` for the error classification. The on-screen checks
+below are the evidence, against the local stack
 (section 3a):
 - wrong password;
 - plain http with a **non-loopback** address, `http://192.168.1.50`:
@@ -495,7 +524,9 @@ iOS) cover its logic. The on-screen checks below are the evidence, against the l
 
   Core always allows http to `localhost`, `127.0.0.1` and `::1`
   (`core/src/config.rs:46-49`), so the local stack cannot show the refusal;
-- an address with a path;
+- an address with a query is refused. An address with a path is accepted: the shared
+  `ServerAddress` allows one by design (`https://host.lan/brook`) and refuses only credentials, a
+  query or a fragment;
 - a TOTP account: a code is asked, a wrong code shows the error, a recovery code works;
 - quit and relaunch: still signed in (Done 4). At this point the placeholder signed-in view is
   enough.
@@ -524,10 +555,20 @@ Files:
   - When `recoveryCodesLeft <= 2`, one line above the list: "You have N recovery code(s) left."
     (the Mac's wording, pluralized the same way).
   - A toolbar Sign Out button opens a `confirmationDialog`, which calls `store.signOut()`.
-  - `.task { await channels.start() }`; `.onDisappear { channels.stop() }`.
-  - `.onChange(of: scenePhase)` calls `channels.sceneChanged(from:to:)`.
-
-  `ChannelsModel` is built with `me: user.id`, no notifier, and the `AppActivity` default.
+  - `.task`, `.onDisappear` and `.onChange(of: scenePhase)` forward to the `SignedInSession`
+    below (`start()`, `stop()`, `sceneChanged(from:to:)`).
+  - No plain unread count: it comes from the Mac's local cache, which iOS does not have. The
+    server's mention count shows.
+  - In a `.lockedUntilFirstUnlock` launch, Sign Out shows `store.signOutNotice`, and sign-out sets
+    it as `signOutWarning`, so the sign-in screen keeps it.
+- New `clients/ios/Brook/SignedInSession.swift`: owns the per-session `ChannelsModel`, built once
+  per sign-in with `me: user.id`, no notifier, the `AppActivity` default and
+  `rereadOnReconnect: true`. The view only forwards `start`, `stop` and the scene change to it,
+  so `SignedInSessionTests` can prove `stop()` cancels the subscription and each sign-in gets a
+  fresh model.
+- Shared `ChannelsModel`: `rereadOnReconnect` (default off). When on, any `ready` after the first
+  re-reads the list: iOS has no cache to re-read after a reconnect. The Mac leaves it off; its
+  `CacheFeed` re-reads. A flag, because the iOS client still conforms to `OfflineClient`.
 - New `clients/ios/Brook/ForegroundReload.swift`:
   `extension ChannelsModel { func sceneChanged(from old: ScenePhase, to new: ScenePhase) async }`.
   It calls `reloadList()` when `new == .active && old != .active`. A comment says why: iOS
@@ -559,6 +600,7 @@ Docs made wrong: `clients/ios/README.md` (step 8).
 ### Step 8: README, then the owner's device check
 
 Subagent: `brook-docs-writer`. Commit: `docs: build and run the iOS app; what it shares with the Mac`.
+The spec and plan are brought up to date with steps 1 to 7 in the same PR.
 
 - `clients/ios/README.md`:
   - build and test (`build.sh`, `build.sh test`, `build.sh run`);
@@ -585,6 +627,16 @@ server:
   quit) and Done 5 (sign out, then relaunch).
 - On the iPhone: Done 2 (two-factor, with the owner's help) and the Done 3 lock and unlock
   badge check.
+- On the iPhone, the pre-unlock path, which the simulator cannot produce (it does not enforce
+  file protection):
+  - restart the iPhone and open Brook before unlocking it: it must not restore, and must show
+    the unlock message;
+  - restart, unlock, then open Brook: it must restore. This also checks that a prewarm before
+    the first unlock does not leave the process off;
+  - which error a locked device returns for the probe (`isProtectionRefusal` assumes a
+    permission error). The safety does not depend on it, only the message does.
+- On the iPhone: type a recovery code, then open the app switcher. The app's card must not show
+  the code.
 
 This is where the iOS TLS path (rustls, certificate verification, a real handshake) runs for
 the first time. Until then the only network test is step 1's `brook.invalid` smoke test, which
@@ -685,9 +737,10 @@ needs nothing else. No new script; the existing Makefile does it, from `deploy/`
 - **Package resolution for iOS** still downloads the `WebRTC` binary target (it is in the same
   package) but does not build it. If Xcode does try to build `BrookMedia` for iOS, depend on the
   product by name only, and check the generated scheme.
-- **The data directory is in Application Support**, which iOS backs up. The sign-out fences could
-  come back from a backup onto the same device. For the security review, step 5: decide whether
-  to set `isExcludedFromBackup` on it. That is a one-line change if asked.
+- **The data directory is in Application Support**, which iOS backs up. Settled in step 5's
+  security review: it stays in backups, on purpose. An encrypted backup restored to the same
+  device brings back the Keychain item (this device only); excluding the fences would restore a
+  session without its fence. A comment beside `live()` says so.
 
 ## 5. Decisions for the owner
 

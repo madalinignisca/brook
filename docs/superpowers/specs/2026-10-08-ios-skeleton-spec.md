@@ -13,6 +13,12 @@ prefill (§4); Keychain items that outlive an app deletion (§4).
 Changed after approval: the owner's answers to the open questions are recorded in §6
 (bundle id, signing, where manual checks run, test accounts); §7 is now empty.
 
+Changed after steps 1 to 7 merged, to match what was built: an address with a path is accepted
+(§4 Sign-in); a launch before the first unlock is its own state with its own message, and Sign
+Out in it leaves a notice (§4 Launch, Session; Done 4, 6); iOS shows mention counts but no unread
+counts (§4 Signed in); iOS re-reads the list on a reconnect (§4 Signed in); the data directory
+stays in backups (§4 Session); the decisions taken while building (§6).
+
 ## 1. Problem
 
 Brook has no iOS app. `clients/ios/` holds only a README. Someone on an iPhone cannot sign in to
@@ -42,6 +48,8 @@ Done when, each checked and written in the PR:
    Also: start a call, lock the phone, end the call from another client, unlock: the badge is
    gone once the list is back.
 4. Quit the app from the app switcher and open it again: it is still signed in and shows the list.
+   On a real iPhone, restarted and still locked, opening the app does not restore and shows the
+   unlock message (§4 Launch); unlocked, then closed and opened again, it restores.
 5. Sign out returns to the sign-in screen. Quit and open the app again: it shows the sign-in
    screen, not the list.
 6. `clients/ios/build.sh test` exits 0, and in that run:
@@ -50,7 +58,8 @@ Done when, each checked and written in the PR:
    - the unit tests run on a simulator and cover: the iOS persistence setup (data directory
      created, persistence on, local data off); no sign-in or sign-out message the iOS app can
      show contains "Mac" or "macOS"; the list is re-read when the app returns to the foreground;
-     `liveCalls` is cleared on `ready`.
+     `liveCalls` is cleared on `ready`; a launch before the first unlock gives its own state and
+     message, and only a permission refusal counts as locked.
 
    `clients/macos/build.sh test` still passes, and covers the `liveCalls` reset too.
 7. Code used by both apps exists once in the repository: no Swift file is copied between
@@ -98,13 +107,22 @@ Non-goals, each its own ticket later:
 - A stored session: "Signing in..." and then the list, with no form flashing first. If the server
   cannot be reached, the sign-in screen says so and keeps the stored session for next time (the
   Mac app's rule). If the Keychain cannot be read, the sign-in screen says so.
+- A launch before the first unlock after a restart: the saved sign-in cannot be read yet. The
+  app restores nothing, stores nothing and skips the first-launch cleanup (below), and the
+  sign-in screen says: "Brook can't use its saved sign-in until your iPhone has been unlocked
+  once after restarting. Unlock it, then close Brook and open it again." The app does not check
+  again by itself (decided for simplicity). The check has three outcomes: readable, locked, or
+  failed for another reason. Only a permission refusal counts as locked; any other failure turns
+  persistence off for that launch with no message, because the phone is not known to be locked.
 
 ### Sign-in
 - A grouped system form: Server, Handle, Password, and a Log In button. The keyboard types for
   each field and password autofill work as the system offers them.
 - The same checks and messages as the Mac app: missing handle or password, an invalid address, an
-  address with more than scheme and host, wrong handle or password, server unreachable, an
-  `http://` address refused unless insecure connections are allowed.
+  address with credentials, a query or a fragment, wrong handle or password, server unreachable,
+  an `http://` address refused unless insecure connections are allowed. An address with a path is
+  accepted, for a server under a path (`https://host.lan/brook`): the shared `ServerAddress`
+  allows it by design.
 - No message the iOS app shows says "Mac" or "macOS". The local-network hint names the iPhone's
   prompt instead (iOS also asks before an app reaches a LAN server).
 - The password field clears after each attempt that reached the server.
@@ -117,11 +135,17 @@ Non-goals, each its own ticket later:
   core already defines (`sidebarOrder`): channels first, then DMs.
 - Each row: the conversation label (`#name`, or the other person for a DM, as core's
   `conversationLabel`), and a call badge with the participant count while a call is live. The
-  badge is readable by VoiceOver, not only a coloured mark.
+  badge is readable by VoiceOver, not only a coloured mark. The row also shows the server's
+  unread-mention count. It shows no plain unread count: on the Mac that comes from the local
+  cache, which iOS does not have, so nothing on iOS could keep it right.
 - Live: a renamed channel relabels in place; a channel the account joins or is added to appears;
   one it leaves or is removed from disappears; a call starting or ending shows or hides the badge.
 - Back in the foreground after being suspended, the list is re-read, so changes made meanwhile
   show.
+- After a reconnect (any `ready` after the first), iOS re-reads the list too: a rename or
+  removal made while the socket was down is never sent as an event, and iOS has no cache to
+  re-read. The Mac does not: its local cache re-reads on reconnect. This is a flag on the shared
+  `ChannelsModel` (`rereadOnReconnect`), off by default.
 - Call badges after a reconnect: the server sends one `channel.call` per running call right
   after `ready` (PROTOCOL.md, `ready`), and nothing for a call that ended while the socket was
   down. Today `ChannelsModel` keeps `liveCalls` across a reconnect (`reloadList` does not touch
@@ -149,6 +173,13 @@ Non-goals, each its own ticket later:
 - Sign out calls core's `logout` (forget the stored copy, then revoke). If the stored session
   could not be made unusable, the sign-in screen warns that the app may sign in again at next
   launch (the Mac app's rule).
+- Sign Out in a launch before the first unlock (the user signed in by hand): this launch never
+  opened the saved sign-in, so it cannot remove it. The sign-in screen keeps a notice that says
+  so: "Brook couldn't reach this iPhone's saved sign-in in this session. Close Brook and open it
+  again, then sign out to remove it."
+- The data directory stays in device backups, on purpose. An encrypted backup restored to the
+  same device brings back the Keychain item (this device only), so the sign-out fences must come
+  back with it; excluding them would restore a session without its fence.
 - A remote sign-out (password changed elsewhere, an admin reset) returns to the sign-in screen
   with "You're signed out. Sign in again."
 - App deleted and installed again: iOS keeps Keychain items, but removes the defaults and the
@@ -249,6 +280,14 @@ Taken in this spec (the owner may override):
 - The iOS app keeps its own Keychain items; nothing is shared with the Mac app's Keychain group.
 - Sign-out has no "remove this device's data" choice (nothing to remove without local data).
 - First-launch prefill is empty, with a placeholder.
+
+Taken while building (steps 1 to 7):
+- An address with a path is accepted, as the shared `ServerAddress` does.
+- A launch before the first unlock is its own state (`lockedUntilFirstUnlock`), with no
+  automatic re-check.
+- No plain unread counts on iOS; mention counts only.
+- iOS re-reads the list on a reconnect; the Mac does not.
+- The data directory stays in backups.
 
 ## 7. Open questions
 
