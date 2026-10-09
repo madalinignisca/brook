@@ -48,11 +48,11 @@ jobs:
           sudo apt-get install -y libssl-dev
 
       # The runner image has the Android SDK but not necessarily this NDK; installing the exact
-      # version keeps CI and local builds on the same compiler. `yes` answers any licence prompt;
-      # it is wrapped in `|| true` because Actions runs bash with pipefail and `yes` always ends
-      # killed by SIGPIPE when sdkmanager exits, which would otherwise fail the step.
+      # version keeps CI and local builds on the same compiler. `yes` answers any licence prompt.
+      # The step's default shell is `bash -e` without pipefail, so only sdkmanager's exit status
+      # counts: `yes` ending on SIGPIPE when sdkmanager exits does not fail the step.
       - name: Android NDK
-        run: (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
 
       - name: Clippy for Android (warnings = errors)
         run: |
