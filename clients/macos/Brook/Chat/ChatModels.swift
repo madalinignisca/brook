@@ -466,9 +466,14 @@ final class ComposerModel {
     var text = "" {
         // Not while editing (choosing Edit fills the field without the user typing), and not when
         // the app puts a failed message's text back (`restore`).
-        didSet { if text != oldValue, editing == nil, !restoring { typing.draftChanged(text) } }
+        didSet {
+            if text != oldValue, editing == nil, !restoring { typing.draftChanged(text) }
+            if text != oldValue { forgetDraftUnlessOwnWrite() }
+        }
     }
-    private(set) var replyingTo: FfiMessage?
+    private(set) var replyingTo: FfiMessage? {
+        didSet { if replyingTo?.id != oldValue?.id { forgetDraftUnlessOwnWrite() } }
+    }
     private(set) var editing: FfiMessage?
     private(set) var sending = false
     private(set) var error: String?
@@ -493,6 +498,8 @@ final class ComposerModel {
     // ---- Files for the next message (#66, spec 2026-09-26-mac-send-files) ----
 
     /// Staged files, each holding its security-scoped access until removed or sent.
+    // No draft reset here: every staged file gets a new transfer id, so a changed set can never
+    // match the draft's `files` in `draftId` (a removed file does not come back with its id).
     private(set) var staged: [StagedFile] = []
     /// The files are being copied into the outbox: nothing staged may change meanwhile.
     private(set) var preparing = false
@@ -560,10 +567,28 @@ final class ComposerModel {
         staged.removeAll { $0 === file }
         file.release()
     }
-    /// A queued send that failed: the same text, quote and channel again reuse its id, so
-    /// a retry can never become two messages (core keeps the first); anything else changed
-    /// is a new message with a new id (as GTK, #162).
+    /// The id of a send that failed, and what it was sent with. A failed send may still have
+    /// arrived (the network can drop after the server stored it), so pressing Send again on the
+    /// restored, unchanged box reuses the id and the server (or core's outbox) keeps one copy.
+    /// It is reused ONLY for that. As soon as the user changes the text, the quote or the files,
+    /// clears the box, or starts an edit or a reply, the draft is dropped (`forgetDraft...`
+    /// below). Otherwise a later, different message that happens to match ("ok" typed again, or
+    /// "hello" re-sent after editing the delivered "hello" to "goodbye") would carry the old id,
+    /// and the server would return the stored message and silently lose the new one (as GTK, #162).
     private var draft: (body: String, reply: String?, files: [UInt64], id: String)?
+    /// True while the composer itself writes the box (clearing it on send, putting a failed
+    /// message back): those writes must not count as the user changing the message.
+    private var ownWrite = false
+
+    private func forgetDraftUnlessOwnWrite() {
+        if !ownWrite { draft = nil }
+    }
+
+    private func writingTheBoxItself(_ change: () -> Void) {
+        ownWrite = true
+        change()
+        ownWrite = false
+    }
 
     init(channelId: String, client: any ChatClient, onMessage: @escaping (FfiMessage) -> Void) {
         self.channelId = channelId
@@ -574,18 +599,21 @@ final class ComposerModel {
 
     func reply(to message: FfiMessage) {
         guard !readOnly else { return }
+        draft = nil
         editing = nil
         replyingTo = message
     }
 
     func edit(_ message: FfiMessage) {
         guard !readOnly else { return }
+        draft = nil // a delivered message being edited must not lend its id to a later send
         replyingTo = nil
         editing = message
         text = message.body
     }
 
     func cancel() {
+        draft = nil
         replyingTo = nil
         if editing != nil { text = "" }
         editing = nil
@@ -613,8 +641,10 @@ final class ComposerModel {
         let (typed, reply, editing) = (text, replyingTo, self.editing)
         // A blank caption goes out as no caption, not as spaces.
         let body = typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : typed
-        text = ""
-        replyingTo = nil
+        writingTheBoxItself { // clearing the box is not the user changing the message
+            text = ""
+            replyingTo = nil
+        }
         self.editing = nil
         sending = true
         defer { sending = false }
@@ -636,8 +666,10 @@ final class ComposerModel {
                 // send fails after the server stored it, sending again must reuse the id.
             } catch {
                 if text.isEmpty { // unless something new was typed meanwhile
-                    restore(typed)
-                    replyingTo = reply
+                    writingTheBoxItself {
+                        restore(typed)
+                        replyingTo = reply
+                    }
                 }
                 self.error = Self.explainQueued(error)
                 return
@@ -654,14 +686,22 @@ final class ComposerModel {
                 // Delivered: the next message, even with the same text, is a new one and needs
                 // a new id, or the server would hand back this one and drop the new one.
                 draft = nil
+                // A retry can come back as a tombstone: the message arrived the first time and
+                // was deleted before this answer. It is gone, not a live message to show.
+                if message.deleted {
+                    error = nil
+                    return
+                }
             }
             error = nil
             onMessage(message)
         } catch {
             if text.isEmpty {  // unless something new was typed meanwhile
-                restore(typed)
-                replyingTo = reply
-                self.editing = editing
+                writingTheBoxItself {
+                    restore(typed)
+                    replyingTo = reply
+                    self.editing = editing
+                }
             }
             self.error = Self.explain(error)
         }
