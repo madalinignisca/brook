@@ -16,6 +16,46 @@ final class ScrollFollowTests: XCTestCase {
         XCTAssertFalse(ScrollToLatest.follows(away: true, mine: false))
     }
 
+    func testTheTopIsNearWithinOneScreen() {
+        XCTAssertTrue(ScrollToLatest.isNearTop(visibleMinY: 0, viewportHeight: 800))
+        XCTAssertTrue(ScrollToLatest.isNearTop(visibleMinY: 799, viewportHeight: 800))
+    }
+
+    func testTheTopIsNotNearFurtherThanOneScreen() {
+        XCTAssertFalse(ScrollToLatest.isNearTop(visibleMinY: 800, viewportHeight: 800))
+        XCTAssertFalse(ScrollToLatest.isNearTop(visibleMinY: 5000, viewportHeight: 800))
+    }
+
+    func testStayedPutWithinTheToleranceOfTheAsk() {
+        XCTAssertTrue(ScrollToLatest.stayedPut(askedAt: 100, now: 100))
+        XCTAssertTrue(ScrollToLatest.stayedPut(askedAt: 100, now: 144))
+        XCTAssertTrue(ScrollToLatest.stayedPut(askedAt: 100, now: 56))
+    }
+
+    func testMovedWhenFurtherThanTheToleranceFromTheAsk() {
+        XCTAssertFalse(ScrollToLatest.stayedPut(askedAt: 100, now: 145))
+        XCTAssertFalse(ScrollToLatest.stayedPut(askedAt: 100, now: 55))
+    }
+
+    func testGrowthAtTheVeryBottomWhileIdlePinsToTheBottom() {
+        XCTAssertTrue(ScrollToLatest.pinsToBottom(oldDistanceFromBottom: 0, oldContentHeight: 1000,
+                                                  newContentHeight: 1040, scrolling: false))
+        XCTAssertTrue(ScrollToLatest.pinsToBottom(oldDistanceFromBottom: ScrollToLatest.gap, oldContentHeight: 1000,
+                                                  newContentHeight: 1040, scrolling: false))
+    }
+
+    func testGrowthDoesNotPinWhenAboveTheBottomScrollingOrNotGrowing() {
+        // Above the bottom, even inside the "away" band: a slow drag up must not be pulled back.
+        XCTAssertFalse(ScrollToLatest.pinsToBottom(oldDistanceFromBottom: ScrollToLatest.gap + 1, oldContentHeight: 1000,
+                                                   newContentHeight: 1040, scrolling: false))
+        XCTAssertFalse(ScrollToLatest.pinsToBottom(oldDistanceFromBottom: 0, oldContentHeight: 1000,
+                                                   newContentHeight: 1040, scrolling: true))
+        XCTAssertFalse(ScrollToLatest.pinsToBottom(oldDistanceFromBottom: 0, oldContentHeight: 1000,
+                                                   newContentHeight: 1000, scrolling: false))
+        XCTAssertFalse(ScrollToLatest.pinsToBottom(oldDistanceFromBottom: 0, oldContentHeight: 1000,
+                                                   newContentHeight: 900, scrolling: false))
+    }
+
     func testFollowsTheUsersOwnMessageEvenWhenAway() {
         XCTAssertTrue(ScrollToLatest.follows(away: true, mine: true))
     }

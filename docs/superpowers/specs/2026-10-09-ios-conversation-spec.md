@@ -42,6 +42,36 @@ The extra fetch asks only for the newest page when the turn before it already pr
 contiguous (its anchor is raised to that turn's newest fetched id). A replace also keeps shown
 messages that live events or the user's own sends touched while it ran, inside the fetched range (one below it would leave a hole).
 
+As built, step 4 (the iOS reading screen): `ConversationSession` owns the lifecycle, opens with
+`rereadOnReady: true`, and its `stop()` clears `openChannel` and `timeline` only when the channel
+is this one and the timeline is nil or its own. The view keeps the reading position with the plan's fallback, not `.scrollPosition(id:)`: it notes
+the first row before `loadOlder()` and `scrollTo`s it (anchor top, no animation) after a page lands.
+Older pages are asked for from the scroll geometry, not from the loader appearing: when the
+visible area turns from far to within one screen of the top (`ScrollToLatest.isNearTop`), one page
+is asked for. When it lands, the reading place is put back with `scrollTo` only if the user has not
+moved since the ask (`ScrollToLatest.stayedPut`, 44 pt), after a layout turn and checked once by
+geometry. Scrolling alone does not re-ask: after a good restore the top is a page away, so the next
+page needs the user to scroll up again. The view asks once by itself in two other cases: when a
+short conversation has its landing done, and when older history can be offered again (a failed
+older page or head fetch recovers, so `olderFailed` and `headFailed` clear) while the view is near
+the top.
+The first page is scrolled to the bottom as soon as it appears (`messages.isEmpty` turns false),
+before the landing is confirmed. The first landing happens after
+`session.start()` returns (the newest page is merged), and older pages and the follow rule wait for
+it, so a live message before the first page cannot count as the landing. The "away" test uses
+`visibleRect`, not `contentOffset` (which carries the safe-area inset). An empty channel shows no
+start text on iOS, as on the Mac (its loader needs a message to offer older ones). Checked on the
+simulator: it opens on the newest message with no jump button, swiping up shows the button and
+tapping it returns and hides it, and the first older page keeps the reading position. The geometry-driven asking (pages beyond the first) is
+checked on screen (flicks load one page per arrival and reach the start). Content that grows while the
+view is at the very bottom (within the 12 pt gap) and the scroll is idle keeps the bottom in view
+(a reaction on the last row, say; `ScrollToLatest.pinsToBottom`). A drag up is not pulled back.
+Checked on the simulator: with the gateway stopped at the top, "Couldn't load older messages. Retry"
+showed; after it restarted, the reconnect re-read was followed by one older-page request with no tap,
+and the place held.
+Done 6 (background with a dead socket) and the Retry check with the network off move to step 5's
+full simulator pass.
+
 Changed after approval: the owner took the recommended answer to each open question; §7 records
 them, and the spec now reads as decided: the checks' servers (Done), `client_id` on the direct
 send (§4 Sending, §5, Done 7, 10), and the scroll rule with the jump-to-latest button (§4, Done

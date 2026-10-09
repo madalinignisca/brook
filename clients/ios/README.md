@@ -76,6 +76,8 @@ make down    # stop, keep the data
 - The screens: `BrookApp.swift`, `LoginView.swift`, `ChannelListView.swift`.
 - The seam files, which give shared code the few platform facts it needs: `AppActivity.swift`,
   `ThisDevice.swift`, `SessionPersistence+iOS.swift`.
+- `ConversationSession.swift` and `ConversationView.swift`: the open conversation's lifecycle
+  (start, stop, re-read on return, close on removal) and its screen.
 - `SignedInSession.swift`, which starts and stops one sign-in's channel model, and
   `ForegroundReload.swift`, which re-reads the list when the app comes back.
 - The iOS tests in `clients/ios/BrookTests`.
@@ -97,13 +99,22 @@ one symbol is not enough. To add a platform fact, add a seam type; do not add a 
   first, then the most recently opened, then the name. The Mac uses the same order. Each row shows
   a red `@N` for unread mentions and a call badge with the participant count while a call is running.
   The list updates live, and re-reads when the app comes back to the foreground or reconnects.
+- **Open a channel or DM** by tapping its row, and read it: the newest messages at the bottom,
+  older ones loading as you scroll up, new, edited and deleted messages and reactions arriving
+  live, and replies, files and reactions shown (read-only). A jump-to-latest button shows when you
+  have scrolled up; a new message from someone else does not move the view then. What arrived while
+  the app was away is re-read on return and after a reconnect, and the conversation is marked read.
+  If the channel leaves the list (deleted, or you were removed), the app goes back to the list.
 - **Sign out** from the list screen, after a confirmation.
 
 ## Known limits
 
-- **No unread counts.** Only mention counts show. The Mac's unread counts come from its local
-  cache, and iOS has none yet. Nothing opens a channel yet either, so a count could only grow.
-- **Nothing opens a channel yet.** Tapping a row does nothing.
+- **No unread counts.** Only mention counts show. The server sends `unread_count` in
+  `GET /channels`, but the Apple binding drops it (`FfiChannel` has no such field), so iOS cannot
+  show it until the binding passes it on.
+- **No cache.** Each opening of a conversation and each older page is fetched again, and with no
+  network an open conversation shows only the error.
+- **No message box yet.** A conversation is read-only until the message box lands.
 - **A launch before the first unlock.** After a restart, the saved sign-in cannot be read until
   the phone is unlocked once. Brook says so. Unlock the phone, then quit Brook and open it again.
   A sign-out in that launch cannot remove the saved sign-in either, and Brook says that too.
