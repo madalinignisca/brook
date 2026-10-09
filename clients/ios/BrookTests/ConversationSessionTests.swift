@@ -157,6 +157,23 @@ final class ConversationSessionTests: XCTestCase {
         XCTAssertTrue(s2.isRemoved, "a re-read that dropped the row did not close the conversation")
     }
 
+    /// After a removal `timeline` is nil but `openChannel` still names the removed channel. Another
+    /// conversation's stop must not take that as "nothing is open" and clear it: only the
+    /// `openChannel == channelId` half of the guard says it is not this one's.
+    func testLeavingAfterAnotherChannelWasRemovedLeavesItsOpenChannelAlone() async {
+        let (client, channels) = await list([channel("c1", "general"), channel("c2", "random")])
+        let a = session("c1", channels, FakeChat())
+        let b = session("c2", channels, FakeChat())
+        await a.start()
+        await b.start()
+        client.deliver(.channelDelete(channelId: "c2"))
+        await drainMain()
+        XCTAssertNil(channels.timeline)
+        XCTAssertEqual(channels.openChannel, "c2")
+        a.stop()
+        XCTAssertEqual(channels.openChannel, "c2", "A's stop cleared the open channel of B, which is not A's")
+    }
+
     func testOpeningClearsTheRowsMentionBadge() async {
         let withMention = FfiChannel(id: "c1", kind: "public", name: "general", archived: false, topic: nil,
                                      isPublic: false, unreadMentions: 1, members: [], ownerOffers: [])

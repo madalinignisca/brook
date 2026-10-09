@@ -49,8 +49,21 @@ struct ConversationView: View {
     /// hidden: it sits at the top, and a page it loaded before the first landing would push the
     /// view away from the newest message.
     @State private var landed = false
-    /// The older-page loader is on screen right now.
-    @State private var loaderVisible = false
+    /// The visible area in content coordinates, from the scroll geometry. `nearTop` (within one
+    /// screen of the top, `ScrollToLatest.isNearTop`) is derived from it. The older page is asked for
+    /// when `nearTop` turns true, not by a view appearing: a view that stays on screen while a page
+    /// lands never appears again, and asking from `.task(id:)` chained through every page.
+    @State private var visible = CGRect.zero
+    private var nearTop: Bool {
+        ScrollToLatest.isNearTop(visibleMinY: visible.minY, viewportHeight: visible.height)
+    }
+    /// The running older-page ask, so leaving the screen can cancel it.
+    @State private var olderTask: Task<Void, Never>?
+    /// What the scroll geometry reports, in one value so `old` and `new` are one consistent pair.
+    private struct Metrics: Equatable {
+        let content: CGFloat
+        let visible: CGRect
+    }
     private static let bottomId = "bottom"
     private var timeline: TimelineModel { session.timeline }
 
@@ -85,22 +98,33 @@ struct ConversationView: View {
             } action: { _, isAway in
                 away = isAway
             }
-            .onChange(of: timeline.messages.last?.id) { old, _ in
-                guard let newest = timeline.messages.last else { return }
-                if old == nil {
-                    // The first page. Rows below the screen are not measured yet (the stack is lazy),
-                    // so one scroll can stop short: scroll, let layout settle, scroll again, and only
-                    // then let the older-page loader appear.
-                    proxy.scrollTo(Self.bottomId, anchor: .bottom)
-                    Task {
-                        try? await Task.sleep(for: .milliseconds(150))
-                        proxy.scrollTo(Self.bottomId, anchor: .bottom)
-                        landed = true
-                    }
-                    return
+            .onScrollGeometryChange(for: Metrics.self) { geometry in
+                Metrics(content: geometry.contentSize.height, visible: geometry.visibleRect)
+            } action: { old, new in
+                visible = new.visible
+                // Only the turn from far to near asks: one page per arrival at the top.
+                let was = ScrollToLatest.isNearTop(visibleMinY: old.visible.minY, viewportHeight: old.visible.height)
+                let now = ScrollToLatest.isNearTop(visibleMinY: new.visible.minY, viewportHeight: new.visible.height)
+                if !was, now { askOlder(proxy) }
+                // Taller content while at the bottom (a reaction on the last row, say) keeps the
+                // bottom in view. "At the bottom" is judged on the geometry BEFORE this change, which
+                // is `old`: the new geometry already counts the growth as scrolled away.
+                let wasAway = ScrollToLatest.isAway(contentHeight: old.content, offset: old.visible.minY,
+                                                    viewportHeight: old.visible.height)
+                if landed, ScrollToLatest.pinsToBottom(wasAway: wasAway, oldContentHeight: old.content,
+                                                       newContentHeight: new.content) {
+                    restore(Self.bottomId, proxy, anchor: .bottom)
                 }
-                // The first page always goes to the bottom; later, the follow rule decides: at the
-                // bottom a new message is followed, scrolled up only the user's own moves the view.
+            }
+            // A short conversation is near the top from the start, so no turn ever happens: ask once,
+            // when the first landing is done. One ask, never repeated by itself.
+            .onChange(of: landed) { if nearTop { askOlder(proxy) } }
+            .onChange(of: timeline.messages.last?.id) {
+                // Before the first landing `.task` below decides where the view goes (a live message
+                // can arrive before the first page and must not count as the landing).
+                guard landed, let newest = timeline.messages.last else { return }
+                // At the bottom a new message is followed; scrolled up only the user's own moves the
+                // view (spec decision 3).
                 let mine = newest.authorId == session.me
                 if ScrollToLatest.follows(away: away, mine: mine) {
                     proxy.scrollTo(Self.bottomId, anchor: .bottom)
@@ -109,6 +133,19 @@ struct ConversationView: View {
             // A re-read replaced the shown history: the old position means nothing, go to the newest.
             .onChange(of: timeline.replaced) {
                 proxy.scrollTo(Self.bottomId, anchor: .bottom)
+            }
+            // The first landing: `start()` returns once `load()` has merged the newest page, so
+            // the bottom exists now (a live message arriving before the page does not count).
+            // Rows below the screen are not measured yet (the stack is lazy), so one scroll can stop
+            // short: scroll, give layout a moment, scroll again, and only then let older pages load.
+            // (`.defaultScrollAnchor(.bottom, for: .sizeChanges)` was not tried: it also pins to the
+            // bottom when the user is reading further up.)
+            .task {
+                await session.start()
+                proxy.scrollTo(Self.bottomId, anchor: .bottom)
+                try? await Task.sleep(for: .milliseconds(100))
+                proxy.scrollTo(Self.bottomId, anchor: .bottom)
+                landed = true
             }
             .overlay(alignment: .bottomTrailing) {
                 if away {
@@ -138,8 +175,10 @@ struct ConversationView: View {
         .navigationBarTitleDisplayMode(.inline)
         // The lifecycle modifiers sit here, on the scroll view, which always exists (see
         // `ConversationHost` for why that matters).
-        .task { await session.start() }
-        .onDisappear { session.stop() }
+        .onDisappear {
+            olderTask?.cancel()
+            session.stop()
+        }
         // A plain call, not inside a `Task`: the session takes its gap anchor synchronously, so
         // nothing can be merged between the scene change and the anchor.
         .onChange(of: scenePhase) { old, new in session.sceneChanged(from: old, to: new) }
@@ -149,17 +188,51 @@ struct ConversationView: View {
         }
     }
 
-    /// Reading position when an older page lands at the top: the new rows would push the view, so
-    /// note the first row, and put it back at the top once they are in (the plan's fallback; no
-    /// transaction without animation, so the page appears without a visible move).
-    private func loadOlderKeepingPlace(_ proxy: ScrollViewProxy) async {
-        let first = timeline.messages.first?.id
+    /// Ask for one older page, unless one is already being asked for or the first landing has not
+    /// happened. Called when the top comes near, not on every scroll: one page per arrival at the top.
+    /// `retry` is the Retry button: the one ask allowed while the last page has failed.
+    private func askOlder(_ proxy: ScrollViewProxy, retry: Bool = false) {
+        guard landed, olderTask == nil, timeline.offersOlder, retry || !timeline.olderFailed else { return }
+        olderTask = Task {
+            let again = await loadOlderKeepingPlace(proxy)
+            olderTask = nil
+            // The user moved while the page was on its way and is at the top now: no turn from far
+            // to near will happen, so ask as if they had just arrived. One call, not a loop: each
+            // further ask needs a page that landed while they were moving again.
+            if again { askOlder(proxy) }
+        }
+    }
+
+    /// Reading position when an older page lands at the top: the new rows are inserted above the
+    /// view, which stays at the same offset, so the user would see the new top rows. Note the first
+    /// row and where the view was at the ask, and once the page is in, scroll that row back to the
+    /// top. Only if the user has not moved since the ask (`stayedPut`), or the scroll would pull them
+    /// back. No automatic re-ask: after a good restore the old first row is a page below the top,
+    /// so `nearTop` is false and the next page needs the user to scroll up again.
+    /// Returns true when a page landed, the user had moved (so nothing was restored), and the view
+    /// is near the top now: the caller asks once more.
+    @discardableResult
+    private func loadOlderKeepingPlace(_ proxy: ScrollViewProxy) async -> Bool {
+        guard let first = timeline.messages.first?.id else { return false }
+        let askedAt = visible.minY
         await timeline.loadOlder()
         // Nothing was added (the start, or a failure): nothing to put back.
-        guard let first, timeline.messages.first?.id != first else { return }
+        guard timeline.messages.first?.id != first, !Task.isCancelled else { return false }
+        guard ScrollToLatest.stayedPut(askedAt: askedAt, now: visible.minY) else { return nearTop }
+        // After layout: the new rows are not measured in the same turn they are merged, and a
+        // scroll then can land on nothing.
+        await Task.yield()
+        restore(first, proxy)
+        // Check by geometry, and scroll once more if the first try did not take.
+        try? await Task.sleep(for: .milliseconds(50))
+        if nearTop, !Task.isCancelled { restore(first, proxy) }
+        return false
+    }
+
+    private func restore(_ id: String, _ proxy: ScrollViewProxy, anchor: UnitPoint = .top) {
         var none = Transaction()
         none.disablesAnimations = true
-        withTransaction(none) { proxy.scrollTo(first, anchor: .top) }
+        withTransaction(none) { proxy.scrollTo(id, anchor: anchor) }
     }
 
     /// Above the first message: the start of the conversation, the older-page loader, or its retry.
@@ -169,25 +242,13 @@ struct ConversationView: View {
                 .font(.caption).foregroundStyle(.secondary)
         } else if timeline.offersOlder {
             if timeline.olderFailed {
-                Button("Couldn't load older messages. Retry") { Task { await loadOlderKeepingPlace(proxy) } }
+                Button("Couldn't load older messages. Retry") { askOlder(proxy, retry: true) }
                     .font(.caption)
             } else {
-                // Asks once, when it appears: the model keeps a spinner from ever being left
-                // without an answer (see `loadOlder`).
+                // Asked for by `askOlder`, when the top comes near (see `nearTop`); this only shows
+                // that a page is on its way.
                 ProgressView().controlSize(.small)
                     .frame(maxWidth: .infinity)
-                    .onAppear { loaderVisible = true }
-                    .onDisappear { loaderVisible = false }
-                    // `.onAppear` alone asks once: when a page is short enough that the loader is
-                    // still on screen after it lands, it never appears again and the next page is
-                    // never asked for. So the ask is tied to the first row (it changes with every
-                    // page) and repeated while the loader is visible. The wait lets the scroll back
-                    // to the reading place settle first: if that took the loader off screen, stop.
-                    .task(id: timeline.messages.first?.id) {
-                        try? await Task.sleep(for: .milliseconds(150))
-                        guard loaderVisible, !Task.isCancelled else { return }
-                        await loadOlderKeepingPlace(proxy)
-                    }
             }
         }
     }

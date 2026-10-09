@@ -57,7 +57,7 @@ final class TimelineModel {
     /// stored with. Never a finished label, so Show usernames relabels without a reload.
     private(set) var authors: [String: (name: String, handle: String)] = [:]
 
-    /// For iOS (see `init`; nothing sets it yet): every newest-page fetch also closes a gap, and
+    /// For iOS (see `init`; the Mac leaves it off): every newest-page fetch also closes a gap, and
     /// `.ready` re-reads.
     private let rereadOnReady: Bool
     /// Up to 150 older messages (3 pages of `pageSize`) are fetched to find where a re-read meets
@@ -140,7 +140,7 @@ final class TimelineModel {
     /// name, and the handle comes from here.
     private let members: @MainActor () -> [FfiMember]
 
-    /// `rereadOnReady` is meant for iOS (nothing sets it yet), the twin of `ChannelsModel.rereadOnReconnect`. iOS suspends the
+    /// `rereadOnReady` is for iOS (`ConversationSession` sets it; the Mac leaves it off), the twin of `ChannelsModel.rereadOnReconnect`. iOS suspends the
     /// socket in the background and keeps no cache, so events sent meanwhile are lost; a re-read of
     /// the newest page (on every `.ready` and on return to the foreground) is the only way to show
     /// them. The Mac's `CacheFeed` fills that hole, so it leaves this off, and there a `.ready` only

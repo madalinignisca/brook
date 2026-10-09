@@ -74,8 +74,9 @@ final class ConversationSession {
         let reread = timeline.reread()
         return Task { [timeline] in
             await reread.value
-            // After, not before: the re-read may bring newer messages, and what was owed is then
-            // marked read against the newest one.
+            // After the re-read, so the read goes against the newest message it brought.
+            // `reread()` itself marks read only when the newest id changed; what was owed for a
+            // message already shown (read while not active) is marked here.
             timeline.appBecameActive()
         }
     }

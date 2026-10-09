@@ -16,6 +16,29 @@ enum ScrollToLatest {
         contentHeight - (offset + viewportHeight) > threshold
     }
 
+    /// Whether the top of the content is within one screen of the visible area: time to ask for the
+    /// older page, so it is there before the user reaches the top. `visibleMinY` is the visible
+    /// rect's top edge in content coordinates (0 at the very top). iOS only; the Mac's loader asks
+    /// when it appears.
+    static func isNearTop(visibleMinY: CGFloat, viewportHeight: CGFloat) -> Bool {
+        visibleMinY < viewportHeight
+    }
+
+    /// Whether the user has not scrolled since an older page was asked for: the visible top is
+    /// within `tolerance` points of where it was at the ask. Only then is the reading place put
+    /// back when the page lands; otherwise the user moved on and a scroll would pull them back.
+    static func stayedPut(askedAt: CGFloat, now: CGFloat, tolerance: CGFloat = 44) -> Bool {
+        abs(now - askedAt) <= tolerance
+    }
+
+    /// Whether the view must scroll to keep the bottom in view: it was at the bottom (not away)
+    /// before the content got taller (a row grew, as when a reaction lands on the last message, or
+    /// rows were added). Without it the growth pushes the bottom out of view, the jump button shows,
+    /// and the next new message is not followed. iOS only.
+    static func pinsToBottom(wasAway: Bool, oldContentHeight: CGFloat, newContentHeight: CGFloat) -> Bool {
+        !wasAway && newContentHeight > oldContentHeight
+    }
+
     /// Whether the view scrolls to a new newest message. At the bottom it follows; scrolled up, only
     /// the user's own message moves it (spec 2026-10-09-ios-conversation, decision 3). The Mac
     /// does not call this yet.

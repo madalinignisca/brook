@@ -126,6 +126,13 @@ if [[ "$mode" == "test" ]]; then
     ConversationSessionTests/testComingBackToTheForegroundRereadsTheConversation
     ConversationSessionTests/testAChannelGoneFromTheListClosesTheConversation
     ConversationSessionTests/testOpeningClearsTheRowsMentionBadge
+    ConversationSessionTests/testLeavingAfterAnotherChannelWasRemovedLeavesItsOpenChannelAlone
+    ScrollFollowTests/testTheTopIsNearWithinOneScreen
+    ScrollFollowTests/testTheTopIsNotNearFurtherThanOneScreen
+    ScrollFollowTests/testStayedPutWithinTheToleranceOfTheAsk
+    ScrollFollowTests/testGrowthAtTheBottomPinsToTheBottom
+    ScrollFollowTests/testGrowthWhileAwayOrNoGrowthDoesNotPin
+    ScrollFollowTests/testMovedWhenFurtherThanTheToleranceFromTheAsk
   )
 
   # 1. All three slices are in the xcframework (a Mac build leaves only the macOS one).
