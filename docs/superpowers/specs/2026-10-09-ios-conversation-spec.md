@@ -78,12 +78,16 @@ channel's row each time so a `channel.update` reaches it. In `ConversationView` 
 is one `.safeAreaInset(edge: .bottom)` together with the error line, so it rides above the keyboard;
 the scroll view has `.scrollDismissesKeyboard(.interactively)`. The field is
 `TextField(axis: .vertical)` with `lineLimit(1...6)` and no `.onSubmit`. The sent message scrolls into
-view through the existing `follows(away:mine:)` (the answer's author is this user). When the field gains
-focus and the view is not away, the view scrolls to the bottom after 300 ms (the keyboard's rise); `away`
-is judged before the keyboard shrinks the area. Paste of text is the field's own, and Copy is the
+view through the existing `follows(away:mine:)` (the answer's author is this user). A visible area
+that gets shorter with the content unchanged (the keyboard rising, the box growing to more lines)
+keeps the bottom in view when the view was at the very bottom and idle
+(`ScrollToLatest.pinsAfterShrink`, the sibling of `pinsToBottom`). A first version with a 300 ms
+timer on focus was dropped: it missed the growing box and could pull back a drag. Paste of text is the field's own, and Copy is the
 long-press on a message's text (`textSelection`, already there since step 4). `readOnly` follows
-`session.archived` through an `.onChange` on the always-present screen, not in the bar. Plan difference:
-the plan lists two shared tests and two session tests; they are as named, none changed.
+`session.archived` through an `.onChange` on the always-present screen, not in the bar. Plan differences:
+the error line shares the one bottom inset with the box (the plan has the box alone), and the plan's
+"scroll to `bottom` when the field gains focus" is the geometry rule above, with two more shared
+tests for it. The four named tests are as written.
 
 Changed after approval: the owner took the recommended answer to each open question; §7 records
 them, and the spec now reads as decided: the checks' servers (Done), `client_id` on the direct
