@@ -42,6 +42,15 @@ The extra fetch asks only for the newest page when the turn before it already pr
 contiguous (its anchor is raised to that turn's newest fetched id). A replace also keeps shown
 messages that live events or the user's own sends touched while it ran, inside the fetched range (one below it would leave a hole).
 
+As built, step 4 (the iOS reading screen): `ConversationSession` owns the lifecycle, opens with
+`rereadOnReady: true`, and its `stop()` clears `openChannel` and `timeline` only when the channel
+is this one and the timeline is nil or its own. The view keeps the reading position with the plan's fallback, not `.scrollPosition(id:)`: it notes
+the first row before `loadOlder()` and `scrollTo`s it (anchor top, no animation) after a page lands.
+The loader's ask is tied to the first row's id and repeats while the loader is still on screen,
+because `.onAppear` alone asked only once. The "away" test uses `visibleRect`, not `contentOffset`
+(which carries the safe-area inset), and the loader stays hidden until the first page has been
+scrolled to the bottom. Checked on the iOS 27 simulator against the local stack, in #itest with 121 messages: it opens on the newest message with no jump button; scrolling up shows the button, and tapping it returns to the newest message and hides it; scrolling up loads each older page and keeps the reading place, down to "This is the start of the conversation."
+
 Changed after approval: the owner took the recommended answer to each open question; §7 records
 them, and the spec now reads as decided: the checks' servers (Done), `client_id` on the direct
 send (§4 Sending, §5, Done 7, 10), and the scroll rule with the jump-to-latest button (§4, Done
