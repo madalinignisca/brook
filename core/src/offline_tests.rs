@@ -539,6 +539,8 @@ mod client {
     /// store was locked or slow at launch) used to answer `Ok(())` and erase nothing, so the
     /// app told the user their data was removed. It must be an error, distinct from success,
     /// while the sign-out still happens and the data is left for a later launch.
+    #[cfg(not(target_os = "android"))]
+    // Relies on a locked key slot turning local data off; Android stores use no key (ADR 0001).
     #[tokio::test]
     async fn forget_with_stores_that_never_opened_is_an_error() {
         let server = TestServer::start().await;
@@ -595,16 +597,22 @@ mod client {
         );
     }
 
-    /// The two cases that must stay a success: local data was never turned on, and a first
-    /// launch whose key store was locked before anything had been stored.
+    /// Local data was never turned on: forgetting is still a success.
     #[tokio::test]
-    async fn forget_with_nothing_stored_is_still_ok() {
+    async fn forget_when_local_data_was_never_enabled_is_ok() {
         let server = TestServer::start().await;
-
         let never_enabled = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
         never_enabled.login("alice", "pw").await.unwrap();
         never_enabled.sign_out_and_forget().await.unwrap();
+    }
 
+    /// A first launch whose key store was locked before anything had been stored is still a
+    /// success.
+    #[cfg(not(target_os = "android"))]
+    // Relies on a locked key slot turning local data off; Android stores use no key (ADR 0001).
+    #[tokio::test]
+    async fn forget_after_a_locked_first_launch_is_ok() {
+        let server = TestServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         let slot = Arc::new(InMemoryKeySlot::default());
         let locked_first_launch = BrookClient::new(CoreConfig::new(&server.base).unwrap()).unwrap();
@@ -686,6 +694,8 @@ mod client {
     /// messages), so "an index exists" must not count as stored data: after an erase that
     /// worked, or on a device where nobody ever stored anything, a later launch with a locked
     /// key store has nothing to erase and must not be told it failed.
+    #[cfg(not(target_os = "android"))]
+    // Relies on a locked key slot turning local data off; Android stores use no key (ADR 0001).
     #[tokio::test]
     async fn an_index_with_no_stores_is_nothing_to_erase() {
         let server = TestServer::start().await;
@@ -780,6 +790,8 @@ mod client {
 
     /// Unsent messages lost while the local data was being opened (before any listener
     /// existed) are still reported afterwards, until acknowledged.
+    #[cfg(not(target_os = "android"))]
+    // Keyed stores only; Android stores are plain, ADR 0001.
     #[tokio::test]
     async fn a_loss_found_while_enabling_is_kept_for_the_app() {
         let server = TestServer::start().await;

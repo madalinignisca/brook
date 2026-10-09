@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::store::{self, Kind, Opened, Rebuilt, StoreError};
+use crate::store::{self, Kind, Opened, Protection, Rebuilt, StoreError};
 use crate::{InMemoryKeySlot, KeySlot, KeySlotError, KeyStore};
 
 const SENTINEL: &str = "BROOK-SENTINEL-c1-5e7a";
@@ -23,6 +23,8 @@ fn ready(o: Result<Opened, StoreError>) -> (store::Db, Option<Rebuilt>) {
     }
 }
 
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 /// Every file under `dir`, including SQLite's `-wal` and `-shm`, scanned for `needle`.
 fn plaintext_anywhere(dir: &Path, needle: &str) -> Vec<String> {
     let mut hits = Vec::new();
@@ -51,6 +53,8 @@ async fn write_sentinel(db: &store::Db, n: usize) {
     .unwrap();
 }
 
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 #[tokio::test]
 async fn nothing_under_the_store_is_plaintext() {
     let dir = tempfile::tempdir().unwrap();
@@ -86,6 +90,8 @@ async fn nothing_under_the_store_is_plaintext() {
     db.close().await;
 }
 
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 #[tokio::test]
 async fn a_store_opens_only_with_its_own_key() {
     let dir = tempfile::tempdir().unwrap();
@@ -103,6 +109,8 @@ async fn a_store_opens_only_with_its_own_key() {
 }
 
 /// Crypto-erase: once the slot is destroyed, a copy of the database taken before is useless.
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 #[tokio::test]
 async fn a_copied_store_is_unreadable_once_its_slot_is_destroyed() {
     let dir = tempfile::tempdir().unwrap();
@@ -131,6 +139,8 @@ async fn a_copied_store_is_unreadable_once_its_slot_is_destroyed() {
     assert_eq!(users, 0, "the old contents came back");
 }
 
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 #[tokio::test]
 async fn an_unreadable_key_deletes_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -149,6 +159,8 @@ async fn an_unreadable_key_deletes_nothing() {
 
 /// The key was lost (or a crash split a new key from the rebuild): the check doesn't match,
 /// so the old database is remade, and the caller hears it (an outbox says what was lost).
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 #[tokio::test]
 async fn a_missing_key_rebuilds_and_says_so() {
     let dir = tempfile::tempdir().unwrap();
@@ -264,10 +276,14 @@ async fn store_ids_are_random_and_stable() {
         a
     );
     assert!(!a.contains("example") && a.len() == 32);
-    assert_eq!(
-        plaintext_anywhere(dir.path(), "chat.example.com"),
-        Vec::<String>::new()
-    );
+    #[cfg(not(target_os = "android"))]
+    {
+        // Keyed stores only; Android stores are plain, ADR 0001.
+        assert_eq!(
+            plaintext_anywhere(dir.path(), "chat.example.com"),
+            Vec::<String>::new()
+        );
+    }
 }
 
 #[test]
@@ -296,6 +312,8 @@ async fn a_panicking_job_releases_the_store() {
 }
 
 /// An unreadable check file is not a missing one: nothing is decided, nothing deleted.
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 #[tokio::test]
 async fn an_unreadable_check_deletes_nothing() {
     use std::os::unix::fs::PermissionsExt;
@@ -314,6 +332,8 @@ async fn an_unreadable_check_deletes_nothing() {
 
 /// The check was lost (a crash before it was written), but the key still opens the
 /// database: it's kept, with its data, and the check is restored.
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 #[tokio::test]
 async fn a_lost_check_with_the_right_key_keeps_the_store() {
     let dir = tempfile::tempdir().unwrap();
@@ -390,6 +410,8 @@ fn crash_child() {
 
 /// A real crash mid-transaction: no plaintext anywhere, the committed rows survive and the
 /// uncommitted ones don't.
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 #[tokio::test]
 async fn a_crash_mid_transaction_leaves_only_ciphertext_and_committed_rows() {
     let dir = tempfile::tempdir().unwrap();
@@ -430,6 +452,8 @@ async fn a_crash_mid_transaction_leaves_only_ciphertext_and_committed_rows() {
 
 /// No check and a database the key can't open: damage and a lost key look the same, so
 /// nothing is deleted (only an explicit reset clears it).
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 #[tokio::test]
 async fn a_damaged_store_without_its_check_is_kept() {
     let dir = tempfile::tempdir().unwrap();
@@ -448,6 +472,8 @@ async fn a_damaged_store_without_its_check_is_kept() {
 
 /// No check, and the slot was gone so a key was made just now: a fresh random key can't be
 /// the database's, so it is keyless and remade.
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
 #[tokio::test]
 async fn a_lost_slot_and_a_lost_check_rebuild() {
     let dir = tempfile::tempdir().unwrap();
@@ -470,7 +496,173 @@ async fn only_the_owner_can_enter_the_store_directory() {
     let (_db, _) = ready(store::open(&stores, Kind::Cache, "s1", &keys(&slot)));
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&stores), 0o700);
-    assert_eq!(mode(&stores.join("cache.check")), 0o600);
+}
+
+#[tokio::test]
+#[cfg(not(target_os = "android"))]
+// Keyed stores only; Android stores are plain, ADR 0001.
+async fn the_key_check_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let (_db, _) = ready(store::open(dir.path(), Kind::Cache, "s1", &keys(&slot)));
+    let mode = std::fs::metadata(dir.path().join("cache.check"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+// ---- plain stores (Android, ADR 0001), driven on the host through `open_as(Plain, ..)` ----
+
+/// A plain store never touches the key store: every slot call is scripted to fail, so one
+/// that did would come back `Locked` (or not open). Rows survive a reopen, no slot and no
+/// check file are made, and a bare SQLite with **no** `PRAGMA key` reads the rows: that last
+/// read is the proof no key pragma was applied (on the host the library is SQLCipher, which
+/// encrypts whenever a key is set).
+#[tokio::test]
+async fn a_plain_store_needs_no_key_and_keeps_its_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    for _ in 0..8 {
+        slot.fail_next("load", KeySlotError::Unavailable);
+        slot.fail_next("create", KeySlotError::Unavailable);
+    }
+    let open = || {
+        store::open_as(
+            Protection::Plain,
+            dir.path(),
+            Kind::Cache,
+            "s1",
+            &keys(&slot),
+        )
+    };
+    let (db, rebuilt) = ready(open());
+    assert_eq!(rebuilt, None);
+    write_sentinel(&db, 3).await;
+    db.close().await;
+    let (db, rebuilt) = ready(open());
+    assert_eq!(rebuilt, None, "a reopen must keep the data");
+    let users: i64 = db
+        .call(|c| c.query_row("SELECT count(*) FROM users", [], |r| r.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(users, 3);
+    db.close().await;
+    assert!(!slot.contains("cache:s1"), "a plain store made a key");
+    assert!(
+        !dir.path().join("cache.check").exists(),
+        "a plain store wrote a check file"
+    );
+    let bare = rusqlite::Connection::open(dir.path().join("cache.db")).unwrap();
+    let rows: i64 = bare
+        .query_row("SELECT count(*) FROM users", [], |r| r.get(0))
+        .expect("the database was encrypted: a key pragma was applied");
+    assert_eq!(rows, 3);
+}
+
+/// A plain reset has no key to destroy, so a slot that refuses to delete changes nothing:
+/// it still answers `true` ("keys gone", which `LocalData::erase_row` waits for), the
+/// files go, and the slot is left alone.
+#[tokio::test]
+async fn a_plain_reset_deletes_every_file_and_destroys_no_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    slot.put("cache:s1", vec![9; 32]); // not this store's: a plain reset must leave it
+    let (db, _) = ready(store::open_as(
+        Protection::Plain,
+        dir.path(),
+        Kind::Cache,
+        "s1",
+        &keys(&slot),
+    ));
+    write_sentinel(&db, 3).await;
+    assert!(dir.path().join("cache.db-wal").exists(), "WAL mode");
+    assert!(dir.path().join("cache.db-shm").exists());
+    db.close().await;
+    // Closing checkpoints and removes the WAL files; leave stand-ins so the reset is shown
+    // to remove them whether or not SQLite had.
+    std::fs::write(dir.path().join("cache.db-wal"), b"x").unwrap();
+    std::fs::write(dir.path().join("cache.db-shm"), b"x").unwrap();
+    slot.fail_next("delete", KeySlotError::Unavailable);
+    assert!(store::reset_as(
+        Protection::Plain,
+        dir.path(),
+        Kind::Cache,
+        "s1",
+        &keys(&slot)
+    )
+    .unwrap());
+    for f in ["cache.db", "cache.db-wal", "cache.db-shm"] {
+        assert!(!dir.path().join(f).exists(), "{f} was left behind");
+    }
+    assert!(slot.contains("cache:s1"), "a plain reset touched the slot");
+}
+
+/// Without a key to prove whose a file is, an unreadable plain database is damaged and kept.
+#[tokio::test]
+async fn a_damaged_plain_store_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let (db, _) = ready(store::open_as(
+        Protection::Plain,
+        dir.path(),
+        Kind::Cache,
+        "s1",
+        &keys(&slot),
+    ));
+    write_sentinel(&db, 50).await;
+    db.close().await;
+    let path = dir.path().join("cache.db");
+    let mut bytes = std::fs::read(&path).unwrap();
+    for b in bytes.iter_mut().take(4096) {
+        *b ^= 0x5a; // page 1 garbled
+    }
+    std::fs::write(&path, &bytes).unwrap();
+    let o = store::open_as(
+        Protection::Plain,
+        dir.path(),
+        Kind::Cache,
+        "s1",
+        &keys(&slot),
+    )
+    .unwrap();
+    assert!(matches!(o, Opened::Damaged), "{o:?}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "a damaged store was touched"
+    );
+}
+
+/// The format check is shared code; this proves it still runs for a plain cache.
+#[tokio::test]
+async fn a_plain_cache_in_another_format_rebuilds() {
+    let dir = tempfile::tempdir().unwrap();
+    let slot = Arc::new(InMemoryKeySlot::default());
+    let open = || {
+        store::open_as(
+            Protection::Plain,
+            dir.path(),
+            Kind::Cache,
+            "s1",
+            &keys(&slot),
+        )
+    };
+    let (db, _) = ready(open());
+    write_sentinel(&db, 2).await;
+    db.call(|c| c.execute("UPDATE meta SET format = 0", []))
+        .await
+        .unwrap();
+    db.close().await;
+    let (db, rebuilt) = ready(open());
+    assert_eq!(rebuilt, Some(Rebuilt::FormatChanged));
+    let users: i64 = db
+        .call(|c| c.query_row("SELECT count(*) FROM users", [], |r| r.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(users, 0, "the old contents came back");
 }
 
 /// A close cancelled while jobs are still queued leaves the wait for the next close: that

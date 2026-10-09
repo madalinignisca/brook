@@ -27,11 +27,22 @@ url = { workspace = true }
 # Keys for the local store: OS randomness, wiped from memory after use.
 getrandom = "0.3"
 zeroize = "1"
-# The offline cache and outbox (#61, #63): SQLCipher, CommonCrypto on Apple, the system
-# libcrypto on Linux (plan C0: go on both). ring is already in the tree via rustls: the
-# stores' key check (HMAC-SHA256).
-rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
+# ring is already in the tree via rustls: the stores' key check (HMAC-SHA256).
 ring = "0.17"
+
+# The offline cache and outbox (#61, #63). Two builds of SQLite, chosen by target (docs/adr/
+# 0001-plain-sqlite-on-android.md):
+# - everywhere but Android: SQLCipher, CommonCrypto on Apple, the system libcrypto on Linux
+#   (plan C0: go on both); each store has its own key.
+# - Android: plain bundled SQLite, because the OS encrypts and sandboxes the app's storage.
+#   SQLCipher also fails to build for Android here (it wants libcrypto for the target).
+# Resolver 2 (root Cargo.toml) keeps the two feature sets apart, so neither build pulls in
+# the other's.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [target.'cfg(unix)'.dependencies]
 # The quarantine xattr on Open copies of cached files (keep-offline spec §4.4, macOS), and
