@@ -29,12 +29,13 @@ final class TimelineRereadTests: XCTestCase {
         }
     }
 
-    /// Let started tasks run to rest. For asserting that something did NOT happen.
-    private func settleFor() async {
-        for _ in 0 ..< 20 {
-            await Task.yield()
-            try? await Task.sleep(for: .milliseconds(5))
-        }
+    /// Hand the main actor to the jobs already queued, a few times. Main-actor jobs run in the
+    /// order they were queued, and a task started by `apply` does all its synchronous work (joining
+    /// the drain, or making its history call) before its first suspension, so a few turns are enough
+    /// for it to have shown what it does. Used only where a fetch is HELD, so the state cannot move
+    /// on by itself; elsewhere `isRereading` says when everything has finished.
+    private func letQueuedJobsRun() async {
+        for _ in 0 ..< 10 { await Task.yield() }
     }
 
     private func asked(_ chat: FakeChat) -> [String?] { chat.historyAsked.withLock { $0 } }
@@ -52,7 +53,9 @@ final class TimelineRereadTests: XCTestCase {
         let t = TimelineModel(channelId: "c", client: chat, isActive: { true })
         await t.load()
         t.apply(.ready)
-        await settleFor()
+        // `isRereading` is true from the moment a re-read is asked for, so with the flag wrongly on
+        // this waits for the extra fetch to finish instead of looking too early.
+        await settle { !t.isRereading }
         XCTAssertEqual(chat.historyCalls.withLock { $0 }, 1, "the Mac's ready re-read the newest page")
     }
 
@@ -68,9 +71,8 @@ final class TimelineRereadTests: XCTestCase {
         t.apply(.ready)
         await settle { self.idle(chat, t, calls: 2) }
         t.apply(.ready)
-        await settle { self.idle(chat, t, calls: 3) }
-        await settleFor()
-        XCTAssertEqual(chat.historyCalls.withLock { $0 }, 3)
+        await settle { !t.isRereading }
+        XCTAssertEqual(chat.historyCalls.withLock { $0 }, 3, "an extra fetch was scheduled")
     }
 
     // 3
@@ -109,7 +111,9 @@ final class TimelineRereadTests: XCTestCase {
         await t.reread().value
         XCTAssertEqual(ids(t), ["a14", "a16", "a18", "a20"])
         XCTAssertFalse(t.atStart, "the replace left atStart on, so the loader never asks again")
-        XCTAssertFalse(t.olderFailed)
+        // `olderFailed` is not asserted: it cannot be true together with `atStart` (a new ask clears
+        // it first), and every successful head fetch clears it anyway, so no test of the replace
+        // could tell whether the replace branch did.
         XCTAssertEqual(t.replaced, 1)
         XCTAssertEqual(asked(chat), [nil, "a01", nil, "a20", "a18", "a16"], "four calls for the re-read")
     }
@@ -149,12 +153,12 @@ final class TimelineRereadTests: XCTestCase {
         t.apply(.ready)
         await settle { self.asked(chat).count == 3 } // the head, then its page-back, held
         t.apply(.ready)
-        await settleFor()
+        await letQueuedJobsRun()
         XCTAssertEqual(asked(chat), [nil, nil, "a10"], "a second head fetch started beside the page-back")
         gate.open()
-        await settle { self.idle(chat, t, calls: 4) }
-        await settleFor()
+        await settle { !t.isRereading }
         XCTAssertEqual(asked(chat), [nil, nil, "a10", nil], "exactly one more head fetch follows")
+        XCTAssertEqual(chat.historyMaxInFlight.withLock { $0 }, 1, "two history calls ran at once")
         XCTAssertEqual(ids(t), ["a05", "a06", "a07", "a10", "a11", "a12"])
     }
 
@@ -293,6 +297,84 @@ final class TimelineRereadTests: XCTestCase {
         await older.value
         XCTAssertFalse(asked(chat).contains("a01"), "loadOlder asked for a page before replaced history")
         XCTAssertEqual(asked(chat).last, "a14")
+    }
+
+    // 17
+    func testALiveMessageWithALowerIdThanTheFetchedNewestSurvivesAReplace() async {
+        let chat = FakeChat()
+        chat.pages = [page("a01", "a02"), page("a20"), page("a18"), page("a16"), page("a14")]
+        let t = timeline(chat)
+        await t.load()
+        chat.olderGate = Gate()
+        let gate = chat.olderGate!
+        t.apply(.ready)
+        await settle { self.asked(chat).count == 3 } // the first page-back is held
+        // Ids are made when a send starts, so a message committed now can sort below a20.
+        t.apply(.messageNew(message: msg("a10", "late")))
+        gate.open()
+        await settle { !t.isRereading }
+        XCTAssertEqual(ids(t), ["a10", "a14", "a16", "a18", "a20"], "a live message below the fetched newest was dropped")
+    }
+
+    // 18
+    func testALiveEditToAFetchedMessageDuringThePageBackSurvives() async {
+        let chat = FakeChat()
+        chat.pages = [page("a01", "a02"), page("a20"), page("a18"), page("a16"), page("a14")]
+        let t = timeline(chat)
+        await t.load()
+        chat.olderGate = Gate()
+        let gate = chat.olderGate!
+        t.apply(.ready)
+        await settle { self.asked(chat).count == 3 }
+        var edited = msg("a18", "edited")
+        edited.editedAt = "2026-09-26T11:00:00Z"
+        t.apply(.messageUpdate(message: edited)) // a18 is in the page the page-back brings
+        gate.open()
+        await settle { !t.isRereading }
+        XCTAssertEqual(t.messages.first { $0.id == "a18" }?.body, "edited", "the fetched copy undid a live edit")
+    }
+
+    // 19
+    func testARereadAskedDuringAReplacingTurnAsksOnlyTheHeadPage() async {
+        let chat = FakeChat()
+        // The load; turn A (head and three page-backs, so it replaces); turn B's head page.
+        chat.pages = [page("a01", "a02"), page("a20"), page("a18"), page("a16"), page("a14"), page("a20", "a21")]
+        let t = timeline(chat)
+        await t.load()
+        chat.olderGate = Gate()
+        let gate = chat.olderGate!
+        t.apply(.ready)
+        await settle { self.asked(chat).count == 3 }
+        t.apply(.ready) // noted from the old, gappy a02, while turn A runs
+        await letQueuedJobsRun()
+        gate.open()
+        await settle { !t.isRereading }
+        XCTAssertEqual(asked(chat), [nil, nil, "a20", "a18", "a16", nil], "turn B paged back over what turn A proved")
+        XCTAssertEqual(t.replaced, 1)
+        XCTAssertEqual(ids(t), ["a14", "a16", "a18", "a20", "a21"])
+    }
+
+    // 20
+    func testAFailedRereadKeepsItsAnchorForTheNextOne() async {
+        let chat = FakeChat()
+        chat.pages = [page("a05", "a06"), page("a10", "a11")]
+        let t = timeline(chat)
+        await t.load()
+        chat.olderGate = Gate()
+        let gate = chat.olderGate!
+        let failing = t.reread()
+        await settle { self.asked(chat).count == 3 } // held in the page-back
+        t.apply(.messageNew(message: msg("a40", "live"))) // now the newest shown message is a40
+        chat.historyFailure = LoginError.Network(message: "offline")
+        gate.open()
+        await failing.value
+        XCTAssertNotNil(t.error)
+        // The next re-read must still reach back to a06, not to a40: a gap is still open.
+        chat.historyFailure = nil
+        chat.pages = [page("a30"), page("a06", "a07")]
+        await t.reread().value
+        XCTAssertEqual(Array(asked(chat).suffix(2)), [nil, "a30"], "the anchor was lost with the failed try")
+        XCTAssertEqual(ids(t), ["a05", "a06", "a07", "a30", "a40"])
     }
 
     // 16

@@ -71,14 +71,30 @@ final class FakeChat: ChatClient, @unchecked Sendable {
     let historyAsked = Mutex<[String?]>([])
     /// Holds the next call that has a `before`, once, after it is recorded (as `cacheGate` does for
     /// the cache). The page is taken when the gate opens, not when the call is made.
-    var olderGate: Gate?
+    var olderGate: Gate? {
+        get { olderGateBox.withLock { $0 } }
+        set { olderGateBox.withLock { $0 = newValue } }
+    }
+    private let olderGateBox = Mutex<Gate?>(nil)
+    /// Calls in flight now, and the most there ever were at once: a head fetch must never run
+    /// beside another.
+    let historyInFlight = Mutex(0)
+    let historyMaxInFlight = Mutex(0)
     func channelHistory(channelId: String, before: String?) async throws -> [FfiMessage] {
+        // Claim the gate BEFORE the call is recorded: a test that waits for the record and then
+        // opens the gate must find the gate already taken by this call, not by a later one.
+        let gate: Gate? = before == nil ? nil : olderGateBox.withLock { box in
+            defer { box = nil }
+            return box
+        }
         historyCalls.withLock { $0 += 1 }
         historyAsked.withLock { $0.append(before) }
-        if before != nil, let gate = olderGate {
-            olderGate = nil
-            await gate.wait()
+        historyInFlight.withLock { n in
+            n += 1
+            historyMaxInFlight.withLock { $0 = max($0, n) }
         }
+        defer { historyInFlight.withLock { $0 -= 1 } }
+        await gate?.wait()
         await historyGate?.wait()
         if let historyFailure { throw historyFailure }
         return pages.isEmpty ? [] : pages.removeFirst()

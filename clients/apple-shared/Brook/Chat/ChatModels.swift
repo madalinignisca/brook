@@ -57,7 +57,8 @@ final class TimelineModel {
     /// stored with. Never a finished label, so Show usernames relabels without a reload.
     private(set) var authors: [String: (name: String, handle: String)] = [:]
 
-    /// iOS only (see `init`): every newest-page fetch also closes a gap, and `.ready` re-reads.
+    /// For iOS (see `init`; nothing sets it yet): every newest-page fetch also closes a gap, and
+    /// `.ready` re-reads.
     private let rereadOnReady: Bool
     /// Up to 150 older messages (3 pages of `pageSize`) are fetched to find where a re-read meets
     /// what is shown. Past that, replacing the shown history is cheaper than paging further.
@@ -71,6 +72,19 @@ final class TimelineModel {
     /// newest when the fetch finally runs: a live message merged in between (a `message.new`
     /// right after `ready`, or the user's own send) is newer than the gap and would hide it.
     private var gapAnchor: String?
+    /// Ids that live events (new, update, delete, reaction) or the user's own sends touched while a
+    /// gap-filling fetch runs; nil when none runs. Message ids are UUIDv7 made when a send STARTS,
+    /// not when it commits, so such a message can have an id below the newest fetched one. A replace
+    /// keeps these as well as the ones newer than the fetch, or it would drop a message the user just
+    /// saw (and a live edit to a fetched message would be dropped before `merge` could compare
+    /// `editedAt`). A reaction event only keeps the message here; the fetched copy still supplies
+    /// the reaction counts, which the next event or re-read corrects.
+    private var touchedDuringFetch: Set<String>?
+    /// Re-reads asked for and not finished (counted from the moment `reread()` is called, before its
+    /// task has started). Tests wait for this to reach zero before asserting that nothing more was
+    /// fetched: otherwise "nothing happened" could just mean "has not happened yet".
+    private var rereadsRunning = 0
+    var isRereading: Bool { rereadsRunning > 0 || headDrain != nil }
 
     /// Ids deleted, including ones not shown yet: every later copy stays a tombstone.
     private var deleted: Set<String> = []
@@ -126,7 +140,7 @@ final class TimelineModel {
     /// name, and the handle comes from here.
     private let members: @MainActor () -> [FfiMember]
 
-    /// `rereadOnReady` is iOS only, the twin of `ChannelsModel.rereadOnReconnect`. iOS suspends the
+    /// `rereadOnReady` is meant for iOS (nothing sets it yet), the twin of `ChannelsModel.rereadOnReconnect`. iOS suspends the
     /// socket in the background and keeps no cache, so events sent meanwhile are lost; a re-read of
     /// the newest page (on every `.ready` and on return to the foreground) is the only way to show
     /// them. The Mac's `CacheFeed` fills that hole, so it leaves this off, and there a `.ready` only
@@ -293,7 +307,7 @@ final class TimelineModel {
             }
             if before != nil, page.messages.isEmpty, !page.needsNetwork { atStart = true }
             if !page.messages.isEmpty { fromCache = true }
-            merge(page.messages)
+            store(page.messages)
             return true
         } catch {
             return false // no local data (yet): the network path
@@ -316,7 +330,7 @@ final class TimelineModel {
             // The newest page is back: an older page is asked for again, and a Retry left from the time
             // it was held back is not shown.
             if before == nil { headFailed = false; olderFailed = false }
-            merge(page)
+            store(page)
             error = nil
         } catch {
             // A failure of a dropped ask says nothing about the new history either.
@@ -346,6 +360,8 @@ final class TimelineModel {
         defer { loading = false }
         let anchor = gapAnchor ?? messages.last?.id
         gapAnchor = nil
+        touchedDuringFetch = []
+        defer { touchedDuringFetch = nil }
         do {
             var fetched = try await client.channelHistory(channelId: channelId, before: nil)
             var met = Self.meets(fetched, anchor: anchor)
@@ -357,20 +373,26 @@ final class TimelineModel {
                 met = older.isEmpty || Self.meets(older, anchor: anchor)
             }
             if met {
-                merge(fetched)
+                store(fetched)
             } else {
                 // Still no meeting point: the shown history is too far behind to join. Keep what was
-                // fetched, plus the shown messages newer than the newest fetched one: live messages
-                // and the user's own sends merged while the page-backs ran are in `messages` and
-                // not in `fetched`. Dropping them would lose a message the user just saw. `deleted`
-                // is kept, so a message deleted earlier stays a tombstone in `merge`.
+                // fetched, plus the shown messages the fetch does not cover: newer than its newest
+                // id, or touched by a live event or the user's own send while it ran (see
+                // `touchedDuringFetch`: their ids can be lower). Then `store` merges the fetched page
+                // over them, so a live edit keeps its newer body. `deleted` is kept, so a message
+                // deleted earlier stays a tombstone.
                 let newest = fetched.map(\.id).max() ?? ""
-                messages = messages.filter { $0.id > newest }
+                let touched = touchedDuringFetch ?? []
+                messages = messages.filter { $0.id > newest || touched.contains($0.id) }
                 atStart = false // the start of the channel is no longer the oldest shown message's
-                olderFailed = false
                 replaced += 1
-                merge(fetched)
+                store(fetched)
             }
+            // Everything up to the newest fetched id is contiguous now. A trigger that landed during
+            // this turn noted its anchor from the old, gappy `messages.last`; left alone, the turn
+            // queued behind this one would page back to it and replace again for nothing. Raise it
+            // to what this turn proved (a failed turn proves nothing, so the catch does not).
+            if let pending = gapAnchor, let n = fetched.map(\.id).max(), pending < n { gapAnchor = n }
             headFailed = false
             olderFailed = false
             error = nil
@@ -405,7 +427,9 @@ final class TimelineModel {
     func reread() -> Task<Void, Never> {
         noteGapAnchor()
         let newestBefore = messages.last?.id
+        rereadsRunning += 1
         return Task {
+            defer { rereadsRunning -= 1 }
             await fetchHead()
             if error == nil, messages.last?.id != newestBefore { await markNewestRead() }
         }
@@ -486,6 +510,7 @@ final class TimelineModel {
             }
         case let .messageDelete(channel, messageId):
             guard channel == channelId else { return }
+            touchedDuringFetch?.insert(messageId)
             deleted.insert(messageId) // even before its page lands
             if let i = messages.firstIndex(where: { $0.id == messageId }) {
                 messages[i] = Self.tombstone(messages[i])
@@ -511,6 +536,7 @@ final class TimelineModel {
             let countFresh = seq > (reactionSeqs[key] ?? Int64.min)
             let meFresh = byMe && seq > (reactionMineSeqs[key] ?? Int64.min)
             guard countFresh || meFresh else { return }
+            touchedDuringFetch?.insert(messageId)
             if countFresh { reactionSeqs[key] = seq }
             if meFresh { reactionMineSeqs[key] = seq }
             reactionEvents[messageId, default: 0] += 1
@@ -542,7 +568,15 @@ final class TimelineModel {
     /// - the body and its edited mark change only for a newer `editedAt` (a missing one is
     ///   older than any), so a stale page never undoes an edit;
     /// - every other field (names, the quoted excerpt, files) takes the incoming copy.
+    ///
+    /// This is the entry for live events and the user's own sends; a gap-filling fetch remembers the
+    /// ids they touch (`touchedDuringFetch`). Pages from the network or the cache use `store`.
     func merge(_ incoming: [FfiMessage]) {
+        touchedDuringFetch?.formUnion(incoming.map(\.id))
+        store(incoming)
+    }
+
+    private func store(_ incoming: [FfiMessage]) {
         guard !incoming.isEmpty else { return }
         var byId = Dictionary(messages.map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })
         for var m in incoming {

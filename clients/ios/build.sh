@@ -108,6 +108,10 @@ if [[ "$mode" == "test" ]]; then
     TimelineRereadTests/testTheGapAnchorIsTakenWhenTheReadyArrives
     TimelineRereadTests/testAnOlderPageWaitingOnAReplacingRereadAsksFromTheNewOldest
     TimelineRereadTests/testAResyncTakesTheGapAnchorWhenItArrives
+    TimelineRereadTests/testALiveMessageWithALowerIdThanTheFetchedNewestSurvivesAReplace
+    TimelineRereadTests/testALiveEditToAFetchedMessageDuringThePageBackSurvives
+    TimelineRereadTests/testARereadAskedDuringAReplacingTurnAsksOnlyTheHeadPage
+    TimelineRereadTests/testAFailedRereadKeepsItsAnchorForTheNextOne
     ScrollFollowTests/testFollowsANewMessageAtTheBottom
     ScrollFollowTests/testStaysPutForSomeoneElsesMessageWhenAway
     ScrollFollowTests/testFollowsTheUsersOwnMessageEvenWhenAway
