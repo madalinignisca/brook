@@ -209,13 +209,23 @@ async def test_pending_token_dies_on_a_password_change(
     assert dead.status_code == 403 and dead.json()["error"]["code"] == "auth.totp_expired"
 
 
-async def test_activation_signs_out_other_sessions(client: httpx.AsyncClient, clock: Clock) -> None:
+async def test_activation_signs_out_every_old_session_including_the_callers(
+    client: httpx.AsyncClient, clock: Clock
+) -> None:
+    # Activation calls sign_out_everywhere before issuing the new pair, so the pair that
+    # authorised the activation dies too, not just other devices. Clients rely on this:
+    # they keep only the new pair and never probe the old one themselves.
     pair = await _setup(client)
     other = dict((await _login(client)).json())  # a second device, before enrolment
     _secret, activated = await _enable(client, pair, clock)
     stale = await client.post(f"{AUTH}/refresh", json={"refresh_token": other["refresh_token"]})
     assert stale.status_code == 401
     assert (await client.get(f"{AUTH}/me", headers=_h(other["access_token"]))).status_code == 401
+    own_refresh = await client.post(
+        f"{AUTH}/refresh", json={"refresh_token": pair["refresh_token"]}
+    )
+    assert own_refresh.status_code == 401
+    assert (await client.get(f"{AUTH}/me", headers=_h(pair["access_token"]))).status_code == 401
     assert (
         await client.get(f"{AUTH}/me", headers=_h(activated["access_token"]))
     ).status_code == 200
