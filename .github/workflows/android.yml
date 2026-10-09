@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: 2026 Madalin Ignisca and Brook contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Android checks. `core-android` lints core and brook-ffi for an Android target, which is the
+# only way the `#[cfg(target_os = "android")]` branch of core's store (plain SQLite, ADR 0001)
+# is compiled in CI: the host build in rust.yml never sees it. It also runs the plain-store
+# tests, which run on the host through `Protection::Plain`, so they cannot drop out unseen.
+# The app job joins this file with the Android client (plan for #273, step 15).
+name: android
+
+on:
+  push:
+    branches: [main]
+    paths:
+      ["core/**", "bindings/apple/**", "clients/android/**", "Cargo.toml", "Cargo.lock", ".github/workflows/android.yml"]
+  pull_request:
+    paths:
+      ["core/**", "bindings/apple/**", "clients/android/**", "Cargo.toml", "Cargo.lock", ".github/workflows/android.yml"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in step with the NDK in docs/superpowers/specs/2026-10-08-android-skeleton-plan.md.
+  NDK_VERSION: 30.0.16248370
+
+jobs:
+  core-android:
+    runs-on: ubuntu-24.04
+    steps:
+      # Actions are pinned by commit SHA (CLAUDE.md §9); these are the same pins as release-gtk.yml.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          components: clippy
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # The host `cargo test` below builds SQLCipher, which on Linux compiles against the
+      # system OpenSSL headers (rust.yml installs the same package).
+      - name: OpenSSL headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev
+
+      # The runner image has the Android SDK but not necessarily this NDK; installing the exact
+      # version keeps CI and local builds on the same compiler. `yes` answers any licence prompt;
+      # it is wrapped in `|| true` because Actions runs bash with pipefail and `yes` always ends
+      # killed by SIGPIPE when sdkmanager exits, which would otherwise fail the step.
+      - name: Android NDK
+        run: (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+
+      - name: Clippy for Android (warnings = errors)
+        run: |
+          clients/android/with-ndk.sh "$ANDROID_HOME/ndk/$NDK_VERSION" \
+            cargo clippy --locked -p brook-core -p brook-ffi --all-targets --target x86_64-linux-android -- -D warnings
+
+      - name: Plain-store tests
+        run: cargo test --locked -p brook-core --lib store_tests
