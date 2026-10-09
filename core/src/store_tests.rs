@@ -516,28 +516,43 @@ async fn the_key_check_file_is_owner_only() {
 
 // ---- plain stores (Android, ADR 0001), driven on the host through `open_as(Plain, ..)` ----
 
-/// A plain store never touches the key store: every slot call is scripted to fail, so one
-/// that did would come back `Locked` (or not open). Rows survive a reopen, no slot and no
-/// check file are made, and a bare SQLite with **no** `PRAGMA key` reads the rows: that last
-/// read is the proof no key pragma was applied (on the host the library is SQLCipher, which
+/// A key slot that records every call and fails it: a plain store must make none.
+#[derive(Default)]
+struct CountingSlot(std::sync::atomic::AtomicUsize);
+
+impl CountingSlot {
+    fn hit(&self) -> Result<(), KeySlotError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(KeySlotError::Unavailable)
+    }
+}
+
+impl KeySlot for CountingSlot {
+    fn load(&self, _: String) -> Result<Option<Vec<u8>>, KeySlotError> {
+        self.hit().map(|()| None)
+    }
+    fn create(&self, _: String, _: Vec<u8>) -> Result<(), KeySlotError> {
+        self.hit()
+    }
+    fn replace(&self, _: String, _: Vec<u8>) -> Result<(), KeySlotError> {
+        self.hit()
+    }
+    fn delete(&self, _: String) -> Result<(), KeySlotError> {
+        self.hit()
+    }
+}
+
+/// A plain store never touches the key store: the slot records (and fails) every call, and
+/// none may arrive, even one whose result would be ignored. Rows survive a reopen, no check
+/// file is made, and a bare SQLite with **no** `PRAGMA key` reads the rows: that last read
+/// is the proof no key pragma was applied (on the host the library is SQLCipher, which
 /// encrypts whenever a key is set).
 #[tokio::test]
 async fn a_plain_store_needs_no_key_and_keeps_its_data() {
     let dir = tempfile::tempdir().unwrap();
-    let slot = Arc::new(InMemoryKeySlot::default());
-    for _ in 0..8 {
-        slot.fail_next("load", KeySlotError::Unavailable);
-        slot.fail_next("create", KeySlotError::Unavailable);
-    }
-    let open = || {
-        store::open_as(
-            Protection::Plain,
-            dir.path(),
-            Kind::Cache,
-            "s1",
-            &keys(&slot),
-        )
-    };
+    let slot = Arc::new(CountingSlot::default());
+    let keys = KeyStore::new(slot.clone() as Arc<dyn KeySlot>);
+    let open = || store::open_as(Protection::Plain, dir.path(), Kind::Cache, "s1", &keys);
     let (db, rebuilt) = ready(open());
     assert_eq!(rebuilt, None);
     write_sentinel(&db, 3).await;
@@ -550,7 +565,11 @@ async fn a_plain_store_needs_no_key_and_keeps_its_data() {
         .unwrap();
     assert_eq!(users, 3);
     db.close().await;
-    assert!(!slot.contains("cache:s1"), "a plain store made a key");
+    assert_eq!(
+        slot.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a plain store called the key slot"
+    );
     assert!(
         !dir.path().join("cache.check").exists(),
         "a plain store wrote a check file"

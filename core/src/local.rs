@@ -5,14 +5,16 @@
 //! and wiping them.
 //!
 //! Layout: `<root>/index.db` maps `(origin, user id)` to a random store id, and each store id
-//! is a directory holding `cache.db` and `outbox.db` (plus their key checks). Paths carry
-//! only store ids.
+//! is a directory holding `cache.db` and `outbox.db` (plus their key checks, except on
+//! Android, where stores are plain and have no key or check). Paths carry only store ids.
 //!
 //! **Wiping is close, then erase.** The caller closes the user's cache and outbox first
 //! (their threads are joined), then `wipe` destroys the key slots (crypto-erase) and deletes
-//! the directory. A late writer holds a closed handle and can't reach anything (a store made
-//! later has a new key and a new check file), which is why no per-store generation counter
-//! is needed: close-and-join gives the same guarantee.
+//! the directory. On Android there is no key to destroy: the wipe relies on deleting the
+//! files (ADR 0001). A late writer holds a closed handle and can't reach anything (a store
+//! made later has a new store id, so a new directory, and off Android a new key and a new
+//! check file too), which is why no per-store generation counter is needed:
+//! close-and-join gives the same guarantee.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,8 +44,9 @@ pub(crate) struct LocalData {
 }
 
 impl LocalData {
-    /// Open the index under `root`. `None` when the key store is locked or damaged: the app
-    /// runs online-only, and nothing is deleted.
+    /// Open the index under `root`. `None` when the key store is locked or the index is
+    /// damaged: the app runs online-only, and nothing is deleted. On Android there is no key
+    /// to lock, so `None` comes only from a damaged index.
     pub(crate) async fn open(
         root: &Path,
         slot: Arc<dyn KeySlot>,
@@ -148,7 +151,8 @@ impl LocalData {
 
     /// Erase `(origin, user_id)`'s stores. Their handles must be closed first. The row is
     /// marked doomed first; then the key slots go (crypto-erase), then the files; the row goes
-    /// only once every key is destroyed. A key store that refused keeps the row doomed and
+    /// only once every key is destroyed (on Android there is none, so deleting the files is
+    /// the erase and the row goes with them). A key store that refused keeps the row doomed and
     /// this reports an error: the next open of that user, or `reconcile`, finishes it (the
     /// old keys are never reused). Works on a locked or damaged store: nothing is read.
     pub(crate) async fn wipe(&self, origin: &str, user_id: &str) -> Result<(), StoreError> {
