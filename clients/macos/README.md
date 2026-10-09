@@ -28,10 +28,15 @@ Rendered screenshots of the views (light + dark, off-screen, no window):
 ## Shape
 Code the Mac and iOS apps share lives in [`clients/apple-shared`](../apple-shared): the session
 store (`SessionStore`, the only owner of `BrookCore`), the sign-in form (`LoginForm`), address
-validation and the remembered server (`ServerAddress`, `Settings`), and the channel model. Its tests
-run in both apps. The Mac's own files include the SwiftUI views (`LoginView`, `SignedInView`) and its
-platform files (`ThisDevice`, `AppActivity`, `SessionPersistence+Mac`), which fill in the platform
-facts that shared code asks for. The rule for those is in the [iOS README](../ios/README.md#what-is-shared-and-what-is-ios-only).
+validation and the remembered server (`ServerAddress`, `Settings`), the channel model, and the
+conversation models (`TimelineModel`, `ComposerModel`, file staging, pending messages, typing and
+search, and the small `ScrollToLatest` and `MessageText` helpers). Its tests run in both apps,
+including the timeline, composer, pending, typing and search tests. The Mac's own files include
+the SwiftUI views (`LoginView`, `SignedInView`, `ChatView`), the conversation files that stay on
+the Mac (`PasteImport`, which needs AppKit and is set on the composer in `ChatView.makeComposer`;
+`FileRowModel`, which opens files through `NSWorkspace`; `CacheFeed`, the Mac's local-data feed),
+and its platform files (`ThisDevice`, `AppActivity`, `SessionPersistence+Mac`), which fill in the
+platform facts that shared code asks for. The rule for those is in the [iOS README](../ios/README.md#what-is-shared-and-what-is-ios-only).
 
 Specs: [design](../../docs/superpowers/specs/2026-09-24-macos-phase0-app-design.md) ·
 [plan](../../docs/superpowers/specs/2026-09-24-macos-phase0-app-plan.md).

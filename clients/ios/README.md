@@ -65,7 +65,11 @@ make down    # stop, keep the data
 - The Rust core, through `bindings/apple/swift/BrookCore`.
 - `clients/apple-shared/Brook`: among other files, the session store, the sign-in form, the server
   address, the settings, the channel model, the offline client, `Chat/Notifications.swift` and
-  `PersonName.swift`.
+  `PersonName.swift`, and the conversation models: `TimelineModel` and `ComposerModel`
+  (`Chat/ChatModels.swift`), file staging and drop import (`Chat/Staging.swift`), pending messages,
+  typing and search, `ScrollToLatest` and `MessageText`. iOS compiles the file staging, drop
+  import, pending, save and search code, but no iOS screen uses it yet. The Mac sets its own
+  paste importer (`PasteImport`, which needs AppKit) on its composer, in `ChatView.makeComposer`.
 - `clients/apple-shared/BrookTests`: the shared tests, which run in both apps.
 
 **iOS-only** (`clients/ios`):
