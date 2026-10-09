@@ -110,6 +110,14 @@ class SessionModel(
     /** The signed-in client: later phases talk to the server through it. */
     val client: FfiBrookClient? get() = if (_phase.value is Phase.SignedIn) current else null
 
+    /**
+     * The conversations of the signed-in user: made when the sign-in completes, stopped when the
+     * attempt ends. Set before [phase] becomes `SignedIn`, so a screen showing that phase can
+     * rely on it.
+     */
+    var channelList: ChannelListModel? = null
+        private set
+
     /** The current attempt; bumping it ends the previous one. */
     private var attempt = 0
     private var subscription: Subscription? = null
@@ -330,6 +338,7 @@ class SessionModel(
         signIns++
         _signOutWarning.value = null // the new sign-in replaced the stored copy
         settings.lastGoodServer = address
+        channelList = ChannelListModel(client, user.id, scope).also { it.start() }
         _phase.value = Phase.SignedIn(user)
     }
 
@@ -367,6 +376,9 @@ class SessionModel(
      */
     private fun end(): FfiBrookClient? {
         attempt++
+        // Stopped before the caller closes the client: the list model calls it.
+        channelList?.stop()
+        channelList = null
         subscription?.let {
             it.cancel()
             it.close()

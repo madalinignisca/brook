@@ -7,14 +7,17 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import uniffi.brook_ffi.AuthStateListener
 import uniffi.brook_ffi.FfiAuthState
+import uniffi.brook_ffi.FfiChannel
 import uniffi.brook_ffi.FfiBrookClient
 import uniffi.brook_ffi.FfiKeySlot
 import uniffi.brook_ffi.FfiRestoreOutcome
+import uniffi.brook_ffi.FfiServerEvent
 import uniffi.brook_ffi.FfiSession
 import uniffi.brook_ffi.FfiTotpChallenge
 import uniffi.brook_ffi.FfiUser
 import uniffi.brook_ffi.LoginResult
 import uniffi.brook_ffi.NoHandle
+import uniffi.brook_ffi.ServerEventListener
 import uniffi.brook_ffi.Subscription
 
 // Fakes shared by the session tests. Port of the Mac's FakeClient / FactoryRecorder
@@ -147,6 +150,36 @@ class FakeClient(
         if (persistence.isEmpty()) return FfiRestoreOutcome.NotSignedIn
         (restoreOutcome as? FfiRestoreOutcome.LoggedIn)?.let { coreState = FfiAuthState.LoggedIn(it.user) }
         return restoreOutcome
+    }
+
+    // The channel list's side of the client. Separate from `log` so the session tests' exact
+    // call sequences do not change when a sign-in starts the list model.
+    /** "subscribeEvents", "startRealtime", "listChannels", in call order. */
+    val listCalls = mutableListOf<String>()
+    var channels: List<FfiChannel> = emptyList()
+    var listFails = false
+    var eventSubscription: FakeSubscription? = null
+    private var eventListener: ServerEventListener? = null
+
+    override fun subscribeEvents(listener: ServerEventListener): Subscription {
+        listCalls += "subscribeEvents"
+        eventListener = listener
+        return FakeSubscription().also { eventSubscription = it }
+    }
+
+    override suspend fun startRealtime() {
+        listCalls += "startRealtime"
+    }
+
+    override suspend fun listChannels(): List<FfiChannel> {
+        listCalls += "listChannels"
+        if (listFails) error("offline")
+        return channels
+    }
+
+    /** Deliver a realtime event as core would (on a Rust thread in production). */
+    fun deliver(event: FfiServerEvent) {
+        eventListener?.onEvent(event)
     }
 
     override fun signOutComplete(): Boolean {

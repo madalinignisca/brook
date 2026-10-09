@@ -9,8 +9,12 @@
 
     <application
         android:name=".BrookApp"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:enableOnBackInvokedCallback="true"
         android:icon="@mipmap/ic_launcher"
-        android:label="Brook">
+        android:label="Brook"
+        android:theme="@style/Theme.Brook">
         <activity
             android:name=".MainActivity"
             android:exported="true">

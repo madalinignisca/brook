@@ -388,4 +388,18 @@ class SessionModelTest {
         assertEquals(Phase.NeedsCode(SessionModel.Message.recoveryFormat), model.state)
         assertTrue(fake.totpCalls.isEmpty())
     }
+
+    // MARK: the channel list follows the session
+
+    @Test
+    fun signingInStartsTheChannelListAndSigningOutStopsIt() = runTest {
+        val fake = loggedIn()
+        val model = signedIn(fake)
+        runCurrent()
+        assertNotNull(model.channelList)
+        assertEquals(listOf("subscribeEvents", "startRealtime", "listChannels"), fake.listCalls)
+        model.signOut()
+        assertNull(model.channelList)
+        assertTrue(fake.eventSubscription!!.cancelled)
+    }
 }
