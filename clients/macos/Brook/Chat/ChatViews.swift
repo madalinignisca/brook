@@ -34,14 +34,24 @@ struct ChatView: View {
         self.feed = feed
         self.client = client
         _timeline = State(initialValue: timeline)
+        _composer = State(initialValue: Self.makeComposer(channelId: channelId, client: client,
+                                                          timeline: timeline, pending: pending))
+        _saves = State(initialValue: SaveModel(client: client))
+    }
+
+    /// The composer this view ships with. A static function so a test can build the very composer
+    /// the Mac uses: the `importer` line is the one place that makes a pasted image a PNG file,
+    /// and a test of a hand-built composer would not notice if it were dropped.
+    static func makeComposer(channelId: String, client: any ChatClient, timeline: TimelineModel,
+                             pending: PendingModel?) -> ComposerModel {
         let composer = ComposerModel(
             channelId: channelId, client: client, onMessage: { [weak timeline] in
                 timeline?.merge([$0])
             })
         composer.pending = pending
         pending?.timeline = timeline
-        _composer = State(initialValue: composer)
-        _saves = State(initialValue: SaveModel(client: client))
+        composer.importer = ComposerModel.macImporter
+        return composer
     }
 
     var body: some View {
@@ -171,19 +181,6 @@ extension ChatView {
     }
 }
 
-/// When the "jump to latest" button shows: the view has been scrolled up by more than a little.
-enum ScrollToLatest {
-    /// Space under the last message, above the composer.
-    static let gap: CGFloat = 12
-    /// Further up than this (points, beyond the gap) counts as away.
-    static let threshold: CGFloat = 80
-
-    static func isAway(contentHeight: CGFloat, offset: CGFloat, viewportHeight: CGFloat) -> Bool {
-        // Content shorter than the view can't be scrolled up.
-        contentHeight - (offset + viewportHeight) > threshold
-    }
-}
-
 /// An unsent message: dimmed while it's on its way, with its actions once it failed.
 struct PendingRow: View {
     let message: FfiPendingMessage
@@ -235,13 +232,13 @@ struct MessageRow: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(author).bold()
-                Text(Self.time(message.createdAt)).font(.caption).foregroundStyle(.secondary)
+                Text(MessageText.time(message.createdAt)).font(.caption).foregroundStyle(.secondary)
                 if message.editedAt != nil, !message.deleted {
                     Text("edited").font(.caption).foregroundStyle(.secondary)
                 }
             }
             if let quote = message.replyTo, !message.deleted {
-                Text("↳ Replying to \(Self.excerpt(quote))")
+                Text("↳ Replying to \(MessageText.excerpt(quote))")
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             if message.deleted {
@@ -289,22 +286,6 @@ struct MessageRow: View {
                 }
             }
         }
-    }
-
-    /// A quote's line, from its state rather than its text.
-    static func excerpt(_ quote: FfiReplyExcerpt) -> String {
-        if quote.deleted { return "a deleted message" }
-        let flat = quote.body.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-        if flat.isEmpty { return quote.attachments > 0 ? "a file" : "a message" }
-        return String(flat.prefix(80))
-    }
-
-    static func time(_ iso: String) -> String {
-        let parser = ISO8601DateFormatter()
-        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let date = parser.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
-        guard let date else { return "" }
-        return date.formatted(date: .omitted, time: .shortened)
     }
 }
 
@@ -366,7 +347,7 @@ struct AttachmentRow: View {
 
     private var line: some View {
         HStack(spacing: 8) {
-            Image(systemName: Self.icon(file.contentType))
+            Image(systemName: MessageText.fileIcon(file.contentType))
             VStack(alignment: .leading, spacing: 0) {
                 Text(file.originalName).lineLimit(1)
                 Text(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file))
@@ -418,14 +399,6 @@ struct AttachmentRow: View {
                 Task { await saves.save(file, to: url) }
             }
         }
-    }
-
-    static func icon(_ type: String) -> String {
-        if type.hasPrefix("image/") { return "photo" }
-        if type.hasPrefix("video/") { return "film" }
-        if type.hasPrefix("audio/") { return "waveform" }
-        if type == "application/pdf" { return "doc.richtext" }
-        return "doc"
     }
 }
 
