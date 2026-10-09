@@ -29,6 +29,9 @@ sim_dest="platform=iOS Simulator,name=$sim"
 
 "$ROOT/bindings/apple/build-xcframework.sh" --ios
 (cd "$HERE" && xcodegen --quiet)
+# The conversation rows show people's names: they must go through PersonName so "Show usernames"
+# applies (#238). The Mac runs the same check on its own folder.
+"$ROOT/clients/macos/check-person-names.sh" "$HERE/Brook"
 
 build() {  # build <xcodebuild args...>
   xcodebuild -project "$HERE/Brook.xcodeproj" -scheme Brook -derivedDataPath "$derived" "$@"
@@ -116,6 +119,13 @@ if [[ "$mode" == "test" ]]; then
     ScrollFollowTests/testFollowsANewMessageAtTheBottom
     ScrollFollowTests/testStaysPutForSomeoneElsesMessageWhenAway
     ScrollFollowTests/testFollowsTheUsersOwnMessageEvenWhenAway
+    ConversationSessionTests/testOpeningSetsTheOpenChannelAndItsEventsAndLeavingClearsThem
+    ConversationSessionTests/testLeavingAnOlderConversationLeavesTheNewerOneOpen
+    ConversationSessionTests/testLeavingAndReopeningTheSameChannelKeepsTheNewOneOpen
+    ConversationSessionTests/testTheOpenConversationRereadsOnEveryReady
+    ConversationSessionTests/testComingBackToTheForegroundRereadsTheConversation
+    ConversationSessionTests/testAChannelGoneFromTheListClosesTheConversation
+    ConversationSessionTests/testOpeningClearsTheRowsMentionBadge
   )
 
   # 1. All three slices are in the xcframework (a Mac build leaves only the macOS one).

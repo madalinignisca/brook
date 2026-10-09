@@ -12,10 +12,12 @@ func recoveryCodesWarning(left: UInt32?) -> String? {
 }
 
 /// The signed-in home: the channels and DMs in the model's order, kept live by the model's
-/// event stream. Plain system List; rows do not open anything yet.
+/// event stream. Plain system List; a row pushes its conversation (`ConversationHost`).
 struct ChannelListView: View {
     let store: SessionStore
     let session: SignedInSession
+    /// The conversation's client: the same signed-in client the list uses.
+    let client: any ChatClient
     @Environment(\.scenePhase) private var scenePhase
     @State private var confirmingSignOut = false
     private var channels: ChannelsModel { session.channels }
@@ -23,6 +25,11 @@ struct ChannelListView: View {
     var body: some View {
         NavigationStack {
             content
+                // The path carries only the channel id, so a row leaving the list cannot leave a
+                // stale value on the stack; the conversation looks its row up itself.
+                .navigationDestination(for: String.self) { id in
+                    ConversationHost(channelId: id, channels: channels, client: client, me: session.me)
+                }
                 .navigationTitle("Brook")
                 .toolbar {
                     ToolbarItem(placement: .topBarTrailing) {
@@ -57,7 +64,9 @@ struct ChannelListView: View {
                     Label(warning, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
                 }
                 ForEach(channels.channels) { row in
-                    ChannelRowView(channels: channels, row: row)
+                    NavigationLink(value: row.id) {
+                        ChannelRowView(channels: channels, row: row)
+                    }
                 }
             }
             .refreshable { await channels.reloadList() }
@@ -71,10 +80,10 @@ private struct ChannelRowView: View {
 
     var body: some View {
         // One VoiceOver stop per row: title, then call and mentions, each with its own label.
-        // No unread count here, on purpose: the server's `unread_mentions` comes with every list
-        // read, but a plain unread count only exists in the Mac's local cache. iOS has no cache
-        // to clear one, and nothing can open a channel yet, so a count would only go up. Add it
-        // with the cache or the first screen that opens a channel.
+        // No unread count here, on purpose: the server sends `unread_count` in `GET /channels`,
+        // but the Apple binding's `FfiChannel` drops it (`bindings/apple/src/types.rs`), so only
+        // `unread_mentions` can be shown. The Mac's count comes from its local cache, which iOS
+        // does not have. Showing a count is its own issue (spec 2026-10-09-ios-conversation, §3).
         HStack {
             Text(channels.title(row))
             Spacer()

@@ -58,7 +58,8 @@ private struct SignedInHome: View {
     var body: some View {
         Group {
             if let session {
-                ChannelListView(store: store, session: session)
+                // `FfiBrookClient` is the conversation's `ChatClient` too (an extension in shared code).
+                ChannelListView(store: store, session: session, client: client)
             } else {
                 ProgressView()
             }
