@@ -48,31 +48,18 @@ impl From<User> for FfiUser {
     }
 }
 
-/// Tokens plus the resolved user. Crosses the FFI because the Apple clients keep the
-/// tokens in the Keychain; the Swift side redacts them from every description/reflection.
-#[derive(Clone, uniffi::Record)]
+/// The signed-in user. The tokens are deliberately not here: core keeps the session itself
+/// (through the `KeySlot` the client gives it), and a client never needs the raw tokens. Kotlin's
+/// generated `toString` for a record prints every field and cannot be redacted, so a token field
+/// would leak into any log line that prints the session.
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiSession {
-    pub access_token: String,
-    pub refresh_token: String,
     pub user: FfiUser,
-}
-
-// Same rule as core's `Session`: tokens never reach a log through `Debug`.
-impl std::fmt::Debug for FfiSession {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FfiSession")
-            .field("access_token", &"<redacted>")
-            .field("refresh_token", &"<redacted>")
-            .field("user", &self.user)
-            .finish()
-    }
 }
 
 impl From<Session> for FfiSession {
     fn from(s: Session) -> Self {
         Self {
-            access_token: s.access_token,
-            refresh_token: s.refresh_token,
             user: s.user.into(),
         }
     }

@@ -242,7 +242,7 @@ final class FactoryRecorder: @unchecked Sendable {
 }
 
 let alice = FfiUser(id: "u1", handle: "alice", displayName: "Alice", globalRole: "admin", statusText: nil)
-let aliceSession = FfiSession(accessToken: "a", refreshToken: "r", user: alice)
+let aliceSession = FfiSession(user: alice)
 
 /// A challenge with no Rust side (the store only passes it back to the client).
 final class FakeChallenge: FfiTotpChallenge, @unchecked Sendable {
