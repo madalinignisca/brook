@@ -249,6 +249,25 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(plainOff.phase, .signedOut(error: nil), "a plain .off must not claim a locked phone")
     }
 
+    /// L3 of the step-6 review: the persistence choice is made once per process. In a launch
+    /// before the first unlock nothing is stored by this process, so Sign Out cannot remove a
+    /// session an earlier launch stored; the confirmation must say so. Only that state says it:
+    /// a store that can clear (`.on`) or that never stored (`.off`) must stay silent.
+    func testSignOutSaysItCannotReachTheSavedSignInOnlyInALockedLaunch() {
+        let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)))
+        let recorder = FactoryRecorder { fake }
+        func store(_ persistence: SessionPersistence) -> SessionStore {
+            SessionStore(
+                settings: Settings(defaults: defaults, environment: [:]), persistence: persistence,
+                makeFeed: nil, makeClient: recorder.factory)
+        }
+        XCTAssertEqual(
+            store(.lockedUntilFirstUnlock).signOutNotice, SessionStore.Message.signOutCannotReachSavedSignIn)
+        XCTAssertNil(store(.off).signOutNotice)
+        XCTAssertNil(store(.on(slot: UnusedSlot(), dataDir: "/data")).signOutNotice)
+        XCTAssertNil(store(.secondInstance).signOutNotice)
+    }
+
     func testSignOutEndsTheSessionQuietlyAndSignsOutOfCore() async {
         let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)))
         let store = await signedIn(fake)

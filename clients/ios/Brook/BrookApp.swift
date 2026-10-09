@@ -4,8 +4,7 @@
 import BrookCore
 import SwiftUI
 
-/// The app: the root follows `store.phase`, as on the Mac. The signed-in screen is still a
-/// placeholder until the channel list arrives (#272, step 7).
+/// The app: the root follows `store.phase`, as on the Mac.
 @main
 struct BrookApp: App {
     @State private var store: SessionStore
@@ -25,12 +24,9 @@ struct BrookApp: App {
             Group {
                 switch store.phase {
                 case let .signedIn(user):
-                    // A call into Rust made by the app (not only by the test bundle): reads
-                    // "#general" when the core is linked and running.
-                    VStack(spacing: 8) {
-                        Text("Signed in as \(user.displayName)")
-                        Text(conversationLabel(kind: "public", name: "general", members: [], me: "", showUsernames: false))
-                            .foregroundStyle(.secondary)
+                    // `store.client` is set whenever the phase is signed in.
+                    if let client = store.client {
+                        SignedInHome(store: store, client: client, user: user)
                     }
                 case .restoring:
                     ProgressView("Signing in…")
@@ -41,5 +37,22 @@ struct BrookApp: App {
             // Once per process; later appearances no-op. Restores the stored session.
             .task { await store.restoreAtLaunch() }
         }
+    }
+}
+
+/// Owns the channel list's model for one signed-in session. It is created with the view and
+/// dropped with it, so a sign-out (or a remote one) and the next sign-in start from a fresh model.
+private struct SignedInHome: View {
+    let store: SessionStore
+    @State private var channels: ChannelsModel
+
+    init(store: SessionStore, client: FfiBrookClient, user: FfiUser) {
+        self.store = store
+        // No notifier: iOS notifications are later work. `AppActivity` is iOS's default.
+        _channels = State(initialValue: ChannelsModel(client: client, me: user.id))
+    }
+
+    var body: some View {
+        ChannelListView(store: store, channels: channels)
     }
 }

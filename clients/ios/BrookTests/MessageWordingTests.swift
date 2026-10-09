@@ -30,6 +30,7 @@ final class MessageWordingTests: XCTestCase {
         SessionStore.Message.signOutIncomplete,
         SessionStore.Message.secondInstance,
         SessionStore.Message.waitingForFirstUnlock,
+        SessionStore.Message.signOutCannotReachSavedSignIn,
         SessionStore.Message.removalIncomplete,
         SessionStore.Message.removalAndSignOutIncomplete,
     ]
@@ -54,6 +55,9 @@ final class MessageWordingTests: XCTestCase {
         XCTAssertEqual(
             SessionStore.Message.waitingForFirstUnlock,
             "Brook can't use its saved sign-in until your iPhone has been unlocked once after restarting. Unlock it, then close Brook and open it again.")
+        XCTAssertEqual(
+            SessionStore.Message.signOutCannotReachSavedSignIn,
+            "Brook couldn't reach this iPhone's saved sign-in in this session. Close Brook and open it again, then sign out to remove it.")
         XCTAssertEqual(Settings.fallbackServer, "")
     }
 }
