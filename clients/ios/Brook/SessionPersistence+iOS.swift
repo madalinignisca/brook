@@ -27,7 +27,18 @@ extension SessionPersistence {
         return prepare(
             dataDir: dir, calls: SystemSecItem(), defaults: .standard,
             defaultsDomain: Bundle.main.bundleIdentifier ?? "",
-            protectedDataAvailable: { protectedDataAvailable(in: dir) })
+            protectedData: { protectedData(in: dir) })
+    }
+
+    /// What the probe found.
+    enum ProtectedData: Equatable {
+        /// Files of the "after first unlock" class can be read.
+        case available
+        /// The protection class refused: the device has not been unlocked since boot.
+        case locked
+        /// Something else went wrong (disk full, directory can't be made, probe file malformed).
+        /// This says nothing about the lock, so it must not tell the user to unlock the phone.
+        case failed
     }
 
     /// Whether files that unlock at the first unlock after a reboot (the class the defaults and
@@ -36,37 +47,62 @@ extension SessionPersistence {
     /// while `App.init` runs (measured: it answers false there, always), so that would keep the
     /// app off at every launch.
     /// The probe file is written once with that protection class; later it can be read only
-    /// when the device has been unlocked since boot. A failed first write also means locked.
-    static func protectedDataAvailable(in dir: URL) -> Bool {
+    /// when the device has been unlocked since boot. Only a permission-style error from the
+    /// protection class (`isProtectionRefusal`) means `.locked`; any other error is `.failed`,
+    /// which `prepare` treats as plain `.off`.
+    static func protectedData(in dir: URL) -> ProtectedData {
         let fm = FileManager.default
-        guard (try? fm.createDirectory(at: dir, withIntermediateDirectories: true)) != nil else { return false }
         let probe = dir.appending(path: "protected-data-probe")
-        if fm.fileExists(atPath: probe.path(percentEncoded: false)) {
-            return (try? Data(contentsOf: probe)) != nil
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            if fm.fileExists(atPath: probe.path(percentEncoded: false)) {
+                _ = try Data(contentsOf: probe)
+            } else {
+                // The protection class below is what makes this probe work. "Until first user
+                // authentication" is the class of the Keychain item and the defaults file: readable from
+                // the first unlock after a boot, not before. So a refused write here means the phone has
+                // not been unlocked since boot. Do not weaken it (`.none`, `.completeFileProtectionUnlessOpen`):
+                // the probe would then be readable before the first unlock, say "available", and reopen
+                // the pre-unlock hole: the cleanup would run against a Keychain it cannot see and set its
+                // marker. Do not strengthen it to `.complete` either: the probe would then say "locked"
+                // whenever the screen is locked. The simulator cannot catch a wrong choice (it does not
+                // enforce file protection); only a real device, restarted and left locked, can.
+                try Data("x".utf8).write(to: probe, options: .completeFileProtectionUntilFirstUserAuthentication)
+            }
+            return .available
+        } catch {
+            return isProtectionRefusal(error) ? .locked : .failed
         }
-        // The protection class below is what makes this probe work. "Until first user
-        // authentication" is the class of the Keychain item and the defaults file: readable from
-        // the first unlock after a boot, not before. So a failed write here means the phone has
-        // not been unlocked since boot. Do not weaken it (`.none`, `.completeFileProtectionUnlessOpen`):
-        // the probe would then be readable before the first unlock, say "available", and reopen
-        // the pre-unlock hole: the cleanup would run against a Keychain it cannot see and set its
-        // marker. Do not strengthen it to `.complete` either: the probe would then say "locked"
-        // whenever the screen is locked. The simulator cannot catch a wrong choice (it does not
-        // enforce file protection); only a real device, restarted and left locked, can.
-        return (try? Data("x".utf8).write(to: probe, options: .completeFileProtectionUntilFirstUserAuthentication)) != nil
     }
 
-    /// Why `.off` here: the first-launch cleanup failed, the data directory can't be made, or
-    /// the Keychain is unusable in this build. A launch before the first unlock after a reboot
+    /// Whether an error is the protection class saying "not yet" rather than some other I/O
+    /// failure: EPERM or EACCES, bare or as the underlying error of a Cocoa error, or the Cocoa
+    /// no-permission codes. (Which of these a locked device actually returns is not measured
+    /// here; the simulator does not enforce file protection. All of them are permission errors,
+    /// and none of the failures that must stay silent -- ENOSPC, EISDIR, a corrupt file -- is.)
+    static func isProtectionRefusal(_ error: Error) -> Bool {
+        let e = error as NSError
+        switch (e.domain, e.code) {
+        case (NSPOSIXErrorDomain, Int(EPERM)), (NSPOSIXErrorDomain, Int(EACCES)),
+             (NSCocoaErrorDomain, NSFileReadNoPermissionError), (NSCocoaErrorDomain, NSFileWriteNoPermissionError):
+            return true
+        default:
+            guard let underlying = e.userInfo[NSUnderlyingErrorKey] as? Error else { return false }
+            return isProtectionRefusal(underlying)
+        }
+    }
+
+    /// Why `.off` here: the first-launch cleanup failed, the data directory can't be made, the
+    /// probe failed for a reason other than the lock, or the Keychain is unusable in this build. A launch before the first unlock after a reboot
     /// is `.lockedUntilFirstUnlock` instead (also nothing stored, but the sign-in screen says
     /// why). Nothing is stored then; quitting signs out.
     ///
     /// `defaultsDomain` is the name of the persistent domain `defaults` writes to (the bundle
-    /// identifier for `.standard`). `protectedDataAvailable` is injected so a test can fake a
+    /// identifier for `.standard`). `protectedData` is injected so a test can fake a
     /// locked device.
     static func prepare(
         dataDir: URL, calls: SecItemCalls, defaults: UserDefaults, defaultsDomain: String,
-        protectedDataAvailable: () -> Bool
+        protectedData: () -> ProtectedData
     ) -> SessionPersistence {
         // 0. Before the first unlock after a reboot, files and Keychain items of class "after
         // first unlock" can't be read. The defaults file then reads as empty (no marker) and the
@@ -74,7 +110,13 @@ extension SessionPersistence {
         // would set the marker while the old install's token is still there. So wait for an
         // unlocked launch, and store nothing meanwhile. This runs before the marker is read.
         // Not plain `.off`: the sign-in screen then tells the user to unlock the phone once.
-        guard protectedDataAvailable() else { return .lockedUntilFirstUnlock }
+        // A probe that failed for another reason is plain `.off`: same safety (nothing is read,
+        // deleted or marked), but no message, because the phone is not known to be locked.
+        switch protectedData() {
+        case .available: break
+        case .locked: return .lockedUntilFirstUnlock
+        case .failed: return .off
+        }
 
         // The access group is nil: the app's default group, which is its own and needs no
         // entitlement (an iOS Keychain item is visible only to the app that wrote it).

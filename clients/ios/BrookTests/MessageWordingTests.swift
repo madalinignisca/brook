@@ -53,7 +53,7 @@ final class MessageWordingTests: XCTestCase {
         XCTAssertTrue(SessionStore.Message.removalAndSignOutIncomplete.contains("this iPhone's data"))
         XCTAssertEqual(
             SessionStore.Message.waitingForFirstUnlock,
-            "Unlock your iPhone once after restarting so Brook can use its saved sign-in.")
+            "Brook can't use its saved sign-in until your iPhone has been unlocked once after restarting. Unlock it, then close Brook and open it again.")
         XCTAssertEqual(Settings.fallbackServer, "")
     }
 }

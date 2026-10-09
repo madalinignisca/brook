@@ -13,7 +13,10 @@ enum SessionPersistence {
     /// iOS only: this launch came before the first unlock after a reboot, when the Keychain and
     /// the app's files can't be read yet. Nothing is stored (like `.off`), but the sign-in
     /// screen says why, so the user knows to unlock the phone once and relaunch. Kept apart
-    /// from `.off` so the message comes from this state and is never guessed.
+    /// from `.off` so the message comes from this state and is never guessed. Only a real
+    /// protection-class refusal gives this state; any other failure of the check is `.off`. The
+    /// state lasts the whole process: the user has usually unlocked by the time they read the
+    /// message, and the message tells them to close Brook and open it again (no re-checking).
     case lockedUntilFirstUnlock
     /// Another Brook holds the instance lock: this one never touches the stored session.
     case secondInstance

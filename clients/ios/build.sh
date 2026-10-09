@@ -48,7 +48,10 @@ if [[ "$mode" == "test" ]]; then
     SessionPersistenceIOSTests/testAFatalProbeStaysOff
     SessionPersistenceIOSTests/testALockedProbeStaysOn
     SessionPersistenceIOSTests/testProtectedDataUnavailableStaysOffWithoutDeletingOrMarking
-    SessionPersistenceIOSTests/testTheFileProbeSaysAvailableWhenReadableAndLockedWhenNot
+    SessionPersistenceIOSTests/testAProbeThatFailedButIsNotLockedStaysOffWithoutTouchingAnything
+    SessionPersistenceIOSTests/testTheFileProbeSaysAvailableWhenReadable
+    SessionPersistenceIOSTests/testTheFileProbeSaysFailedForOtherFailures
+    SessionPersistenceIOSTests/testOnlyAPermissionRefusalCountsAsLocked
     SessionPersistenceIOSTests/testAMarkerOnlyInANonPersistentDomainDoesNotCount
     SessionPersistenceIOSTests/testTheCleanupDeletesBeforeAnyReadAndBeforeTheMarker
     SessionPersistenceIOSTests/testOtherDefaultsAlreadySetDoNotSkipTheFirstLaunchCleanup

@@ -95,7 +95,11 @@ struct CodeStepView: View {
             Form {
                 Section {
                     if form.useRecovery {
-                        TextField("Recovery code", text: $form.code, prompt: Text("xxxx-xxxx-xxxx-xxxx-xxxx"))
+                        // Secure, unlike the 6-digit code below: a recovery code is long-lived and
+                        // would otherwise sit in the clear in the app-switcher snapshot. The
+                        // 6-digit code stays visible because iOS code autofill needs a plain field
+                        // and the code expires within seconds.
+                        SecureField("Recovery code", text: $form.code, prompt: Text("xxxx-xxxx-xxxx-xxxx-xxxx"))
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                     } else {
