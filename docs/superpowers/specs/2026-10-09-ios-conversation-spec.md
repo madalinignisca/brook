@@ -72,6 +72,19 @@ and the place held.
 Done 6 (background with a dead socket) and the Retry check with the network off move to step 5's
 full simulator pass.
 
+As built, step 5 (the iOS message box): `ConversationSession` builds the shared `ComposerModel`
+(its `onMessage` merges the answer into the timeline, weakly) and exposes `archived`, read from the
+channel's row each time so a `channel.update` reaches it. In `ConversationView` the box (`ComposerBar`)
+is one `.safeAreaInset(edge: .bottom)` together with the error line, so it rides above the keyboard;
+the scroll view has `.scrollDismissesKeyboard(.interactively)`. The field is
+`TextField(axis: .vertical)` with `lineLimit(1...6)` and no `.onSubmit`. The sent message scrolls into
+view through the existing `follows(away:mine:)` (the answer's author is this user). When the field gains
+focus and the view is not away, the view scrolls to the bottom after 300 ms (the keyboard's rise); `away`
+is judged before the keyboard shrinks the area. Paste of text is the field's own, and Copy is the
+long-press on a message's text (`textSelection`, already there since step 4). `readOnly` follows
+`session.archived` through an `.onChange` on the always-present screen, not in the bar. Plan difference:
+the plan lists two shared tests and two session tests; they are as named, none changed.
+
 Changed after approval: the owner took the recommended answer to each open question; §7 records
 them, and the spec now reads as decided: the checks' servers (Done), `client_id` on the direct
 send (§4 Sending, §5, Done 7, 10), and the scroll rule with the jump-to-latest button (§4, Done
