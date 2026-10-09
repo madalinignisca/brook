@@ -229,6 +229,26 @@ final class SessionStoreTests: XCTestCase {
         }
     }
 
+    /// A launch before the first unlock (iOS) stores nothing, and the sign-in screen says why.
+    /// The message comes from the persistence state, so a plain `.off` must stay silent.
+    func testALaunchBeforeTheFirstUnlockSaysSoAndStoresNothing() async {
+        let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)))
+        let recorder = FactoryRecorder { fake }
+        let store = SessionStore(
+            settings: Settings(defaults: defaults, environment: [:]),
+            persistence: .lockedUntilFirstUnlock, makeFeed: nil, makeClient: recorder.factory)
+        XCTAssertEqual(store.phase, .signedOut(error: SessionStore.Message.waitingForFirstUnlock))
+        await store.restoreAtLaunch()
+        await store.signIn(server: "https://h", handle: "alice", password: "pw")
+        XCTAssertEqual(fake.restores, 0)
+        XCTAssertEqual(fake.persistence, [], "a locked launch stored the session")
+
+        let plainOff = SessionStore(
+            settings: Settings(defaults: defaults, environment: [:]), persistence: .off, makeFeed: nil,
+            makeClient: recorder.factory)
+        XCTAssertEqual(plainOff.phase, .signedOut(error: nil), "a plain .off must not claim a locked phone")
+    }
+
     func testSignOutEndsTheSessionQuietlyAndSignsOutOfCore() async {
         let fake = FakeClient(result: .success(.loggedIn(session: aliceSession)))
         let store = await signedIn(fake)

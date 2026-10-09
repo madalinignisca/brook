@@ -182,7 +182,7 @@ final class SessionPersistenceIOSTests: XCTestCase {
         let keychain = RecordingKeychain()
         let defaults = suite()
         let locked = prepare(keychain, defaults, unlocked: false)
-        XCTAssertTrue(isOff(locked))
+        guard case .lockedUntilFirstUnlock = locked else { return XCTFail("expected .lockedUntilFirstUnlock, got \(locked)") }
         XCTAssertEqual(keychain.events, [], "a locked launch touched the Keychain")
         XCTAssertFalse(cleared(defaults), "a locked launch set the marker")
         XCTAssertFalse(FileManager.default.fileExists(atPath: dataDir.path))

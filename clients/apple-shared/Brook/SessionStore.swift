@@ -58,6 +58,7 @@ final class SessionStore {
         static let keychainUnavailable = "Your saved sign-in couldn't be read (the keychain may be locked). Sign in again."
         static let restoreOffline = "Couldn't reach the server to resume your session. It's kept for next time; you can also sign in again."
         static let signOutIncomplete = "This \(ThisDevice.name) couldn't forget your saved sign-in, so Brook may sign you in again at the next launch. Sign in and out again to retry."
+        static let waitingForFirstUnlock = "Unlock \(ThisDevice.system) once after restarting so Brook can use its saved sign-in."
         static let secondInstance = "Brook is already open. This window won't remember your sign-in."
         static let removalIncomplete = "Brook couldn't remove all of this \(ThisDevice.name)'s data. Sign in and out again to retry."
         static let removalAndSignOutIncomplete = "Brook couldn't remove all of this \(ThisDevice.name)'s data, and may sign you in again at the next launch. Sign in and out again to retry."
@@ -107,6 +108,7 @@ final class SessionStore {
         // Start on "Signing in…" rather than flash the form the restore may replace.
         case .on where settings.lastGoodServer != nil: phase = .restoring
         case .secondInstance: phase = .signedOut(error: Message.secondInstance)
+        case .lockedUntilFirstUnlock: phase = .signedOut(error: Message.waitingForFirstUnlock)
         case .on, .off: break
         }
     }

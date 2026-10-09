@@ -29,6 +29,7 @@ final class MessageWordingTests: XCTestCase {
         SessionStore.Message.restoreOffline,
         SessionStore.Message.signOutIncomplete,
         SessionStore.Message.secondInstance,
+        SessionStore.Message.waitingForFirstUnlock,
         SessionStore.Message.removalIncomplete,
         SessionStore.Message.removalAndSignOutIncomplete,
     ]
@@ -50,6 +51,9 @@ final class MessageWordingTests: XCTestCase {
         XCTAssertTrue(SessionStore.Message.signOutIncomplete.hasPrefix("This iPhone couldn't forget your saved sign-in"))
         XCTAssertTrue(SessionStore.Message.removalIncomplete.contains("this iPhone's data"))
         XCTAssertTrue(SessionStore.Message.removalAndSignOutIncomplete.contains("this iPhone's data"))
+        XCTAssertEqual(
+            SessionStore.Message.waitingForFirstUnlock,
+            "Unlock your iPhone once after restarting so Brook can use its saved sign-in.")
         XCTAssertEqual(Settings.fallbackServer, "")
     }
 }

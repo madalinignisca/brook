@@ -44,12 +44,22 @@ extension SessionPersistence {
         if fm.fileExists(atPath: probe.path(percentEncoded: false)) {
             return (try? Data(contentsOf: probe)) != nil
         }
+        // The protection class below is what makes this probe work. "Until first user
+        // authentication" is the class of the Keychain item and the defaults file: readable from
+        // the first unlock after a boot, not before. So a failed write here means the phone has
+        // not been unlocked since boot. Do not weaken it (`.none`, `.completeFileProtectionUnlessOpen`):
+        // the probe would then be readable before the first unlock, say "available", and reopen
+        // the pre-unlock hole: the cleanup would run against a Keychain it cannot see and set its
+        // marker. Do not strengthen it to `.complete` either: the probe would then say "locked"
+        // whenever the screen is locked. The simulator cannot catch a wrong choice (it does not
+        // enforce file protection); only a real device, restarted and left locked, can.
         return (try? Data("x".utf8).write(to: probe, options: .completeFileProtectionUntilFirstUserAuthentication)) != nil
     }
 
-    /// Why `.off` here: protected data is not available yet (a launch before the first unlock
-    /// after a reboot), the first-launch cleanup failed, the data directory can't be made, or
-    /// the Keychain is unusable in this build. Nothing is stored then; quitting signs out.
+    /// Why `.off` here: the first-launch cleanup failed, the data directory can't be made, or
+    /// the Keychain is unusable in this build. A launch before the first unlock after a reboot
+    /// is `.lockedUntilFirstUnlock` instead (also nothing stored, but the sign-in screen says
+    /// why). Nothing is stored then; quitting signs out.
     ///
     /// `defaultsDomain` is the name of the persistent domain `defaults` writes to (the bundle
     /// identifier for `.standard`). `protectedDataAvailable` is injected so a test can fake a
@@ -63,7 +73,8 @@ extension SessionPersistence {
         // Keychain delete finds nothing (`errSecItemNotFound` counts as success), so the cleanup
         // would set the marker while the old install's token is still there. So wait for an
         // unlocked launch, and store nothing meanwhile. This runs before the marker is read.
-        guard protectedDataAvailable() else { return .off }
+        // Not plain `.off`: the sign-in screen then tells the user to unlock the phone once.
+        guard protectedDataAvailable() else { return .lockedUntilFirstUnlock }
 
         // The access group is nil: the app's default group, which is its own and needs no
         // entitlement (an iOS Keychain item is visible only to the app that wrote it).

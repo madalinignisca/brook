@@ -55,6 +55,7 @@ if [[ "$mode" == "test" ]]; then
     MessageWordingTests/testNoMessageNamesTheMac
     MessageWordingTests/testTheIPhoneWording
     SessionStoreTests/testNoFeedFactoryKeepsLocalDataOff
+    SessionStoreTests/testALaunchBeforeTheFirstUnlockSaysSoAndStoresNothing
     SessionStoreTests/testWithoutLocalDataSigningOutStillLeavesCoresFence
     ChannelEventsTests/testReadyClearsLiveCalls
   )
