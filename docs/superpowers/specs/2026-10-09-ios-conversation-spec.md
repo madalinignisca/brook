@@ -46,10 +46,23 @@ As built, step 4 (the iOS reading screen): `ConversationSession` owns the lifecy
 `rereadOnReady: true`, and its `stop()` clears `openChannel` and `timeline` only when the channel
 is this one and the timeline is nil or its own. The view keeps the reading position with the plan's fallback, not `.scrollPosition(id:)`: it notes
 the first row before `loadOlder()` and `scrollTo`s it (anchor top, no animation) after a page lands.
-The loader's ask is tied to the first row's id and repeats while the loader is still on screen,
-because `.onAppear` alone asked only once. The "away" test uses `visibleRect`, not `contentOffset`
-(which carries the safe-area inset), and the loader stays hidden until the first page has been
-scrolled to the bottom. Checked on the iOS 27 simulator against the local stack, in #itest with 121 messages: it opens on the newest message with no jump button; scrolling up shows the button, and tapping it returns to the newest message and hides it; scrolling up loads each older page and keeps the reading place, down to "This is the start of the conversation."
+Older pages are asked for from the scroll geometry, not from the loader appearing: when the
+visible area turns from far to within one screen of the top (`ScrollToLatest.isNearTop`), one page
+is asked for. When it lands, the reading place is put back with `scrollTo` only if the user has not
+moved since the ask (`ScrollToLatest.stayedPut`, 44 pt), after a layout turn and checked once by
+geometry. There is no automatic re-ask: after a good restore the top is a page away, so the next
+page needs the user to scroll up again (a short conversation gets one ask when the landing is done).
+The first landing happens after
+`session.start()` returns (the newest page is merged), and older pages and the follow rule wait for
+it, so a live message before the first page cannot count as the landing. The "away" test uses
+`visibleRect`, not `contentOffset` (which carries the safe-area inset). An empty channel shows no
+start text on iOS, as on the Mac (its loader needs a message to offer older ones). Checked on the
+simulator: it opens on the newest message with no jump button, swiping up shows the button and
+tapping it returns and hides it, and the first older page keeps the reading position. The geometry-driven asking (pages beyond the first) is
+checked on screen (flicks load one page per arrival and reach the start). Content that grows while the
+view is at the bottom (a reaction on the last row) keeps the bottom in view (`ScrollToLatest.pinsToBottom`).
+Done 6 (background with a dead socket) and the Retry check with the network off move to step 5's
+full simulator pass.
 
 Changed after approval: the owner took the recommended answer to each open question; §7 records
 them, and the spec now reads as decided: the checks' servers (Done), `client_id` on the direct
