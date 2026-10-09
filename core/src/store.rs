@@ -28,7 +28,6 @@
 
 use std::collections::HashSet;
 use std::fs;
-#[cfg(not(target_os = "android"))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, LazyLock, Mutex};
