@@ -1,7 +1,7 @@
 # Android: app skeleton that signs in and lists channels (#273): spec
 
-Status: all open questions answered by the owner (2026-10-08); awaiting the owner's approval of
-the spec. Review dial: **Heavy** (sign-in, TOTP and a session kept on the device). CLAUDE.md §2
+Status: approved by the owner (2026-10-08), merged in #309; the plan is
+`2026-10-08-android-skeleton-plan.md`, next to this file. Review dial: **Heavy** (sign-in, TOTP and a session kept on the device). CLAUDE.md §2
 asks for an `auth-reviewer` on any authentication change. None is defined in the repo or on this
 machine; one exists as a user-level agent on the server agent's machine. The owner accepted the
 Opus review in its place for this spec (2026-10-08); the token-removal PR goes to that
