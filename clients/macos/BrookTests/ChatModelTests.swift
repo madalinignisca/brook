@@ -368,6 +368,22 @@ final class ComposerModelTests: XCTestCase {
         XCTAssertNotEqual(ids[1], ids[2])
     }
 
+    /// "hello" fails but arrives and is then deleted; sending the unchanged box must not reuse
+    /// its id, or the server would answer with the tombstone and nothing would be posted.
+    func testDeletingAMessageDropsTheDraft() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.Network(message: "offline")
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hello"
+        await c.send()
+        chat.sendFailure = nil
+        await c.delete(msg("m1", "hello"))
+        await c.send()
+        let ids = chat.sentIds.withLock { $0 }
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertNotEqual(ids[0], ids[1])
+    }
+
     /// Clearing the restored box and typing the same words again is a new message.
     func testClearingTheBoxGetsANewClientId() async {
         let chat = FakeChat()

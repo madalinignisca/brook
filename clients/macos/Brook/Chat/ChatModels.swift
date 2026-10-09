@@ -776,6 +776,7 @@ final class ComposerModel {
     }
 
     func delete(_ message: FfiMessage) async {
+        draft = nil // the failed send may be the one deleted: its id would now return a tombstone
         do {
             try await client.deleteMessage(channelId: channelId, messageId: message.id)
         } catch {
