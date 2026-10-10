@@ -105,6 +105,14 @@ one symbol is not enough. To add a platform fact, add a seam type; do not add a 
   have scrolled up; a new message from someone else does not move the view then. What arrived while
   the app was away is re-read on return and after a reconnect, and the conversation is marked read.
   If the channel leaves the list (deleted, or you were removed), the app goes back to the list.
+- **Send text.** The message box sits above the keyboard: a field that grows to about six lines and
+  a Send button (off while the box is empty or only spaces). Return adds a new line; it does not
+  send. The sent message shows at once and always scrolls into view, and the live copy of it
+  merges into the same row. If the send fails, the text comes back with the reason; after "It may
+  not have been sent", pressing Send again is safe (the same message keeps one `client_id`, so the
+  server stores it once). Scrolling the messages dismisses the keyboard. Plain text pastes into the
+  box, and long-pressing a message's text offers Copy. In an archived channel the box is replaced
+  by a note, live. What you type tells the others you are typing.
 - **Sign out** from the list screen, after a confirmation.
 
 ## Known limits
@@ -114,7 +122,9 @@ one symbol is not enough. To add a platform fact, add a seam type; do not add a 
   show it until the binding passes it on.
 - **No cache.** Each opening of a conversation and each older page is fetched again, and with no
   network an open conversation shows only the error.
-- **No message box yet.** A conversation is read-only until the message box lands.
+- **Text only.** Not on the phone yet: attachments (send, open, save, previews), reply, edit,
+  delete and react, showing who is typing, drafts kept after leaving a conversation,
+  notifications, and offline history.
 - **A launch before the first unlock.** After a restart, the saved sign-in cannot be read until
   the phone is unlocked once. Brook says so. Unlock the phone, then quit Brook and open it again.
   A sign-out in that launch cannot remove the saved sign-in either, and Brook says that too.

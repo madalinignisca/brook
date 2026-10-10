@@ -183,4 +183,30 @@ final class ConversationSessionTests: XCTestCase {
         await s.start()
         XCTAssertNil(channels.mentions(channels.channels[0]), "opening left the mention badge")
     }
+
+    /// Send shows the answer at once, and the live echo of the same message merges into that row.
+    func testASentMessageShowsOnceWhenItsEchoArrives() async {
+        let (client, channels) = await list([channel("c1", "general")])
+        let s = session("c1", channels, FakeChat())
+        await s.start()
+        s.composer.text = "hi"
+        await s.composer.send()
+        XCTAssertEqual(shown(s), ["m9"], "the sent message did not show before its echo")
+        client.deliver(.messageNew(message: msg("m9", "hi", channel: "c1")))
+        await drainMain()
+        XCTAssertEqual(shown(s), ["m9"], "the echo made a second row")
+    }
+
+    /// `channel.update` archives the open channel: the view swaps the box for the note from this.
+    func testArchivingTheChannelMakesItArchived() async {
+        let (client, channels) = await list([channel("c1", "general")])
+        let s = session("c1", channels, FakeChat())
+        await s.start()
+        XCTAssertFalse(s.archived)
+        var archived = channel("c1", "general")
+        archived.archived = true
+        client.deliver(.channelUpdate(channel: archived))
+        await drainMain()
+        XCTAssertTrue(s.archived, "an archiving update did not reach the open conversation")
+    }
 }

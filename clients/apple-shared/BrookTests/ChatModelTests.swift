@@ -186,6 +186,27 @@ final class ComposerModelTests: XCTestCase {
         XCTAssertEqual(c.error, "The message you replied to was deleted.")
     }
 
+    /// Send stays off for a box with only spaces and new lines (Return adds a line on iOS, so a
+    /// stray one is easy to leave), and turns on with a word.
+    func testOnlySpacesCannotBeSent() {
+        let c = ComposerModel(channelId: "c", client: FakeChat(), onMessage: { _ in })
+        c.text = "  \n "
+        XCTAssertFalse(c.canSend)
+        c.text = "hi"
+        XCTAssertTrue(c.canSend)
+    }
+
+    /// A send refused because the session ended gives the text back and says so, not "Couldn't send.".
+    func testASignedOutSendSaysSo() async {
+        let chat = FakeChat()
+        chat.sendFailure = LoginError.NotAuthenticated
+        let c = ComposerModel(channelId: "c", client: chat, onMessage: { _ in })
+        c.text = "hello"
+        await c.send()
+        XCTAssertEqual(c.text, "hello")
+        XCTAssertEqual(c.error, "You were signed out.")
+    }
+
     /// A network failure may have delivered it: the text comes back, but the words don't
     /// claim it wasn't sent.
     func testANetworkFailureDoesntClaimItWasntSent() async {

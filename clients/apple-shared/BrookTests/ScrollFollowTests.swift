@@ -56,6 +56,24 @@ final class ScrollFollowTests: XCTestCase {
                                                    newContentHeight: 900, scrolling: false))
     }
 
+    func testAShrinkAtTheVeryBottomWhileIdlePinsToTheBottom() {
+        XCTAssertTrue(ScrollToLatest.pinsAfterShrink(oldDistanceFromBottom: 0, oldViewportHeight: 700,
+                                                     newViewportHeight: 400, scrolling: false))
+        XCTAssertTrue(ScrollToLatest.pinsAfterShrink(oldDistanceFromBottom: ScrollToLatest.gap, oldViewportHeight: 700,
+                                                     newViewportHeight: 650, scrolling: false))
+    }
+
+    func testAShrinkDoesNotPinWhenAboveTheBottomScrollingOrNotShrinking() {
+        XCTAssertFalse(ScrollToLatest.pinsAfterShrink(oldDistanceFromBottom: ScrollToLatest.gap + 1, oldViewportHeight: 700,
+                                                      newViewportHeight: 400, scrolling: false))
+        XCTAssertFalse(ScrollToLatest.pinsAfterShrink(oldDistanceFromBottom: 0, oldViewportHeight: 700,
+                                                      newViewportHeight: 400, scrolling: true))
+        XCTAssertFalse(ScrollToLatest.pinsAfterShrink(oldDistanceFromBottom: 0, oldViewportHeight: 700,
+                                                      newViewportHeight: 700, scrolling: false))
+        XCTAssertFalse(ScrollToLatest.pinsAfterShrink(oldDistanceFromBottom: 0, oldViewportHeight: 400,
+                                                      newViewportHeight: 700, scrolling: false))
+    }
+
     func testFollowsTheUsersOwnMessageEvenWhenAway() {
         XCTAssertTrue(ScrollToLatest.follows(away: true, mine: true))
     }
