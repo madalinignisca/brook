@@ -1,5 +1,8 @@
 # iOS: audio and video calls (#355)
 
+Status: approved by the owner (2026-10-10), who took the recommended answer to each question
+in §8.
+
 Review: Opus review at every stage (CLAUDE.md §2). Two phases (§3). Phase 1 is iOS and shared
 Swift, plus one dev-only server file: the browser call harness gains an audio count (§7). No
 route, protocol or auth change. Phase 2 (push) is only outlined here; it gets its own spec, with
@@ -284,48 +287,49 @@ Taken in this spec (the owner may override):
   app from being suspended). Only this proves: items 2 (by ear, echo), 3 (system screen), 4, 6
   (system screen, indicators), 7, 8, 9, 10 (camera), and anything the spike moves.
 
-## 8. Open questions
+## 8. Decided by the owner (2026-10-10)
 
 1. **Phasing.** Phase 1 under #355; phase 2 as a new issue (server and iOS) with its own spec and
    plan, started after phase 1 merges. #355's "while in the background or closed" moves to it.
-   *Recommended: yes.*
+   *Decided: yes.*
 2. **The iPhone sharing its screen.** It needs a ReplayKit broadcast extension: a second target
    running in its own process with about 50 MB of memory, its own connection to the call, and
-   an app group. *Recommended: out, its own issue.*
+   an app group. *Decided: out, its own issue.*
 3. **Camera at join.** Off, with the permission asked at the first camera tap. A phone joined
    from a pocket or the lock screen should not start filming, and the camera cannot run in the
    background anyway. The engine already keeps a video track without running capture; what
    changes is shared code the Mac also uses: the engine's starting media intent (camera on
    today), `JoinPlan.resolve` asking for the camera at join, and `CallModel.toggleCamera`
-   refusing when the join had no camera. *Recommended: off on iPhone, the Mac's behavior
+   refusing when the join had no camera. *Decided: off on iPhone, the Mac's behavior
    unchanged; the plan says how the shared code takes both.*
 4. **Audio route.** The speaker by default (the call screen is a video call), headphones or
    Bluetooth when connected, and the system's route picker on the call screen.
-   *Recommended: yes.*
+   *Decided: yes.*
 5. **Leaving the call screen while in the call.** A button hides it, the call goes on, and a bar
    above the list and the conversation returns to it, so the user can read the chat during a
-   call as on the Mac. *Recommended: in.*
-6. **Order with #293.** The ring rule lives in #293, open with conflicts. *Recommended: #293
+   call as on the Mac. *Decided: in.*
+6. **Order with #293.** The ring rule lives in #293, open with conflicts. *Decided: #293
    lands first, its rule moves to shared code in this work; only item 9 waits for it.*
 7. **What the push carries (phase 2).** The call id, the DM's channel id and the caller's display
-   name, which the ring screen shows on a locked phone. No message content. *Recommended: yes.*
+   name, which the ring screen shows on a locked phone. No message content. *Decided: yes.*
 8. **Push without a relay (phase 2).** Each server sends to APNs with its own key. Only the team
    that signs the app can push to it, so a third party's server can ring only an app built under
-   its own Apple team. A shared relay is its own design. *Recommended: direct for now, written
+   its own Apple team. A shared relay is its own design. *Decided: direct for now, written
    in an ADR.*
 9. **A registration's life (phase 2).** Should a push registration end when the sign-in it was
    made under ends elsewhere (password change, admin reset), so a lost phone stops showing
    caller names? Access tokens carry only the user, role and times, not the sign-in, so this
-   needs the server to know which sign-in registered the token. *Recommended: decide in the
+   needs the server to know which sign-in registered the token. *Decided: settled in the
    phase-2 spec with the auth review; at minimum, sign-out on the phone removes it.*
 10. **How the iPhone build is distributed (phase 2).** The APNs environment follows the signing
     profile: development-signed builds get sandbox tokens, distribution-signed (TestFlight, App
     Store, ad hoc) get production. If the owner's builds are always development-signed from
-    Xcode, the server needs one environment and the registration no field. *Recommended: tell
-    us the distribution; with one kind of build, one environment set in server config.*
+    Xcode, the server needs one environment and the registration no field. *Decided: the owner
+    states the distribution in the phase-2 spec; with one kind of build, one environment set in
+    server config.*
 11. **Stopping a ring (phase 2).** The plan above relies on the woken app staying awake while it
     rings, connecting, and reading `channel.call`. If iOS or a bad network keeps it from doing so,
     the ring runs to 45 s after the caller hung up or someone answered. The fallback is a cancel
     push from the server, which, as every VoIP push, the app must report to CallKit and then end
-    at once. *Recommended: no cancel push at first; the phase-2 device check measures it, and
+    at once. *Decided: no cancel push at first; the phase-2 device check measures it, and
     the cancel push is added only if rings outlive their calls.*
